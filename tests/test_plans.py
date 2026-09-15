@@ -3,6 +3,7 @@ import pytest
 from gimme.config import (
     AppConfig,
     FrontendBuildConfig,
+    HealthCheckConfig,
     HorizonWorkerConfig,
     QueueWorkerConfig,
     SchedulerConfig,
@@ -13,6 +14,7 @@ from gimme.plans import (
     app_process_plan,
     app_resource_plan,
     artisan_command_plan,
+    deployment_plan,
     stack_plan,
 )
 
@@ -145,6 +147,51 @@ def test_app_plan_changes_when_deployment_definition_changes() -> None:
     )
 
     assert first["plan_id"] != second["plan_id"]
+
+
+def test_deployment_plan_exposes_candidate_and_live_health_gates() -> None:
+    app = AppConfig(
+        repository="git@example.test:me/my-app.git",
+        framework="laravel",
+        branch="stable",
+        health=HealthCheckConfig(
+            path="/up",
+            expected_status=204,
+            attempts=5,
+            delay_seconds=2,
+            timeout_seconds=3,
+        ),
+    )
+
+    plan = deployment_plan(server(), "my-app", app)
+
+    assert plan["kind"] == "application_deploy"
+    assert plan["repository"] == app.repository
+    assert plan["branch"] == "stable"
+    assert plan["health"]["pre_activation"] == {
+        "target": "candidate_release",
+        "path": "/up",
+        "expected_status": 204,
+        "attempts": 5,
+        "delay_seconds": 2,
+        "timeout_seconds": 3,
+        "failure": "prevent_symlink_switch",
+    }
+    assert plan["health"]["post_activation"] == {
+        "target": "https://my-app.devbox.local/up",
+        "expected_status": 204,
+        "attempts": 5,
+        "delay_seconds": 2,
+        "timeout_seconds": 3,
+        "failure": "rollback_previous_release",
+    }
+
+    changed = deployment_plan(
+        server(),
+        "my-app",
+        app.model_copy(update={"health": HealthCheckConfig(path="/health")}),
+    )
+    assert changed["plan_id"] != plan["plan_id"]
 
 
 def test_static_frontend_has_no_backend_resources() -> None:

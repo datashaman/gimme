@@ -2,7 +2,13 @@ import json
 import subprocess
 from pathlib import Path
 
-from gimme.config import AppConfig, HorizonWorkerConfig, SchedulerConfig, ServerConfig
+from gimme.config import (
+    AppConfig,
+    HealthCheckConfig,
+    HorizonWorkerConfig,
+    SchedulerConfig,
+    ServerConfig,
+)
 from gimme.deployer import DeployerRunner
 
 
@@ -118,6 +124,7 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
         framework="laravel",
         workers=HorizonWorkerConfig(),
         scheduler=SchedulerConfig(),
+        health=HealthCheckConfig(path="/up", attempts=5),
     )
 
     runner(tmp_path).run(
@@ -126,3 +133,10 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
 
     assert json.loads(captured["GIMME_WORKERS_JSON"])["driver"] == "horizon"
     assert json.loads(captured["GIMME_SCHEDULER_JSON"]) == {"enabled": True}
+    assert json.loads(captured["GIMME_HEALTH_JSON"]) == {
+        "path": "/up",
+        "expected_status": 200,
+        "attempts": 5,
+        "delay_seconds": 2,
+        "timeout_seconds": 5,
+    }

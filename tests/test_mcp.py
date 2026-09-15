@@ -52,7 +52,7 @@ async def test_tool_surface_and_annotations() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
 
-    assert len(tools) == 18
+    assert len(tools) == 19
     assert {tool.name for tool in tools} >= {
         "inspect_host",
         "plan_stack",
@@ -69,6 +69,7 @@ async def test_tool_surface_and_annotations() -> None:
         "provision_app_processes",
         "app_process_status",
         "configure_app_processes",
+        "configure_app_health",
     }
     for tool in tools:
         assert tool.annotations is not None
@@ -79,6 +80,42 @@ async def test_tool_surface_and_annotations() -> None:
     register = next(tool for tool in tools if tool.name == "register_app")
     worker_schema = register.inputSchema["properties"]["workers"]
     assert "standard queue worker or Horizon" in worker_schema["description"]
+
+
+async def test_configure_health_through_mcp_is_local_and_preserves_app(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "configure_app_health",
+            {
+                "name": "example-app",
+                "health": {
+                    "path": "/up",
+                    "expected_status": 200,
+                    "attempts": 5,
+                    "delay_seconds": 1,
+                    "timeout_seconds": 3,
+                },
+            },
+        )
+
+    assert result.data == {
+        "application": "example-app",
+        "changed": True,
+        "health": {
+            "path": "/up",
+            "expected_status": 200,
+            "attempts": 5,
+            "delay_seconds": 1,
+            "timeout_seconds": 3,
+        },
+    }
+    assert server_module.store.app("example-app").repository == (
+        "git@github.com:example/example-app.git"
+    )
 
 
 async def test_read_only_plan_through_mcp() -> None:
@@ -200,6 +237,86 @@ def test_artisan_tools_require_an_exact_plan_and_pass_structured_context(
     assert captured["kwargs"]["artisan_command"] == "migrate"
     assert captured["kwargs"]["artisan_arguments"] == ["--force"]
     assert "migrate" in captured["kwargs"]["artisan_allowed_commands"]
+
+
+def test_deploy_plan_includes_both_health_gates(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    server_module.configure_app_health(
+        "example-app",
+        {
+            "path": "/up",
+            "expected_status": 200,
+            "attempts": 5,
+            "delay_seconds": 1,
+            "timeout_seconds": 3,
+        },
+    )
+
+    monkeypatch.setattr(
+        "gimme.server.runner.run",
+        lambda *args, **kwargs: CommandResult(
+            ["dep", "deploy", "devbox", "--plan"], 0, "deployment tasks"
+        ),
+    )
+
+    plan = server_module.plan_deploy("example-app")
+
+    assert plan["kind"] == "application_deploy"
+    assert plan["health"]["pre_activation"]["failure"] == (
+        "prevent_symlink_switch"
+    )
+    assert plan["health"]["post_activation"]["failure"] == (
+        "rollback_previous_release"
+    )
+    assert plan["deployer_plan"] == "deployment tasks"
+
+
+def test_deploy_rejects_plan_after_health_policy_changes(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def fake_run(task, *args, **kwargs) -> CommandResult:
+        calls.append(task)
+        return CommandResult(["dep", task, "devbox"], 0, "ok")
+
+    monkeypatch.setattr("gimme.server.runner.run", fake_run)
+    server_module.configure_app_health("example-app", {"path": "/up"})
+    plan = server_module.plan_deploy("example-app")
+    server_module.configure_app_health("example-app", {"path": "/health"})
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.deploy_app("example-app", plan["plan_id"])
+
+    assert calls == ["deploy", "deploy"]
+
+
+def test_deploy_rejects_plan_when_deployer_task_graph_changes(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    rendered_plans = iter(["candidate -> symlink -> live", "symlink -> live"])
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_run(task, *args, **kwargs) -> CommandResult:
+        arguments = tuple(kwargs.get("arguments", ()))
+        calls.append((task, arguments))
+        if arguments == ("--plan",):
+            return CommandResult(
+                ["dep", task, "devbox", "--plan"], 0, next(rendered_plans)
+            )
+        return CommandResult(["dep", task, "devbox"], 0, "deployed")
+
+    monkeypatch.setattr("gimme.server.runner.run", fake_run)
+    server_module.configure_app_health("example-app", {"path": "/up"})
+    plan = server_module.plan_deploy("example-app")
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.deploy_app("example-app", plan["plan_id"])
+
+    assert calls == [
+        ("deploy", ("--plan",)),
+        ("deploy", ("--plan",)),
+    ]
 
 
 def test_run_artisan_rejects_stale_plan_before_remote_execution(

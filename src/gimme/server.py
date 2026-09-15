@@ -12,7 +12,9 @@ from gimme.config import (
     ArtisanConfig,
     ConfigStore,
     FrontendBuildConfig,
+    HealthCheckConfig,
     SchedulerConfig,
+    ServerConfig,
     WorkerConfig,
 )
 from gimme.deployer import DeployerRunner
@@ -20,6 +22,8 @@ from gimme.plans import (
     app_process_plan,
     app_resource_plan,
     artisan_command_plan,
+    deployment_plan,
+    plan_id as compute_plan_id,
     stack_plan,
 )
 
@@ -100,17 +104,45 @@ SchedulerRegistration = Annotated[
     SchedulerConfig | None,
     Field(description="Optional every-minute Laravel scheduler definition."),
 ]
+HealthRegistration = Annotated[
+    HealthCheckConfig | None,
+    Field(
+        description=(
+            "Optional Laravel health policy used as a candidate-release gate before "
+            "activation and a live HTTPS rollback gate afterward. Null disables it."
+        )
+    ),
+]
 PlanIdentifier = Annotated[
     str,
     Field(
         pattern=r"^plan_[a-f0-9]{20}$",
-        description="Exact plan_id returned by plan_artisan for this invocation.",
+        description="Exact plan_id returned by the corresponding planning tool.",
     ),
 ]
 
 
 def titled(base: ToolAnnotations, title: str) -> ToolAnnotations:
     return base.model_copy(update={"title": title})
+
+
+def resolved_deployment_plan(
+    server: ServerConfig, name: str, app: AppConfig
+) -> dict[str, object]:
+    definition = deployment_plan(server, name, app)
+    rendered = runner.run(
+        "deploy",
+        server,
+        app_name=name,
+        app=app,
+        arguments=("--plan",),
+        timeout=60,
+    )
+    resolved = {
+        key: value for key, value in definition.items() if key != "plan_id"
+    }
+    resolved["deployer_plan"] = rendered.output
+    return {"plan_id": compute_plan_id(resolved), **resolved}
 
 
 @mcp.resource(
@@ -345,8 +377,9 @@ def list_apps() -> dict[str, object]:
 @mcp.tool(
     description=(
         "Register or update a PHP application's allowlisted deployment definition. "
-        "Laravel definitions may override the default Artisan command allowlist. Changes "
-        "only the local registry; it does not connect to or modify the host."
+        "Laravel definitions may override the default Artisan command allowlist and declare "
+        "process and deployment-health policies. Changes only the local registry; it does "
+        "not connect to or modify the host."
     ),
     annotations=ToolAnnotations(
         title="Register application",
@@ -367,6 +400,7 @@ def register_app(
     artisan: ArtisanConfig | None = None,
     workers: WorkerRegistration = None,
     scheduler: SchedulerRegistration = None,
+    health: HealthRegistration = None,
 ) -> dict[str, object]:
     app = AppConfig(
         repository=repository,
@@ -376,6 +410,7 @@ def register_app(
         artisan=artisan,
         workers=workers,
         scheduler=scheduler,
+        health=health,
     )
     changed = store.register_app(name, app)
     return {"application": name, "changed": changed, **app.model_dump()}
@@ -408,6 +443,34 @@ def configure_app_processes(
         "changed": changed,
         "workers": app.workers.model_dump() if app.workers is not None else None,
         "scheduler": app.scheduler.model_dump() if app.scheduler is not None else None,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Replace only the local Laravel deployment health policy while preserving the "
+        "application's repository, branch, frontend, Artisan, worker, and scheduler "
+        "settings. The policy gates candidate activation and rolls back a failed live "
+        "HTTPS check; null disables it. Makes no remote changes."
+    ),
+    annotations=ToolAnnotations(
+        title="Configure application health",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def configure_app_health(
+    name: ApplicationName,
+    health: HealthRegistration = None,
+) -> dict[str, object]:
+    changed = store.configure_app_health(name, health)
+    app = store.app(name)
+    return {
+        "application": name,
+        "changed": changed,
+        "health": app.health.model_dump() if app.health is not None else None,
     }
 
 
@@ -447,34 +510,24 @@ def provision_app_resources(name: str, plan_id: str) -> dict[str, object]:
 
 @mcp.tool(
     description=(
-        "Return Deployer's task execution plan for a registered application. Makes no "
-        "remote changes and returns the current application plan_id for deploy_app."
+        "Return the exact deployment definition and Deployer task order for a registered "
+        "application, including configured pre-activation and live rollback health gates. "
+        "Makes no remote changes and returns the plan_id required by deploy_app."
     ),
     annotations=titled(READ_ONLY, "Plan application deployment"),
 )
 def plan_deploy(name: str) -> dict[str, object]:
     server = store.server()
     app = store.app(name)
-    resource_plan = app_resource_plan(server, name, app)
-    result = runner.run(
-        "deploy",
-        server,
-        app_name=name,
-        app=app,
-        arguments=("--plan",),
-        timeout=60,
-    )
-    return {
-        "plan_id": resource_plan["plan_id"],
-        "application": name,
-        "deployer_plan": result.output,
-    }
+    return resolved_deployment_plan(server, name, app)
 
 
 @mcp.tool(
     description=(
         "Deploy a registered application from Git using its pinned Deployer recipe. "
-        "Requires the current plan_id and may run framework migrations defined by that recipe."
+        "Requires the current plan_id and may run framework migrations. Configured health "
+        "checks gate the candidate before symlink activation and restore the previous release "
+        "if the subsequent live HTTPS check fails."
     ),
     annotations=ToolAnnotations(
         title="Deploy application",
@@ -487,7 +540,7 @@ def plan_deploy(name: str) -> dict[str, object]:
 def deploy_app(name: str, plan_id: str) -> dict[str, object]:
     server = store.server()
     app = store.app(name)
-    expected = app_resource_plan(server, name, app)
+    expected = resolved_deployment_plan(server, name, app)
     if plan_id != expected["plan_id"]:
         raise ValueError("plan_id is invalid or stale; call plan_deploy again")
     return runner.run("deploy", server, app_name=name, app=app).as_dict()

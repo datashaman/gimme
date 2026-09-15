@@ -10,6 +10,7 @@ from gimme.config import (
     ArtisanInvocation,
     ConfigStore,
     FrontendBuildConfig,
+    HealthCheckConfig,
     HorizonWorkerConfig,
     QueueWorkerConfig,
     SchedulerConfig,
@@ -69,6 +70,51 @@ def test_configure_app_processes_preserves_the_deployment_definition(tmp_path: P
     assert updated.branch == "stable"
     assert updated.workers.driver == "horizon"
     assert updated.scheduler.enabled is True
+
+
+def test_configure_app_health_preserves_the_deployment_definition(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    original = AppConfig(
+        repository="git@example.test:acme/app.git",
+        framework="laravel",
+        branch="stable",
+        workers=HorizonWorkerConfig(),
+    )
+    store.register_app("acme", original)
+
+    health = HealthCheckConfig(
+        path="/up",
+        expected_status=200,
+        attempts=5,
+        delay_seconds=2,
+        timeout_seconds=3,
+    )
+    changed = store.configure_app_health("acme", health)
+    updated = store.app("acme")
+
+    assert changed is True
+    assert updated.repository == original.repository
+    assert updated.branch == "stable"
+    assert updated.workers == original.workers
+    assert updated.health == health
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["up", "//up", "/../secret", "/up?debug=1", "/up#fragment", "/up%0aevil"],
+)
+def test_health_path_is_a_bounded_absolute_url_path(path: str) -> None:
+    with pytest.raises(ValidationError):
+        HealthCheckConfig(path=path)
+
+
+def test_health_checks_require_laravel() -> None:
+    with pytest.raises(ValidationError, match="Laravel"):
+        AppConfig(
+            repository="https://example.test/app.git",
+            framework="symfony",
+            health=HealthCheckConfig(),
+        )
 
 
 @pytest.mark.parametrize("name", ["../bad", "Bad", "-bad", "bad_name", ""])

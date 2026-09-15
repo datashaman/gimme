@@ -232,6 +232,119 @@ function configured_process_object(string $environment): ?array
     return $decoded;
 }
 
+function configured_health(): ?array
+{
+    $decoded = json_decode(required_env('GIMME_HEALTH_JSON'), true, flags: JSON_THROW_ON_ERROR);
+    if ($decoded === null) {
+        return null;
+    }
+    if (!is_array($decoded) || array_is_list($decoded)) {
+        throw new \RuntimeException('GIMME_HEALTH_JSON must be an object or null');
+    }
+    $expectedKeys = [
+        'attempts',
+        'delay_seconds',
+        'expected_status',
+        'path',
+        'timeout_seconds',
+    ];
+    $actualKeys = array_keys($decoded);
+    sort($actualKeys);
+    if ($actualKeys !== $expectedKeys) {
+        throw new \RuntimeException('Health configuration has unknown or missing fields');
+    }
+    $path = $decoded['path'];
+    $segments = is_string($path) && $path !== '/'
+        ? explode('/', trim($path, '/'))
+        : [];
+    if (!is_string($path) || strlen($path) > 200 || !str_starts_with($path, '/') ||
+        str_starts_with($path, '//') || strpbrk($path, '?#%\\') !== false ||
+        array_filter(
+            $segments,
+            static fn (string $segment): bool => $segment === '' ||
+                in_array($segment, ['.', '..'], true) ||
+                !preg_match('/^[a-zA-Z0-9._~-]+$/', $segment),
+        )) {
+        throw new \RuntimeException('Unsafe health path');
+    }
+    foreach ([
+        'expected_status' => [200, 399],
+        'attempts' => [1, 30],
+        'delay_seconds' => [0, 30],
+        'timeout_seconds' => [1, 30],
+    ] as $key => [$minimum, $maximum]) {
+        $value = $decoded[$key];
+        if (!is_int($value) || $value < $minimum || $value > $maximum) {
+            throw new \RuntimeException("Invalid health configuration field {$key}");
+        }
+    }
+    return $decoded;
+}
+
+function laravel_candidate_health_script(): string
+{
+    return <<<'PHP'
+$path = getenv('GIMME_HEALTH_PATH');
+$host = getenv('GIMME_HEALTH_HOST');
+$expected = filter_var(getenv('GIMME_HEALTH_EXPECTED'), FILTER_VALIDATE_INT);
+try {
+    require getcwd() . '/vendor/autoload.php';
+    $app = require getcwd() . '/bootstrap/app.php';
+    $kernel = $app->make(\Illuminate\Contracts\Http\Kernel::class);
+    $request = \Illuminate\Http\Request::create(
+        $path,
+        'GET',
+        [],
+        [],
+        [],
+        ['HTTP_HOST' => $host, 'HTTPS' => 'on', 'SERVER_PORT' => 443]
+    );
+    $response = $kernel->handle($request);
+    $status = $response->getStatusCode();
+    $kernel->terminate($request, $response);
+    fwrite(STDOUT, "GIMME_HEALTH_STATUS|{$status}\n");
+    exit($status === $expected ? 0 : 1);
+} catch (\Throwable) {
+    fwrite(STDOUT, "GIMME_HEALTH_STATUS|exception\n");
+    exit(1);
+}
+PHP;
+}
+
+function laravel_live_health_script(): string
+{
+    return <<<'PHP'
+$url = getenv('GIMME_HEALTH_URL');
+$host = getenv('GIMME_HEALTH_HOST');
+$ca = getenv('GIMME_HEALTH_CA');
+$expected = filter_var(getenv('GIMME_HEALTH_EXPECTED'), FILTER_VALIDATE_INT);
+$timeout = filter_var(getenv('GIMME_HEALTH_TIMEOUT'), FILTER_VALIDATE_INT);
+try {
+    $handle = curl_init($url);
+    if ($handle === false) {
+        throw new \RuntimeException('curl initialization failed');
+    }
+    curl_setopt_array($handle, [
+        CURLOPT_CAINFO => $ca,
+        CURLOPT_CONNECTTIMEOUT => $timeout,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_RESOLVE => ["{$host}:443:127.0.0.1"],
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_WRITEFUNCTION => static fn ($curl, string $body): int => strlen($body),
+    ]);
+    $ok = curl_exec($handle);
+    $status = curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
+    curl_close($handle);
+    fwrite(STDOUT, "GIMME_HEALTH_STATUS|{$status}\n");
+    exit($ok !== false && $status === $expected ? 0 : 1);
+} catch (\Throwable) {
+    fwrite(STDOUT, "GIMME_HEALTH_STATUS|exception\n");
+    exit(1);
+}
+PHP;
+}
+
 function configured_workers(): ?array
 {
     return configured_process_object('GIMME_WORKERS_JSON');
@@ -308,6 +421,7 @@ $mdnsName = (string) env_or_config('GIMME_MDNS_NAME', 'server', 'mdns_name');
 $remoteUser = (string) env_or_config('GIMME_REMOTE_USER', 'server', 'remote_user');
 $appsRoot = rtrim((string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/');
 $app = getenv('GIMME_APP') ?: '';
+$health = $app === '' ? null : configured_health();
 
 if (!valid_endpoint($hostname) || !valid_endpoint($bootstrapHostname) || !valid_endpoint($sshHostname)) {
     throw new \RuntimeException('Unsafe host endpoint');
@@ -333,6 +447,9 @@ if (
 }
 if ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,47}$/', $app)) {
     throw new \RuntimeException('Unsafe application name');
+}
+if ($health !== null && $framework !== 'laravel') {
+    throw new \RuntimeException('Deployment health gates require a Laravel application');
 }
 
 host($hostAlias)
@@ -395,6 +512,87 @@ if ($hasFrontend) {
     ]);
     after('deploy:update_code', 'gimme:frontend:install');
     after('deploy:vendors', 'gimme:frontend:build');
+}
+
+if ($health !== null) {
+    task('gimme:health:candidate', function () use ($health, $app, $mdnsName): void {
+        $host = "{$app}.{$mdnsName}.local";
+        $expected = $health['expected_status'];
+        $command = 'cd {{release_path}} && ' .
+            'GIMME_HEALTH_PATH=' . escapeshellarg($health['path']) . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+            '/usr/bin/timeout --signal=TERM ' .
+            escapeshellarg((string) $health['timeout_seconds']) . 's ' .
+            'php -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
+            $output = run(
+                $command,
+                secrets: [
+                    'health_script' => escapeshellarg(laravel_candidate_health_script()),
+                ],
+            );
+            if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
+                writeln("candidate_health=ready attempts={$attempt}");
+                return;
+            }
+            if ($attempt < $health['attempts'] && $health['delay_seconds'] > 0) {
+                run('/usr/bin/sleep ' . escapeshellarg((string) $health['delay_seconds']));
+            }
+        }
+        throw new \RuntimeException(
+            "Candidate release health check failed before activation after " .
+            "{$health['attempts']} attempts"
+        );
+    });
+
+    task('gimme:health:live', function () use (
+        $health,
+        $app,
+        $mdnsName,
+        $appsRoot,
+    ): void {
+        $host = "{$app}.{$mdnsName}.local";
+        $url = "https://{$host}{$health['path']}";
+        $expected = $health['expected_status'];
+        $command =
+            'GIMME_HEALTH_URL=' . escapeshellarg($url) . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
+            'GIMME_HEALTH_CA=' . escapeshellarg("{$appsRoot}/.caddy-local-root.crt") . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+            'GIMME_HEALTH_TIMEOUT=' .
+            escapeshellarg((string) $health['timeout_seconds']) . ' ' .
+            'php -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
+            $output = run(
+                $command,
+                secrets: [
+                    'health_script' => escapeshellarg(laravel_live_health_script()),
+                ],
+            );
+            if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
+                writeln("live_health=ready attempts={$attempt}");
+                return;
+            }
+            if ($attempt < $health['attempts'] && $health['delay_seconds'] > 0) {
+                run('/usr/bin/sleep ' . escapeshellarg((string) $health['delay_seconds']));
+            }
+        }
+        try {
+            invoke('rollback');
+        } catch (\Throwable $rollbackError) {
+            throw new \RuntimeException(
+                'Live health check failed and automatic rollback also failed',
+                previous: $rollbackError,
+            );
+        }
+        throw new \RuntimeException(
+            'Live health check failed; the previous release was restored'
+        );
+    });
+
+    before('deploy:symlink', 'gimme:health:candidate');
+    after('deploy:symlink', 'gimme:health:live');
 }
 
 task('gimme:inspect', function () use ($mdnsName): void {
@@ -1057,7 +1255,11 @@ task('gimme:restart:workers', function (): void {
     );
 });
 
-after('deploy:symlink', 'gimme:restart:workers');
+if ($health === null) {
+    after('deploy:symlink', 'gimme:restart:workers');
+} else {
+    after('gimme:health:live', 'gimme:restart:workers');
+}
 after('rollback', 'gimme:restart:workers');
 
 task('gimme:service:status', function (): void {

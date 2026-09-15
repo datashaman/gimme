@@ -1,9 +1,48 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def rendered_deploy_plan(health: dict[str, object]) -> str:
+    environment = {
+        **os.environ,
+        "GIMME_HOSTNAME": "devbox.local",
+        "GIMME_BOOTSTRAP_HOSTNAME": "192.0.2.10",
+        "GIMME_SSH_HOSTNAME": "devbox.local",
+        "GIMME_HOST_ALIAS": "devbox",
+        "GIMME_MDNS_NAME": "devbox",
+        "GIMME_REMOTE_USER": "deployer",
+        "GIMME_APPS_ROOT": "/srv/gimme/apps",
+        "GIMME_KEEP_RELEASES": "5",
+        "GIMME_APP": "example-app",
+        "GIMME_REPOSITORY": "git@example.test:acme/example-app.git",
+        "GIMME_FRAMEWORK": "laravel",
+        "GIMME_BRANCH": "main",
+        "GIMME_WORKERS_JSON": "null",
+        "GIMME_SCHEDULER_JSON": "null",
+        "GIMME_HEALTH_JSON": json.dumps(health),
+    }
+    result = subprocess.run(
+        [
+            str(ROOT / "vendor" / "bin" / "dep"),
+            "--file=deploy.php",
+            "deploy",
+            "devbox",
+            "--no-interaction",
+            "--plan",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
 
 
 def test_deployer_recipe_passes_static_analysis() -> None:
@@ -200,6 +239,38 @@ def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
     assert "after('rollback', 'gimme:restart:workers')" in recipe
     assert "QUEUE_CONNECTION=redis" in recipe
     assert "php artisan --no-interaction config:clear" in recipe
+
+
+def test_deployment_health_gates_candidate_before_live_activation() -> None:
+    plan = rendered_deploy_plan(
+        {
+            "path": "/up",
+            "expected_status": 200,
+            "attempts": 5,
+            "delay_seconds": 1,
+            "timeout_seconds": 3,
+        }
+    )
+
+    assert plan.index("gimme:health:candidate") < plan.index("deploy:symlink")
+    assert plan.index("deploy:symlink") < plan.index("gimme:health:live")
+    assert plan.index("gimme:health:live") < plan.index("gimme:restart:workers")
+
+
+def test_health_probes_are_local_bounded_and_do_not_return_response_bodies() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    health = recipe.split("function laravel_candidate_health_script", 1)[1].split(
+        "task('gimme:inspect'", 1
+    )[0]
+
+    assert "/usr/bin/timeout --signal=TERM" in health
+    assert "CURLOPT_CAINFO" in health
+    assert "CURLOPT_FOLLOWLOCATION => false" in health
+    assert 'CURLOPT_RESOLVE => ["{$host}:443:127.0.0.1"]' in health
+    assert "CURLOPT_WRITEFUNCTION" in health
+    assert "GIMME_HEALTH_STATUS|exception" in health
+    assert "invoke('rollback')" in health
+    assert "response->getContent" not in health
 
 
 def test_privileged_helper_is_narrowly_allowlisted() -> None:

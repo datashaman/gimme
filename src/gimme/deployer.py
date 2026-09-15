@@ -124,6 +124,9 @@ class DeployerRunner:
                     "GIMME_SCHEDULER_JSON": json.dumps(
                         app.scheduler.model_dump() if app.scheduler is not None else None
                     ),
+                    "GIMME_HEALTH_JSON": json.dumps(
+                        app.health.model_dump() if app.health is not None else None
+                    ),
                 }
             )
             if app.frontend is not None:

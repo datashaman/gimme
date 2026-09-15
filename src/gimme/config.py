@@ -284,6 +284,57 @@ class SchedulerConfig(BaseModel):
     )
 
 
+class HealthCheckConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        default="/up",
+        min_length=1,
+        max_length=200,
+        description="Absolute Laravel URL path checked before and after activation.",
+    )
+    expected_status: int = Field(
+        default=200,
+        ge=200,
+        le=399,
+        description="Exact successful HTTP status required from both health gates.",
+    )
+    attempts: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        description="Maximum attempts for each health gate.",
+    )
+    delay_seconds: int = Field(
+        default=2,
+        ge=0,
+        le=30,
+        description="Delay between health attempts in seconds.",
+    )
+    timeout_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=30,
+        description="Timeout for one health attempt in seconds.",
+    )
+
+    @field_validator("path")
+    @classmethod
+    def safe_absolute_url_path(cls, value: str) -> str:
+        if not value.startswith("/") or value.startswith("//"):
+            raise ValueError("health path must be an absolute single-slash URL path")
+        if any(character in value for character in ("?", "#", "%", "\\")):
+            raise ValueError("health path must not contain query, fragment, or escapes")
+        segments = value.strip("/").split("/") if value != "/" else []
+        if any(
+            segment in {"", ".", ".."}
+            or re.fullmatch(r"[a-zA-Z0-9._~-]+", segment) is None
+            for segment in segments
+        ):
+            raise ValueError("health path contains unsafe path segments")
+        return value
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -294,6 +345,7 @@ class AppConfig(BaseModel):
     artisan: ArtisanConfig | None = None
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
+    health: HealthCheckConfig | None = None
 
     @model_validator(mode="after")
     def validate_framework_configuration(self) -> "AppConfig":
@@ -304,9 +356,11 @@ class AppConfig(BaseModel):
         elif self.framework != "laravel" and self.artisan is not None:
             raise ValueError("Artisan configuration is supported only for Laravel applications")
         if self.framework != "laravel" and (
-            self.workers is not None or self.scheduler is not None
+            self.workers is not None or self.scheduler is not None or self.health is not None
         ):
-            raise ValueError("worker and scheduler configuration require a Laravel application")
+            raise ValueError(
+                "worker, scheduler, and health configuration require a Laravel application"
+            )
         return self
 
     @field_validator("repository")
@@ -441,6 +495,20 @@ class ConfigStore:
                 **app.model_dump(mode="python"),
                 "workers": workers,
                 "scheduler": scheduler,
+            }
+        )
+        return self.register_app(name, updated)
+
+    def configure_app_health(
+        self,
+        name: str,
+        health: HealthCheckConfig | None,
+    ) -> bool:
+        app = self.app(name)
+        updated = AppConfig.model_validate(
+            {
+                **app.model_dump(mode="python"),
+                "health": health,
             }
         )
         return self.register_app(name, updated)

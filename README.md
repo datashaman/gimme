@@ -208,11 +208,12 @@ Example MCP client configuration:
 4. `register_app`
 5. `plan_app_resources`, then approve and call `provision_app_resources`
 6. Complete framework-specific values in the remote `shared/.env`
-7. `plan_deploy`, then approve and call `deploy_app`
-8. Use `list_releases` and `rollback_app` for release operations
-9. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
+7. For Laravel, optionally call `configure_app_health` to gate release activation
+8. `plan_deploy`, review both health gates, then approve and call `deploy_app`
+9. Use `list_releases` and `rollback_app` for release operations
+10. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
    `plan_id` unchanged to `run_artisan`
-10. For background execution, call `configure_app_processes`, then
+11. For background execution, call `configure_app_processes`, then
     `plan_app_processes`, approve `provision_app_processes`, and inspect it later with
     `app_process_status`
 
@@ -236,6 +237,41 @@ It also exposes two resource templates for registered applications:
 Template parameters are validated as registered application names. They cannot select
 arbitrary hosts or filesystem paths. The release resource contacts the configured
 host when read; the three manifest resources and application detail are local.
+
+## Deployment health gates
+
+Laravel health checks are opt-in and apply to deployments, not stack provisioning.
+Configure them with `configure_app_health` or in the private application manifest:
+
+```json
+{
+  "health": {
+    "path": "/up",
+    "expected_status": 200,
+    "attempts": 10,
+    "delay_seconds": 2,
+    "timeout_seconds": 5
+  }
+}
+```
+
+The first gate runs before `deploy:symlink`. It boots the candidate release from its
+immutable release directory and dispatches a GET request through Laravel's HTTP kernel.
+Only the status code is retained; response bodies and exception details are discarded.
+A failure leaves `current` untouched.
+
+After the atomic symlink switch, the second gate sends the same GET through the real
+local Caddy HTTPS route and PHP-FPM. DNS is pinned to `127.0.0.1`, TLS is verified with
+the VM's exported Caddy CA, redirects are not followed, and response bodies are
+discarded. If this gate exhausts its bounded retries, Gimme invokes Deployer's rollback
+task to restore the previous non-bad release. Queue workers or Horizon restart only
+after the live gate succeeds; rollback also restarts them against the restored release.
+
+Health paths are strict absolute paths without queries, fragments, percent escapes, or
+traversal. The endpoint should be side-effect-free and should verify only dependencies
+that must be available for the application to serve traffic. Database migrations still
+need to be backward-compatible because Laravel's deployment recipe runs them before the
+candidate health gate.
 
 ## Laravel Artisan commands
 

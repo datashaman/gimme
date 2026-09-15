@@ -34,6 +34,13 @@
       "scheduler": {
         "enabled": true
       },
+      "health": {
+        "path": "/up",
+        "expected_status": 200,
+        "attempts": 10,
+        "delay_seconds": 2,
+        "timeout_seconds": 5
+      },
       "frontend": {
         "build_script": "build",
         "output_dir": "public/build",

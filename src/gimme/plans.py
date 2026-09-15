@@ -104,6 +104,55 @@ def app_resource_plan(
     return {"plan_id": plan_id(plan), **plan}
 
 
+def deployment_plan(
+    server: ServerConfig, name: str, app: AppConfig
+) -> dict[str, Any]:
+    site_url = f"https://{name}.{server.mdns_name}.local"
+    health: dict[str, Any] | None = None
+    if app.health is not None:
+        settings = app.health.model_dump()
+        common = {
+            "expected_status": settings["expected_status"],
+            "attempts": settings["attempts"],
+            "delay_seconds": settings["delay_seconds"],
+            "timeout_seconds": settings["timeout_seconds"],
+        }
+        health = {
+            "pre_activation": {
+                "target": "candidate_release",
+                "path": settings["path"],
+                **common,
+                "failure": "prevent_symlink_switch",
+            },
+            "post_activation": {
+                "target": f"{site_url}{settings['path']}",
+                **common,
+                "failure": "rollback_previous_release",
+            },
+        }
+    plan: dict[str, Any] = {
+        "kind": "application_deploy",
+        "host": server.hostname,
+        "application": name,
+        "repository": app.repository,
+        "branch": app.branch,
+        "framework": app.framework,
+        "frontend": app.frontend.model_dump() if app.frontend is not None else None,
+        "workers": app.workers.model_dump() if app.workers is not None else None,
+        "site_url": site_url,
+        "health": health,
+        "effects": [
+            "prepare a new immutable release",
+            "run configured candidate health gate before switching current",
+            "atomically switch current only after the candidate is healthy",
+            "run configured live HTTPS health gate after activation",
+            "rollback the symlink automatically if the live gate fails",
+            "gracefully restart configured workers after successful activation",
+        ],
+    }
+    return {"plan_id": plan_id(plan), **plan}
+
+
 def artisan_command_plan(
     server: ServerConfig,
     name: str,
