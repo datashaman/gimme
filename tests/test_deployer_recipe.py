@@ -77,15 +77,16 @@ def test_host_inspection_reports_application_reachability() -> None:
     assert "site.{$name}.https_status=" in task
     assert "site.{$name}.path_permissions=" in task
     assert "site.{$name}.env_keys=" in task
-    assert "site.{$name}.laravel_errors=" in task
-    assert "site.{$name}.laravel_log=" in task
-    assert "xargs -0 tail -n 30" in task
+    assert "site.{$name}.laravel_log_files=" in task
+    assert "site.{$name}.laravel_errors=" not in task
+    assert "site.{$name}.laravel_log=" not in task
+    assert "xargs -0 tail -n 30" not in task
     assert "site.{$name}.runtime_path_permissions=" in task
     assert "php_fpm_socket=" in task
-    assert "php_fpm_recent_log=" in task
+    assert "php_fpm_recent_log=" not in task
     assert "ssh_agent=forwarded" in task
     assert "ssh_agent=missing" in task
-    assert "ssh_agent_key=" in task
+    assert "ssh_agent_key=" not in task
 
 
 def test_app_role_can_become_database_owner() -> None:

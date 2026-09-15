@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -48,6 +49,37 @@ def test_php_site_resolves_deployer_current_symlink() -> None:
         "        resolve_root_symlink\n"
         "    }"
     ) in site
+
+
+def test_state_file_must_not_be_accessible_to_other_users(tmp_path: Path) -> None:
+    helper = load_helper()
+    state_path = tmp_path / "stack.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "package_manager": "apt",
+                "remote_user": "deployer",
+                "apps_root": "/srv/gimme/apps",
+            }
+        )
+    )
+    state_path.chmod(0o644)
+    helper["STATE_PATH"] = state_path
+
+    with pytest.raises(RuntimeError, match="must not be group or world accessible"):
+        helper["load_state"]("deployer", os.getuid())
+
+
+def test_mdns_service_has_a_restricted_systemd_sandbox() -> None:
+    unit = load_helper()["render_mdns_unit"](
+        "example-app", "example-app.devbox.local", "192.0.2.10"
+    )
+
+    assert "NoNewPrivileges=true" in unit
+    assert "ProtectSystem=strict" in unit
+    assert "ProtectHome=true" in unit
+    assert "CapabilityBoundingSet=" in unit
 
 
 def test_php_renders_python_safe_helper_state_path() -> None:

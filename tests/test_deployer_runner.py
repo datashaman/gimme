@@ -39,6 +39,26 @@ def test_normal_tasks_connect_to_advertised_hostname(
 
     assert captured["GIMME_SSH_HOSTNAME"] == "devbox.local"
     assert captured["GIMME_HOSTNAME"] == "devbox.local"
+    assert captured["GIMME_HOST_ALIAS"] == "devbox"
+
+
+def test_runner_does_not_inherit_unrelated_secrets(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setenv("UNRELATED_API_TOKEN", "must-not-cross-boundary")
+    monkeypatch.setenv("GIMME_INTERACTIVE_SUDO", "must-not-cross-boundary")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/test-agent.sock")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    runner(tmp_path).run("deploy", server())
+
+    assert "UNRELATED_API_TOKEN" not in captured
+    assert "GIMME_INTERACTIVE_SUDO" not in captured
+    assert captured["SSH_AUTH_SOCK"] == "/tmp/test-agent.sock"
 
 
 def test_stack_tasks_can_connect_to_bootstrap_hostname(

@@ -28,6 +28,7 @@ APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 MDNS_NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
+RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
 DNS_NAME = re.compile(
     r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
@@ -133,6 +134,16 @@ def validate_endpoint(value: Any) -> str:
     return value
 
 
+def validate_ipv4_address(value: str) -> str:
+    try:
+        address = ip_address(value)
+    except ValueError:
+        fail("resolved host endpoint is not an IP address")
+    if address.version != 4:
+        fail("resolved host endpoint is not IPv4")
+    return str(address)
+
+
 def validate_apps(value: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         fail("apps must be an object")
@@ -153,7 +164,13 @@ def validate_apps(value: Any) -> dict[str, dict[str, Any]]:
             if not isinstance(output_dir, str) or not output_dir:
                 fail(f"invalid frontend output directory for {name}")
             parts = Path(output_dir).parts
-            if Path(output_dir).is_absolute() or ".." in parts or output_dir.startswith("-"):
+            if (
+                Path(output_dir).is_absolute()
+                or ".." in parts
+                or "." in parts
+                or output_dir.startswith("-")
+                or RELATIVE_DIRECTORY.fullmatch(output_dir) is None
+            ):
                 fail(f"unsafe frontend output directory for {name}")
         validated[name] = {"framework": framework, "output_dir": output_dir}
     return validated
@@ -183,12 +200,39 @@ def render_caddy_site(
     )
 
 
+def render_mdns_unit(name: str, site_host: str, address: str) -> str:
+    require_string(name, "application name", APP_NAME)
+    if DNS_NAME.fullmatch(site_host) is None:
+        fail("invalid application site hostname")
+    address = validate_ipv4_address(address)
+    return (
+        "[Unit]\n"
+        f"Description=Publish mDNS alias {site_host}\n"
+        "After=avahi-daemon.service network-online.target\n"
+        "Requires=avahi-daemon.service\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart=/usr/bin/avahi-publish -a -R {site_host} {address}\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=true\n"
+        "CapabilityBoundingSet=\n"
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"
+        "RestrictSUIDSGID=true\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
 def load_state(sudo_user: str, sudo_uid: int) -> dict[str, Any]:
     if STATE_PATH.is_symlink():
         fail("desired-state file must not be a symlink")
     details = STATE_PATH.stat()
     if not stat.S_ISREG(details.st_mode) or details.st_uid != sudo_uid:
         fail("desired-state file must be a regular file owned by the sudo caller")
+    if details.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        fail("desired-state file must not be group or world accessible")
     if details.st_size > MAX_STATE_BYTES:
         fail("desired-state file is too large")
     state = json.loads(STATE_PATH.read_text())
@@ -269,6 +313,7 @@ def reconcile() -> None:
     address = address_output.split()[0] if address_output.split() else ""
     if not address:
         fail("could not resolve the configured host endpoint to IPv4")
+    address = validate_ipv4_address(address)
     for name, definition in sorted(apps.items()):
         framework = definition["framework"]
         if framework in {"laravel", "symfony"}:
@@ -286,19 +331,7 @@ def reconcile() -> None:
         atomic_write(site_path, site)
         desired_site_files.add(site_path)
         unit_path = Path(f"/etc/systemd/system/gimme-mdns-{name}.service")
-        unit = (
-            "[Unit]\n"
-            f"Description=Publish mDNS alias {site_host}\n"
-            "After=avahi-daemon.service network-online.target\n"
-            "Requires=avahi-daemon.service\n\n"
-            "[Service]\n"
-            "Type=simple\n"
-            f"ExecStart=/usr/bin/avahi-publish -a -R {site_host} {address}\n"
-            "Restart=on-failure\n"
-            "RestartSec=2\n\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n"
-        )
+        unit = render_mdns_unit(name, site_host, address)
         atomic_write(unit_path, unit)
         desired_mdns_units.add(unit_path)
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from gimme.config import AppConfig, ConfigStore, FrontendBuildConfig
+from gimme.config import AppConfig, ConfigStore, FrontendBuildConfig, ServerConfig
 
 
 def make_store(tmp_path: Path) -> ConfigStore:
@@ -51,6 +51,77 @@ def test_rejects_non_git_repository() -> None:
         AppConfig(repository="/tmp/application")
 
 
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://token@github.com/acme/app.git",
+        "https://github.com/acme/app.git?token=secret",
+        "https://github.com/acme/app.git#fragment",
+        "git@github.com:../app.git",
+        "git@github.com:acme/app.git\nmalicious",
+        "ssh://-oProxyCommand@github.com/acme/app.git",
+        "https://github.com/acme/app%0aevil.git",
+    ],
+)
+def test_rejects_credentialed_or_malformed_git_repositories(repository: str) -> None:
+    with pytest.raises(ValueError):
+        AppConfig(repository=repository)
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://github.com/acme/app.git",
+        "ssh://git@github.com/acme/app.git",
+        "git@github.com:acme/app.git",
+    ],
+)
+def test_accepts_credential_free_git_repositories(repository: str) -> None:
+    assert AppConfig(repository=repository).repository == repository
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "-main",
+        "feature branch",
+        "main..evil",
+        "feature@{1}",
+        "topic.lock",
+        "a~b",
+        "main\x01evil",
+    ],
+)
+def test_rejects_unsafe_git_refs(branch: str) -> None:
+    with pytest.raises(ValueError):
+        AppConfig(repository="https://github.com/acme/app.git", branch=branch)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("hostname", "-oProxyCommand=evil"),
+        ("hostname", "host/name"),
+        ("bootstrap_hostname", "host\nname"),
+        ("apps_root", "/etc/gimme"),
+        ("apps_root", "/"),
+    ],
+)
+def test_rejects_unsafe_server_boundaries(field: str, value: str) -> None:
+    values = {
+        "host_alias": "devbox",
+        "bootstrap_hostname": "192.0.2.10",
+        "hostname": "devbox.local",
+        "mdns_name": "devbox",
+        "remote_user": "deployer",
+        "apps_root": "/srv/gimme/apps",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        ServerConfig(**values)
+
+
 def test_stack_manifest_is_validated(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     assert store.stack().packages == ["postgresql", "valkey-server"]
@@ -75,3 +146,6 @@ def test_static_app_requires_safe_frontend_build() -> None:
 
     with pytest.raises(ValueError):
         FrontendBuildConfig(output_dir="../outside")
+
+    with pytest.raises(ValueError):
+        FrontendBuildConfig(output_dir="dist;touch-pwned")

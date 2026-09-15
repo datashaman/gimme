@@ -4,8 +4,10 @@ import json
 import os
 import re
 import tempfile
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -14,6 +16,54 @@ APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 SSH_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
 SERVICE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@_.:-]{0,79}$")
+DNS_NAME = re.compile(
+    r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
+)
+SCP_REPOSITORY = re.compile(
+    r"^git@(?P<host>[a-zA-Z0-9.-]+):(?P<path>[a-zA-Z0-9._~/-]+)$"
+)
+REPOSITORY_PATH = re.compile(r"^[a-zA-Z0-9._~/-]+$")
+RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
+SAFE_APPS_ROOTS = (Path("/srv"), Path("/var/www"), Path("/opt"), Path("/home"))
+
+
+def _valid_endpoint(value: str) -> str:
+    if value.startswith("-") or any(char.isspace() for char in value):
+        raise ValueError("host endpoint is not a safe IP address or DNS name")
+    try:
+        ip_address(value)
+    except ValueError:
+        if DNS_NAME.fullmatch(value) is None:
+            raise ValueError("host endpoint is not a safe IP address or DNS name")
+    return value
+
+
+def _safe_repository_path(value: str) -> bool:
+    parts = value.strip("/").split("/")
+    return (
+        REPOSITORY_PATH.fullmatch(value) is not None
+        and bool(parts)
+        and all(part not in {"", ".", ".."} for part in parts)
+    )
+
+
+def _valid_git_branch(value: str) -> bool:
+    return not (
+        value.startswith(("-", ".", "/"))
+        or value.endswith((".", "/", ".lock"))
+        or value == "@"
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+        or any(
+            char.isspace()
+            or ord(char) < 32
+            or ord(char) == 127
+            or char in "~^:?*[\\"
+            for char in value
+        )
+    )
 
 
 class ServerConfig(BaseModel):
@@ -26,6 +76,11 @@ class ServerConfig(BaseModel):
     remote_user: str
     apps_root: str
     keep_releases: int = Field(default=5, ge=2, le=20)
+
+    @field_validator("bootstrap_hostname", "hostname")
+    @classmethod
+    def valid_endpoint(cls, value: str) -> str:
+        return _valid_endpoint(value)
 
     @field_validator("remote_user")
     @classmethod
@@ -40,7 +95,13 @@ class ServerConfig(BaseModel):
         path = Path(value)
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("apps_root must be an absolute path without '..'")
-        return value.rstrip("/")
+        normalized = Path(value.rstrip("/"))
+        if not any(
+            normalized != root and normalized.is_relative_to(root)
+            for root in SAFE_APPS_ROOTS
+        ):
+            raise ValueError("apps_root must be beneath /srv, /var/www, /opt, or /home")
+        return str(normalized)
 
 
 class FrontendBuildConfig(BaseModel):
@@ -54,7 +115,13 @@ class FrontendBuildConfig(BaseModel):
     @classmethod
     def safe_relative_output_dir(cls, value: str) -> str:
         path = Path(value)
-        if path.is_absolute() or ".." in path.parts or value.startswith("-"):
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or "." in path.parts
+            or value.startswith("-")
+            or RELATIVE_DIRECTORY.fullmatch(value) is None
+        ):
             raise ValueError("output_dir must be a safe relative path")
         return value.rstrip("/")
 
@@ -76,17 +143,43 @@ class AppConfig(BaseModel):
     @field_validator("repository")
     @classmethod
     def valid_repository(cls, value: str) -> str:
-        if not value.startswith(("https://", "ssh://", "git@")):
-            raise ValueError("repository must be an HTTPS or SSH Git URL")
         if any(char in value for char in ("\n", "\r", "\x00")):
             raise ValueError("repository contains invalid characters")
+        if value.startswith("git@"):
+            match = SCP_REPOSITORY.fullmatch(value)
+            if match is None or DNS_NAME.fullmatch(match["host"]) is None:
+                raise ValueError("repository must be a safe HTTPS or SSH Git URL")
+            if not _safe_repository_path(match["path"]):
+                raise ValueError("repository contains an unsafe path")
+            return value
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("repository must be a safe HTTPS or SSH Git URL") from exc
+        if parsed.scheme not in {"https", "ssh"} or parsed.hostname is None:
+            raise ValueError("repository must be a safe HTTPS or SSH Git URL")
+        if parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError("repository must not contain credentials, query, or fragment")
+        if parsed.scheme == "https" and parsed.username is not None:
+            raise ValueError("HTTPS repository must not contain credentials")
+        if parsed.username is not None and (
+            parsed.username.startswith("-")
+            or SSH_NAME.fullmatch(parsed.username) is None
+        ):
+            raise ValueError("SSH repository contains an unsafe user name")
+        if port is not None and parsed.scheme != "ssh":
+            raise ValueError("HTTPS repository must use its default port")
+        _valid_endpoint(parsed.hostname)
+        if not _safe_repository_path(parsed.path):
+            raise ValueError("repository contains an unsafe path")
         return value
 
     @field_validator("branch")
     @classmethod
     def valid_branch(cls, value: str) -> str:
-        if value.startswith("-") or any(char.isspace() for char in value):
-            raise ValueError("branch must not start with '-' or contain whitespace")
+        if not _valid_git_branch(value):
+            raise ValueError("branch is not a safe Git branch name")
         return value
 
 

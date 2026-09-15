@@ -78,6 +78,19 @@ async def test_read_only_plan_through_mcp() -> None:
     assert plan_stack.annotations.readOnlyHint is True
 
 
+async def test_remote_mutations_are_marked_destructive() -> None:
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    for name in (
+        "provision_stack",
+        "provision_app_resources",
+        "deploy_app",
+        "rollback_app",
+    ):
+        assert tools[name].annotations.destructiveHint is True
+
+
 async def test_static_resource_catalog_and_contents(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
     async with Client(mcp) as client:

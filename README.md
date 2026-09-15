@@ -28,6 +28,18 @@ path parameters. Application names and Git metadata are validated, every remote
 mutation has a separate read-only plan tool, and PostgreSQL passwords are generated
 on the remote host without being returned through MCP.
 
+Repository definitions accept only credential-free HTTPS or SSH Git URLs and safe Git
+branch names. Put authentication in SSH agents, deploy keys, or a credential helper;
+tokens embedded in repository URLs are rejected because manifests and plans are
+browsable MCP resources. The Deployer child process receives an explicit environment
+allowlist, so unrelated API tokens and shell-session secrets do not cross that process
+boundary.
+
+Remote mutation tools are marked destructive in their MCP annotations. `inspect_host`
+reports health, permissions, and application-log file counts, but never returns raw
+application or service log content or SSH key identities. Deployment roots are limited
+to dedicated subdirectories beneath `/srv`, `/var/www`, `/opt`, or `/home`.
+
 Standalone static frontends and PHP applications with frontend assets can declare an
 npm build. Gimme runs `npm ci` from the committed lockfile followed by one validated
 npm script. It does not accept arbitrary install or build commands.
@@ -86,6 +98,11 @@ Verify both mDNS and the non-interactive SSH path:
 ssh -o BatchMode=yes devbox.local true
 ssh devbox.local 'ssh -T git@github.com'
 ```
+
+Agent forwarding allows processes running as the remote deployment user to request
+signatures from the forwarded key. Use a dedicated, repository-scoped key where
+possible, and do not deploy code you have not reviewed while a broad personal agent is
+forwarded.
 
 On the first connection after the reset, verify the presented SSH host-key fingerprint
 through a trusted channel before accepting it. Gimme keeps strict host-key checking

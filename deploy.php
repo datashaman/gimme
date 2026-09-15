@@ -33,6 +33,80 @@ function sudo_prefix(): string
     return getenv('GIMME_INTERACTIVE_SUDO') === '1' ? 'sudo' : 'sudo -n';
 }
 
+function valid_endpoint(string $value): bool
+{
+    if ($value === '' || str_starts_with($value, '-') || preg_match('/\\s/', $value)) {
+        return false;
+    }
+    if (filter_var($value, FILTER_VALIDATE_IP) !== false) {
+        return true;
+    }
+    return preg_match(
+        '/^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)*' .
+        '[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/',
+        $value,
+    ) === 1;
+}
+
+function valid_repository_path(string $path): bool
+{
+    if (!preg_match('/^[a-zA-Z0-9._~\\/-]+$/', $path)) {
+        return false;
+    }
+    $parts = explode('/', trim($path, '/'));
+    return !array_filter(
+        $parts,
+        static fn (string $part): bool => in_array($part, ['', '.', '..'], true),
+    );
+}
+
+function valid_repository(string $value): bool
+{
+    if (preg_match('/[\\x00\\r\\n]/', $value)) {
+        return false;
+    }
+    if (str_starts_with($value, 'git@')) {
+        if (!preg_match(
+            '/^git@(?<host>[a-zA-Z0-9.-]+):(?<path>[a-zA-Z0-9._~\\/-]+)$/',
+            $value,
+            $matches,
+        )) {
+            return false;
+        }
+        return valid_endpoint($matches['host']) && valid_repository_path($matches['path']);
+    }
+    $parts = parse_url($value);
+    if (!is_array($parts) || !isset($parts['scheme'], $parts['host'], $parts['path'])) {
+        return false;
+    }
+    if (!in_array($parts['scheme'], ['https', 'ssh'], true)) {
+        return false;
+    }
+    if (isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment'])) {
+        return false;
+    }
+    if ($parts['scheme'] === 'https' && (isset($parts['user']) || isset($parts['port']))) {
+        return false;
+    }
+    if (isset($parts['user']) &&
+        (str_starts_with($parts['user'], '-') ||
+        !preg_match('/^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$/', $parts['user']))) {
+        return false;
+    }
+    return valid_endpoint($parts['host']) && valid_repository_path($parts['path']);
+}
+
+function valid_git_branch(string $value): bool
+{
+    return $value !== '' && $value !== '@' &&
+        !str_starts_with($value, '-') && !str_starts_with($value, '.') &&
+        !str_starts_with($value, '/') && !str_ends_with($value, '.') &&
+        !str_ends_with($value, '/') && !str_ends_with($value, '.lock') &&
+        !str_contains($value, '..') && !str_contains($value, '@{') &&
+        !str_contains($value, '//') &&
+        !preg_match('/[\\x00-\\x20\\x7f~^:?*\[\\\\]/', $value);
+}
+
 function local_config(string $file): array
 {
     static $cache = [];
@@ -163,6 +237,9 @@ $remoteUser = (string) env_or_config('GIMME_REMOTE_USER', 'server', 'remote_user
 $appsRoot = rtrim((string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/');
 $app = getenv('GIMME_APP') ?: '';
 
+if (!valid_endpoint($hostname) || !valid_endpoint($bootstrapHostname) || !valid_endpoint($sshHostname)) {
+    throw new \RuntimeException('Unsafe host endpoint');
+}
 if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$/', $remoteUser)) {
     throw new \RuntimeException('Unsafe remote user');
 }
@@ -172,7 +249,13 @@ if (!preg_match('/^[a-z][a-z0-9-]{0,47}$/', $hostAlias)) {
 if (!preg_match('/^[a-z][a-z0-9-]{0,62}$/', $mdnsName)) {
     throw new \RuntimeException('Unsafe mDNS host name');
 }
-if (!str_starts_with($appsRoot, '/') || str_contains($appsRoot, '..')) {
+if (
+    str_contains($appsRoot, '..') ||
+    !array_filter(
+        ['/srv/', '/var/www/', '/opt/', '/home/'],
+        static fn (string $prefix): bool => str_starts_with($appsRoot, $prefix),
+    )
+) {
     throw new \RuntimeException('Unsafe application root');
 }
 if ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,47}$/', $app)) {
@@ -189,8 +272,16 @@ set('ssh_multiplexing', true);
 
 if ($app !== '') {
     set('application', $app);
-    set('repository', required_env('GIMME_REPOSITORY'));
-    set('branch', required_env('GIMME_BRANCH'));
+    $repository = required_env('GIMME_REPOSITORY');
+    $branch = required_env('GIMME_BRANCH');
+    if (!valid_repository($repository)) {
+        throw new \RuntimeException('Unsafe Git repository URL');
+    }
+    if (!valid_git_branch($branch)) {
+        throw new \RuntimeException('Unsafe Git branch name');
+    }
+    set('repository', $repository);
+    set('branch', $branch);
     if ($framework !== 'static') {
         set('shared_files', array_values(array_unique([
             ...get('shared_files', []),
@@ -210,10 +301,9 @@ if ($hasFrontend) {
     if (!preg_match('/^[a-zA-Z0-9:_-]{1,64}$/', $buildScript)) {
         throw new \RuntimeException('Unsafe frontend build script');
     }
-    if (
-        str_starts_with($outputDir, '/') || str_starts_with($outputDir, '-') ||
-        in_array('..', explode('/', $outputDir), true)
-    ) {
+    if (!preg_match('/^[a-zA-Z0-9._-]+(?:\/[a-zA-Z0-9._-]+)*$/', $outputDir) ||
+        str_starts_with($outputDir, '-') ||
+        count(array_intersect(explode('/', $outputDir), ['.', '..'])) > 0) {
         throw new \RuntimeException('Unsafe frontend output directory');
     }
     if ($framework === 'static') {
@@ -308,16 +398,10 @@ BASH;
                 "sed -n 's/^\\([A-Z][A-Z0-9_]*\\)=.*/\\1/p' " .
                 escapeshellarg("{$deployPath}/shared/.env") . ' 2>/dev/null || true'
             );
-            $laravelLog = run(
+            $laravelLogFiles = run(
                 'find ' . escapeshellarg("{$deployPath}/current/storage/logs") .
-                " -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null | " .
-                'xargs -0 tail -n 30 2>/dev/null || true'
-            );
-            $laravelErrors = run(
-                'find ' . escapeshellarg("{$deployPath}/current/storage/logs") .
-                " -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null | " .
-                "xargs -0 grep -hE '^\\[[^]]+\\].*\\.(ERROR|CRITICAL): ' " .
-                '2>/dev/null | tail -n 10 || true'
+                " -maxdepth 1 -type f -name '*.log' -printf '.\\n' " .
+                '2>/dev/null | wc -l'
             );
             $runtimePaths = run(
                 'for path in ' .
@@ -328,8 +412,7 @@ BASH;
                 '; do namei -l "$path" 2>/dev/null || true; done'
             );
             writeln("site.{$name}.env_keys=\n{$envKeys}");
-            writeln("site.{$name}.laravel_errors=\n{$laravelErrors}");
-            writeln("site.{$name}.laravel_log=\n{$laravelLog}");
+            writeln("site.{$name}.laravel_log_files={$laravelLogFiles}");
             writeln("site.{$name}.runtime_path_permissions=\n{$runtimePaths}");
         }
     }
@@ -351,22 +434,13 @@ BASH;
     writeln('php_fpm_processes=\n' . run(
         "ps -eo user=,comm= | awk '\$2 ~ /^php-fpm/ { print \$1, \$2 }'"
     ));
-    writeln('php_fpm_recent_log=\n' . run(
-        "journalctl -u 'php*-fpm.service' --no-pager -n 60 2>/dev/null || true"
-    ));
     writeln('avahi_managed_hosts=\n' . run(
         "sed -n '/^# BEGIN GIMME MANAGED HOSTS\$/,/^# END GIMME MANAGED HOSTS\$/p' " .
         '/etc/avahi/hosts 2>/dev/null || true'
     ));
-    writeln('avahi_recent_log=\n' . run(
-        'journalctl -u avahi-daemon --no-pager -n 30 2>/dev/null || true'
-    ));
     $agentScript = <<<'BASH'
 if [ -S "${SSH_AUTH_SOCK:-}" ]; then
     printf 'ssh_agent=forwarded\n'
-    if command -v ssh-add >/dev/null 2>&1; then
-        ssh-add -l 2>/dev/null | sed 's/^/ssh_agent_key=/' || true
-    fi
 else
     printf 'ssh_agent=missing\n'
 fi

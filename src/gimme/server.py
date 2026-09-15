@@ -32,7 +32,7 @@ READ_ONLY = ToolAnnotations(
 )
 IDEMPOTENT_WRITE = ToolAnnotations(
     readOnlyHint=False,
-    destructiveHint=False,
+    destructiveHint=True,
     idempotentHint=True,
     openWorldHint=True,
 )
@@ -331,7 +331,7 @@ def plan_deploy(name: str) -> dict[str, object]:
     annotations=ToolAnnotations(
         title="Deploy application",
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     ),

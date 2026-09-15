@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-import subprocess
+# Deployer is invoked through a fixed argv vector and never through a shell.
+import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -10,6 +11,20 @@ from gimme.config import AppConfig, ServerConfig, StackConfig
 
 
 MAX_OUTPUT = 24_000
+PASSTHROUGH_ENVIRONMENT = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "SSH_AUTH_SOCK",
+    "TMPDIR",
+    "USER",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+)
 
 
 class DeployerError(RuntimeError):
@@ -64,13 +79,16 @@ class DeployerRunner:
             "--no-interaction",
             *arguments,
         ]
-        environment = os.environ.copy()
-        # This escape hatch is reserved for a human-run bootstrap command. It must
-        # never cross the MCP process boundary, even if set in the parent shell.
-        environment.pop("GIMME_INTERACTIVE_SUDO", None)
+        environment = {
+            name: os.environ[name]
+            for name in PASSTHROUGH_ENVIRONMENT
+            if name in os.environ
+        }
+        environment.setdefault("PATH", os.defpath)
         environment.update(
             {
                 "GIMME_HOSTNAME": server.hostname,
+                "GIMME_HOST_ALIAS": server.host_alias,
                 "GIMME_BOOTSTRAP_HOSTNAME": server.bootstrap_hostname,
                 "GIMME_SSH_HOSTNAME": (
                     server.bootstrap_hostname if bootstrap else server.hostname
@@ -111,7 +129,8 @@ class DeployerRunner:
                 )
 
         try:
-            completed = subprocess.run(
+            # The executable is fixed beneath the project root; shell=False is implicit.
+            completed = subprocess.run(  # nosec B603
                 command,
                 cwd=self.root,
                 env=environment,
