@@ -33,6 +33,23 @@ def test_helper_template_has_fixed_privilege_policy() -> None:
     assert helper["ALLOWED_PACKAGES"] == {"caddy", "python3"}
 
 
+def test_php_site_resolves_deployer_current_symlink() -> None:
+    render_caddy_site = load_helper()["render_caddy_site"]
+
+    site = render_caddy_site(
+        "example-app",
+        "devbox",
+        Path("/srv/gimme/apps/example-app/current/public"),
+        "laravel",
+    )
+
+    assert (
+        "php_fastcgi unix//run/php/php-fpm.sock {\n"
+        "        resolve_root_symlink\n"
+        "    }"
+    ) in site
+
+
 def test_php_renders_python_safe_helper_state_path() -> None:
     recipe = (ROOT / "deploy.php").read_text()
     state_replacement = recipe.split('"__GIMME_STATE_PATH__"', 1)[1].split(

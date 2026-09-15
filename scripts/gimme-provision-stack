@@ -159,6 +159,30 @@ def validate_apps(value: Any) -> dict[str, dict[str, Any]]:
     return validated
 
 
+def render_caddy_site(
+    name: str, mdns_name: str, document_root: Path, framework: str
+) -> str:
+    site_host = f"{name}.{mdns_name}.local"
+    php_handler = (
+        ""
+        if framework == "static"
+        else (
+            "    php_fastcgi unix//run/php/php-fpm.sock {\n"
+            "        resolve_root_symlink\n"
+            "    }\n"
+        )
+    )
+    return (
+        f"{site_host} {{\n"
+        "    tls internal\n"
+        f"    root * {json.dumps(str(document_root))}\n"
+        "    encode zstd gzip\n"
+        f"{php_handler}"
+        "    file_server\n"
+        "}\n"
+    )
+
+
 def load_state(sudo_user: str, sudo_uid: int) -> dict[str, Any]:
     if STATE_PATH.is_symlink():
         fail("desired-state file must not be a symlink")
@@ -257,18 +281,7 @@ def reconcile() -> None:
         if relative_root:
             document_root /= relative_root
         site_host = f"{name}.{mdns_name}.local"
-        php_handler = (
-            "" if framework == "static" else "    php_fastcgi unix//run/php/php-fpm.sock\n"
-        )
-        site = (
-            f"{site_host} {{\n"
-            "    tls internal\n"
-            f"    root * {json.dumps(str(document_root))}\n"
-            "    encode zstd gzip\n"
-            f"{php_handler}"
-            "    file_server\n"
-            "}\n"
-        )
+        site = render_caddy_site(name, mdns_name, document_root, framework)
         site_path = caddy_directory / f"{name}.caddy"
         atomic_write(site_path, site)
         desired_site_files.add(site_path)

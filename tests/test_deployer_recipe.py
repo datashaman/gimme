@@ -133,6 +133,7 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
 
     assert "tls internal" in helper
     assert "php_fastcgi unix//run/php/php-fpm.sock" in helper
+    assert "resolve_root_symlink" in helper
     assert "/etc/caddy/gimme" in helper
     assert '"caddy", "validate"' in helper
     assert "avahi-publish" in helper
