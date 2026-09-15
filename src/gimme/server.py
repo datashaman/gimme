@@ -7,9 +7,21 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from gimme.config import AppConfig, ArtisanConfig, ConfigStore, FrontendBuildConfig
+from gimme.config import (
+    AppConfig,
+    ArtisanConfig,
+    ConfigStore,
+    FrontendBuildConfig,
+    SchedulerConfig,
+    WorkerConfig,
+)
 from gimme.deployer import DeployerRunner
-from gimme.plans import app_resource_plan, artisan_command_plan, stack_plan
+from gimme.plans import (
+    app_process_plan,
+    app_resource_plan,
+    artisan_command_plan,
+    stack_plan,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,6 +86,19 @@ ArtisanArguments = Annotated[
             "shell-escaped; environment-selection arguments are rejected."
         ),
     ),
+]
+WorkerRegistration = Annotated[
+    WorkerConfig | None,
+    Field(
+        description=(
+            "Optional standard queue worker or Horizon process definition. Omit to keep "
+            "application workers unmanaged."
+        )
+    ),
+]
+SchedulerRegistration = Annotated[
+    SchedulerConfig | None,
+    Field(description="Optional every-minute Laravel scheduler definition."),
 ]
 PlanIdentifier = Annotated[
     str,
@@ -197,6 +222,44 @@ def resolved_stack_plan() -> dict[str, object]:
     )
 
 
+def resolved_app_process_plan(name: str) -> dict[str, object]:
+    server = store.server()
+    stack = store.stack()
+    app = store.app(name)
+    result = runner.run(
+        "gimme:preflight:processes",
+        server,
+        stack=stack,
+        app_name=name,
+        app=app,
+        timeout=30,
+    )
+    observations = {
+        "helper": "unknown",
+        "current_release": "unknown",
+        "pcntl": "unknown",
+        "posix": "unknown",
+        "horizon": "unknown",
+    }
+    markers = {
+        "GIMME_PROCESS_HELPER": "helper",
+        "GIMME_CURRENT_RELEASE": "current_release",
+        "GIMME_PCNTL": "pcntl",
+        "GIMME_POSIX": "posix",
+        "GIMME_HORIZON": "horizon",
+    }
+    for raw_line in result.output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and "] " in line:
+            line = line.split("] ", 1)[1]
+        if "|" not in line:
+            continue
+        marker, value = line.split("|", 1)
+        if marker in markers:
+            observations[markers[marker]] = value
+    return app_process_plan(server, name, app, **observations)
+
+
 @mcp.tool(
     description=(
         "Inspect the configured Ubuntu host and report its OS, installed runtime "
@@ -302,6 +365,8 @@ def register_app(
     branch: str = "main",
     frontend: FrontendBuildConfig | None = None,
     artisan: ArtisanConfig | None = None,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
 ) -> dict[str, object]:
     app = AppConfig(
         repository=repository,
@@ -309,9 +374,41 @@ def register_app(
         branch=branch,
         frontend=frontend,
         artisan=artisan,
+        workers=workers,
+        scheduler=scheduler,
     )
     changed = store.register_app(name, app)
     return {"application": name, "changed": changed, **app.model_dump()}
+
+
+@mcp.tool(
+    description=(
+        "Replace only the local worker/Horizon and scheduler definition for an existing "
+        "Laravel application while preserving its repository, branch, frontend, and Artisan "
+        "settings. Null values disable management; makes no remote changes. Use register_app "
+        "for the initial application definition."
+    ),
+    annotations=ToolAnnotations(
+        title="Configure application processes",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def configure_app_processes(
+    name: ApplicationName,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+) -> dict[str, object]:
+    changed = store.configure_app_processes(name, workers, scheduler)
+    app = store.app(name)
+    return {
+        "application": name,
+        "changed": changed,
+        "workers": app.workers.model_dump() if app.workers is not None else None,
+        "scheduler": app.scheduler.model_dump() if app.scheduler is not None else None,
+    }
 
 
 @mcp.tool(
@@ -483,6 +580,67 @@ def run_artisan(
         artisan_arguments=normalized_arguments,
         artisan_allowed_commands=app.artisan.allowed_commands,
         timeout=300,
+    ).as_dict()
+
+
+@mcp.tool(
+    description=(
+        "Inspect prerequisites and return the exact systemd worker, Horizon, and scheduler "
+        "process plan for one registered Laravel application. Makes no changes and returns "
+        "a plan_id for provision_app_processes."
+    ),
+    annotations=titled(READ_ONLY, "Plan application processes"),
+)
+def plan_app_processes(name: ApplicationName) -> dict[str, object]:
+    return resolved_app_process_plan(name)
+
+
+@mcp.tool(
+    description=(
+        "Apply a reviewed application process plan by reconciling narrowly generated systemd "
+        "queue worker or Horizon units and an optional scheduler timer. Requires an exact, "
+        "ready plan from plan_app_processes and never runs processes as root."
+    ),
+    annotations=titled(IDEMPOTENT_WRITE, "Provision application processes"),
+)
+def provision_app_processes(
+    name: ApplicationName,
+    plan_id: PlanIdentifier,
+) -> dict[str, object]:
+    expected = resolved_app_process_plan(name)
+    if plan_id != expected["plan_id"]:
+        raise ValueError("plan_id is invalid or stale; call plan_app_processes again")
+    if not expected["ready"]:
+        blockers = ", ".join(str(value) for value in expected["blockers"])
+        raise ValueError(f"application process plan is not ready; blockers: {blockers}")
+    server = store.server()
+    app = store.app(name)
+    return runner.run(
+        "gimme:provision:processes",
+        server,
+        app_name=name,
+        app=app,
+        timeout=1800,
+    ).as_dict()
+
+
+@mcp.tool(
+    description=(
+        "Report systemd load, active state, substate, PID, and restart count for the configured "
+        "queue workers or Horizon master and scheduler timer of one Laravel application. "
+        "Returns no journal or application log content and makes no changes."
+    ),
+    annotations=titled(READ_ONLY, "Get application process status"),
+)
+def app_process_status(name: ApplicationName) -> dict[str, object]:
+    server = store.server()
+    app = store.app(name)
+    return runner.run(
+        "gimme:processes:status",
+        server,
+        app_name=name,
+        app=app,
+        timeout=30,
     ).as_dict()
 
 

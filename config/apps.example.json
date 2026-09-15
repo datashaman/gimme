@@ -9,6 +9,10 @@
           "cache:clear",
           "config:cache",
           "config:clear",
+          "horizon:continue",
+          "horizon:pause",
+          "horizon:status",
+          "horizon:terminate",
           "migrate",
           "migrate:status",
           "optimize",
@@ -21,6 +25,14 @@
           "view:cache",
           "view:clear"
         ]
+      },
+      "workers": {
+        "driver": "horizon",
+        "enabled": true,
+        "stop_wait_seconds": 3600
+      },
+      "scheduler": {
+        "enabled": true
       },
       "frontend": {
         "build_script": "build",

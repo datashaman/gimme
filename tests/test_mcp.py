@@ -52,7 +52,7 @@ async def test_tool_surface_and_annotations() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
 
-    assert len(tools) == 14
+    assert len(tools) == 18
     assert {tool.name for tool in tools} >= {
         "inspect_host",
         "plan_stack",
@@ -65,12 +65,20 @@ async def test_tool_surface_and_annotations() -> None:
         "rollback_app",
         "plan_artisan",
         "run_artisan",
+        "plan_app_processes",
+        "provision_app_processes",
+        "app_process_status",
+        "configure_app_processes",
     }
     for tool in tools:
         assert tool.annotations is not None
         assert tool.annotations.title
         assert tool.annotations.readOnlyHint is not None
         assert tool.annotations.destructiveHint is not None
+
+    register = next(tool for tool in tools if tool.name == "register_app")
+    worker_schema = register.inputSchema["properties"]["workers"]
+    assert "standard queue worker or Horizon" in worker_schema["description"]
 
 
 async def test_read_only_plan_through_mcp() -> None:
@@ -114,6 +122,7 @@ async def test_remote_mutations_are_marked_destructive() -> None:
         "deploy_app",
         "rollback_app",
         "run_artisan",
+        "provision_app_processes",
     ):
         assert tools[name].annotations.destructiveHint is True
 
@@ -205,3 +214,86 @@ def test_run_artisan_rejects_stale_plan_before_remote_execution(
 
     with pytest.raises(ValueError, match="invalid or stale"):
         server_module.run_artisan("example-app", "about", "plan_invented", [])
+
+
+def test_horizon_process_plan_and_apply_use_preflight_and_exact_plan(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    _write_json(
+        tmp_path / "config" / "apps.json",
+        {
+            "apps": {
+                "example-app": {
+                    "branch": "main",
+                    "framework": "laravel",
+                    "repository": "git@github.com:example/example-app.git",
+                    "workers": {"driver": "horizon", "enabled": True},
+                    "scheduler": {"enabled": True},
+                }
+            }
+        },
+    )
+    calls: list[str] = []
+
+    def fake_run(task, *args, **kwargs) -> CommandResult:
+        calls.append(task)
+        if task == "gimme:preflight:processes":
+            return CommandResult(
+                ["dep", task, "devbox"],
+                0,
+                "\n".join(
+                    [
+                        "[devbox] GIMME_PROCESS_HELPER|ready",
+                        "[devbox] GIMME_CURRENT_RELEASE|ready",
+                        "[devbox] GIMME_PCNTL|ready",
+                        "[devbox] GIMME_POSIX|ready",
+                        "[devbox] GIMME_HORIZON|ready",
+                    ]
+                ),
+            )
+        return CommandResult(["dep", task, "devbox"], 0, "reconciled")
+
+    monkeypatch.setattr("gimme.server.runner.run", fake_run)
+
+    plan = server_module.plan_app_processes("example-app")
+    result = server_module.provision_app_processes("example-app", plan["plan_id"])
+
+    assert plan["ready"] is True
+    assert plan["worker"]["driver"] == "horizon"
+    assert plan["scheduler"]["timer"] == "gimme-scheduler-example-app.timer"
+    assert result["output"] == "reconciled"
+    assert calls == [
+        "gimme:preflight:processes",
+        "gimme:preflight:processes",
+        "gimme:provision:processes",
+    ]
+
+
+def test_process_apply_rejects_unready_plan_before_mutation(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def fake_run(task, *args, **kwargs) -> CommandResult:
+        calls.append(task)
+        return CommandResult(
+            ["dep", task, "devbox"],
+            0,
+            "\n".join(
+                [
+                    "GIMME_PROCESS_HELPER|bootstrap_required",
+                    "GIMME_CURRENT_RELEASE|ready",
+                    "GIMME_PCNTL|not_required",
+                    "GIMME_POSIX|not_required",
+                    "GIMME_HORIZON|not_required",
+                ]
+            ),
+        )
+
+    monkeypatch.setattr("gimme.server.runner.run", fake_run)
+    plan = server_module.plan_app_processes("example-app")
+
+    with pytest.raises(ValueError, match="privileged_helper"):
+        server_module.provision_app_processes("example-app", plan["plan_id"])
+
+    assert calls == ["gimme:preflight:processes", "gimme:preflight:processes"]

@@ -136,8 +136,10 @@ For this local development host, run the two bootstrap tasks from an interactive
 terminal. The explicit environment flag permits sudo to prompt only for these manual
 commands. Stack reconciliation is sent as one root transaction, so it asks for the
 sudo password once rather than once per package, service, or configuration file. It
-also installs a root-owned, argument-free `/usr/local/sbin/gimme-provision-stack`
-helper and an exact sudoers rule for that executable:
+also installs root-owned `/usr/local/sbin/gimme-provision-stack` and
+`/usr/local/sbin/gimme-provision-processes` helpers with exact sudoers rules. The
+stack helper accepts no arguments; the process helper accepts exactly one validated
+registered application name:
 
 ```bash
 GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:provision:stack devbox
@@ -163,13 +165,14 @@ authentication without ongoing operating-system sudo. These are powerful databas
 privileges, but they do not grant operating-system root access.
 
 The MCP server never sets `GIMME_INTERACTIVE_SUDO` and disconnects stdin, so stack
-provisioning fails closed until the helper is bootstrapped. After that one-time step,
+and process provisioning fail closed until the helpers are bootstrapped. After that
+one-time step,
 `provision_stack` writes validated desired state beneath `/srv/gimme/apps/.gimme` and
-may invoke only the root-owned helper without a password. The helper accepts no
-arguments, checks that state is owned by the invoking sudo user, validates every
-package, service, application, framework, and path, and hard-allowlists managed
-services. It never grants arbitrary shell access. Do not add an unrestricted
-`NOPASSWD: ALL` rule.
+may invoke only the root-owned stack helper without a password. Process provisioning
+writes a separate owner-only document for one registered application and invokes the
+process helper with that validated application name. Both helpers verify state
+ownership and strictly validate every managed value before writing system files. They
+never grant arbitrary shell access. Do not add an unrestricted `NOPASSWD: ALL` rule.
 
 ## Run
 
@@ -209,6 +212,9 @@ Example MCP client configuration:
 8. Use `list_releases` and `rollback_app` for release operations
 9. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
    `plan_id` unchanged to `run_artisan`
+10. For background execution, call `configure_app_processes`, then
+    `plan_app_processes`, approve `provision_app_processes`, and inspect it later with
+    `app_process_status`
 
 ## Resources
 
@@ -259,6 +265,70 @@ commands:
 and requires the exact `plan_id` returned for the same application, command, and
 arguments. For example, production migrations can be planned with `command: "migrate"`
 and `arguments: ["--force"]`.
+
+## Laravel workers, Horizon, and scheduler
+
+An application may select standard Laravel queue workers or one Horizon master. The
+two modes are mutually exclusive, while the scheduler may be enabled independently.
+Nothing starts unless the application manifest opts in.
+
+Standard workers are explicit, bounded systemd instances:
+
+```json
+{
+  "workers": {
+    "driver": "queue",
+    "enabled": true,
+    "processes": 2,
+    "connection": "database",
+    "queues": ["high", "default"],
+    "sleep_seconds": 3,
+    "tries": 3,
+    "timeout_seconds": 60,
+    "memory_mb": 256,
+    "max_time_seconds": 3600,
+    "max_jobs": 0,
+    "backoff_seconds": 0
+  },
+  "scheduler": {"enabled": true}
+}
+```
+
+Horizon keeps its supervisor counts, queues, balancing, timeouts, and retry policy in
+the application's version-controlled `config/horizon.php`; Gimme supervises only the
+single Horizon master process:
+
+```json
+{
+  "workers": {
+    "driver": "horizon",
+    "enabled": true,
+    "stop_wait_seconds": 3600
+  },
+  "scheduler": {"enabled": true}
+}
+```
+
+Horizon must already be installed in the application with `composer require
+laravel/horizon`, and its production environment must be configured in
+`config/horizon.php`. Horizon requires a Redis queue connection; Gimme uses the
+provisioned local Valkey service through the Redis protocol, sets the protected
+`QUEUE_CONNECTION=redis` value during process provisioning, and clears cached Laravel
+configuration without returning environment contents.
+
+Gimme generates hardened systemd services running as the deployment user, with no
+new privileges, an empty capability set, read-only system paths, and write access
+limited to the application's shared runtime and bootstrap cache. The scheduler is a
+persistent every-minute systemd timer invoking `schedule:run`. Raw journals remain
+excluded from MCP responses.
+
+After a successful deployment or rollback symlink switch, Gimme runs `queue:restart`
+for standard workers or `horizon:terminate` for Horizon. Active jobs finish gracefully,
+then systemd restarts the process against the new `current` release. Ensure worker or
+Horizon timeouts remain shorter than the queue connection's `retry_after` setting to
+avoid duplicate processing. See the official
+[queue worker lifecycle](https://laravel.com/docs/queues#queue-workers) and
+[Horizon deployment guidance](https://laravel.com/docs/horizon#deploying-horizon).
 
 Example Vite/static application entry in `config/apps.json`:
 

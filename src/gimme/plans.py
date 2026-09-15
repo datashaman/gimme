@@ -138,3 +138,109 @@ def artisan_command_plan(
         ],
     }
     return {"plan_id": plan_id(plan), **plan}
+
+
+def app_process_plan(
+    server: ServerConfig,
+    name: str,
+    app: AppConfig,
+    *,
+    helper: str,
+    current_release: str,
+    pcntl: str,
+    posix: str,
+    horizon: str,
+) -> dict[str, Any]:
+    if app.framework != "laravel":
+        raise ValueError("managed application processes require a Laravel application")
+
+    worker: dict[str, Any] | None = None
+    workers_enabled = app.workers is not None and app.workers.enabled
+    if workers_enabled and app.workers is not None:
+        if app.workers.driver == "queue":
+            worker = {
+                "driver": "queue",
+                "units": [
+                    f"gimme-worker-{name}@{index}.service"
+                    for index in range(1, app.workers.processes + 1)
+                ],
+                "argv": [
+                    "/usr/bin/php",
+                    "artisan",
+                    "queue:work",
+                    app.workers.connection,
+                    f"--queue={','.join(app.workers.queues)}",
+                    f"--sleep={app.workers.sleep_seconds}",
+                    f"--tries={app.workers.tries}",
+                    f"--timeout={app.workers.timeout_seconds}",
+                    f"--memory={app.workers.memory_mb}",
+                    f"--max-time={app.workers.max_time_seconds}",
+                    f"--max-jobs={app.workers.max_jobs}",
+                    f"--backoff={app.workers.backoff_seconds}",
+                    "--no-interaction",
+                ],
+                "stop_wait_seconds": app.workers.timeout_seconds + 30,
+            }
+        else:
+            worker = {
+                "driver": "horizon",
+                "unit": f"gimme-horizon-{name}.service",
+                "argv": ["/usr/bin/php", "artisan", "horizon"],
+                "stop_wait_seconds": app.workers.stop_wait_seconds,
+            }
+
+    scheduler_enabled = app.scheduler is not None and app.scheduler.enabled
+    scheduler = (
+        {
+            "service": f"gimme-scheduler-{name}.service",
+            "timer": f"gimme-scheduler-{name}.timer",
+            "argv": ["/usr/bin/php", "artisan", "--no-interaction", "schedule:run"],
+            "calendar": "*-*-* *:*:00",
+        }
+        if scheduler_enabled
+        else None
+    )
+
+    blockers: list[str] = []
+    if helper != "ready":
+        blockers.append("privileged_helper")
+    if (workers_enabled or scheduler_enabled) and current_release != "ready":
+        blockers.append("current_release")
+    if workers_enabled and pcntl != "ready":
+        blockers.append("pcntl")
+    if worker is not None and worker["driver"] == "horizon" and posix != "ready":
+        blockers.append("posix")
+    if worker is not None and worker["driver"] == "horizon" and horizon != "ready":
+        blockers.append("horizon")
+
+    plan: dict[str, Any] = {
+        "kind": "app_processes",
+        "host": server.hostname,
+        "application": name,
+        "working_directory": f"{server.apps_root}/{name}/current",
+        "worker": worker,
+        "scheduler": scheduler,
+        "preflight": {
+            "privileged_helper": helper,
+            "current_release": current_release,
+            "pcntl": pcntl,
+            "posix": posix,
+            "horizon": horizon,
+        },
+        "ready": blockers == [],
+        "blockers": blockers,
+        "effects": [
+            "reconcile root-owned systemd units for this application",
+            "run configured processes as the deployment user, never root",
+            "disable obsolete Gimme-managed process units for this application",
+            *(
+                [
+                    "set QUEUE_CONNECTION=redis in the protected shared environment "
+                    "and clear cached Laravel configuration"
+                ]
+                if worker is not None and worker["driver"] == "horizon"
+                else []
+            ),
+        ],
+    }
+    return {"plan_id": plan_id(plan), **plan}

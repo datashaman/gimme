@@ -2,7 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from gimme.config import ServerConfig
+from gimme.config import AppConfig, HorizonWorkerConfig, SchedulerConfig, ServerConfig
 from gimme.deployer import DeployerRunner
 
 
@@ -101,3 +101,28 @@ def test_artisan_invocation_crosses_the_runner_boundary_as_json(
     assert captured["GIMME_ARTISAN_COMMAND"] == "migrate"
     assert json.loads(captured["GIMME_ARTISAN_ARGS_JSON"]) == ["--force"]
     assert json.loads(captured["GIMME_ARTISAN_ALLOWED_JSON"]) == ["about", "migrate"]
+
+
+def test_process_configuration_crosses_the_runner_boundary_as_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        workers=HorizonWorkerConfig(),
+        scheduler=SchedulerConfig(),
+    )
+
+    runner(tmp_path).run(
+        "gimme:preflight:processes", server(), app_name="example-app", app=app
+    )
+
+    assert json.loads(captured["GIMME_WORKERS_JSON"])["driver"] == "horizon"
+    assert json.loads(captured["GIMME_SCHEDULER_JSON"]) == {"enabled": True}

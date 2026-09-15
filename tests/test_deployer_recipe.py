@@ -179,6 +179,26 @@ def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release
     assert "GIMME_ARTISAN_ALLOWED_JSON" in recipe
 
 
+def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+
+    assert "task('gimme:preflight:processes'" in recipe
+    assert "task('gimme:provision:processes'" in recipe
+    assert "task('gimme:processes:status'" in recipe
+    assert "GIMME_PROCESS_HELPER|" in recipe
+    assert "GIMME_CURRENT_RELEASE|" in recipe
+    assert "GIMME_PCNTL|" in recipe
+    assert "GIMME_POSIX|" in recipe
+    assert "GIMME_HORIZON|" in recipe
+    assert "sudo -n /usr/local/sbin/gimme-provision-processes" in recipe
+    assert "'queue' => 'queue:restart'" in recipe
+    assert "'horizon' => 'horizon:terminate'" in recipe
+    assert "after('deploy:symlink', 'gimme:restart:workers')" in recipe
+    assert "after('rollback', 'gimme:restart:workers')" in recipe
+    assert "QUEUE_CONNECTION=redis" in recipe
+    assert "php artisan --no-interaction config:clear" in recipe
+
+
 def test_privileged_helper_is_narrowly_allowlisted() -> None:
     recipe = (ROOT / "deploy.php").read_text()
     helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()
@@ -186,12 +206,16 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-stack" in recipe
     assert "NOPASSWD: ALL" not in recipe
     assert "SUDO_USER" in helper
+    process_helper = (ROOT / "scripts" / "gimme-provision-processes").read_text()
+
     assert "len(sys.argv) != 1" in helper
+    assert "len(sys.argv) != 2" in process_helper
     assert "ALLOWED_PACKAGES" in helper
     assert "ALLOWED_SERVICES" in helper
     assert "EXPECTED_HOSTNAME" in helper
     assert "GIMME_POLICY_ID" in helper
-    assert "'helper_source_sha256' => privileged_helper_source_hash()" in recipe
+    assert "'helper_source_sha256' => privileged_helper_source_hashes()" in recipe
+    assert "NOPASSWD: /usr/local/sbin/gimme-provision-processes" in recipe
     assert "shell_exec" not in helper
     assert "GIMME_HELPER|" in recipe
     assert "chown {$user}:{$user}" in recipe

@@ -1,0 +1,480 @@
+#!/usr/bin/python3
+# GIMME_POLICY_ID=__GIMME_POLICY_ID__
+"""Reconcile one Laravel application's systemd processes as root."""
+
+from __future__ import annotations
+
+import json
+import grp
+import os
+import pwd
+import re
+import stat
+# Subprocess calls use fixed executable argv vectors and never invoke a shell.
+import subprocess  # nosec B404
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+STATE_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "processes"
+APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
+UNIX_GROUP = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")
+QUEUE_CONNECTION = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+QUEUE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
+MAX_STATE_BYTES = 64 * 1024
+SYSTEMD_ROOT = Path("/etc/systemd/system")
+EXECUTABLES = {"systemctl": "/usr/bin/systemctl"}
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def fixed_command(command: list[str]) -> list[str]:
+    if not command or command[0] not in EXECUTABLES:
+        fail("process helper attempted an unexpected executable")
+    return [EXECUTABLES[command[0]], *command[1:]]
+
+
+def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    command = fixed_command(command)
+    print("+ " + " ".join(command), flush=True)
+    # Callers construct validated argv vectors.
+    return subprocess.run(  # nosec B603
+        command, check=True, text=True, capture_output=capture
+    )
+
+
+def succeeds(command: list[str]) -> bool:
+    command = fixed_command(command)
+    # Callers construct validated argv vectors.
+    return subprocess.run(  # nosec B603
+        command,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def atomic_write_if_changed(path: Path, content: str) -> bool:
+    if path.is_file() and not path.is_symlink() and path.read_text() == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def require_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        fail(f"invalid {name}")
+    return value
+
+
+def require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        fail(f"invalid {name}")
+    return value
+
+
+def require_string(value: Any, name: str, pattern: re.Pattern[str]) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        fail(f"invalid {name}")
+    return value
+
+
+def validate_queue_names(value: Any) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+        fail("queues must contain between one and sixteen items")
+    if not all(isinstance(item, str) and QUEUE_NAME.fullmatch(item) for item in value):
+        fail("queues contain an invalid value")
+    if len(value) != len(set(value)):
+        fail("queues contain duplicates")
+    return value
+
+
+def validate_workers(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        fail("workers must be an object or null")
+    driver = value.get("driver")
+    enabled = require_bool(value.get("enabled"), "workers.enabled")
+    if driver == "queue":
+        expected = {
+            "driver",
+            "enabled",
+            "processes",
+            "connection",
+            "queues",
+            "sleep_seconds",
+            "tries",
+            "timeout_seconds",
+            "memory_mb",
+            "max_time_seconds",
+            "max_jobs",
+            "backoff_seconds",
+        }
+        if set(value) != expected:
+            fail("queue worker configuration contains unknown or missing fields")
+        return {
+            "driver": "queue",
+            "enabled": enabled,
+            "processes": require_int(value["processes"], "processes", 1, 16),
+            "connection": require_string(
+                value["connection"], "connection", QUEUE_CONNECTION
+            ),
+            "queues": validate_queue_names(value["queues"]),
+            "sleep_seconds": require_int(value["sleep_seconds"], "sleep_seconds", 0, 60),
+            "tries": require_int(value["tries"], "tries", 0, 100),
+            "timeout_seconds": require_int(
+                value["timeout_seconds"], "timeout_seconds", 1, 86400
+            ),
+            "memory_mb": require_int(value["memory_mb"], "memory_mb", 32, 8192),
+            "max_time_seconds": require_int(
+                value["max_time_seconds"], "max_time_seconds", 60, 86400
+            ),
+            "max_jobs": require_int(value["max_jobs"], "max_jobs", 0, 100000),
+            "backoff_seconds": require_int(
+                value["backoff_seconds"], "backoff_seconds", 0, 86400
+            ),
+        }
+    if driver == "horizon":
+        if set(value) != {"driver", "enabled", "stop_wait_seconds"}:
+            fail("Horizon worker configuration contains unknown or missing fields")
+        return {
+            "driver": "horizon",
+            "enabled": enabled,
+            "stop_wait_seconds": require_int(
+                value["stop_wait_seconds"], "stop_wait_seconds", 60, 86400
+            ),
+        }
+    fail("workers.driver must be queue or horizon")
+
+
+def validate_scheduler(value: Any) -> dict[str, bool] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"enabled"}:
+        fail("scheduler must contain only enabled")
+    return {"enabled": require_bool(value["enabled"], "scheduler.enabled")}
+
+
+def load_state(application: str, sudo_user: str, sudo_uid: int) -> dict[str, Any]:
+    if STATE_ROOT.is_symlink():
+        fail("process desired-state directory must not be a symlink")
+    state_path = STATE_ROOT / f"{application}.json"
+    if state_path.is_symlink():
+        fail("process desired-state file must not be a symlink")
+    details = state_path.stat()
+    if not stat.S_ISREG(details.st_mode) or details.st_uid != sudo_uid:
+        fail("process desired-state file must be regular and owned by the sudo caller")
+    if details.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        fail("process desired-state file must not be group or world accessible")
+    if details.st_size > MAX_STATE_BYTES:
+        fail("process desired-state file is too large")
+    state = json.loads(state_path.read_text())
+    if not isinstance(state, dict) or set(state) != {
+        "version",
+        "application",
+        "framework",
+        "remote_user",
+        "apps_root",
+        "workers",
+        "scheduler",
+    }:
+        fail("invalid process desired-state document")
+    if state["version"] != 1 or state["application"] != application:
+        fail("process desired-state identity mismatch")
+    if state["framework"] != "laravel":
+        fail("managed processes require a Laravel application")
+    if state["remote_user"] != sudo_user or state["apps_root"] != str(EXPECTED_APPS_ROOT):
+        fail("process desired-state authority mismatch")
+    return {
+        "workers": validate_workers(state["workers"]),
+        "scheduler": validate_scheduler(state["scheduler"]),
+    }
+
+
+def quote(value: str | Path) -> str:
+    return json.dumps(str(value))
+
+
+def hardening(application_root: Path) -> str:
+    return (
+        "NoNewPrivileges=true\n"
+        "PrivateTmp=true\n"
+        "PrivateDevices=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=read-only\n"
+        "ProtectKernelTunables=true\n"
+        "ProtectKernelModules=true\n"
+        "ProtectControlGroups=true\n"
+        "ProtectClock=true\n"
+        "ProtectHostname=true\n"
+        "RestrictSUIDSGID=true\n"
+        "LockPersonality=true\n"
+        "RestrictRealtime=true\n"
+        "CapabilityBoundingSet=\n"
+        "AmbientCapabilities=\n"
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"
+        f"ReadWritePaths={quote(application_root / 'shared')} "
+        f"{quote(application_root / 'current' / 'bootstrap' / 'cache')}\n"
+        "UMask=0027\n"
+    )
+
+
+def service_header(description: str, account: pwd.struct_passwd, current: Path) -> str:
+    group_name = require_string(
+        grp.getgrgid(account.pw_gid).gr_name, "deployment group", UNIX_GROUP
+    )
+    return (
+        "[Unit]\n"
+        f"Description={description}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "StartLimitIntervalSec=60\n"
+        "StartLimitBurst=5\n\n"
+        "[Service]\n"
+        f"User={account.pw_name}\n"
+        f"Group={group_name}\n"
+        f"WorkingDirectory={quote(current)}\n"
+        "Environment=APP_ENV=production\n"
+    )
+
+
+def render_queue_worker_unit(
+    application: str,
+    account: pwd.struct_passwd,
+    application_root: Path,
+    config: dict[str, Any],
+) -> str:
+    current = application_root / "current"
+    arguments = [
+        "/usr/bin/php",
+        "artisan",
+        "queue:work",
+        config["connection"],
+        f"--queue={','.join(config['queues'])}",
+        f"--sleep={config['sleep_seconds']}",
+        f"--tries={config['tries']}",
+        f"--timeout={config['timeout_seconds']}",
+        f"--memory={config['memory_mb']}",
+        f"--max-time={config['max_time_seconds']}",
+        f"--max-jobs={config['max_jobs']}",
+        f"--backoff={config['backoff_seconds']}",
+        "--no-interaction",
+    ]
+    return (
+        service_header(f"Gimme Laravel queue worker {application} %i", account, current)
+        + "ExecStart="
+        + " ".join(quote(argument) for argument in arguments)
+        + "\nRestart=always\nRestartSec=5\nKillSignal=SIGTERM\n"
+        + f"TimeoutStopSec={config['timeout_seconds'] + 30}\n"
+        + hardening(application_root)
+        + "\n[Install]\nWantedBy=multi-user.target\n"
+    )
+
+
+def render_horizon_unit(
+    application: str,
+    account: pwd.struct_passwd,
+    application_root: Path,
+    config: dict[str, Any],
+) -> str:
+    current = application_root / "current"
+    return (
+        service_header(f"Gimme Laravel Horizon {application}", account, current)
+        + 'ExecStart="/usr/bin/php" "artisan" "horizon"\n'
+        + "Restart=always\nRestartSec=5\nKillSignal=SIGTERM\n"
+        + f"TimeoutStopSec={config['stop_wait_seconds']}\n"
+        + hardening(application_root)
+        + "\n[Install]\nWantedBy=multi-user.target\n"
+    )
+
+
+def render_scheduler_service(
+    application: str, account: pwd.struct_passwd, application_root: Path
+) -> str:
+    current = application_root / "current"
+    return (
+        service_header(f"Gimme Laravel scheduler {application}", account, current)
+        + 'Type=oneshot\nExecStart="/usr/bin/php" "artisan" "--no-interaction" '
+        '"schedule:run"\n'
+        + hardening(application_root)
+    )
+
+
+def render_scheduler_timer(application: str) -> str:
+    return (
+        "[Unit]\n"
+        f"Description=Run Gimme Laravel scheduler for {application} every minute\n\n"
+        "[Timer]\n"
+        "OnCalendar=*-*-* *:*:00\n"
+        "Persistent=true\n"
+        "AccuracySec=1s\n"
+        f"Unit=gimme-scheduler-{application}.service\n\n"
+        "[Install]\nWantedBy=timers.target\n"
+    )
+
+
+def listed_worker_instances(application: str) -> set[str]:
+    pattern = re.compile(
+        rf"^gimme-worker-{re.escape(application)}@[1-9][0-9]*\.service$"
+    )
+    units: set[str] = set()
+    for operation in ("list-units", "list-unit-files"):
+        result = subprocess.run(  # nosec B603
+            [
+                "/usr/bin/systemctl",
+                operation,
+                "--all",
+                "--plain",
+                "--no-legend",
+                f"gimme-worker-{application}@*.service",
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        units.update(
+            line.split()[0]
+            for line in result.stdout.splitlines()
+            if line.split() and pattern.fullmatch(line.split()[0])
+        )
+    return units
+
+
+def disable(unit: str) -> None:
+    if succeeds(["systemctl", "is-enabled", "--quiet", unit]) or succeeds(
+        ["systemctl", "is-active", "--quiet", unit]
+    ):
+        run(["systemctl", "disable", "--now", unit])
+
+
+def remove(path: Path) -> bool:
+    if not path.exists() and not path.is_symlink():
+        return False
+    path.unlink()
+    return True
+
+
+def reconcile() -> None:
+    if os.geteuid() != 0:
+        fail("gimme-provision-processes must run as root")
+    if len(sys.argv) != 2:
+        fail("gimme-provision-processes requires exactly one application name")
+    application = require_string(sys.argv[1], "application name", APP_NAME)
+    sudo_user = require_string(os.environ.get("SUDO_USER"), "SUDO_USER", UNIX_USER)
+    account = pwd.getpwnam(sudo_user)
+    state = load_state(application, sudo_user, account.pw_uid)
+    application_root = EXPECTED_APPS_ROOT / application
+    current = application_root / "current"
+    if not current.exists() or not (current / "artisan").is_file():
+        fail("current release does not contain Artisan")
+
+    worker = state["workers"]
+    scheduler = state["scheduler"]
+    queue_template = SYSTEMD_ROOT / f"gimme-worker-{application}@.service"
+    horizon_unit = SYSTEMD_ROOT / f"gimme-horizon-{application}.service"
+    scheduler_service = SYSTEMD_ROOT / f"gimme-scheduler-{application}.service"
+    scheduler_timer = SYSTEMD_ROOT / f"gimme-scheduler-{application}.timer"
+    existing_instances = listed_worker_instances(application)
+    changed_units: set[str] = set()
+    desired_instances: set[str] = set()
+    changed = False
+
+    if worker is not None and worker["enabled"] and worker["driver"] == "queue":
+        if atomic_write_if_changed(
+            queue_template,
+            render_queue_worker_unit(application, account, application_root, worker),
+        ):
+            changed = True
+            changed_units.update(existing_instances)
+        desired_instances = {
+            f"gimme-worker-{application}@{index}.service"
+            for index in range(1, worker["processes"] + 1)
+        }
+        disable(horizon_unit.name)
+        changed = remove(horizon_unit) or changed
+    elif worker is not None and worker["enabled"] and worker["driver"] == "horizon":
+        if atomic_write_if_changed(
+            horizon_unit,
+            render_horizon_unit(application, account, application_root, worker),
+        ):
+            changed = True
+            changed_units.add(horizon_unit.name)
+        for unit in existing_instances:
+            disable(unit)
+        changed = remove(queue_template) or changed
+    else:
+        for unit in existing_instances:
+            disable(unit)
+        disable(horizon_unit.name)
+        changed = remove(queue_template) or changed
+        changed = remove(horizon_unit) or changed
+
+    for unit in existing_instances - desired_instances:
+        disable(unit)
+
+    if scheduler is not None and scheduler["enabled"]:
+        if atomic_write_if_changed(
+            scheduler_service,
+            render_scheduler_service(application, account, application_root),
+        ):
+            changed = True
+        if atomic_write_if_changed(scheduler_timer, render_scheduler_timer(application)):
+            changed = True
+            changed_units.add(scheduler_timer.name)
+    else:
+        disable(scheduler_timer.name)
+        disable(scheduler_service.name)
+        changed = remove(scheduler_service) or changed
+        changed = remove(scheduler_timer) or changed
+
+    if changed:
+        run(["systemctl", "daemon-reload"])
+
+    for unit in sorted(desired_instances):
+        if not succeeds(["systemctl", "is-enabled", "--quiet", unit]):
+            run(["systemctl", "enable", unit])
+        if unit in changed_units or not succeeds(["systemctl", "is-active", "--quiet", unit]):
+            run(["systemctl", "restart", unit])
+
+    if worker is not None and worker["enabled"] and worker["driver"] == "horizon":
+        if not succeeds(["systemctl", "is-enabled", "--quiet", horizon_unit.name]):
+            run(["systemctl", "enable", horizon_unit.name])
+        if horizon_unit.name in changed_units or not succeeds(
+            ["systemctl", "is-active", "--quiet", horizon_unit.name]
+        ):
+            run(["systemctl", "restart", horizon_unit.name])
+
+    if scheduler is not None and scheduler["enabled"]:
+        if not succeeds(["systemctl", "is-enabled", "--quiet", scheduler_timer.name]):
+            run(["systemctl", "enable", scheduler_timer.name])
+        if scheduler_timer.name in changed_units or not succeeds(
+            ["systemctl", "is-active", "--quiet", scheduler_timer.name]
+        ):
+            run(["systemctl", "restart", scheduler_timer.name])
+
+
+if __name__ == "__main__":
+    try:
+        reconcile()
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"gimme-provision-processes: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

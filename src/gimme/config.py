@@ -6,7 +6,7 @@ import re
 import tempfile
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -25,13 +25,20 @@ SCP_REPOSITORY = re.compile(
 )
 REPOSITORY_PATH = re.compile(r"^[a-zA-Z0-9._~/-]+$")
 RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
+ABSOLUTE_DIRECTORY = re.compile(r"^/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+$")
 ARTISAN_COMMAND = re.compile(r"^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$")
+QUEUE_CONNECTION = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+QUEUE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
 SAFE_APPS_ROOTS = (Path("/srv"), Path("/var/www"), Path("/opt"), Path("/home"))
 DEFAULT_ARTISAN_COMMANDS = (
     "about",
     "cache:clear",
     "config:cache",
     "config:clear",
+    "horizon:continue",
+    "horizon:pause",
+    "horizon:status",
+    "horizon:terminate",
     "migrate",
     "migrate:status",
     "optimize",
@@ -114,6 +121,8 @@ class ServerConfig(BaseModel):
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("apps_root must be an absolute path without '..'")
         normalized = Path(value.rstrip("/"))
+        if ABSOLUTE_DIRECTORY.fullmatch(str(normalized)) is None:
+            raise ValueError("apps_root contains unsafe path characters")
         if not any(
             normalized != root and normalized.is_relative_to(root)
             for root in SAFE_APPS_ROOTS
@@ -186,6 +195,95 @@ class ArtisanInvocation(BaseModel):
         return value
 
 
+class QueueWorkerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    driver: Literal["queue"] = Field(
+        default="queue", description="Use standard Laravel queue:work processes."
+    )
+    enabled: bool = Field(default=True, description="Whether these worker units should run.")
+    processes: int = Field(
+        default=1, ge=1, le=16, description="Number of identical systemd worker instances."
+    )
+    connection: str = Field(
+        default="database",
+        pattern=QUEUE_CONNECTION.pattern,
+        description="Laravel queue connection passed literally to queue:work.",
+    )
+    queues: list[str] = Field(
+        default_factory=lambda: ["default"],
+        min_length=1,
+        max_length=16,
+        description="Ordered queue names passed to queue:work.",
+    )
+    sleep_seconds: int = Field(
+        default=3, ge=0, le=60, description="Seconds to sleep when no job is available."
+    )
+    tries: int = Field(
+        default=3, ge=0, le=100, description="Maximum attempts; zero means unlimited."
+    )
+    timeout_seconds: int = Field(
+        default=60, ge=1, le=86400, description="Worker job timeout in seconds."
+    )
+    memory_mb: int = Field(
+        default=256, ge=32, le=8192, description="Worker memory ceiling in megabytes."
+    )
+    max_time_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="Maximum worker lifetime before systemd restarts it.",
+    )
+    max_jobs: int = Field(
+        default=0,
+        ge=0,
+        le=100000,
+        description="Maximum jobs per worker lifetime; zero means unlimited.",
+    )
+    backoff_seconds: int = Field(
+        default=0, ge=0, le=86400, description="Retry delay after an unhandled job error."
+    )
+
+    @field_validator("queues")
+    @classmethod
+    def valid_queues(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("queue names must not contain duplicates")
+        invalid = [name for name in value if QUEUE_NAME.fullmatch(name) is None]
+        if invalid:
+            raise ValueError(f"invalid queue names: {', '.join(invalid)}")
+        return value
+
+
+class HorizonWorkerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    driver: Literal["horizon"] = Field(
+        default="horizon", description="Use one Laravel Horizon master process."
+    )
+    enabled: bool = Field(default=True, description="Whether the Horizon unit should run.")
+    stop_wait_seconds: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="Maximum graceful systemd stop time for active Horizon jobs.",
+    )
+
+
+WorkerConfig = Annotated[
+    QueueWorkerConfig | HorizonWorkerConfig,
+    Field(discriminator="driver"),
+]
+
+
+class SchedulerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=True, description="Run Laravel schedule:run from a systemd timer every minute."
+    )
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -194,6 +292,8 @@ class AppConfig(BaseModel):
     branch: str = Field(default="main", min_length=1, max_length=120)
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
+    workers: WorkerConfig | None = None
+    scheduler: SchedulerConfig | None = None
 
     @model_validator(mode="after")
     def validate_framework_configuration(self) -> "AppConfig":
@@ -203,6 +303,10 @@ class AppConfig(BaseModel):
             self.artisan = ArtisanConfig()
         elif self.framework != "laravel" and self.artisan is not None:
             raise ValueError("Artisan configuration is supported only for Laravel applications")
+        if self.framework != "laravel" and (
+            self.workers is not None or self.scheduler is not None
+        ):
+            raise ValueError("worker and scheduler configuration require a Laravel application")
         return self
 
     @field_validator("repository")
@@ -324,6 +428,22 @@ class ConfigStore:
         if changed:
             self._atomic_json_write(self.apps_path, registry.model_dump(mode="json"))
         return changed
+
+    def configure_app_processes(
+        self,
+        name: str,
+        workers: WorkerConfig | None,
+        scheduler: SchedulerConfig | None,
+    ) -> bool:
+        app = self.app(name)
+        updated = AppConfig.model_validate(
+            {
+                **app.model_dump(mode="python"),
+                "workers": workers,
+                "scheduler": scheduler,
+            }
+        )
+        return self.register_app(name, updated)
 
     @staticmethod
     def validate_app_name(name: str) -> None:

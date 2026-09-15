@@ -118,6 +118,12 @@ class DeployerRunner:
                     "GIMME_REPOSITORY": app.repository,
                     "GIMME_FRAMEWORK": app.framework,
                     "GIMME_BRANCH": app.branch,
+                    "GIMME_WORKERS_JSON": json.dumps(
+                        app.workers.model_dump() if app.workers is not None else None
+                    ),
+                    "GIMME_SCHEDULER_JSON": json.dumps(
+                        app.scheduler.model_dump() if app.scheduler is not None else None
+                    ),
                 }
             )
             if app.frontend is not None:

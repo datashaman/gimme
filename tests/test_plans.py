@@ -1,7 +1,20 @@
 import pytest
 
-from gimme.config import AppConfig, FrontendBuildConfig, ServerConfig, StackConfig
-from gimme.plans import app_resource_plan, artisan_command_plan, stack_plan
+from gimme.config import (
+    AppConfig,
+    FrontendBuildConfig,
+    HorizonWorkerConfig,
+    QueueWorkerConfig,
+    SchedulerConfig,
+    ServerConfig,
+    StackConfig,
+)
+from gimme.plans import (
+    app_process_plan,
+    app_resource_plan,
+    artisan_command_plan,
+    stack_plan,
+)
 
 
 def server() -> ServerConfig:
@@ -180,3 +193,81 @@ def test_artisan_command_plan_enforces_framework_and_allowlist() -> None:
 
     with pytest.raises(ValueError, match="Laravel"):
         artisan_command_plan(server(), "my-app", symfony, "about", [])
+
+
+def test_standard_worker_plan_contains_exact_units_and_argv() -> None:
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        workers=QueueWorkerConfig(
+            processes=2,
+            connection="database",
+            queues=["high", "default"],
+            timeout_seconds=90,
+        ),
+        scheduler=SchedulerConfig(),
+    )
+
+    plan = app_process_plan(
+        server(),
+        "my-app",
+        app,
+        helper="ready",
+        current_release="ready",
+        pcntl="ready",
+        posix="not_required",
+        horizon="not_required",
+    )
+
+    assert plan["ready"] is True
+    assert plan["worker"]["driver"] == "queue"
+    assert plan["worker"]["units"] == [
+        "gimme-worker-my-app@1.service",
+        "gimme-worker-my-app@2.service",
+    ]
+    assert plan["worker"]["argv"][:5] == [
+        "/usr/bin/php",
+        "artisan",
+        "queue:work",
+        "database",
+        "--queue=high,default",
+    ]
+    assert plan["scheduler"]["timer"] == "gimme-scheduler-my-app.timer"
+
+
+def test_horizon_plan_uses_one_master_and_reports_preflight_blockers() -> None:
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        workers=HorizonWorkerConfig(),
+    )
+
+    blocked = app_process_plan(
+        server(),
+        "my-app",
+        app,
+        helper="bootstrap_required",
+        current_release="ready",
+        pcntl="ready",
+        posix="ready",
+        horizon="missing",
+    )
+    ready = app_process_plan(
+        server(),
+        "my-app",
+        app,
+        helper="ready",
+        current_release="ready",
+        pcntl="ready",
+        posix="ready",
+        horizon="ready",
+    )
+
+    assert blocked["ready"] is False
+    assert blocked["blockers"] == ["privileged_helper", "horizon"]
+    assert ready["worker"] == {
+        "driver": "horizon",
+        "unit": "gimme-horizon-my-app.service",
+        "argv": ["/usr/bin/php", "artisan", "horizon"],
+        "stop_wait_seconds": 3600,
+    }

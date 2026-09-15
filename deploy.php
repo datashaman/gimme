@@ -220,6 +220,28 @@ function configured_artisan_arguments(): array
     return $arguments;
 }
 
+function configured_process_object(string $environment): ?array
+{
+    if (!in_array($environment, ['GIMME_WORKERS_JSON', 'GIMME_SCHEDULER_JSON'], true)) {
+        throw new \RuntimeException('Unknown process configuration');
+    }
+    $decoded = json_decode(required_env($environment), true, flags: JSON_THROW_ON_ERROR);
+    if ($decoded !== null && (!is_array($decoded) || array_is_list($decoded))) {
+        throw new \RuntimeException("{$environment} must be an object or null");
+    }
+    return $decoded;
+}
+
+function configured_workers(): ?array
+{
+    return configured_process_object('GIMME_WORKERS_JSON');
+}
+
+function configured_scheduler(): ?array
+{
+    return configured_process_object('GIMME_SCHEDULER_JSON');
+}
+
 function configured_apps(): array
 {
     $registry = local_config('apps');
@@ -239,13 +261,17 @@ function configured_apps(): array
     return $apps;
 }
 
-function privileged_helper_source_hash(): string
+function privileged_helper_source_hashes(): array
 {
-    $source = file_get_contents(__DIR__ . '/scripts/gimme-provision-stack');
-    if ($source === false) {
-        throw new \RuntimeException('Missing privileged helper source');
+    $hashes = [];
+    foreach (['gimme-provision-stack', 'gimme-provision-processes'] as $name) {
+        $source = file_get_contents(__DIR__ . "/scripts/{$name}");
+        if ($source === false) {
+            throw new \RuntimeException("Missing privileged helper source: {$name}");
+        }
+        $hashes[$name] = hash('sha256', $source);
     }
-    return hash('sha256', $source);
+    return $hashes;
 }
 
 function privileged_helper_policy(
@@ -257,7 +283,7 @@ function privileged_helper_policy(
     string $appsRoot,
 ): string {
     return hash('sha256', json_encode([
-        'helper_source_sha256' => privileged_helper_source_hash(),
+        'helper_source_sha256' => privileged_helper_source_hashes(),
         'packages' => $packages,
         'services' => $services,
         'hostname' => $hostname,
@@ -297,6 +323,7 @@ if (!preg_match('/^[a-z][a-z0-9-]{0,62}$/', $mdnsName)) {
 }
 if (
     str_contains($appsRoot, '..') ||
+    !preg_match('#^/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+$#', $appsRoot) ||
     !array_filter(
         ['/srv/', '/var/www/', '/opt/', '/home/'],
         static fn (string $prefix): bool => str_starts_with($appsRoot, $prefix),
@@ -381,7 +408,9 @@ else
     printf 'passwordless_sudo=no\n'
 fi
 if [ -x /usr/local/sbin/gimme-provision-stack ] && \
-   sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1; then
+   [ -x /usr/local/sbin/gimme-provision-processes ] && \
+   sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && \
+   sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1; then
     printf 'privileged_helper=ready\n'
 else
     printf 'privileged_helper=bootstrap_required\n'
@@ -525,8 +554,11 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
     $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
+        '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
-        'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1'
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
     );
     writeln('GIMME_HELPER|' . ($helperReady ? 'ready' : 'bootstrap_required'));
     $packages = configured_packages();
@@ -595,9 +627,20 @@ BASH;
     }
 
     $helperTemplate = file_get_contents(__DIR__ . '/scripts/gimme-provision-stack');
-    if ($helperTemplate === false) {
+    $processHelperTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-provision-processes'
+    );
+    if ($helperTemplate === false || $processHelperTemplate === false) {
         throw new \RuntimeException('Missing privileged helper source');
     }
+    $policy = privileged_helper_policy(
+        $packages,
+        $services,
+        $hostname,
+        $mdnsName,
+        $remoteUser,
+        $appsRoot,
+    );
     $helper = str_replace(
         '"__GIMME_STATE_PATH__"',
         json_encode($statePath, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
@@ -620,21 +663,22 @@ BASH;
     );
     $helper = str_replace(
         '__GIMME_POLICY_ID__',
-        privileged_helper_policy(
-            $packages,
-            $services,
-            $hostname,
-            $mdnsName,
-            $remoteUser,
-            $appsRoot,
-        ),
+        $policy,
         $helper,
     );
+    $processHelper = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $processHelperTemplate,
+    );
+    $processHelper = str_replace('__GIMME_POLICY_ID__', $policy, $processHelper);
     $helperEncoded = escapeshellarg(base64_encode($helper));
+    $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
     $user = escapeshellarg($remoteUser);
     $sudoers = escapeshellarg(
-        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n"
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n"
     );
     $rootWriteState = str_replace(
         'install -d -m 0700',
@@ -663,16 +707,21 @@ fi
 
 {$rootWriteState}
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
+process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
+printf %s {$processHelperEncoded} | base64 -d > "\$process_helper_tmp"
+chown root:root "\$process_helper_tmp"
+chmod 0755 "\$process_helper_tmp"
 printf %s {$sudoers} > "\$sudoers_tmp"
 chown root:root "\$sudoers_tmp"
 chmod 0440 "\$sudoers_tmp"
 visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
+mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack
 trap - EXIT
 /usr/local/sbin/gimme-provision-stack
@@ -820,6 +869,183 @@ task('gimme:artisan', function () use ($app): void {
         forceOutput: true,
     );
 });
+
+task('gimme:preflight:processes', function () use (
+    $app,
+    $appsRoot,
+    $hostname,
+    $mdnsName,
+    $remoteUser,
+): void {
+    if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
+        throw new \RuntimeException('Process management requires a Laravel application');
+    }
+    $policy = privileged_helper_policy(
+        configured_packages(),
+        configured_services(),
+        $hostname,
+        $mdnsName,
+        $remoteUser,
+        $appsRoot,
+    );
+    $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
+    $helperReady = test(
+        '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
+    );
+    $currentPath = get('deploy_path') . '/current';
+    $currentReady = test('[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]');
+    $workers = configured_workers();
+    $workersEnabled = is_array($workers) && ($workers['enabled'] ?? null) === true;
+    $horizonRequired = $workersEnabled && ($workers['driver'] ?? null) === 'horizon';
+    $pcntlReady = !$workersEnabled || test(
+        "/usr/bin/php -r 'exit(extension_loaded(\"pcntl\") ? 0 : 1);'"
+    );
+    $posixReady = !$horizonRequired || test(
+        "/usr/bin/php -r 'exit(extension_loaded(\"posix\") ? 0 : 1);'"
+    );
+    $horizonReady = !$horizonRequired || test(
+        '[ -d ' . escapeshellarg("{$currentPath}/vendor/laravel/horizon") . ' ] && ' .
+        '[ -f ' . escapeshellarg("{$currentPath}/config/horizon.php") . ' ]'
+    );
+
+    writeln('GIMME_PROCESS_HELPER|' . ($helperReady ? 'ready' : 'bootstrap_required'));
+    writeln('GIMME_CURRENT_RELEASE|' . ($currentReady ? 'ready' : 'missing'));
+    writeln(
+        'GIMME_PCNTL|' . (!$workersEnabled ? 'not_required' : ($pcntlReady ? 'ready' : 'missing'))
+    );
+    writeln(
+        'GIMME_POSIX|' . (!$horizonRequired ? 'not_required' : ($posixReady ? 'ready' : 'missing'))
+    );
+    writeln(
+        'GIMME_HORIZON|' .
+        (!$horizonRequired ? 'not_required' : ($horizonReady ? 'ready' : 'missing'))
+    );
+});
+
+task('gimme:provision:processes', function () use ($app, $appsRoot, $remoteUser): void {
+    if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
+        throw new \RuntimeException('Process management requires a Laravel application');
+    }
+    $workers = configured_workers();
+    if (is_array($workers) && ($workers['enabled'] ?? null) === true &&
+        ($workers['driver'] ?? null) === 'horizon') {
+        $deployPath = get('deploy_path');
+        $envPath = "{$deployPath}/shared/.env";
+        $currentPath = "{$deployPath}/current";
+        $quotedEnvPath = escapeshellarg($envPath);
+        $configureRedis = <<<BASH
+set -eu
+env_path={$quotedEnvPath}
+if [ -L "\$env_path" ] || [ ! -f "\$env_path" ]; then
+    printf 'Horizon requires a regular shared environment file\n' >&2
+    exit 1
+fi
+if grep -q '^QUEUE_CONNECTION=' "\$env_path"; then
+    sed -i 's/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=redis/' "\$env_path"
+else
+    printf '\nQUEUE_CONNECTION=redis\n' >> "\$env_path"
+fi
+chmod 0600 "\$env_path"
+BASH;
+        run('bash -c ' . escapeshellarg($configureRedis));
+        run(
+            'cd ' . escapeshellarg($currentPath) .
+            ' && php artisan --no-interaction config:clear'
+        );
+    }
+    $statePath = "{$appsRoot}/.gimme/processes/{$app}.json";
+    $state = json_encode([
+        'version' => 1,
+        'application' => $app,
+        'framework' => 'laravel',
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'workers' => $workers,
+        'scheduler' => configured_scheduler(),
+    ], JSON_THROW_ON_ERROR);
+    $encoded = escapeshellarg(base64_encode($state));
+    $directory = escapeshellarg(dirname($statePath));
+    $path = escapeshellarg($statePath);
+    $script = <<<BASH
+set -eu
+install -d -m 0700 {$directory}
+temporary={$path}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$encoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$path}
+trap - EXIT
+BASH;
+    run('bash -c ' . escapeshellarg($script));
+    run(
+        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($app),
+        forceOutput: true,
+        timeout: 1800,
+    );
+});
+
+task('gimme:processes:status', function () use ($app): void {
+    if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
+        throw new \RuntimeException('Process management requires a Laravel application');
+    }
+    $status = static function (string $unit): string {
+        if (!preg_match('/^gimme-[a-z0-9@.-]+\.(?:service|timer)$/', $unit)) {
+            throw new \RuntimeException('Unsafe process unit name');
+        }
+        $properties = run(
+            'systemctl show --no-pager ' . escapeshellarg($unit) .
+            ' --property=LoadState,ActiveState,SubState,MainPID,NRestarts ' .
+            '2>/dev/null || true'
+        );
+        return $properties === '' ? 'missing' : str_replace("\n", ',', $properties);
+    };
+    $workers = configured_workers();
+    if (!is_array($workers) || ($workers['enabled'] ?? null) !== true) {
+        writeln('process.worker=disabled');
+    } elseif (($workers['driver'] ?? null) === 'queue') {
+        $processes = $workers['processes'] ?? null;
+        if (!is_int($processes) || $processes < 1 || $processes > 16) {
+            throw new \RuntimeException('Invalid queue worker process count');
+        }
+        for ($index = 1; $index <= $processes; $index++) {
+            $unit = "gimme-worker-{$app}@{$index}.service";
+            writeln("process.worker.{$index}=" . $status($unit));
+        }
+    } elseif (($workers['driver'] ?? null) === 'horizon') {
+        writeln('process.horizon=' . $status("gimme-horizon-{$app}.service"));
+    } else {
+        throw new \RuntimeException('Invalid worker driver');
+    }
+    $scheduler = configured_scheduler();
+    if (is_array($scheduler) && ($scheduler['enabled'] ?? null) === true) {
+        writeln('process.scheduler=' . $status("gimme-scheduler-{$app}.timer"));
+    } else {
+        writeln('process.scheduler=disabled');
+    }
+});
+
+task('gimme:restart:workers', function (): void {
+    $workers = configured_workers();
+    if (!is_array($workers) || ($workers['enabled'] ?? null) !== true) {
+        return;
+    }
+    $driver = $workers['driver'] ?? null;
+    $command = match ($driver) {
+        'queue' => 'queue:restart',
+        'horizon' => 'horizon:terminate',
+        default => throw new \RuntimeException('Invalid worker driver'),
+    };
+    $currentPath = get('deploy_path') . '/current';
+    run(
+        'cd ' . escapeshellarg($currentPath) . ' && php artisan --no-interaction ' .
+        escapeshellarg($command)
+    );
+});
+
+after('deploy:symlink', 'gimme:restart:workers');
+after('rollback', 'gimme:restart:workers');
 
 task('gimme:service:status', function (): void {
     $service = get('gimme_service');

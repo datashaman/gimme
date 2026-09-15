@@ -10,6 +10,9 @@ from gimme.config import (
     ArtisanInvocation,
     ConfigStore,
     FrontendBuildConfig,
+    HorizonWorkerConfig,
+    QueueWorkerConfig,
+    SchedulerConfig,
     ServerConfig,
 )
 
@@ -45,6 +48,27 @@ def test_register_app_is_idempotent(tmp_path: Path) -> None:
     assert store.register_app("acme", app) is True
     assert store.register_app("acme", app) is False
     assert store.app("acme") == app
+
+
+def test_configure_app_processes_preserves_the_deployment_definition(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    original = AppConfig(
+        repository="git@example.test:acme/app.git",
+        framework="laravel",
+        branch="stable",
+    )
+    store.register_app("acme", original)
+
+    changed = store.configure_app_processes(
+        "acme", HorizonWorkerConfig(), SchedulerConfig()
+    )
+    updated = store.app("acme")
+
+    assert changed is True
+    assert updated.repository == original.repository
+    assert updated.branch == "stable"
+    assert updated.workers.driver == "horizon"
+    assert updated.scheduler.enabled is True
 
 
 @pytest.mark.parametrize("name", ["../bad", "Bad", "-bad", "bad_name", ""])
@@ -113,6 +137,8 @@ def test_rejects_unsafe_git_refs(branch: str) -> None:
         ("bootstrap_hostname", "host\nname"),
         ("apps_root", "/etc/gimme"),
         ("apps_root", "/"),
+        ("apps_root", "/srv/gimme/%n"),
+        ("apps_root", "/srv/gimme/app root"),
     ],
 )
 def test_rejects_unsafe_server_boundaries(field: str, value: str) -> None:
@@ -202,3 +228,44 @@ def test_artisan_configuration_is_laravel_only_and_strictly_validated() -> None:
 def test_artisan_invocation_rejects_unsafe_arguments(arguments: list[str]) -> None:
     with pytest.raises(ValidationError):
         ArtisanInvocation(command="about", arguments=arguments)
+
+
+def test_laravel_process_configuration_supports_queue_workers_or_horizon() -> None:
+    queue_app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        workers=QueueWorkerConfig(
+            processes=3,
+            connection="database",
+            queues=["high", "default"],
+        ),
+        scheduler=SchedulerConfig(),
+    )
+    horizon_app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        workers=HorizonWorkerConfig(stop_wait_seconds=3600),
+    )
+
+    assert queue_app.workers.driver == "queue"
+    assert queue_app.workers.processes == 3
+    assert queue_app.scheduler.enabled is True
+    assert horizon_app.workers.driver == "horizon"
+
+
+def test_process_configuration_is_laravel_only_and_rejects_unsafe_values() -> None:
+    with pytest.raises(ValidationError, match="Laravel"):
+        AppConfig(
+            repository="https://example.test/app.git",
+            framework="symfony",
+            workers=QueueWorkerConfig(),
+        )
+
+    with pytest.raises(ValidationError):
+        QueueWorkerConfig(processes=0)
+
+    with pytest.raises(ValidationError):
+        QueueWorkerConfig(queues=["default; reboot"])
+
+    with pytest.raises(ValidationError):
+        QueueWorkerConfig(queues=["default", "default"])

@@ -32,6 +32,13 @@ def test_helper_template_has_fixed_privilege_policy() -> None:
     assert helper["EXPECTED_HOSTNAME"] == "192.0.2.10"
     assert helper["EXPECTED_MDNS_NAME"] == "devbox"
     assert helper["ALLOWED_PACKAGES"] == {"caddy", "python3"}
+    assert helper["fixed_command"](["systemctl", "is-active", "caddy"]) == [
+        "/usr/bin/systemctl",
+        "is-active",
+        "caddy",
+    ]
+    with pytest.raises(RuntimeError, match="unexpected executable"):
+        helper["fixed_command"](["sh", "-c", "reboot"])
 
 
 def test_php_site_resolves_deployer_current_symlink() -> None:

@@ -14,7 +14,8 @@ import pwd
 import re
 import shutil
 import stat
-import subprocess
+# Subprocess calls use fixed executable argv vectors and never invoke a shell.
+import subprocess  # nosec B404
 import sys
 import tempfile
 from ipaddress import ip_address
@@ -45,15 +46,33 @@ CADDY_ROOT = Path(
 ALLOWED_PACKAGES = set(json.loads("__GIMME_ALLOWED_PACKAGES_JSON__"))
 EXPECTED_HOSTNAME = "__GIMME_HOSTNAME__"
 EXPECTED_MDNS_NAME = "__GIMME_MDNS_NAME__"
+EXECUTABLES = {
+    "apt-get": "/usr/bin/apt-get",
+    "caddy": "/usr/bin/caddy",
+    "env": "/usr/bin/env",
+    "getent": "/usr/bin/getent",
+    "hostname": "/usr/bin/hostname",
+    "hostnamectl": "/usr/bin/hostnamectl",
+    "setfacl": "/usr/bin/setfacl",
+    "systemctl": "/usr/bin/systemctl",
+}
 
 
 def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
+def fixed_command(command: list[str]) -> list[str]:
+    if not command or command[0] not in EXECUTABLES:
+        fail("privileged helper attempted an unexpected executable")
+    return [EXECUTABLES[command[0]], *command[1:]]
+
+
 def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    command = fixed_command(command)
     print("+ " + " ".join(command), flush=True)
-    return subprocess.run(
+    # Callers construct validated argv vectors.
+    return subprocess.run(  # nosec B603
         command,
         check=True,
         text=True,
@@ -62,7 +81,9 @@ def run(command: list[str], *, capture: bool = False) -> subprocess.CompletedPro
 
 
 def succeeds(command: list[str]) -> bool:
-    return subprocess.run(
+    command = fixed_command(command)
+    # Callers construct validated argv vectors.
+    return subprocess.run(  # nosec B603
         command,
         check=False,
         stdout=subprocess.DEVNULL,
@@ -71,13 +92,18 @@ def succeeds(command: list[str]) -> bool:
 
 
 def attempt(command: list[str]) -> None:
+    command = fixed_command(command)
     print("+ " + " ".join(command), flush=True)
-    subprocess.run(command, check=False)
+    # Callers construct validated argv vectors.
+    subprocess.run(  # nosec B603
+        command, check=False
+    )
 
 
 def package_is_installed(package: str) -> bool:
-    result = subprocess.run(
-        ["dpkg-query", "-W", "-f=${Status}", package],
+    # Package is validated against the installed helper's fixed allowlist.
+    result = subprocess.run(  # nosec B603
+        ["/usr/bin/dpkg-query", "-W", "-f=${Status}", package],
         check=False,
         text=True,
         capture_output=True,
@@ -303,7 +329,8 @@ def reconcile() -> None:
         run(["systemctl", "restart", "avahi-daemon"])
 
     EXPECTED_APPS_ROOT.mkdir(parents=True, exist_ok=True)
-    os.chmod(EXPECTED_APPS_ROOT, 0o750)
+    # Group traversal is intentional and further narrowed by explicit ACLs below.
+    os.chmod(EXPECTED_APPS_ROOT, 0o750)  # nosec B103
     os.chown(EXPECTED_APPS_ROOT, account.pw_uid, account.pw_gid)
 
     if not apps:
