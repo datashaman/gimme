@@ -227,6 +227,8 @@ def render_mdns_unit(name: str, site_host: str, address: str) -> str:
         "[Install]\n"
         "WantedBy=multi-user.target\n"
     )
+
+
 def load_state(sudo_user: str, sudo_uid: int) -> dict[str, Any]:
     if STATE_PATH.is_symlink():
         fail("desired-state file must not be a symlink")

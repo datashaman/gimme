@@ -22,6 +22,7 @@ jobs:
       - run: uv sync --frozen
       - run: composer install --no-interaction --prefer-dist
       - run: uv run ruff check .
+      - run: uv run ruff check --stdin-filename gimme-provision-stack - < scripts/gimme-provision-stack
       - run: uv run bandit -q -r src
       - run: uv export --frozen --no-dev --no-emit-project | uv run pip-audit -r /dev/stdin
       - run: uv run pytest -q
