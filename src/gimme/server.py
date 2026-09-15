@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
-from gimme.config import AppConfig, ConfigStore, FrontendBuildConfig
+from gimme.config import AppConfig, ArtisanConfig, ConfigStore, FrontendBuildConfig
 from gimme.deployer import DeployerRunner
-from gimme.plans import app_resource_plan, stack_plan
+from gimme.plans import app_resource_plan, artisan_command_plan, stack_plan
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +20,8 @@ mcp = FastMCP(
     instructions=(
         "Provision and deploy registered PHP applications on an allowlisted Ubuntu "
         "host. Read plans before applying them. The server does not accept arbitrary "
-        "shell commands, SQL, hostnames, or filesystem paths."
+        "shell commands, SQL, hostnames, or filesystem paths. Laravel command execution "
+        "is limited to per-application Artisan allowlists and exact reviewed plans."
     ),
 )
 
@@ -36,6 +38,50 @@ IDEMPOTENT_WRITE = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=True,
 )
+
+ApplicationName = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=48,
+        pattern=r"^[a-z][a-z0-9-]{0,47}$",
+        description="Registered application name from list_apps.",
+    ),
+]
+ArtisanCommand = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=120,
+        pattern=r"^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$",
+        description="Laravel Artisan command present in the application's allowlist.",
+    ),
+]
+ArtisanArgument = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=256,
+        description="One literal Artisan positional argument or option.",
+    ),
+]
+ArtisanArguments = Annotated[
+    list[ArtisanArgument] | None,
+    Field(
+        max_length=32,
+        description=(
+            "Optional argument vector passed literally to Artisan. Each item is bounded and "
+            "shell-escaped; environment-selection arguments are rejected."
+        ),
+    ),
+]
+PlanIdentifier = Annotated[
+    str,
+    Field(
+        pattern=r"^plan_[a-f0-9]{20}$",
+        description="Exact plan_id returned by plan_artisan for this invocation.",
+    ),
+]
 
 
 def titled(base: ToolAnnotations, title: str) -> ToolAnnotations:
@@ -236,7 +282,8 @@ def list_apps() -> dict[str, object]:
 @mcp.tool(
     description=(
         "Register or update a PHP application's allowlisted deployment definition. "
-        "Changes only the local registry; it does not connect to or modify the host."
+        "Laravel definitions may override the default Artisan command allowlist. Changes "
+        "only the local registry; it does not connect to or modify the host."
     ),
     annotations=ToolAnnotations(
         title="Register application",
@@ -254,12 +301,14 @@ def register_app(
     ] = "common",
     branch: str = "main",
     frontend: FrontendBuildConfig | None = None,
+    artisan: ArtisanConfig | None = None,
 ) -> dict[str, object]:
     app = AppConfig(
         repository=repository,
         framework=framework,
         branch=branch,
         frontend=frontend,
+        artisan=artisan,
     )
     changed = store.register_app(name, app)
     return {"application": name, "changed": changed, **app.model_dump()}
@@ -379,6 +428,62 @@ def rollback_app(name: str, confirmation: str) -> dict[str, object]:
     server = store.server()
     app = store.app(name)
     return runner.run("rollback", server, app_name=name, app=app).as_dict()
+
+
+@mcp.tool(
+    description=(
+        "Plan one allowlisted Laravel Artisan command in a registered application's current "
+        "release. Validates the command and literal argument vector, makes no changes, and "
+        "returns the exact argv plus a plan_id for run_artisan."
+    ),
+    annotations=titled(READ_ONLY, "Plan Artisan command"),
+)
+def plan_artisan(
+    name: ApplicationName,
+    command: ArtisanCommand,
+    arguments: ArtisanArguments = None,
+) -> dict[str, object]:
+    return artisan_command_plan(store.server(), name, store.app(name), command, arguments)
+
+
+@mcp.tool(
+    description=(
+        "Execute a previously planned, allowlisted Laravel Artisan command inside the current "
+        "release and return capped combined output. Executes application code and may mutate "
+        "application, database, cache, queue, or filesystem state; rejects stale plan IDs."
+    ),
+    annotations=ToolAnnotations(
+        title="Run Artisan command",
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+def run_artisan(
+    name: ApplicationName,
+    command: ArtisanCommand,
+    plan_id: PlanIdentifier,
+    arguments: ArtisanArguments = None,
+) -> dict[str, object]:
+    server = store.server()
+    app = store.app(name)
+    normalized_arguments = arguments or []
+    expected = artisan_command_plan(server, name, app, command, normalized_arguments)
+    if plan_id != expected["plan_id"]:
+        raise ValueError("plan_id is invalid or stale; call plan_artisan again")
+    if app.artisan is None:
+        raise ValueError("Artisan commands require a registered Laravel application")
+    return runner.run(
+        "gimme:artisan",
+        server,
+        app_name=name,
+        app=app,
+        artisan_command=command,
+        artisan_arguments=normalized_arguments,
+        artisan_allowed_commands=app.artisan.allowed_commands,
+        timeout=300,
+    ).as_dict()
 
 
 @mcp.tool(

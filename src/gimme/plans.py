@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from gimme.config import AppConfig, ServerConfig, StackConfig
+from gimme.config import AppConfig, ArtisanInvocation, ServerConfig, StackConfig
 
 
 def plan_id(plan: dict[str, Any]) -> str:
@@ -100,5 +100,41 @@ def app_resource_plan(
         "branch": app.branch,
         "frontend": app.frontend.model_dump() if app.frontend is not None else None,
         "site_url": f"https://{name}.{server.mdns_name}.local",
+    }
+    return {"plan_id": plan_id(plan), **plan}
+
+
+def artisan_command_plan(
+    server: ServerConfig,
+    name: str,
+    app: AppConfig,
+    command: str,
+    arguments: list[str] | None = None,
+) -> dict[str, Any]:
+    if app.framework != "laravel" or app.artisan is None:
+        raise ValueError("Artisan commands require a registered Laravel application")
+    invocation = ArtisanInvocation(command=command, arguments=arguments or [])
+    if invocation.command not in app.artisan.allowed_commands:
+        raise ValueError(
+            f"Artisan command '{invocation.command}' is not allowlisted for application "
+            f"'{name}'"
+        )
+    working_directory = f"{server.apps_root}/{name}/current"
+    plan: dict[str, Any] = {
+        "kind": "artisan_command",
+        "host": server.hostname,
+        "application": name,
+        "working_directory": working_directory,
+        "argv": [
+            "php",
+            "artisan",
+            "--no-interaction",
+            invocation.command,
+            *invocation.arguments,
+        ],
+        "effects": [
+            "execute allowlisted Laravel application code in the current release",
+            "return capped combined stdout and stderr through MCP",
+        ],
     }
     return {"plan_id": plan_id(plan), **plan}

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from fastmcp import Client
+import pytest
 
 from gimme.config import ConfigStore
 from gimme.deployer import CommandResult
@@ -51,7 +52,7 @@ async def test_tool_surface_and_annotations() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
 
-    assert len(tools) == 12
+    assert len(tools) == 14
     assert {tool.name for tool in tools} >= {
         "inspect_host",
         "plan_stack",
@@ -62,6 +63,8 @@ async def test_tool_surface_and_annotations() -> None:
         "plan_deploy",
         "deploy_app",
         "rollback_app",
+        "plan_artisan",
+        "run_artisan",
     }
     for tool in tools:
         assert tool.annotations is not None
@@ -78,6 +81,29 @@ async def test_read_only_plan_through_mcp() -> None:
     assert plan_stack.annotations.readOnlyHint is True
 
 
+async def test_plan_artisan_through_mcp(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+
+    async with Client(mcp) as client:
+        result = await client.call_tool(
+            "plan_artisan",
+            {
+                "name": "example-app",
+                "command": "migrate",
+                "arguments": ["--force"],
+            },
+        )
+
+    assert result.data["kind"] == "artisan_command"
+    assert result.data["argv"] == [
+        "php",
+        "artisan",
+        "--no-interaction",
+        "migrate",
+        "--force",
+    ]
+
+
 async def test_remote_mutations_are_marked_destructive() -> None:
     async with Client(mcp) as client:
         tools = {tool.name: tool for tool in await client.list_tools()}
@@ -87,6 +113,7 @@ async def test_remote_mutations_are_marked_destructive() -> None:
         "provision_app_resources",
         "deploy_app",
         "rollback_app",
+        "run_artisan",
     ):
         assert tools[name].annotations.destructiveHint is True
 
@@ -139,3 +166,42 @@ async def test_application_resource_templates(tmp_path, monkeypatch) -> None:
     assert app["site_url"] == "https://example-app.devbox.local"
     assert releases["application"] == "example-app"
     assert releases["output"] == "release 8 (current)"
+
+
+def test_artisan_tools_require_an_exact_plan_and_pass_structured_context(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    plan = server_module.plan_artisan("example-app", "migrate", ["--force"])
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs) -> CommandResult:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return CommandResult(["dep", "gimme:artisan", "devbox"], 0, "Migrated")
+
+    monkeypatch.setattr("gimme.server.runner.run", fake_run)
+
+    result = server_module.run_artisan(
+        "example-app", "migrate", plan["plan_id"], ["--force"]
+    )
+
+    assert result["output"] == "Migrated"
+    assert captured["args"][0] == "gimme:artisan"
+    assert captured["kwargs"]["artisan_command"] == "migrate"
+    assert captured["kwargs"]["artisan_arguments"] == ["--force"]
+    assert "migrate" in captured["kwargs"]["artisan_allowed_commands"]
+
+
+def test_run_artisan_rejects_stale_plan_before_remote_execution(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+
+    def unexpected_run(*args, **kwargs) -> CommandResult:
+        raise AssertionError("remote runner must not execute for a stale plan")
+
+    monkeypatch.setattr("gimme.server.runner.run", unexpected_run)
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.run_artisan("example-app", "about", "plan_invented", [])

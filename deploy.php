@@ -184,6 +184,42 @@ function configured_services(): array
     return $services;
 }
 
+function configured_artisan_commands(): array
+{
+    $raw = required_env('GIMME_ARTISAN_ALLOWED_JSON');
+    $commands = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($commands) || !array_is_list($commands) || count($commands) > 32) {
+        throw new \RuntimeException('Artisan command allowlist must be a JSON list');
+    }
+    foreach ($commands as $command) {
+        if (!is_string($command) ||
+            !preg_match('/^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$/', $command)) {
+            throw new \RuntimeException('Unsafe Artisan command allowlist');
+        }
+    }
+    if (count($commands) !== count(array_unique($commands))) {
+        throw new \RuntimeException('Artisan command allowlist contains duplicates');
+    }
+    return $commands;
+}
+
+function configured_artisan_arguments(): array
+{
+    $raw = required_env('GIMME_ARTISAN_ARGS_JSON');
+    $arguments = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($arguments) || !array_is_list($arguments) || count($arguments) > 32) {
+        throw new \RuntimeException('Artisan arguments must be a JSON list');
+    }
+    foreach ($arguments as $argument) {
+        if (!is_string($argument) || $argument === '' || strlen($argument) > 256 ||
+            preg_match('/[\x00-\x1f\x7f]/', $argument) || $argument === '--env' ||
+            str_starts_with($argument, '--env=')) {
+            throw new \RuntimeException('Unsafe Artisan argument');
+        }
+    }
+    return $arguments;
+}
+
 function configured_apps(): array
 {
     $registry = local_config('apps');
@@ -751,6 +787,38 @@ BASH;
             );
         }
     }
+});
+
+task('gimme:artisan', function () use ($app): void {
+    if ($app === '') {
+        throw new \RuntimeException('Application context is required');
+    }
+    if ((getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
+        throw new \RuntimeException('Artisan commands require a Laravel application');
+    }
+    $command = required_env('GIMME_ARTISAN_COMMAND');
+    if (!preg_match('/^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$/', $command)) {
+        throw new \RuntimeException('Unsafe Artisan command');
+    }
+    if (!in_array($command, configured_artisan_commands(), true)) {
+        throw new \RuntimeException('Artisan command is not allowlisted');
+    }
+    $currentPath = get('deploy_path') . '/current';
+    if (!test('[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]')) {
+        throw new \RuntimeException('Current release does not contain an Artisan executable');
+    }
+    $arguments = [
+        'php',
+        'artisan',
+        '--no-interaction',
+        $command,
+        ...configured_artisan_arguments(),
+    ];
+    run(
+        'cd ' . escapeshellarg($currentPath) . ' && ' .
+        implode(' ', array_map('escapeshellarg', $arguments)),
+        forceOutput: true,
+    );
 });
 
 task('gimme:service:status', function (): void {

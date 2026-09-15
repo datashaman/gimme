@@ -2,8 +2,16 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from gimme.config import AppConfig, ConfigStore, FrontendBuildConfig, ServerConfig
+from gimme.config import (
+    AppConfig,
+    ArtisanConfig,
+    ArtisanInvocation,
+    ConfigStore,
+    FrontendBuildConfig,
+    ServerConfig,
+)
 
 
 def make_store(tmp_path: Path) -> ConfigStore:
@@ -149,3 +157,48 @@ def test_static_app_requires_safe_frontend_build() -> None:
 
     with pytest.raises(ValueError):
         FrontendBuildConfig(output_dir="dist;touch-pwned")
+
+
+def test_laravel_apps_receive_a_conservative_artisan_allowlist() -> None:
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+    )
+
+    assert app.artisan is not None
+    assert "about" in app.artisan.allowed_commands
+    assert "migrate" in app.artisan.allowed_commands
+    assert "tinker" not in app.artisan.allowed_commands
+    assert "db:wipe" not in app.artisan.allowed_commands
+    assert "migrate:fresh" not in app.artisan.allowed_commands
+
+
+def test_artisan_configuration_is_laravel_only_and_strictly_validated() -> None:
+    with pytest.raises(ValidationError):
+        AppConfig(
+            repository="https://example.test/app.git",
+            framework="symfony",
+            artisan=ArtisanConfig(allowed_commands=["about"]),
+        )
+
+    with pytest.raises(ValidationError):
+        ArtisanConfig(allowed_commands=["about", "about"])
+
+    with pytest.raises(ValidationError):
+        ArtisanConfig(allowed_commands=["about; reboot"])
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["safe\nunsafe"],
+        ["\x00"],
+        ["x" * 257],
+        ["argument"] * 33,
+        ["--env=testing"],
+        ["--env", "testing"],
+    ],
+)
+def test_artisan_invocation_rejects_unsafe_arguments(arguments: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        ArtisanInvocation(command="about", arguments=arguments)

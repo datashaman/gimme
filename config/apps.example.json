@@ -3,6 +3,25 @@
     "example": {
       "branch": "main",
       "framework": "laravel",
+      "artisan": {
+        "allowed_commands": [
+          "about",
+          "cache:clear",
+          "config:cache",
+          "config:clear",
+          "migrate",
+          "migrate:status",
+          "optimize",
+          "optimize:clear",
+          "queue:restart",
+          "route:cache",
+          "route:clear",
+          "schedule:list",
+          "storage:link",
+          "view:cache",
+          "view:clear"
+        ]
+      },
       "frontend": {
         "build_script": "build",
         "output_dir": "public/build",

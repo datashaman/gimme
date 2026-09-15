@@ -1,5 +1,7 @@
+import pytest
+
 from gimme.config import AppConfig, FrontendBuildConfig, ServerConfig, StackConfig
-from gimme.plans import app_resource_plan, stack_plan
+from gimme.plans import app_resource_plan, artisan_command_plan, stack_plan
 
 
 def server() -> ServerConfig:
@@ -146,3 +148,35 @@ def test_static_frontend_has_no_backend_resources() -> None:
     assert plan["database"] is None
     assert plan["cache"] is None
     assert plan["frontend"]["build_script"] == "build"
+
+
+def test_artisan_command_plan_is_exact_and_stable() -> None:
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+    )
+
+    first = artisan_command_plan(server(), "my-app", app, "migrate", ["--force"])
+    second = artisan_command_plan(server(), "my-app", app, "migrate", ["--force"])
+
+    assert first == second
+    assert first["kind"] == "artisan_command"
+    assert first["working_directory"] == "/srv/gimme/apps/my-app/current"
+    assert first["argv"] == ["php", "artisan", "--no-interaction", "migrate", "--force"]
+
+
+def test_artisan_command_plan_enforces_framework_and_allowlist() -> None:
+    laravel = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+    )
+    symfony = AppConfig(
+        repository="https://example.test/app.git",
+        framework="symfony",
+    )
+
+    with pytest.raises(ValueError, match="not allowlisted"):
+        artisan_command_plan(server(), "my-app", laravel, "tinker", [])
+
+    with pytest.raises(ValueError, match="Laravel"):
+        artisan_command_plan(server(), "my-app", symfony, "about", [])

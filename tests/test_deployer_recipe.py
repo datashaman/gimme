@@ -163,6 +163,22 @@ def test_frontend_build_runs_after_composer_dependencies() -> None:
     assert "after('deploy:update_code', 'gimme:frontend')" not in recipe
 
 
+def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:artisan'", 1)[1].split(
+        "task('gimme:service:status'", 1
+    )[0]
+
+    assert "Application context is required" in task
+    assert "Laravel application" in task
+    assert "Artisan command is not allowlisted" in task
+    assert '"{$currentPath}/artisan"' in task
+    assert "array_map('escapeshellarg', $arguments)" in task
+    assert "--no-interaction" in task
+    assert "GIMME_ARTISAN_ARGS_JSON" in recipe
+    assert "GIMME_ARTISAN_ALLOWED_JSON" in recipe
+
+
 def test_privileged_helper_is_narrowly_allowlisted() -> None:
     recipe = (ROOT / "deploy.php").read_text()
     helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()

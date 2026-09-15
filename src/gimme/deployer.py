@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 # Deployer is invoked through a fixed argv vector and never through a shell.
 import subprocess  # nosec B404
@@ -60,6 +61,9 @@ class DeployerRunner:
         app_name: str | None = None,
         app: AppConfig | None = None,
         arguments: Sequence[str] = (),
+        artisan_command: str | None = None,
+        artisan_arguments: Sequence[str] | None = None,
+        artisan_allowed_commands: Sequence[str] | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
     ) -> CommandResult:
@@ -100,8 +104,6 @@ class DeployerRunner:
             }
         )
         if stack is not None:
-            import json
-
             environment.update(
                 {
                     "GIMME_PACKAGE_MANAGER": stack.package_manager,
@@ -127,6 +129,24 @@ class DeployerRunner:
                         "GIMME_FRONTEND_OUTPUT_DIR": app.frontend.output_dir,
                     }
                 )
+
+        artisan_values = (
+            artisan_command,
+            artisan_arguments,
+            artisan_allowed_commands,
+        )
+        if any(value is not None for value in artisan_values):
+            if any(value is None for value in artisan_values):
+                raise ValueError("complete Artisan invocation context is required")
+            environment.update(
+                {
+                    "GIMME_ARTISAN_COMMAND": artisan_command,
+                    "GIMME_ARTISAN_ARGS_JSON": json.dumps(list(artisan_arguments or [])),
+                    "GIMME_ARTISAN_ALLOWED_JSON": json.dumps(
+                        list(artisan_allowed_commands or [])
+                    ),
+                }
+            )
 
         try:
             # The executable is fixed beneath the project root; shell=False is implicit.

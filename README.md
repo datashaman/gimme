@@ -28,6 +28,14 @@ path parameters. Application names and Git metadata are validated, every remote
 mutation has a separate read-only plan tool, and PostgreSQL passwords are generated
 on the remote host without being returned through MCP.
 
+Laravel applications expose only manifest-allowlisted Artisan commands through a
+separate `plan_artisan` / `run_artisan` pair. The argument vector is bounded, rejects
+control characters and alternate environment selection, crosses the process boundary
+as JSON, and is shell-escaped one item at a time. Gimme never accepts PHP code or a
+free-form shell command. Artisan output is application-controlled and may itself
+contain sensitive data, so commands that dump configuration or secrets should not be
+allowlisted.
+
 Repository definitions accept only credential-free HTTPS or SSH Git URLs and safe Git
 branch names. Put authentication in SSH agents, deploy keys, or a credential helper;
 tokens embedded in repository URLs are rejected because manifests and plans are
@@ -199,6 +207,8 @@ Example MCP client configuration:
 6. Complete framework-specific values in the remote `shared/.env`
 7. `plan_deploy`, then approve and call `deploy_app`
 8. Use `list_releases` and `rollback_app` for release operations
+9. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
+   `plan_id` unchanged to `run_artisan`
 
 ## Resources
 
@@ -220,6 +230,35 @@ It also exposes two resource templates for registered applications:
 Template parameters are validated as registered application names. They cannot select
 arbitrary hosts or filesystem paths. The release resource contacts the configured
 host when read; the three manifest resources and application detail are local.
+
+## Laravel Artisan commands
+
+Laravel registrations receive a conservative default Artisan allowlist. Override it
+per application when a project needs fewer commands or explicitly reviewed custom
+commands:
+
+```json
+{
+  "repository": "git@github.com:example/application.git",
+  "framework": "laravel",
+  "branch": "main",
+  "artisan": {
+    "allowed_commands": [
+      "about",
+      "cache:clear",
+      "migrate",
+      "migrate:status",
+      "queue:restart"
+    ]
+  }
+}
+```
+
+`tinker`, `db:wipe`, and `migrate:fresh` are deliberately absent from the default.
+`run_artisan` executes in the live `current` release, always adds `--no-interaction`,
+and requires the exact `plan_id` returned for the same application, command, and
+arguments. For example, production migrations can be planned with `command: "migrate"`
+and `arguments: ["--force"]`.
 
 Example Vite/static application entry in `config/apps.json`:
 

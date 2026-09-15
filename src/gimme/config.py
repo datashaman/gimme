@@ -25,7 +25,25 @@ SCP_REPOSITORY = re.compile(
 )
 REPOSITORY_PATH = re.compile(r"^[a-zA-Z0-9._~/-]+$")
 RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
+ARTISAN_COMMAND = re.compile(r"^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$")
 SAFE_APPS_ROOTS = (Path("/srv"), Path("/var/www"), Path("/opt"), Path("/home"))
+DEFAULT_ARTISAN_COMMANDS = (
+    "about",
+    "cache:clear",
+    "config:cache",
+    "config:clear",
+    "migrate",
+    "migrate:status",
+    "optimize",
+    "optimize:clear",
+    "queue:restart",
+    "route:cache",
+    "route:clear",
+    "schedule:list",
+    "storage:link",
+    "view:cache",
+    "view:clear",
+)
 
 
 def _valid_endpoint(value: str) -> str:
@@ -126,6 +144,48 @@ class FrontendBuildConfig(BaseModel):
         return value.rstrip("/")
 
 
+class ArtisanConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_commands: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_ARTISAN_COMMANDS), max_length=32
+    )
+
+    @field_validator("allowed_commands")
+    @classmethod
+    def valid_commands(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("Artisan commands must not contain duplicates")
+        invalid = [command for command in value if ARTISAN_COMMAND.fullmatch(command) is None]
+        if invalid:
+            raise ValueError(f"invalid Artisan commands: {', '.join(invalid)}")
+        return value
+
+
+class ArtisanInvocation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(min_length=1, max_length=120, pattern=ARTISAN_COMMAND.pattern)
+    arguments: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("arguments")
+    @classmethod
+    def safe_arguments(cls, value: list[str]) -> list[str]:
+        for argument in value:
+            if (
+                not argument
+                or len(argument) > 256
+                or any(ord(char) < 32 or ord(char) == 127 for char in argument)
+                or argument == "--env"
+                or argument.startswith("--env=")
+            ):
+                raise ValueError(
+                    "Artisan arguments must be non-empty, at most 256 characters, "
+                    "control-character-free, and must not select another environment"
+                )
+        return value
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -133,11 +193,16 @@ class AppConfig(BaseModel):
     framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common"
     branch: str = Field(default="main", min_length=1, max_length=120)
     frontend: FrontendBuildConfig | None = None
+    artisan: ArtisanConfig | None = None
 
     @model_validator(mode="after")
-    def static_requires_frontend_build(self) -> "AppConfig":
+    def validate_framework_configuration(self) -> "AppConfig":
         if self.framework == "static" and self.frontend is None:
             raise ValueError("static applications require frontend build configuration")
+        if self.framework == "laravel" and self.artisan is None:
+            self.artisan = ArtisanConfig()
+        elif self.framework != "laravel" and self.artisan is not None:
+            raise ValueError("Artisan configuration is supported only for Laravel applications")
         return self
 
     @field_validator("repository")
