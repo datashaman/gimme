@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +47,8 @@ def test_queue_worker_unit_is_bounded_and_hardened(monkeypatch) -> None:
         "example-app", account, Path("/srv/gimme/apps/example-app"), queue_config()
     )
 
-    assert 'WorkingDirectory="/srv/gimme/apps/example-app/current"' in unit
+    assert "WorkingDirectory=/srv/gimme/apps/example-app/current" in unit
+    assert 'WorkingDirectory="' not in unit
     assert '"queue:work" "database" "--queue=high,default"' in unit
     assert "User=deployer" in unit
     assert "Group=deployer" in unit
@@ -54,6 +57,7 @@ def test_queue_worker_unit_is_bounded_and_hardened(monkeypatch) -> None:
     assert "ProtectSystem=strict" in unit
     assert "CapabilityBoundingSet=" in unit
     assert "ReadWritePaths=" in unit
+    assert 'ReadWritePaths="' not in unit
 
 
 def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None:
@@ -80,6 +84,51 @@ def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None
     assert "Type=oneshot" in scheduler
     assert "OnCalendar=*-*-* *:*:00" in timer
     assert "Persistent=true" in timer
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None,
+    reason="systemd-analyze is available on Linux CI",
+)
+def test_rendered_process_units_pass_systemd_verification(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    monkeypatch.setitem(helper["service_header"].__globals__, "grp", SimpleNamespace(
+        getgrgid=lambda _gid: SimpleNamespace(gr_name="root")
+    ))
+    account = SimpleNamespace(pw_name="root", pw_gid=0)
+    app_root = tmp_path / "apps" / "example-app"
+    (app_root / "current" / "bootstrap" / "cache").mkdir(parents=True)
+    (app_root / "shared").mkdir()
+    units = {
+        "gimme-horizon-example-app.service": helper["render_horizon_unit"](
+            "example-app",
+            account,
+            app_root,
+            {"driver": "horizon", "enabled": True, "stop_wait_seconds": 3600},
+        ),
+        "gimme-scheduler-example-app.service": helper["render_scheduler_service"](
+            "example-app", account, app_root
+        ),
+        "gimme-scheduler-example-app.timer": helper["render_scheduler_timer"](
+            "example-app"
+        ),
+    }
+    paths = []
+    for name, content in units.items():
+        path = tmp_path / name
+        path.write_text(content)
+        paths.append(str(path))
+
+    result = subprocess.run(
+        ["systemd-analyze", "verify", *paths],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_process_helper_rejects_unknown_or_injected_configuration() -> None:

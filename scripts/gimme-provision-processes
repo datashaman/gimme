@@ -214,6 +214,13 @@ def quote(value: str | Path) -> str:
     return json.dumps(str(value))
 
 
+def unit_path(value: Path) -> str:
+    rendered = str(value)
+    if not rendered.startswith("/") or any(character.isspace() for character in rendered):
+        fail("unsafe systemd unit path")
+    return rendered
+
+
 def hardening(application_root: Path) -> str:
     return (
         "NoNewPrivileges=true\n"
@@ -232,8 +239,8 @@ def hardening(application_root: Path) -> str:
         "CapabilityBoundingSet=\n"
         "AmbientCapabilities=\n"
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"
-        f"ReadWritePaths={quote(application_root / 'shared')} "
-        f"{quote(application_root / 'current' / 'bootstrap' / 'cache')}\n"
+        f"ReadWritePaths={unit_path(application_root / 'shared')} "
+        f"{unit_path(application_root / 'current' / 'bootstrap' / 'cache')}\n"
         "UMask=0027\n"
     )
 
@@ -252,7 +259,7 @@ def service_header(description: str, account: pwd.struct_passwd, current: Path) 
         "[Service]\n"
         f"User={account.pw_name}\n"
         f"Group={group_name}\n"
-        f"WorkingDirectory={quote(current)}\n"
+        f"WorkingDirectory={unit_path(current)}\n"
         "Environment=APP_ENV=production\n"
     )
 

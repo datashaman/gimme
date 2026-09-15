@@ -185,6 +185,9 @@ def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
     assert "task('gimme:preflight:processes'" in recipe
     assert "task('gimme:provision:processes'" in recipe
     assert "task('gimme:processes:status'" in recipe
+    assert "LoadState,LoadError,ActiveState,SubState,MainPID,NRestarts" in recipe
+    assert "/usr/bin/systemd-analyze verify" in recipe
+    assert "LoadState=bad-setting" in recipe
     assert "GIMME_PROCESS_HELPER|" in recipe
     assert "GIMME_CURRENT_RELEASE|" in recipe
     assert "GIMME_PCNTL|" in recipe

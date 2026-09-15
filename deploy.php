@@ -996,10 +996,23 @@ task('gimme:processes:status', function () use ($app): void {
         }
         $properties = run(
             'systemctl show --no-pager ' . escapeshellarg($unit) .
-            ' --property=LoadState,ActiveState,SubState,MainPID,NRestarts ' .
+            ' --property=LoadState,LoadError,ActiveState,SubState,MainPID,NRestarts ' .
             '2>/dev/null || true'
         );
-        return $properties === '' ? 'missing' : str_replace("\n", ',', $properties);
+        if ($properties === '') {
+            return 'missing';
+        }
+        $result = str_replace("\n", ',', $properties);
+        if (str_contains($properties, 'LoadState=bad-setting')) {
+            $unitPath = '/etc/systemd/system/' . $unit;
+            $verification = run(
+                '/usr/bin/systemd-analyze verify ' . escapeshellarg($unitPath) .
+                ' 2>&1 || true'
+            );
+            $verification = preg_replace('/\s+/', ' ', trim($verification)) ?? '';
+            $result .= ',VerifyError=' . substr($verification, 0, 2000);
+        }
+        return $result;
     };
     $workers = configured_workers();
     if (!is_array($workers) || ($workers['enabled'] ?? null) !== true) {
