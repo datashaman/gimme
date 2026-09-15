@@ -154,7 +154,9 @@ def resolved_stack_plan() -> dict[str, object]:
 @mcp.tool(
     description=(
         "Inspect the configured Ubuntu host and report its OS, installed runtime "
-        "commands, service states, and non-interactive sudo availability. Makes no changes."
+        "commands, service states, mDNS publisher and host-local resolution observations, "
+        "and non-interactive sudo availability. Client-side mDNS resolution is explicitly "
+        "reported as not observable. Makes no changes."
     ),
     annotations=titled(READ_ONLY, "Inspect host"),
 )

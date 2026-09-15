@@ -376,7 +376,12 @@ BASH;
             $documentRoot .= "/{$relativeRoot}";
         }
         $siteHost = "{$name}.{$mdnsName}.local";
-        $alias = run('getent ahostsv4 ' . escapeshellarg($siteHost) . ' 2>/dev/null || true');
+        // Local resolver behaviour is not authoritative for an Avahi record published
+        // by this same host. Report it as a separate observation and allow IPv6-only
+        // mDNS results; client resolution cannot be observed from the VM.
+        $localResolution = run(
+            'getent hosts ' . escapeshellarg($siteHost) . ' 2>/dev/null || true'
+        );
         $index = test('[ -f ' . escapeshellarg("{$documentRoot}/index.php") . ' ]')
             || test('[ -f ' . escapeshellarg("{$documentRoot}/index.html") . ' ]');
         $path = run('namei -l ' . escapeshellarg($documentRoot) . ' 2>/dev/null || true');
@@ -391,11 +396,15 @@ BASH;
             ' 2>/dev/null || true'
         );
         writeln("site.{$name}.hostname={$siteHost}");
-        writeln('site.' . $name . '.alias=' . ($alias === '' ? 'unresolved' : $alias));
         writeln(
             'site.' . $name . '.mdns_publisher=' .
             ($publisher === '' ? 'missing' : $publisher)
         );
+        writeln(
+            'site.' . $name . '.mdns_local_resolution=' .
+            ($localResolution === '' ? 'unavailable' : $localResolution)
+        );
+        writeln('site.' . $name . '.mdns_client_resolution=not_observable');
         writeln("site.{$name}.document_root={$documentRoot}");
         writeln('site.' . $name . '.index=' . ($index ? 'present' : 'missing'));
         writeln("site.{$name}.https_status=" . ($http === '' ? 'unreachable' : $http));

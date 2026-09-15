@@ -72,7 +72,11 @@ def test_host_inspection_reports_application_reachability() -> None:
         "task('gimme:preflight:stack'", 1
     )[0]
 
-    assert "'.alias='" in task
+    assert "'.mdns_local_resolution='" in task
+    assert "'.mdns_client_resolution=not_observable'" in task
+    assert "'.alias='" not in task
+    assert "getent hosts ' . escapeshellarg($siteHost)" in task
+    assert "getent ahostsv4 ' . escapeshellarg($siteHost)" not in task
     assert "'.mdns_publisher='" in task
     assert "site.{$name}.https_status=" in task
     assert "site.{$name}.path_permissions=" in task

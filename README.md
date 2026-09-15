@@ -37,8 +37,11 @@ boundary.
 
 Remote mutation tools are marked destructive in their MCP annotations. `inspect_host`
 reports health, permissions, and application-log file counts, but never returns raw
-application or service log content or SSH key identities. Deployment roots are limited
-to dedicated subdirectories beneath `/srv`, `/var/www`, `/opt`, or `/home`.
+application or service log content or SSH key identities. For application mDNS,
+inspection reports publisher state separately from host-local resolution and marks
+client resolution as not observable; a VM failing to resolve its own published alias
+does not imply that clients cannot resolve it. Deployment roots are limited to dedicated
+subdirectories beneath `/srv`, `/var/www`, `/opt`, or `/home`.
 Generated Caddy sites hide environment files and version-control metadata, and Gimme
 refuses symlinked application `.env` files while enforcing owner-only permissions.
 
