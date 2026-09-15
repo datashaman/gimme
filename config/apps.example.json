@@ -1,0 +1,14 @@
+{
+  "apps": {
+    "example": {
+      "branch": "main",
+      "framework": "laravel",
+      "frontend": {
+        "build_script": "build",
+        "output_dir": "public/build",
+        "package_manager": "npm"
+      },
+      "repository": "git@github.com:example/example.git"
+    }
+  }
+}

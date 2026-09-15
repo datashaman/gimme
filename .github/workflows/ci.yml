@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: composer:v2
+      - run: uv sync --frozen
+      - run: composer install --no-interaction --prefer-dist
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+      - run: vendor/bin/phpstan analyse deploy.php --no-progress --level=5
+      - run: php -l deploy.php

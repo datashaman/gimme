@@ -1,0 +1,9 @@
+{
+  "host_alias": "devbox",
+  "bootstrap_hostname": "192.0.2.10",
+  "hostname": "devbox.local",
+  "mdns_name": "devbox",
+  "remote_user": "deployer",
+  "apps_root": "/srv/gimme/apps",
+  "keep_releases": 5
+}
