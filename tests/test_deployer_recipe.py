@@ -171,6 +171,7 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "ALLOWED_SERVICES" in helper
     assert "EXPECTED_HOSTNAME" in helper
     assert "GIMME_POLICY_ID" in helper
+    assert "'helper_source_sha256' => privileged_helper_source_hash()" in recipe
     assert "shell_exec" not in helper
     assert "GIMME_HELPER|" in recipe
     assert "chown {$user}:{$user}" in recipe

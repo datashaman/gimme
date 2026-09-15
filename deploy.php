@@ -203,6 +203,15 @@ function configured_apps(): array
     return $apps;
 }
 
+function privileged_helper_source_hash(): string
+{
+    $source = file_get_contents(__DIR__ . '/scripts/gimme-provision-stack');
+    if ($source === false) {
+        throw new \RuntimeException('Missing privileged helper source');
+    }
+    return hash('sha256', $source);
+}
+
 function privileged_helper_policy(
     array $packages,
     array $services,
@@ -212,6 +221,7 @@ function privileged_helper_policy(
     string $appsRoot,
 ): string {
     return hash('sha256', json_encode([
+        'helper_source_sha256' => privileged_helper_source_hash(),
         'packages' => $packages,
         'services' => $services,
         'hostname' => $hostname,
