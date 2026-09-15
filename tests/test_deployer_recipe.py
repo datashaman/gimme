@@ -113,6 +113,8 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "grep -q '^APP_KEY='" in task
     assert "php artisan optimize:clear" in task
     assert "php artisan optimize" in task
+    assert 'if [ -L "\\$env_path" ]' in task
+    assert 'chmod 0600 "\\$env_path"' in task
 
 
 def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:

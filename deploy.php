@@ -668,6 +668,10 @@ task('gimme:provision:app', function () use ($app, $mdnsName): void {
     $script = <<<BASH
 set -eu
 env_path="{$envPath}"
+if [ -L "\$env_path" ]; then
+    printf 'Refusing to manage symlinked environment file: %s\n' "\$env_path" >&2
+    exit 1
+fi
 if [ ! -f "\$env_path" ]; then
     password=\$(openssl rand -hex 32)
     if ! psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='{$role}'" | grep -qx 1; then
@@ -693,6 +697,7 @@ if [ ! -f "\$env_path" ]; then
         printf 'REDIS_PREFIX=%s\n' 'gimme:{$app}:'
     } > "\$env_path"
 fi
+chmod 0600 "\$env_path"
 BASH;
 
     if ((getenv('GIMME_FRAMEWORK') ?: 'common') === 'laravel') {

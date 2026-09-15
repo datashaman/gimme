@@ -51,6 +51,20 @@ def test_php_site_resolves_deployer_current_symlink() -> None:
     ) in site
 
 
+def test_caddy_site_hides_repository_and_environment_files() -> None:
+    render_caddy_site = load_helper()["render_caddy_site"]
+
+    site = render_caddy_site(
+        "example-app",
+        "devbox",
+        Path("/srv/gimme/apps/example-app/current"),
+        "common",
+    )
+
+    assert "file_server {\n" in site
+    assert "hide .git* .env* .hg* .svn" in site
+
+
 def test_state_file_must_not_be_accessible_to_other_users(tmp_path: Path) -> None:
     helper = load_helper()
     state_path = tmp_path / "stack.json"

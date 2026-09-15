@@ -39,6 +39,8 @@ Remote mutation tools are marked destructive in their MCP annotations. `inspect_
 reports health, permissions, and application-log file counts, but never returns raw
 application or service log content or SSH key identities. Deployment roots are limited
 to dedicated subdirectories beneath `/srv`, `/var/www`, `/opt`, or `/home`.
+Generated Caddy sites hide environment files and version-control metadata, and Gimme
+refuses symlinked application `.env` files while enforcing owner-only permissions.
 
 Standalone static frontends and PHP applications with frontend assets can declare an
 npm build. Gimme runs `npm ci` from the committed lockfile followed by one validated

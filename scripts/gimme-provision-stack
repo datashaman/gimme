@@ -195,7 +195,9 @@ def render_caddy_site(
         f"    root * {json.dumps(str(document_root))}\n"
         "    encode zstd gzip\n"
         f"{php_handler}"
-        "    file_server\n"
+        "    file_server {\n"
+        "        hide .git* .env* .hg* .svn\n"
+        "    }\n"
         "}\n"
     )
 
