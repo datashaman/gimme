@@ -21,6 +21,15 @@ protects existing data with a Safety Recovery Point, and fails closed until inte
 health, and process verification succeed. Explicit partial restore is permitted, but must declare
 that it intentionally breaks cross-component consistency.
 
+Each Restore request writes an append-only, secret-free Restore Record to its Backup Destination.
+That record, rather than controller or Target-local state, is authoritative for resumption and for
+deciding whether a Safety Recovery Point remains protected. Recovery Manifests stay immutable.
+
+PostgreSQL Restore loads and verifies a derived shadow database before swapping it into the
+Deployment's registered database identity. The previous database remains available while managed
+processes and private application health are verified, and is removed only after the Restore
+Record reaches `completed`.
+
 ## Considered alternatives
 
 - Whole-Resource snapshots were rejected because one Resource can serve several Deployments and
@@ -38,4 +47,6 @@ that it intentionally breaks cross-component consistency.
 - Bucket versioning is mandatory; Object Lock remains optional operator hardening.
 - Deployment-changing operations must serialize with backup and restore.
 - Retention may prune only verified, unprotected recovery points after a replacement verifies.
+- A Safety Recovery Point remains protected until its authoritative Restore Record is completed.
+- PostgreSQL Restore never streams an unverified dump directly into the live database identity.
 - Gimme does not provide an MCP force-online bypass after failed restore verification.

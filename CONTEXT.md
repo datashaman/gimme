@@ -75,8 +75,16 @@ An explicitly confirmed operation that replaces selected Deployment-owned data f
 Recovery Points during a controlled maintenance window. A failed or unverified Restore leaves
 the Deployment unavailable rather than exposing partially restored data. It restores every
 Component Backup by default; an explicitly selected partial Restore intentionally leaves all
-unselected components untouched.
+unselected components untouched. PostgreSQL data is loaded and verified in a derived shadow
+database before a bounded name swap; the previous database is retained until the Restore completes.
 _Avoid_: Import, clone, rollback
+
+**Restore Record**:
+The append-only, secret-free history of one Restore request stored in the Deployment's Backup
+Destination. It is authoritative across controller or Target loss and records bounded lifecycle
+transitions from start through verification or failure. A Safety Recovery Point remains protected
+until its Restore Record reaches `completed`; target-local status is only a resumable cache.
+_Avoid_: Restore log, local restore status
 
 ## Example dialogue
 
