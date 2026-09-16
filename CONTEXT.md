@@ -14,13 +14,35 @@ _Avoid_: Host, server, box
 A reusable source and build definition that can participate in many Deployments.
 _Avoid_: App instance, site
 
+**Application Artifact**:
+A content-addressed, immutable package of one Application revision and its production dependencies
+and compiled assets, built under exact declared inputs. Its secret-free provenance manifest is the
+publication marker and authoritative identity; Deployments verify and activate the artifact without
+rebuilding it. Its reviewed `build_id` hashes declared inputs, while its `artifact_digest` hashes
+the deterministic package bytes; rebuilding one `build_id` to different bytes fails closed.
+_Avoid_: Release checkout, build directory
+
+**Artifact Store**:
+A named, versioned S3-compatible object-storage location for Application Artifacts and their
+provenance manifests. It has a separate lifecycle from recovery storage, and Gimme derives every
+object identity rather than accepting caller-supplied bucket paths or keys.
+_Avoid_: Backup Destination, upload path
+
+**Build Target**:
+The registered Target selected by an Application's build policy to produce Application Artifacts
+in an isolated derived workspace. It may also host Deployments, but build and release remain
+separate operations; it receives no Deployment runtime secrets or Resource access.
+_Avoid_: Deployment Target, CI runner
+
 **Resource**:
 A named, versioned service available on one Target and shareable by multiple Deployments.
 _Avoid_: Deployment database, application service
 
 **Deployment**:
 One Application placed at one stage on one Target, with isolated runtime identity, data
-identity, environment, processes, and routing.
+identity, environment, processes, and routing. Its explicit release mode is `source` for a
+destination-built local or preview workflow, or `artifact` for immutable build/release separation;
+staging and production require artifact mode.
 _Avoid_: Environment, release, app
 
 **Recovery Point**:
