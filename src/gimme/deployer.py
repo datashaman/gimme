@@ -241,9 +241,8 @@ class DeployerRunner:
                         else None
                     ),
                     "GIMME_HEALTH_JSON": json.dumps(
-                        app.effective_health(environment_name).model_dump()
-                        if app.effective_health(environment_name) is not None
-                        else None
+                        [probe.model_dump() for probe in
+                         app.effective_health_probes(environment_name)]
                     ),
                 }
             )

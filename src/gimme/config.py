@@ -283,6 +283,17 @@ class SchedulerConfig(BaseModel):
 class HealthCheckConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    name: str = Field(
+        default="primary",
+        pattern=r"^[a-z][a-z0-9-]{0,31}$",
+        description="Stable identifier used in plans and health-gate results.",
+    )
+    phases: list[Literal["candidate", "live"]] = Field(
+        default_factory=lambda: ["candidate", "live"],
+        min_length=1,
+        max_length=2,
+        description="Deployment phases at which this probe must pass.",
+    )
     path: str = Field(
         default="/up",
         min_length=1,
@@ -329,6 +340,13 @@ class HealthCheckConfig(BaseModel):
             raise ValueError("health path contains unsafe path segments")
         return value
 
+    @field_validator("phases")
+    @classmethod
+    def unique_phases(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("health phases must not contain duplicates")
+        return value
+
 
 class EnvironmentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -337,6 +355,7 @@ class EnvironmentConfig(BaseModel):
     app_env: str = "production"
     app_debug: bool = Field(default=False, strict=True)
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit"
+    health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
 
@@ -366,6 +385,7 @@ class AppConfig(BaseModel):
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
     health: HealthCheckConfig | None = None
+    health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     environments: dict[str, EnvironmentConfig] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -418,14 +438,17 @@ class AppConfig(BaseModel):
             environment.workers is not None
             or environment.scheduler is not None
             or environment.health != "inherit"
+            or environment.health_probes
             for environment in self.environments.values()
         )
         if self.framework != "laravel" and (
-            has_environment_laravel_settings or self.health is not None
+            has_environment_laravel_settings or self.health is not None or self.health_probes
         ):
             raise ValueError(
                 "worker, scheduler, and health configuration require a Laravel application"
             )
+        for environment_name in self.environments:
+            self.effective_health_probes(environment_name)
         return self
 
     @field_validator("repository")
@@ -473,6 +496,15 @@ class AppConfig(BaseModel):
     def effective_health(self, name: str = "default") -> HealthCheckConfig | None:
         override = self.environment(name).health
         return self.health if override == "inherit" else override
+
+    def effective_health_probes(self, name: str = "default") -> list[HealthCheckConfig]:
+        primary = self.effective_health(name)
+        probes = [*([primary] if primary is not None else []), *self.health_probes,
+                  *self.environment(name).health_probes]
+        names = [probe.name for probe in probes]
+        if len(names) != len(set(names)):
+            raise ValueError("effective health probe names must be unique")
+        return probes
 
     @property
     def branch(self) -> str:

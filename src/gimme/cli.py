@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 from gimme.control import StateStore, legacy_server, target_sites
 from gimme.deployer import DeployerRunner
@@ -19,6 +20,8 @@ def bootstrap_target() -> None:
     store = StateStore.from_environment(ROOT)
     state = store.load()
     target = state.targets[arguments.target]
+    started = time.monotonic()
+    print(f"Bootstrap target={arguments.target} host={target.bootstrap_hostname}", flush=True)
     result = DeployerRunner(ROOT).run(
         "gimme:provision:stack",
         legacy_server(target),
@@ -31,6 +34,7 @@ def bootstrap_target() -> None:
         interactive_sudo=True,
     )
     print(result.output, end="")
+    print(f"Bootstrap completed in {time.monotonic() - started:.1f}s", flush=True)
 
 
 def bootstrap_database() -> None:
@@ -41,6 +45,11 @@ def bootstrap_database() -> None:
     arguments = parser.parse_args()
     store = StateStore.from_environment(ROOT)
     target = store.target(arguments.target)
+    started = time.monotonic()
+    print(
+        f"Database bootstrap target={arguments.target} host={target.bootstrap_hostname}",
+        flush=True,
+    )
     result = DeployerRunner(ROOT).run(
         "gimme:bootstrap:database-admin",
         legacy_server(target),
@@ -50,3 +59,4 @@ def bootstrap_database() -> None:
         interactive_sudo=True,
     )
     print(result.output, end="")
+    print(f"Database bootstrap completed in {time.monotonic() - started:.1f}s", flush=True)

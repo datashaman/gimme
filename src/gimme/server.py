@@ -150,6 +150,36 @@ def _result(result: CommandResult) -> dict[str, object]:
     return result.as_dict()
 
 
+def _deployment_diagnostics(result: CommandResult) -> dict[str, object]:
+    checks: list[dict[str, str]] = []
+    for line in result.output.splitlines():
+        marker = line.find("GIMME_DIAGNOSTIC|")
+        if marker < 0:
+            continue
+        parts = line[marker:].split("|", 3)
+        if len(parts) != 4:
+            continue
+        _, check, status, detail = parts
+        if (
+            re.fullmatch(
+                r"(?:release|artisan|database|writable|php-fpm|laravel-log|"
+                r"health\.[a-z][a-z0-9-]{0,31})",
+                check,
+            ) is None
+            or status not in {"ready", "failed", "missing"}
+            or re.fullmatch(
+                r"(?:none|invalid|invalid-metadata|[0-9a-f]{40,64}|status=(?:[1-5][0-9]{2}|exception)|bytes=\d{1,15},age_seconds=\d{1,15},errors=\d{1,10})",
+                detail,
+            ) is None
+        ):
+            continue
+        checks.append({"check": check, "status": status, "detail": detail})
+    return {
+        "healthy": bool(checks) and all(check["status"] == "ready" for check in checks),
+        "checks": checks,
+    }
+
+
 def _replace(state: ControlState, collection: str, name: str, value: object) -> ControlState:
     document = state.model_dump(mode="json")
     document[collection][name] = value.model_dump(mode="json")  # type: ignore[attr-defined]
@@ -856,6 +886,14 @@ def run_artisan(name: Name, command: str, plan_id: PlanId,
 def deployment_process_status(name: Name) -> dict[str, object]:
     """Inspect managed queue, Horizon, and scheduler units for one deployment."""
     return _result(_run_deployment("gimme:processes:status", name, timeout=60))
+
+
+@mcp.tool(annotations=READ)
+def diagnose_deployment(name: Name) -> dict[str, object]:
+    """Run fixed secret-safe Laravel deployment diagnostics and live-health checks."""
+    return _deployment_diagnostics(
+        _run_deployment("gimme:diagnose:deployment", name, timeout=120)
+    )
 
 
 @mcp.tool(annotations=READ)

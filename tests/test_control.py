@@ -143,6 +143,21 @@ def test_staging_requires_health_and_debug_off() -> None:
             deployments={"example-staging": candidate},
         )
 
+    candidate_only = no_health.model_copy(
+        update={
+            "health_probes": [
+                HealthCheckConfig(name="candidate", phases=["candidate"])
+            ]
+        }
+    )
+    with pytest.raises(ValidationError, match="candidate and live"):
+        ControlState(
+            targets={"devbox": public},
+            applications={"example": candidate_only},
+            resources=resources(),
+            deployments={"example-staging": candidate},
+        )
+
 
 def test_environment_values_cannot_override_managed_keys() -> None:
     with pytest.raises(ValidationError, match="reserved"):

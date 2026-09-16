@@ -271,17 +271,19 @@ def test_deployment_plan_exposes_candidate_and_live_health_gates() -> None:
     assert plan["kind"] == "application_deploy"
     assert plan["repository"] == app.repository
     assert plan["branch"] == "stable"
-    assert plan["health"]["pre_activation"] == {
+    assert plan["health"][0]["pre_activation"] == {
         "target": "candidate_release",
         "path": "/up",
+        "name": "primary",
         "expected_status": 204,
         "attempts": 5,
         "delay_seconds": 2,
         "timeout_seconds": 3,
         "failure": "prevent_symlink_switch",
     }
-    assert plan["health"]["post_activation"] == {
+    assert plan["health"][0]["post_activation"] == {
         "target": "https://my-app.devbox.local/up",
+        "name": "primary",
         "expected_status": 204,
         "attempts": 5,
         "delay_seconds": 2,
@@ -318,8 +320,8 @@ def test_environment_deployment_plan_uses_branch_url_and_health_override() -> No
     assert plan["revision"] == "a" * 40
     assert plan["deploy_path"] == ("/srv/gimme/apps/my-app/environments/feature-x")
     assert plan["site_url"] == "https://feature-x.my-app.devbox.local"
-    assert plan["health"]["pre_activation"]["path"] == "/health"
-    assert plan["health"]["post_activation"]["target"] == (
+    assert plan["health"][0]["pre_activation"]["path"] == "/health"
+    assert plan["health"][0]["post_activation"]["target"] == (
         "https://feature-x.my-app.devbox.local/health"
     )
 

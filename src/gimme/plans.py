@@ -247,29 +247,32 @@ def deployment_plan(
     definition = app.environment(environment)
     site_url = environment_site_url(server, name, environment)
     deploy_path = environment_deploy_path(server, name, environment)
-    effective_health = app.effective_health(environment)
-    health: dict[str, Any] | None = None
-    if effective_health is not None:
-        settings = effective_health.model_dump()
+    effective_health = app.effective_health_probes(environment)
+    health: list[dict[str, Any]] = []
+    for probe in effective_health:
+        settings = probe.model_dump()
         common = {
+            "name": settings["name"],
             "expected_status": settings["expected_status"],
             "attempts": settings["attempts"],
             "delay_seconds": settings["delay_seconds"],
             "timeout_seconds": settings["timeout_seconds"],
         }
-        health = {
-            "pre_activation": {
+        gates: dict[str, Any] = {"name": settings["name"], "phases": settings["phases"]}
+        if "candidate" in settings["phases"]:
+            gates["pre_activation"] = {
                 "target": "candidate_release",
                 "path": settings["path"],
                 **common,
                 "failure": "prevent_symlink_switch",
-            },
-            "post_activation": {
+            }
+        if "live" in settings["phases"]:
+            gates["post_activation"] = {
                 "target": f"{site_url}{settings['path']}",
                 **common,
                 "failure": "rollback_previous_release",
-            },
-        }
+            }
+        health.append(gates)
     plan: dict[str, Any] = {
         "kind": "application_deploy",
         "host": server.hostname,

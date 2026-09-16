@@ -42,7 +42,7 @@ $environmentName = getenv('GIMME_ENVIRONMENT') ?: 'default';
 $instance = getenv('GIMME_INSTANCE') ?: $app;
 $deployPath = getenv('GIMME_DEPLOY_PATH') ?: ($app === '' ? $appsRoot : "{$appsRoot}/{$app}");
 $siteHost = getenv('GIMME_SITE_HOST') ?: ($app === '' ? '' : "{$app}.{$mdnsName}.local");
-$health = $app === '' ? null : configured_health();
+$health = $app === '' ? [] : configured_health();
 
 if (!valid_endpoint($hostname) || !valid_endpoint($bootstrapHostname) || !valid_endpoint($sshHostname)) {
     throw new \RuntimeException('Unsafe host endpoint');
@@ -105,7 +105,7 @@ if ($app !== '') {
         throw new \RuntimeException('Unsafe environment deployment boundary');
     }
 }
-if ($health !== null && $framework !== 'laravel') {
+if ($health !== [] && $framework !== 'laravel') {
     throw new \RuntimeException('Deployment health gates require a Laravel application');
 }
 
@@ -378,36 +378,130 @@ task('gimme:current-revision', function (): void {
     writeln("GIMME_CURRENT_REVISION|{$revision}");
 });
 
-if ($health !== null) {
+task('gimme:diagnose:deployment', function () use (
+    $app,
+    $framework,
+    $health,
+    $siteHost,
+    $appsRoot,
+): void {
+    if ($app === '') {
+        throw new \RuntimeException('Deployment diagnostics require an application');
+    }
+    if ($framework !== 'laravel') {
+        throw new \RuntimeException('Deployment diagnostics currently require Laravel');
+    }
+    $currentPath = get('deploy_path') . '/current';
+    if (!test('[ -d ' . escapeshellarg($currentPath) . ' ]')) {
+        writeln('GIMME_DIAGNOSTIC|release|missing|none');
+        return;
+    }
+    $revision = trim(run(
+        'cd ' . escapeshellarg($currentPath) . ' && git rev-parse --verify HEAD'
+    ));
+    $revisionDetail = preg_match('/^[0-9a-f]{40,64}$/', $revision) ? $revision : 'invalid';
+    writeln("GIMME_DIAGNOSTIC|release|ready|{$revisionDetail}");
+
+    $php = escapeshellarg(configured_php_binary());
+    $artisan = escapeshellarg("{$currentPath}/artisan");
+    $artisanStatus = trim(run(
+        "if {$php} {$artisan} --no-interaction about >/dev/null 2>&1; " .
+        "then printf ready; else printf failed; fi"
+    ));
+    writeln("GIMME_DIAGNOSTIC|artisan|{$artisanStatus}|none");
+    $databaseStatus = trim(run(
+        "if {$php} {$artisan} --no-interaction migrate:status >/dev/null 2>&1; " .
+        "then printf ready; else printf failed; fi"
+    ));
+    writeln("GIMME_DIAGNOSTIC|database|{$databaseStatus}|none");
+
+    $writable = test('[ -w ' . escapeshellarg("{$currentPath}/storage") . ' ]') &&
+        test('[ -w ' . escapeshellarg("{$currentPath}/bootstrap/cache") . ' ]');
+    writeln('GIMME_DIAGNOSTIC|writable|' . ($writable ? 'ready' : 'failed') . '|none');
+    $versionParts = explode('.', configured_runtimes()['php']['version']);
+    $fpmSocket = "/run/php/php{$versionParts[0]}.{$versionParts[1]}-fpm.sock";
+    writeln('GIMME_DIAGNOSTIC|php-fpm|' .
+        (test('[ -S ' . escapeshellarg($fpmSocket) . ' ]') ? 'ready' : 'missing') . '|none');
+
+    $logSummary = trim(run(
+        'cd ' . escapeshellarg($currentPath) . ' && ' .
+        "latest=\$(find storage/logs -maxdepth 1 -type f -name 'laravel*.log' " .
+        "-printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -n 1 | cut -d' ' -f2-); " .
+        "if [ -z \"\$latest\" ]; then printf missing; else " .
+        "bytes=\$(stat -c %s \"\$latest\"); now=\$(date +%s); " .
+        "modified=\$(stat -c %Y \"\$latest\"); " .
+        "errors=\$(tail -n 200 \"\$latest\" | " .
+        "grep -Ec '\\.(ERROR|CRITICAL|ALERT|EMERGENCY):' || true); " .
+        "printf 'bytes=%s,age_seconds=%s,errors=%s' \"\$bytes\" " .
+        "\"\$((now-modified))\" \"\$errors\"; fi"
+    ));
+    if ($logSummary === 'missing') {
+        writeln('GIMME_DIAGNOSTIC|laravel-log|ready|none');
+    } elseif (preg_match('/^bytes=\d+,age_seconds=\d+,errors=\d+$/', $logSummary)) {
+        writeln("GIMME_DIAGNOSTIC|laravel-log|ready|{$logSummary}");
+    } else {
+        writeln('GIMME_DIAGNOSTIC|laravel-log|failed|invalid-metadata');
+    }
+
+    foreach ($health as $probe) {
+        if (!in_array('live', $probe['phases'], true)) {
+            continue;
+        }
+        $url = "https://{$siteHost}{$probe['path']}";
+        $command =
+            'GIMME_HEALTH_URL=' . escapeshellarg($url) . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($siteHost) . ' ' .
+            'GIMME_HEALTH_CA=' . escapeshellarg("{$appsRoot}/.caddy-local-root.crt") . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $probe['expected_status']) . ' ' .
+            'GIMME_HEALTH_TIMEOUT=' . escapeshellarg((string) $probe['timeout_seconds']) . ' ' .
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        $output = trim(run($command, secrets: [
+            'health_script' => escapeshellarg(laravel_live_health_script()),
+        ]));
+        $status = str_starts_with($output, 'GIMME_HEALTH_STATUS|')
+            ? substr($output, strlen('GIMME_HEALTH_STATUS|'))
+            : 'exception';
+        $ready = $status === (string) $probe['expected_status'];
+        $detail = preg_match('/^(?:[1-5][0-9]{2}|exception)$/', $status)
+            ? "status={$status}"
+            : 'status=exception';
+        writeln("GIMME_DIAGNOSTIC|health.{$probe['name']}|" .
+            ($ready ? 'ready' : 'failed') . "|{$detail}");
+    }
+});
+
+if ($health !== []) {
     task('gimme:health:candidate', function () use ($health, $siteHost): void {
         $host = $siteHost;
-        $expected = $health['expected_status'];
-        $command = 'cd {{release_path}} && ' .
-            'GIMME_HEALTH_PATH=' . escapeshellarg($health['path']) . ' ' .
-            'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
-            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
-            '/usr/bin/timeout --signal=TERM ' .
-            escapeshellarg((string) $health['timeout_seconds']) . 's ' .
-            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
-        for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
-            $output = run(
-                $command,
-                secrets: [
+        foreach ($health as $probe) {
+            if (!in_array('candidate', $probe['phases'], true)) {
+                continue;
+            }
+            $expected = $probe['expected_status'];
+            $command = 'cd {{release_path}} && ' .
+                'GIMME_HEALTH_PATH=' . escapeshellarg($probe['path']) . ' ' .
+                'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
+                'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+                '/usr/bin/timeout --signal=TERM ' .
+                escapeshellarg((string) $probe['timeout_seconds']) . 's ' .
+                '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+            for ($attempt = 1; $attempt <= $probe['attempts']; $attempt++) {
+                $output = run($command, secrets: [
                     'health_script' => escapeshellarg(laravel_candidate_health_script()),
-                ],
+                ]);
+                if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
+                    writeln("health.candidate.{$probe['name']}=ready attempts={$attempt}");
+                    continue 2;
+                }
+                if ($attempt < $probe['attempts'] && $probe['delay_seconds'] > 0) {
+                    run('/usr/bin/sleep ' . escapeshellarg((string) $probe['delay_seconds']));
+                }
+            }
+            throw new \RuntimeException(
+                "Candidate health probe {$probe['name']} failed before activation after " .
+                "{$probe['attempts']} attempts"
             );
-            if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
-                writeln("candidate_health=ready attempts={$attempt}");
-                return;
-            }
-            if ($attempt < $health['attempts'] && $health['delay_seconds'] > 0) {
-                run('/usr/bin/sleep ' . escapeshellarg((string) $health['delay_seconds']));
-            }
         }
-        throw new \RuntimeException(
-            "Candidate release health check failed before activation after " .
-            "{$health['attempts']} attempts"
-        );
     });
 
     task('gimme:health:live', function () use (
@@ -416,42 +510,44 @@ if ($health !== null) {
         $appsRoot,
     ): void {
         $host = $siteHost;
-        $url = "https://{$host}{$health['path']}";
-        $expected = $health['expected_status'];
-        $command =
-            'GIMME_HEALTH_URL=' . escapeshellarg($url) . ' ' .
-            'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
-            'GIMME_HEALTH_CA=' . escapeshellarg("{$appsRoot}/.caddy-local-root.crt") . ' ' .
-            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
-            'GIMME_HEALTH_TIMEOUT=' .
-            escapeshellarg((string) $health['timeout_seconds']) . ' ' .
-            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
-        for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
-            $output = run(
-                $command,
-                secrets: [
+        foreach ($health as $probe) {
+            if (!in_array('live', $probe['phases'], true)) {
+                continue;
+            }
+            $url = "https://{$host}{$probe['path']}";
+            $expected = $probe['expected_status'];
+            $command =
+                'GIMME_HEALTH_URL=' . escapeshellarg($url) . ' ' .
+                'GIMME_HEALTH_HOST=' . escapeshellarg($host) . ' ' .
+                'GIMME_HEALTH_CA=' . escapeshellarg("{$appsRoot}/.caddy-local-root.crt") . ' ' .
+                'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+                'GIMME_HEALTH_TIMEOUT=' .
+                escapeshellarg((string) $probe['timeout_seconds']) . ' ' .
+                '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+            for ($attempt = 1; $attempt <= $probe['attempts']; $attempt++) {
+                $output = run($command, secrets: [
                     'health_script' => escapeshellarg(laravel_live_health_script()),
-                ],
-            );
-            if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
-                writeln("live_health=ready attempts={$attempt}");
-                return;
+                ]);
+                if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
+                    writeln("health.live.{$probe['name']}=ready attempts={$attempt}");
+                    continue 2;
+                }
+                if ($attempt < $probe['attempts'] && $probe['delay_seconds'] > 0) {
+                    run('/usr/bin/sleep ' . escapeshellarg((string) $probe['delay_seconds']));
+                }
             }
-            if ($attempt < $health['attempts'] && $health['delay_seconds'] > 0) {
-                run('/usr/bin/sleep ' . escapeshellarg((string) $health['delay_seconds']));
+            try {
+                invoke('rollback');
+            } catch (\Throwable $rollbackError) {
+                throw new \RuntimeException(
+                    "Live health probe {$probe['name']} failed and automatic rollback also failed",
+                    previous: $rollbackError,
+                );
             }
-        }
-        try {
-            invoke('rollback');
-        } catch (\Throwable $rollbackError) {
             throw new \RuntimeException(
-                'Live health check failed and automatic rollback also failed',
-                previous: $rollbackError,
+                "Live health probe {$probe['name']} failed; the previous release was restored"
             );
         }
-        throw new \RuntimeException(
-            'Live health check failed; the previous release was restored'
-        );
     });
 
     before('deploy:symlink', 'gimme:health:candidate');
@@ -801,6 +897,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     );
     $bootstrap = <<<BASH
 set -euo pipefail
+printf 'GIMME_BOOTSTRAP|preflight|checking installed packages\n'
 packages=({$packageWords})
 mise_version={$miseVersion}
 missing=()
@@ -814,16 +911,23 @@ for package in "\${packages[@]}"; do
     fi
 done
 if (( \${#missing[@]} )); then
+    printf 'GIMME_BOOTSTRAP|packages|updating apt metadata for %s missing packages\n' "\${#missing[@]}"
     apt-get update
+    printf 'GIMME_BOOTSTRAP|packages|installing required packages\n'
     env DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y "\${missing[@]}"
+else
+    printf 'GIMME_BOOTSTRAP|packages|required packages already installed\n'
 fi
 if [ -n "\$mise_version" ]; then
+    printf 'GIMME_BOOTSTRAP|mise|reconciling pinned mise package\n'
     add-apt-repository -y ppa:jdxcode/mise
     apt-get update
     env DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y mise
 fi
 
+printf 'GIMME_BOOTSTRAP|state|writing validated desired state\n'
 {$rootWriteState}
+printf 'GIMME_BOOTSTRAP|helpers|installing privileged helpers\n'
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
 process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
@@ -837,12 +941,15 @@ chmod 0755 "\$process_helper_tmp"
 printf %s {$sudoers} > "\$sudoers_tmp"
 chown root:root "\$sudoers_tmp"
 chmod 0440 "\$sudoers_tmp"
+printf 'GIMME_BOOTSTRAP|policy|validating sudo policy\n'
 visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
 mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack
 trap - EXIT
+printf 'GIMME_BOOTSTRAP|reconcile|applying target desired state\n'
 /usr/local/sbin/gimme-provision-stack
+printf 'GIMME_BOOTSTRAP|complete|target bootstrap complete\n'
 BASH;
     $sudo = sudo_prefix();
     run(
@@ -1429,7 +1536,7 @@ BASH;
     run('rm -f -- ' . escapeshellarg($statePath));
 });
 
-if ($health === null) {
+if ($health === []) {
     after('deploy:symlink', 'gimme:restart:workers');
 } else {
     after('gimme:health:live', 'gimme:restart:workers');

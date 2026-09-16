@@ -177,6 +177,25 @@ def test_health_path_is_a_bounded_absolute_url_path(path: str) -> None:
         HealthCheckConfig(path=path)
 
 
+def test_named_health_probes_have_explicit_unique_phases() -> None:
+    probe = HealthCheckConfig(name="homepage", path="/", phases=["live"])
+
+    assert probe.name == "homepage"
+    assert probe.phases == ["live"]
+    with pytest.raises(ValidationError, match="duplicates"):
+        HealthCheckConfig(phases=["candidate", "candidate"])
+
+
+def test_effective_health_probe_names_are_unique() -> None:
+    with pytest.raises(ValidationError, match="unique"):
+        AppConfig(
+            repository="https://example.test/app.git",
+            framework="laravel",
+            health=HealthCheckConfig(name="same"),
+            health_probes=[HealthCheckConfig(name="same", path="/ready")],
+        )
+
+
 def test_health_checks_require_laravel() -> None:
     with pytest.raises(ValidationError, match="Laravel"):
         AppConfig(

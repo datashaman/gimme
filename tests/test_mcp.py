@@ -80,6 +80,34 @@ def use_store(tmp_path: Path, monkeypatch) -> StateStore:
     return selected
 
 
+def test_deployment_diagnostics_return_only_allowlisted_structured_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    output = """task gimme:diagnose:deployment
+GIMME_DIAGNOSTIC|release|ready|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+GIMME_DIAGNOSTIC|database|failed|none
+GIMME_DIAGNOSTIC|laravel-log|ready|bytes=120,age_seconds=3,errors=2
+GIMME_DIAGNOSTIC|health.primary|ready|status=200
+GIMME_DIAGNOSTIC|bad/check|ready|secret-value
+password=must-not-escape
+"""
+    monkeypatch.setattr(
+        server_module,
+        "_run_deployment",
+        lambda *args, **kwargs: CommandResult(["dep"], 0, output),
+    )
+
+    result = server_module.diagnose_deployment("example-app")
+
+    assert result["healthy"] is False
+    assert [check["check"] for check in result["checks"]] == [
+        "release", "database", "laravel-log", "health.primary"
+    ]
+    assert "password" not in str(result)
+    assert "secret-value" not in str(result)
+
+
 async def test_hard_v3_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
@@ -108,6 +136,7 @@ async def test_hard_v3_tool_surface() -> None:
         "promote_deployment",
         "plan_artisan",
         "run_artisan",
+        "diagnose_deployment",
         "list_operations",
     }
     assert {str(resource.uri) for resource in resources} == {

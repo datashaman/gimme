@@ -196,6 +196,7 @@ class ApplicationConfig(BaseModel):
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
     default_health: HealthCheckConfig | None = None
+    health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     php_extensions: list[str] = Field(default_factory=list, max_length=64)
 
     @field_validator("php_extensions")
@@ -219,11 +220,11 @@ class ApplicationConfig(BaseModel):
             frontend=self.frontend,
             artisan=self.artisan,
             health=self.default_health,
+            health_probes=self.health_probes,
             environments={"default": EnvironmentConfig()},
         )
         self.artisan = validated.artisan
         return self
-
 
 class DeploymentSource(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -280,6 +281,7 @@ class DeploymentConfig(BaseModel):
     app_debug: bool = Field(default=False, strict=True)
     domain: str | None = None
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit"
+    health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
@@ -287,6 +289,15 @@ class DeploymentConfig(BaseModel):
     runtimes: dict[RuntimeName, RuntimePin]
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
     placement: Placement
+
+    @model_validator(mode="after")
+    def unique_own_health_probes(self) -> "DeploymentConfig":
+        probes = [*([self.health] if isinstance(self.health, HealthCheckConfig) else []),
+                  *self.health_probes]
+        names = [probe.name for probe in probes]
+        if len(names) != len(set(names)):
+            raise ValueError("deployment health probe names must be unique")
+        return self
 
     @field_validator("app_env")
     @classmethod
@@ -336,6 +347,7 @@ class DeploymentRegistration(BaseModel):
     app_debug: bool = Field(default=False, strict=True)
     domain: str | None = None
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit"
+    health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
@@ -484,6 +496,11 @@ def validate_stage_policy(
     application: ApplicationConfig,
 ) -> None:
     health = application.default_health if deployment.health == "inherit" else deployment.health
+    probes = [*([health] if health is not None else []), *application.health_probes,
+              *deployment.health_probes]
+    names = [probe.name for probe in probes]
+    if len(names) != len(set(names)):
+        raise ValueError("effective health probe names must be unique")
     if target.network.mode == "local_mdns":
         if deployment.domain is not None:
             raise ValueError("local_mdns deployments derive their domain")
@@ -492,8 +509,11 @@ def validate_stage_policy(
     if deployment.stage in {"staging", "production"}:
         if deployment.app_debug:
             raise ValueError(f"{deployment.stage} deployments cannot enable APP_DEBUG")
-        if health is None:
-            raise ValueError(f"{deployment.stage} deployments require a health gate")
+        phases = {phase for probe in probes for phase in probe.phases}
+        if not {"candidate", "live"} <= phases:
+            raise ValueError(
+                f"{deployment.stage} deployments require candidate and live health gates"
+            )
     if deployment.stage == "production":
         if target.network.mode != "public_dns":
             raise ValueError("production deployments require a public_dns target")
@@ -842,12 +862,14 @@ def legacy_app(application: ApplicationConfig, deployment: DeploymentConfig):
         frontend=application.frontend,
         artisan=application.artisan,
         health=application.default_health,
+        health_probes=application.health_probes,
         environments={
             "default": EnvironmentConfig(
                 branch=deployment.source.ref,
                 app_env=deployment.app_env,
                 app_debug=deployment.app_debug,
                 health=health,
+                health_probes=deployment.health_probes,
                 workers=deployment.workers,
                 scheduler=deployment.scheduler,
             )

@@ -186,13 +186,41 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
 
     assert json.loads(captured["GIMME_WORKERS_JSON"])["driver"] == "horizon"
     assert json.loads(captured["GIMME_SCHEDULER_JSON"]) == {"enabled": True}
-    assert json.loads(captured["GIMME_HEALTH_JSON"]) == {
+    assert json.loads(captured["GIMME_HEALTH_JSON"]) == [{
+        "name": "primary",
+        "phases": ["candidate", "live"],
         "path": "/up",
         "expected_status": 200,
         "attempts": 5,
         "delay_seconds": 2,
         "timeout_seconds": 5,
-    }
+    }]
+
+
+def test_multiple_health_probes_cross_runner_boundary_with_phase_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        health=HealthCheckConfig(name="framework", path="/up"),
+        health_probes=[HealthCheckConfig(name="homepage", path="/", phases=["live"])],
+    )
+
+    runner(tmp_path).run("deploy", server(), app_name="example-app", app=app)
+
+    probes = json.loads(captured["GIMME_HEALTH_JSON"])
+    assert [(probe["name"], probe["phases"]) for probe in probes] == [
+        ("framework", ["candidate", "live"]),
+        ("homepage", ["live"]),
+    ]
 
 
 def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch) -> None:
@@ -232,4 +260,4 @@ def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch
     assert captured["GIMME_APP_ENV"] == "local"
     assert captured["GIMME_APP_DEBUG"] == "true"
     assert captured["GIMME_REVISION"] == "a" * 40
-    assert json.loads(captured["GIMME_HEALTH_JSON"]) is None
+    assert json.loads(captured["GIMME_HEALTH_JSON"]) == []

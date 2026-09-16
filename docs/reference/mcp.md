@@ -109,8 +109,10 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 | `plan_remove_deployment` | Read | Plan route, process, data, and release cleanup |
 | `remove_deployment` | Remote change | Perform exact confirmed cleanup and remove local registration |
 
-Candidate health runs before the `current` symlink switch. Live HTTPS health runs
-afterward and restores the previous release if it fails.
+Each named health probe explicitly selects `candidate`, `live`, or both phases. Candidate
+probes run before the `current` symlink switch. Live HTTPS probes run afterward and
+restore the previous release if any live probe fails. Applications and deployments can
+add probes to the primary inherited or overridden health definition.
 For deployments with Horizon, queue workers, or a scheduler, planning also verifies the
 content-bound privileged process helper and required PHP process extensions. Apply is
 blocked before deployment when that preflight reports `bootstrap_required` or a missing
@@ -123,6 +125,7 @@ extension.
 | `plan_artisan` | Read | Plan a structured, allowlisted Artisan command |
 | `run_artisan` | Remote change | Run the exact reviewed Artisan invocation |
 | `deployment_process_status` | Remote read | Inspect queue, Horizon, and scheduler systemd units |
+| `diagnose_deployment` | Remote read | Run fixed secret-safe release, Laravel, database, filesystem, FPM, log-metadata, and configured live-health checks |
 | `target_service_status` | Remote read | Inspect `postgresql`, `valkey-server`, or `caddy` |
 
 ## Runtime providers

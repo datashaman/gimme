@@ -341,50 +341,67 @@ function configured_environment_values(): array
     return $decoded;
 }
 
-function configured_health(): ?array
+function configured_health(): array
 {
     $decoded = json_decode(required_env('GIMME_HEALTH_JSON'), true, flags: JSON_THROW_ON_ERROR);
-    if ($decoded === null) {
-        return null;
-    }
-    if (!is_array($decoded) || array_is_list($decoded)) {
-        throw new \RuntimeException('GIMME_HEALTH_JSON must be an object or null');
+    if (!is_array($decoded) || !array_is_list($decoded) || count($decoded) > 15) {
+        throw new \RuntimeException('GIMME_HEALTH_JSON must be a bounded list');
     }
     $expectedKeys = [
         'attempts',
         'delay_seconds',
         'expected_status',
+        'name',
         'path',
+        'phases',
         'timeout_seconds',
     ];
-    $actualKeys = array_keys($decoded);
-    sort($actualKeys);
-    if ($actualKeys !== $expectedKeys) {
-        throw new \RuntimeException('Health configuration has unknown or missing fields');
-    }
-    $path = $decoded['path'];
-    $segments = is_string($path) && $path !== '/'
-        ? explode('/', trim($path, '/'))
-        : [];
-    if (!is_string($path) || strlen($path) > 200 || !str_starts_with($path, '/') ||
-        str_starts_with($path, '//') || strpbrk($path, '?#%\\') !== false ||
-        array_filter(
-            $segments,
-            static fn (string $segment): bool => $segment === '' ||
-                in_array($segment, ['.', '..'], true) ||
-                !preg_match('/^[a-zA-Z0-9._~-]+$/', $segment),
-        )) {
-        throw new \RuntimeException('Unsafe health path');
-    }
-    foreach ([
-        'expected_status' => [200, 399],
-        'attempts' => [1, 30],
-        'delay_seconds' => [0, 30],
-        'timeout_seconds' => [1, 30],
-    ] as $key => [$minimum, $maximum]) {
-        $value = $decoded[$key];
-        if (!is_int($value) || $value < $minimum || $value > $maximum) {
-            throw new \RuntimeException("Invalid health configuration field {$key}");
+    $names = [];
+    foreach ($decoded as $probe) {
+        if (!is_array($probe) || array_is_list($probe)) {
+            throw new \RuntimeException('Each health probe must be an object');
+        }
+        $actualKeys = array_keys($probe);
+        sort($actualKeys);
+        if ($actualKeys !== $expectedKeys) {
+            throw new \RuntimeException('Health probe has unknown or missing fields');
+        }
+        $name = $probe['name'];
+        if (!is_string($name) || !preg_match('/^[a-z][a-z0-9-]{0,31}$/', $name) ||
+            in_array($name, $names, true)) {
+            throw new \RuntimeException('Health probe names must be safe and unique');
+        }
+        $names[] = $name;
+        $phases = $probe['phases'];
+        if (!is_array($phases) || !array_is_list($phases) || count($phases) < 1 ||
+            count($phases) > 2 || count($phases) !== count(array_unique($phases)) ||
+            array_diff($phases, ['candidate', 'live'])) {
+            throw new \RuntimeException('Health probe phases are invalid');
+        }
+        $path = $probe['path'];
+        $segments = is_string($path) && $path !== '/'
+            ? explode('/', trim($path, '/'))
+            : [];
+        if (!is_string($path) || strlen($path) > 200 || !str_starts_with($path, '/') ||
+            str_starts_with($path, '//') || strpbrk($path, '?#%\\') !== false ||
+            array_filter(
+                $segments,
+                static fn (string $segment): bool => $segment === '' ||
+                    in_array($segment, ['.', '..'], true) ||
+                    !preg_match('/^[a-zA-Z0-9._~-]+$/', $segment),
+            )) {
+            throw new \RuntimeException('Unsafe health path');
+        }
+        foreach ([
+            'expected_status' => [200, 399],
+            'attempts' => [1, 30],
+            'delay_seconds' => [0, 30],
+            'timeout_seconds' => [1, 30],
+        ] as $key => [$minimum, $maximum]) {
+            $value = $probe[$key];
+            if (!is_int($value) || $value < $minimum || $value > $maximum) {
+                throw new \RuntimeException("Invalid health probe field {$key}");
+            }
         }
     }
     return $decoded;

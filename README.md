@@ -40,11 +40,11 @@ Production is policy, not a branch convention. A production deployment requires:
 - a `public_dns` target and explicit domain;
 - an exact commit source;
 - `APP_ENV=production` and `APP_DEBUG=false`;
-- a health gate before and after the current-symlink switch.
+- named health probes at explicitly selected candidate and live phases.
 
-Staging also requires debug off and a health gate. Local and preview deployments are
-less restrictive. Caddy uses its internal CA for local mDNS and automatic ACME HTTPS
-for public DNS.
+Staging also requires debug off plus candidate and live health gates. Local and preview
+deployments are less restrictive. Caddy uses its internal CA for local mDNS and
+automatic ACME HTTPS for public DNS.
 
 ## Install
 
@@ -202,15 +202,19 @@ Example stdio client configuration:
    PostgreSQL, Valkey, runtime values, workers, Horizon, and the scheduler.
 5. `plan_deployment` to review the resolved commit and Deployer task graph, then
    `apply_deployment` with the exact plan.
-6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools, and
-   `deployment_process_status` for operations.
+6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools,
+   `deployment_process_status`, and `diagnose_deployment` for operations.
 7. Use `plan_promotion` / `promote_deployment` to deploy the exact current commit from
    one deployment to another. The destination source is pinned only after success.
 8. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
 
-Laravel candidate health runs inside the release before activation. The live HTTPS
-health gate runs after activation and automatically restores the prior release on
-failure. Queue workers use `queue:restart`; Horizon uses `horizon:terminate`, matching
+Laravel candidate probes run inside the release before activation. Live HTTPS probes
+run after activation and automatically restore the prior release if any live probe
+fails. Each probe has a stable `name`, a bounded absolute `path`, and explicit `phases`
+chosen from `candidate` and `live`; applications and deployments can add probes to the
+primary inherited or overridden health definition. `diagnose_deployment` reports only
+secret-safe states, numeric log metadata and HTTP statuses—never log content or decrypted
+values. Queue workers use `queue:restart`; Horizon uses `horizon:terminate`, matching
 Laravel's graceful restart model and avoiding a PHP-FPM reload.
 
 ## MCP surface

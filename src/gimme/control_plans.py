@@ -183,7 +183,9 @@ def deployment_release_plan(
     processes: dict[str, Any] | None = None,
     readiness_issues: list[str] | None = None,
 ) -> dict[str, Any]:
-    health = application.default_health if deployment.health == "inherit" else deployment.health
+    primary = application.default_health if deployment.health == "inherit" else deployment.health
+    health = [*([primary] if primary is not None else []), *application.health_probes,
+              *deployment.health_probes]
     issues = readiness_issues or []
     return exact_plan(
         {
@@ -196,7 +198,7 @@ def deployment_release_plan(
             "revision": revision,
             "site_url": f"https://{deployment.placement.site_host}",
             "deploy_path": f"{target.apps_root}/{deployment.placement.relative_path}",
-            "health": health.model_dump(mode="json") if health is not None else None,
+            "health": [probe.model_dump(mode="json") for probe in health],
             "frontend": (
                 application.frontend.model_dump(mode="json")
                 if application.frontend is not None

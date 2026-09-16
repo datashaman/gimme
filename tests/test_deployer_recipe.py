@@ -53,7 +53,7 @@ def rendered_deploy_plan(health: dict[str, object]) -> str:
         "GIMME_BRANCH": "main",
         "GIMME_WORKERS_JSON": "null",
         "GIMME_SCHEDULER_JSON": "null",
-        "GIMME_HEALTH_JSON": json.dumps(health),
+        "GIMME_HEALTH_JSON": json.dumps([health]),
         "GIMME_RUNTIMES_JSON": json.dumps({
             "php": {"provider": "system", "version": "8.4.1"},
             "composer": {"provider": "system", "version": "2.8.4"},
@@ -462,9 +462,21 @@ def test_mise_bootstrap_uses_only_the_fixed_official_ubuntu_ppa() -> None:
     assert "installed mise version does not match desired state" in helper
 
 
+def test_target_bootstrap_streams_bounded_phase_progress() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    bootstrap = recipe.split("$bootstrap = <<<BASH", 1)[1].split("\nBASH;", 1)[0]
+
+    stages = [
+        "preflight", "packages", "mise", "state", "helpers", "policy", "reconcile", "complete"
+    ]
+    assert all(f"GIMME_BOOTSTRAP|{stage}|" in bootstrap for stage in stages)
+
+
 def test_deployment_health_gates_candidate_before_live_activation() -> None:
     plan = rendered_deploy_plan(
         {
+            "name": "primary",
+            "phases": ["candidate", "live"],
             "path": "/up",
             "expected_status": 200,
             "attempts": 5,
@@ -476,6 +488,18 @@ def test_deployment_health_gates_candidate_before_live_activation() -> None:
     assert plan.index("gimme:health:candidate") < plan.index("deploy:symlink")
     assert plan.index("deploy:symlink") < plan.index("gimme:health:live")
     assert plan.index("gimme:health:live") < plan.index("gimme:restart:workers")
+
+
+def test_health_gates_apply_each_probe_only_at_declared_phases() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    health = recipe.split("if ($health !== []) {", 1)[1].split(
+        "task('gimme:inspect'", 1
+    )[0]
+
+    assert "in_array('candidate', $probe['phases'], true)" in health
+    assert "in_array('live', $probe['phases'], true)" in health
+    assert 'health.candidate.{$probe[\'name\']}' in health
+    assert 'health.live.{$probe[\'name\']}' in health
 
 
 def test_health_probes_are_local_bounded_and_do_not_return_response_bodies() -> None:

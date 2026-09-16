@@ -64,12 +64,25 @@
         "allowed_commands": ["about", "migrate", "migrate:status", "queue:restart"]
       },
       "default_health": {
+        "name": "framework",
+        "phases": ["candidate", "live"],
         "path": "/up",
         "expected_status": 200,
         "attempts": 10,
         "delay_seconds": 2,
         "timeout_seconds": 5
       },
+      "health_probes": [
+        {
+          "name": "homepage",
+          "phases": ["live"],
+          "path": "/",
+          "expected_status": 302,
+          "attempts": 3,
+          "delay_seconds": 1,
+          "timeout_seconds": 5
+        }
+      ],
       "php_extensions": ["bcmath", "curl", "gd", "intl", "mbstring", "pdo_pgsql", "redis", "xml", "zip"]
     }
   },
