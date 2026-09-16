@@ -35,6 +35,11 @@ Plans include resolved versions, revisions, identities, effects, and readiness. 
 branch head, DNS answer, package candidate, secret readiness condition, or definition
 makes the reviewed ID stale.
 
+The plan body also carries `execution_fingerprint`, a SHA-256 digest of the executable
+Gimme, Deployer, helper, and dependency-lock inputs. A code or dependency change therefore
+invalidates an already reviewed plan. Documentation and test changes do not, because they
+cannot alter the applied operation.
+
 Creation tools are the exception: registration allocates new local identity and does
 not contact a target. Updates and remote mutations use plan/apply pairs.
 

@@ -77,6 +77,10 @@ Copy the example for a new installation, or use the migration tools for an older
 4. commit the resulting desired state only if that repository is intended to hold
    your operational inventory.
 
+All reviewed plans include an `execution_fingerprint` covering Gimme, Deployer, privileged
+helper, and dependency-lock inputs. Changing executable control-plane code after planning
+invalidates the plan before apply; documentation and test-only changes do not.
+
 See [`config/state.example.json`](config/state.example.json) for the complete shape.
 For a public target, use `network.mode: "public_dns"`, omit `mdns_name`, declare one
 or more literal `expected_addresses`, and give every deployment an explicit `domain`.

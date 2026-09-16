@@ -9,10 +9,18 @@ from gimme.control import (
     StateStore,
     TargetConfig,
 )
+from gimme.execution import execution_fingerprint
 
 
 def exact_plan(value: dict[str, Any]) -> dict[str, Any]:
-    body = {key: item for key, item in value.items() if key != "plan_id"}
+    body = {
+        "execution_fingerprint": execution_fingerprint(),
+        **{
+            key: item
+            for key, item in value.items()
+            if key not in {"plan_id", "execution_fingerprint"}
+        },
+    }
     return {"plan_id": StateStore.digest(body), **body}
 
 

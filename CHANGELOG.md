@@ -5,6 +5,8 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Bound every schema-v3 mutation plan to a fingerprint of executable Gimme, Deployer,
+  privileged-helper, and dependency-lock inputs so code changes invalidate stale plans.
 - Fixed empty deployment environment objects being misclassified as JSON lists by PHP.
 - Fixed the bootstrap CLI to inherit all terminal streams so Deployer's hidden sudo
   prompt is displayed live instead of being buffered with captured task output.

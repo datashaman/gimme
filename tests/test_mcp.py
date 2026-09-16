@@ -22,6 +22,7 @@ from gimme.control import (
 )
 from gimme.deployer import CommandResult
 import gimme.server as server_module
+import gimme.control_plans as control_plans_module
 from gimme.server import mcp
 
 
@@ -160,6 +161,27 @@ def test_deployment_update_rejects_stale_plan(tmp_path, monkeypatch) -> None:
     assert events[0]["status"] == "stale"
     assert events[0]["error_code"] == "stale_plan"
     assert events[1]["phase"] == "apply"
+
+
+def test_deployment_update_rejects_plan_after_execution_code_changes(
+    tmp_path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    current = server_module.store.deployment("example-app")
+    definition = DeploymentRegistration.from_deployment(current).model_copy(
+        update={"source": DeploymentSource(kind="branch", ref="next")}
+    )
+    monkeypatch.setattr(
+        control_plans_module, "execution_fingerprint", lambda: "exec_" + "a" * 64
+    )
+    plan = server_module.plan_update_deployment("example-app", definition)
+
+    monkeypatch.setattr(
+        control_plans_module, "execution_fingerprint", lambda: "exec_" + "b" * 64
+    )
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.update_deployment("example-app", definition, str(plan["plan_id"]))
 
 
 def test_plan_and_apply_have_linked_secret_safe_journal_events(tmp_path, monkeypatch) -> None:

@@ -11,6 +11,8 @@ stable intent, mutation boundary, and pairing of each primitive.
 - Read-only inspection and planning tools do not mutate local or remote state.
 - An `apply_*`, `update_*`, `promote_*`, or `remove_*` tool requiring a `plan_id`
   recomputes the plan and rejects stale or altered IDs.
+- Every plan includes an `execution_fingerprint`; executable control-plane or dependency
+  changes invalidate its `plan_id` before apply.
 - Registration tools create local desired-state entries directly because no prior
   object exists to diff.
 - `rollback_deployment` and `remove_deployment` require exact confirmation text.
