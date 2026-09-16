@@ -5,6 +5,8 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Blocked deployments with managed processes before activation when the target-bound
+  process helper is stale, and made target inspection use the same policy-hash check.
 - Added a private append-only, secret-safe operation journal with correlated plan/apply
   outcomes, classified failures, an MCP resource, trace template, and filtered read tool.
 - Added fixed official Ubuntu PPA bootstrap for an exact mise version.

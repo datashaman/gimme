@@ -172,8 +172,11 @@ def deployment_release_plan(
     revision: str,
     rendered_tasks: str,
     toolchain: dict[str, Any] | None = None,
+    processes: dict[str, Any] | None = None,
+    readiness_issues: list[str] | None = None,
 ) -> dict[str, Any]:
     health = application.default_health if deployment.health == "inherit" else deployment.health
+    issues = readiness_issues or []
     return exact_plan(
         {
             "kind": "deployment_release",
@@ -192,6 +195,9 @@ def deployment_release_plan(
                 else None
             ),
             "runtimes": toolchain,
+            "processes": processes,
+            "ready": not issues,
+            "readiness_issues": issues,
             "deployer_plan": rendered_tasks,
             "effects": [
                 "deploy the exact resolved revision",

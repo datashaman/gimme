@@ -109,6 +109,10 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 
 Candidate health runs before the `current` symlink switch. Live HTTPS health runs
 afterward and restores the previous release if it fails.
+For deployments with Horizon, queue workers, or a scheduler, planning also verifies the
+content-bound privileged process helper and required PHP process extensions. Apply is
+blocked before deployment when that preflight reports `bootstrap_required` or a missing
+extension.
 
 ## Application operation tools
 

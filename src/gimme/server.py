@@ -299,6 +299,7 @@ def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
     selected = revision or _revision(name)
     preflight = _run_deployment("gimme:preflight:runtimes", name, revision=selected,
                                 timeout=60)
+    processes, process_issues = _process_preflight(name, deployment, application)
     rendered = _run_deployment("deploy", name, revision=selected,
                                arguments=("--plan",), timeout=60)
     return deployment_release_plan(name, deployment, target, application, selected,
@@ -306,7 +307,33 @@ def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
                                        key: value.model_dump(mode="json")
                                        for key, value in deployment.runtimes.items()
                                    },
-                                                     "preflight": preflight.output})
+                                                     "preflight": preflight.output},
+                                   processes, process_issues)
+
+
+def _process_preflight(
+    name: str, deployment: DeploymentConfig, application: ApplicationConfig
+) -> tuple[dict[str, object], list[str]]:
+    managed = application.framework == "laravel" and (
+        deployment.workers is not None or deployment.scheduler is not None
+    )
+    if not managed:
+        return {"required": False, "observed": {}}, []
+    result = _run_deployment("gimme:preflight:processes", name, timeout=60)
+    observed: dict[str, str] = {}
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        if line.startswith("GIMME_") and "|" in line:
+            key, value = line.split("|", 1)
+            observed[key.removeprefix("GIMME_").lower()] = value
+    issues = []
+    if observed.get("process_helper") != "ready":
+        issues.append("privileged process helper requires target bootstrap")
+    if observed.get("pcntl") not in {"ready", "not_required"}:
+        issues.append("PHP pcntl extension is required for managed workers")
+    if observed.get("posix") not in {"ready", "not_required"}:
+        issues.append("PHP posix extension is required for Horizon")
+    return {"required": True, "observed": observed}, issues
 
 
 def _migration_targets() -> dict[str, TargetConfig]:
@@ -701,6 +728,8 @@ def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Deploy an exact reviewed revision with health gates and worker refresh."""
     expected = _release_plan(name)
     _assert_plan(expected, plan_id)
+    if not expected["ready"]:
+        raise ValueError("deployment is not ready; inspect readiness_issues")
     result = _run_deployment("deploy", name, revision=str(expected["revision"]),
                              timeout=1800)
     _, deployment, _, application = _context(name)
@@ -753,6 +782,9 @@ def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict
     """Promote an exact reviewed live commit and pin the destination after success."""
     expected = plan_promotion(source, destination)
     _assert_plan(expected, plan_id)
+    release = cast(dict[str, object], expected["release"])
+    if not release["ready"]:
+        raise ValueError("destination deployment is not ready; inspect release readiness_issues")
     revision = str(expected["revision"])
     result = _run_deployment("deploy", destination, revision=revision, timeout=1800)
     state = store.load()

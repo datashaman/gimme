@@ -3,7 +3,9 @@ from pathlib import Path
 from fastmcp import Client
 import pytest
 
-from gimme.config import ArtisanConfig, HealthCheckConfig, StackConfig
+from gimme.config import (
+    ArtisanConfig, HealthCheckConfig, HorizonWorkerConfig, SchedulerConfig, StackConfig,
+)
 from gimme.control import (
     ApplicationConfig,
     ControlState,
@@ -193,6 +195,11 @@ def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> No
         calls.append((task, arguments))
         if task == "gimme:resolve-revision":
             return CommandResult(["dep"], 0, "GIMME_REVISION|" + "a" * 40)
+        if task == "gimme:preflight:processes":
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_PROCESS_HELPER|ready\nGIMME_PCNTL|ready\nGIMME_POSIX|ready",
+            )
         if arguments == ("--plan",):
             return CommandResult(["dep"], 0, "candidate -> health -> symlink -> live")
         return CommandResult(["dep"], 0, "deployed")
@@ -203,6 +210,45 @@ def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> No
 
     assert result["output"] == "deployed"
     assert calls[-1] == ("deploy", ())
+
+
+def test_deploy_blocks_before_activation_when_process_helper_is_stale(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    state = selected.load()
+    managed = state.deployments["example-app"].model_copy(update={
+        "workers": HorizonWorkerConfig(),
+        "scheduler": SchedulerConfig(),
+    })
+    selected.save(state.model_copy(update={
+        "deployments": {**state.deployments, "example-app": managed}
+    }))
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_run(task, *args, **kwargs):
+        arguments = tuple(kwargs.get("arguments", ()))
+        calls.append((task, arguments))
+        if task == "gimme:resolve-revision":
+            return CommandResult(["dep"], 0, "GIMME_REVISION|" + "b" * 40)
+        if task == "gimme:preflight:processes":
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_PROCESS_HELPER|bootstrap_required\n"
+                "GIMME_PCNTL|ready\nGIMME_POSIX|ready",
+            )
+        if arguments == ("--plan",):
+            return CommandResult(["dep"], 0, "candidate -> health -> symlink -> live")
+        return CommandResult(["dep"], 0, "unexpected mutation")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_deployment("example-app")
+
+    assert plan["ready"] is False
+    assert plan["readiness_issues"] == ["privileged process helper requires target bootstrap"]
+    with pytest.raises(ValueError, match="deployment is not ready"):
+        server_module.apply_deployment("example-app", str(plan["plan_id"]))
+    assert ("deploy", ()) not in calls
 
 
 def test_artisan_is_deployment_scoped_and_plan_gated(tmp_path, monkeypatch) -> None:

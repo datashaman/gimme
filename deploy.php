@@ -458,7 +458,12 @@ if ($health !== null) {
     after('deploy:symlink', 'gimme:health:live');
 }
 
-task('gimme:inspect', function () use ($mdnsName): void {
+task('gimme:inspect', function () use (
+    $appsRoot,
+    $hostname,
+    $mdnsName,
+    $remoteUser,
+): void {
     $script = <<<'BASH'
 set -eu
 . /etc/os-release
@@ -468,16 +473,26 @@ if sudo -n true >/dev/null 2>&1; then
 else
     printf 'passwordless_sudo=no\n'
 fi
-if [ -x /usr/local/sbin/gimme-provision-stack ] && \
-   [ -x /usr/local/sbin/gimme-provision-processes ] && \
-   sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && \
-   sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1; then
-    printf 'privileged_helper=ready\n'
-else
-    printf 'privileged_helper=bootstrap_required\n'
-fi
 BASH;
     writeln(run("bash -c " . escapeshellarg($script)));
+    $policy = privileged_helper_policy(
+        configured_packages(),
+        configured_services(),
+        $hostname,
+        $mdnsName,
+        $remoteUser,
+        $appsRoot,
+    );
+    $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
+    $helperReady = test(
+        '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
+        '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
+    );
+    writeln('privileged_helper=' . ($helperReady ? 'ready' : 'bootstrap_required'));
     foreach (configured_services() as $service) {
         $state = run(
             'systemctl is-active ' . escapeshellarg($service) . ' 2>/dev/null || true'

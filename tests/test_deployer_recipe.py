@@ -234,6 +234,17 @@ def test_runtime_reconciliation_upgrades_process_state_before_using_helper() -> 
     assert state_write < helper_call
 
 
+def test_inspection_uses_content_bound_helper_readiness() -> None:
+    recipe = deployer_source()
+    inspect = recipe.split("task('gimme:inspect'", 1)[1].split(
+        "task('gimme:inspect:runtimes'", 1
+    )[0]
+
+    assert "privileged_helper_policy(" in inspect
+    assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack" in inspect
+    assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes" in inspect
+
+
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     tmp_path: Path,
 ) -> None:
