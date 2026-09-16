@@ -49,6 +49,7 @@ for public DNS.
 ## Install
 
 ```bash
+# From the repository root:
 uv sync
 composer install
 ```
@@ -80,6 +81,12 @@ or more literal `expected_addresses`, and give every deployment an explicit `dom
 Planning verifies that DNS resolves to a declared address before Caddy is allowed to
 request an ACME certificate.
 
+For guided workflows, see:
+
+- [`docs/tutorials/first-local-deployment.md`](docs/tutorials/first-local-deployment.md)
+- [`docs/how-to/migrate-a-runtime-to-mise.md`](docs/how-to/migrate-a-runtime-to-mise.md)
+- [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
+
 ## Target bootstrap
 
 SSH must work against `bootstrap_hostname`. For local targets, normal operations use
@@ -103,7 +110,7 @@ The second command grants the deployment user PostgreSQL `CREATEDB` and `CREATER
 they allow database lifecycle management but do not grant operating-system root.
 
 For a local mDNS target, import the exported Caddy public root once on each development
-client. The CA private key never leaves the target:
+workstation. The CA private key never leaves the target:
 
 ```bash
 scp devbox.local:/srv/gimme/apps/.caddy-local-root.crt /tmp/gimme-caddy-root.crt
@@ -208,11 +215,9 @@ Read-only resources:
 - `gimme://resources/{name}`
 - `gimme://deployments/{name}`
 
-The tools cover state migration, registration and reviewed updates, target inspection
-and stack reconciliation, deployment resources, deploy/rollback/promotion/removal,
-allowlisted Artisan execution, process status, and allowlisted service status. Query
-`tools/list`, `resources/list`, and `resources/templates/list` from the client for the
-authoritative schemas.
+See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the complete tool and resource
+catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
+`resources/templates/list` remain authoritative.
 
 ## Current scope
 
@@ -224,6 +229,7 @@ scheduling are intentionally future work rather than implied production guarante
 ## Development
 
 ```bash
+# From the repository root:
 uv run ruff check src tests scripts/gimme-provision-stack
 uv run pytest
 vendor/bin/phpstan analyse deploy.php --level=5

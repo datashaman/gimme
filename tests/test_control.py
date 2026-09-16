@@ -178,6 +178,15 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
+def test_canonical_state_example_validates_against_current_schema() -> None:
+    example = Path(__file__).parents[1] / "config" / "state.example.json"
+
+    state = ControlState.model_validate_json(example.read_text())
+
+    assert state.schema_version == 3
+    assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
+
+
 def test_legacy_migration_preserves_remote_placement(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()
@@ -225,6 +234,10 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
     document["targets"]["devbox"]["toolchains"] = {
         "node": "22.12.0", "npm": "10.9.0", "pnpm": None, "yarn": None, "bun": None,
     }
+    document["targets"]["devbox"]["stack"]["packages"] = [
+        package for package in document["targets"]["devbox"]["stack"]["packages"]
+        if package not in {"mise", "software-properties-common"}
+    ]
     document["targets"]["devbox"].pop("runtimes")
     old_placement = document["deployments"]["example-local"]["placement"]
     document["deployments"]["example-local"].pop("runtimes")

@@ -114,6 +114,9 @@ async def test_hard_v3_tool_surface() -> None:
         "gimme://deployments/{name}",
     }
     assert all(tool.annotations is not None for tool in tools)
+    reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
+    assert all(f"`{name}`" in reference for name in names)
+    assert all(f"`{template.uriTemplate}`" in reference for template in templates)
 
 
 def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch) -> None:
