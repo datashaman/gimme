@@ -36,6 +36,10 @@ protects existing data with a Safety Recovery Point, and fails closed until inte
 health, and process verification succeed. Explicit partial restore is permitted, but must declare
 that it intentionally breaks cross-component consistency.
 
+A Safety Recovery Point contains exactly the components the Restore will overwrite. This permits
+PostgreSQL-only or Valkey-only Safety Recovery Points for explicit partial Restore even though an
+ordinary Recovery Policy includes PostgreSQL by default.
+
 Each Restore request writes an append-only, secret-free Restore Record to its Backup Destination.
 That record, rather than controller or Target-local state, is authoritative for resumption and for
 deciding whether a Safety Recovery Point remains protected. Recovery Manifests stay immutable.
@@ -44,6 +48,21 @@ PostgreSQL Restore loads and verifies a derived shadow database before swapping 
 Deployment's registered database identity. The previous database remains available while managed
 processes and private application health are verified, and is removed only after the Restore
 Record reaches `completed`.
+
+Valkey Restore verifies its complete archive, incrementally clears only the Deployment's registered
+prefix, replays binary-safe records with absolute expiry, and incrementally verifies the result.
+Because a prefix cannot be swapped atomically without blocking the shared Resource, any failure
+remains in maintenance and retry clears and replays that prefix from the verified archive.
+
+For a full PostgreSQL-and-Valkey Restore, both source artifacts and the paired Safety Recovery
+Point verify first. PostgreSQL is prepared in its shadow database, the Valkey prefix is then
+replaced and verified, and the PostgreSQL name swap is the final data activation step before
+private application and managed-process verification.
+
+Valkey replacement compatibility is evaluated against the Deployment's immutable registered
+prefix and the bound Resource's provider, kind, and exact version. An empty replacement means
+that prefix contains no keys; the shared Resource may already contain unrelated Deployment
+prefixes, which Restore must not inspect beyond bounded isolation checks or modify.
 
 ## Considered alternatives
 
@@ -69,4 +88,6 @@ Record reaches `completed`.
   capture or an explicit manual deletion.
 - A Safety Recovery Point remains protected until its authoritative Restore Record is completed.
 - PostgreSQL Restore never streams an unverified dump directly into the live database identity.
+- Valkey Restore never snapshots, restarts, globally locks, or executes one blocking full-prefix
+  operation against the shared Resource.
 - Gimme does not provide an MCP force-online bypass after failed restore verification.

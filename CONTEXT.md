@@ -73,7 +73,10 @@ _Avoid_: Local backup record, journal entry
 
 **Safety Recovery Point**:
 A protected Recovery Point captured and verified immediately before a Restore replaces non-empty
-data. It is not eligible for retention pruning while the Restore remains unsuccessful.
+data. It contains exactly the components that Restore will overwrite, so a partial Restore may
+produce a PostgreSQL-only or Valkey-only Safety Recovery Point even though ordinary Recovery
+Policies include PostgreSQL. It is not eligible for retention pruning while the Restore remains
+unsuccessful.
 _Avoid_: Automatic rollback, temporary dump
 
 **Restore**:
