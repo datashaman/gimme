@@ -29,4 +29,6 @@ done < <(find deploy.php deploy -type f -name '*.php' -print | sort)
 composer audit --locked --no-interaction
 git diff --check
 git diff --cached --check
-git show --check --oneline --no-renames HEAD >/dev/null
+if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+    git diff --check HEAD^ HEAD
+fi
