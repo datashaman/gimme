@@ -52,3 +52,16 @@ Target-local PostgreSQL and Valkey currently permit one exact version per target
 are named resources so external or isolated providers can be added later without
 changing deployment identity.
 
+## Deployer recipe modules
+
+`deploy.php` is the task-registration entry point and preserves the task interface
+used by the Python control plane. Stable implementation details live under `deploy/`:
+
+- `configuration.php` validates environment and desired-state inputs and renders
+  runtime commands.
+- `programs.php` contains the bounded health-probe and environment-reconciliation
+  programs sent to a target.
+- `state.php` renders helper state, site definitions, and policy hashes.
+
+This keeps validation, generated programs, and privileged-helper policy local to one
+module each while leaving Deployer task names and ordering unchanged.

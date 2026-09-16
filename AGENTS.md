@@ -34,7 +34,7 @@ and intentionally ignored. `config/state.example.json` must always validate.
 # From the repository root:
 uv run ruff check .
 uv run pytest -q
-vendor/bin/phpstan analyse deploy.php --level=5
+vendor/bin/phpstan analyse deploy.php deploy --level=5
 uv run bandit -q -r src scripts
 uv run pip-audit
 git diff --check

@@ -8,8 +8,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def laravel_environment_reconciler() -> str:
+DEPLOYER_SOURCES = (
+    ROOT / "deploy" / "configuration.php",
+    ROOT / "deploy" / "programs.php",
+    ROOT / "deploy" / "state.php",
+    ROOT / "deploy.php",
+)
+
+
+def deployer_source() -> str:
+    return "\n".join(path.read_text() for path in DEPLOYER_SOURCES)
+
+
+def test_deployer_recipe_loads_cohesive_support_modules() -> None:
     recipe = (ROOT / "deploy.php").read_text()
+
+    assert "require __DIR__ . '/deploy/configuration.php';" in recipe
+    assert "require __DIR__ . '/deploy/programs.php';" in recipe
+    assert "require __DIR__ . '/deploy/state.php';" in recipe
+    assert "function required_env" not in recipe
+    assert "function laravel_environment_reconcile_script" not in recipe
+    assert "function process_state_write_command" not in recipe
+
+
+def laravel_environment_reconciler() -> str:
+    recipe = deployer_source()
     return recipe.split("return <<<'PYTHON'", 1)[1].split("\nPYTHON;", 1)[0]
 
 
@@ -63,6 +86,7 @@ def test_deployer_recipe_passes_static_analysis() -> None:
             str(ROOT / "vendor" / "bin" / "phpstan"),
             "analyse",
             "deploy.php",
+            "deploy",
             "--no-progress",
             "--level=5",
         ],
@@ -84,7 +108,7 @@ def test_stack_includes_deployer_acl_dependency() -> None:
 
 
 def test_stack_bootstrap_uses_bootstrap_hostname() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
 
     assert "'GIMME_BOOTSTRAP_HOSTNAME', 'server', 'bootstrap_hostname'" in recipe
     assert "['gimme:preflight:stack', 'gimme:provision:stack']" in recipe
@@ -102,7 +126,7 @@ def test_stack_includes_laravel_php_extensions() -> None:
 
 
 def test_apt_install_matches_preflight_and_allows_large_transactions() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
 
     assert recipe.count("apt-get --simulate --no-install-recommends install") == 1
     assert "apt-get --no-install-recommends install -y" in recipe
@@ -111,7 +135,7 @@ def test_apt_install_matches_preflight_and_allows_large_transactions() -> None:
 
 
 def test_database_bootstrap_exposes_sudo_to_deployer() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:bootstrap:database-admin'", 1)[1].split(
         "task('gimme:provision:app'", 1
     )[0]
@@ -121,7 +145,7 @@ def test_database_bootstrap_exposes_sudo_to_deployer() -> None:
 
 
 def test_host_inspection_reports_application_reachability() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:inspect'", 1)[1].split("task('gimme:preflight:stack'", 1)[0]
 
     assert "'.mdns_local_resolution='" in task
@@ -152,7 +176,7 @@ def test_host_inspection_reports_application_reachability() -> None:
 
 
 def test_app_role_can_become_database_owner() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
         0
     ]
@@ -163,7 +187,7 @@ def test_app_role_can_become_database_owner() -> None:
 
 
 def test_laravel_resources_include_required_application_environment() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
         0
     ]
@@ -183,7 +207,7 @@ def test_laravel_resources_include_required_application_environment() -> None:
 
 
 def test_laravel_runtime_reconciliation_is_atomic_and_process_aware() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     reconciler = recipe.split("function laravel_environment_reconcile_script", 1)[1].split(
         "function configured_workers", 1
     )[0]
@@ -200,7 +224,7 @@ def test_laravel_runtime_reconciliation_is_atomic_and_process_aware() -> None:
 
 
 def test_runtime_reconciliation_upgrades_process_state_before_using_helper() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:provision:app'", 1)[1].split(
         "task('gimme:service:status'", 1
     )[0]
@@ -274,7 +298,7 @@ def test_laravel_runtime_reconciler_rejects_symlinks(tmp_path: Path) -> None:
 
 
 def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     configured_sites = recipe.split("function configured_sites", 1)[1].split(
         "function stack_state_write_command", 1
     )[0]
@@ -284,7 +308,7 @@ def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> N
 
 
 def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
         0
     ]
@@ -294,7 +318,7 @@ def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:
 
 
 def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()
     task = recipe.split("task('gimme:provision:stack'", 1)[1].split(
         "task('gimme:bootstrap:database-admin'", 1
@@ -318,7 +342,7 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
 
 
 def test_environment_removal_is_bounded_to_non_default_environment_root() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:remove:environment'", 1)[1].split("if ($health === null)", 1)[
         0
     ]
@@ -334,7 +358,7 @@ def test_environment_removal_is_bounded_to_non_default_environment_root() -> Non
 
 
 def test_frontend_build_runs_after_composer_dependencies() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
 
     assert "after('deploy:update_code', 'gimme:frontend:install')" in recipe
     assert "after('deploy:vendors', 'gimme:frontend:build')" in recipe
@@ -342,7 +366,7 @@ def test_frontend_build_runs_after_composer_dependencies() -> None:
 
 
 def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:artisan'", 1)[1].split("task('gimme:service:status'", 1)[0]
 
     assert "Application context is required" in task
@@ -356,7 +380,7 @@ def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release
 
 
 def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
 
     assert "task('gimme:preflight:processes'" in recipe
     assert "task('gimme:provision:processes'" in recipe
@@ -379,7 +403,7 @@ def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
 
 
 def test_runtime_inspection_emits_remote_observations_to_the_control_plane() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     task = recipe.split("task('gimme:inspect:runtimes'", 1)[1].split(
         "task('gimme:preflight:stack'", 1
     )[0]
@@ -389,7 +413,7 @@ def test_runtime_inspection_emits_remote_observations_to_the_control_plane() -> 
 
 
 def test_mise_bootstrap_uses_only_the_fixed_official_ubuntu_ppa() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()
 
     assert "add-apt-repository -y ppa:jdxcode/mise" in recipe
@@ -415,7 +439,7 @@ def test_deployment_health_gates_candidate_before_live_activation() -> None:
 
 
 def test_health_probes_are_local_bounded_and_do_not_return_response_bodies() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     health = recipe.split("function laravel_candidate_health_script", 1)[1].split(
         "task('gimme:inspect'", 1
     )[0]
@@ -431,7 +455,7 @@ def test_health_probes_are_local_bounded_and_do_not_return_response_bodies() -> 
 
 
 def test_privileged_helper_is_narrowly_allowlisted() -> None:
-    recipe = (ROOT / "deploy.php").read_text()
+    recipe = deployer_source()
     helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()
 
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-stack" in recipe

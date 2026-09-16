@@ -22,14 +22,15 @@ Run the complete local verification suite before opening a pull request:
 # From the repository root:
 uv run ruff check .
 uv run pytest -q
-vendor/bin/phpstan analyse deploy.php --level=5
+vendor/bin/phpstan analyse deploy.php deploy --level=5
 uv run bandit -q -r src scripts
 uv run pip-audit
 git diff --check
 ```
 
-Changes to `deploy.php`, either privileged helper, or desired-state models require
-regression tests. Keep remote command inputs structured and allowlisted.
+Changes to `deploy.php`, `deploy/*.php`, either privileged helper, or desired-state
+models require regression tests. Keep remote command inputs structured and
+allowlisted.
 
 ## Pull requests
 
@@ -39,4 +40,3 @@ schema or tool changes.
 
 Report vulnerabilities through GitHub private vulnerability reporting as described in
 `SECURITY.md`; do not open a public security issue.
-
