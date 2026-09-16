@@ -2,6 +2,14 @@
 
 set -euo pipefail
 
+report_failure() {
+    local exit_code=$?
+    printf 'verification failed (exit %d) at line %d: %s\n' \
+        "$exit_code" "${BASH_LINENO[0]}" "$BASH_COMMAND" >&2
+    exit "$exit_code"
+}
+trap report_failure ERR
+
 repository_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repository_root"
 
