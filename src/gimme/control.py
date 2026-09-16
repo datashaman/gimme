@@ -177,6 +177,14 @@ class TargetConfig(BaseModel):
                 raise ValueError(
                     "local_mdns hostname/system_hostname must match the advertised name"
                 )
+        required_mise_packages = {"mise", "software-properties-common"}
+        declared = set(self.stack.packages)
+        if self.runtimes.mise_version is not None and not required_mise_packages <= declared:
+            raise ValueError(
+                "mise targets require mise and software-properties-common packages"
+            )
+        if "mise" in declared and self.runtimes.mise_version is None:
+            raise ValueError("the mise package requires an exact mise_version")
         return self
 
 

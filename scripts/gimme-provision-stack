@@ -31,6 +31,7 @@ ENVIRONMENT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 MDNS_NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
+VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
 RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
 PHP_FPM_SOCKET = re.compile(r"^/run/php/php[0-9]+\.[0-9]+-fpm\.sock$")
 DNS_NAME = re.compile(
@@ -50,12 +51,14 @@ ALLOWED_PACKAGES = set(json.loads("__GIMME_ALLOWED_PACKAGES_JSON__"))
 EXPECTED_HOSTNAME = "__GIMME_HOSTNAME__"
 EXPECTED_MDNS_NAME = "__GIMME_MDNS_NAME__"
 EXECUTABLES = {
+    "add-apt-repository": "/usr/bin/add-apt-repository",
     "apt-get": "/usr/bin/apt-get",
     "caddy": "/usr/bin/caddy",
     "env": "/usr/bin/env",
     "getent": "/usr/bin/getent",
     "hostname": "/usr/bin/hostname",
     "hostnamectl": "/usr/bin/hostnamectl",
+    "mise": "/usr/bin/mise",
     "setfacl": "/usr/bin/setfacl",
     "systemctl": "/usr/bin/systemctl",
 }
@@ -112,6 +115,14 @@ def package_is_installed(package: str) -> bool:
         capture_output=True,
     )
     return result.returncode == 0 and result.stdout == "install ok installed"
+
+
+def installed_mise_version() -> str:
+    if not Path("/usr/bin/mise").is_file():
+        return ""
+    result = run(["mise", "--version"], capture=True)
+    match = re.search(r"(?:^|\s)v?([0-9]+(?:\.[0-9]+){1,3})", result.stdout)
+    return match.group(1) if match is not None else ""
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -363,10 +374,32 @@ def reconcile() -> None:
     if endpoint != EXPECTED_HOSTNAME or mdns_name != EXPECTED_MDNS_NAME:
         fail("desired-state host identity does not match the installed helper")
     sites = validate_sites(state.get("sites"))
+    mise_version_value = state.get("mise_version")
+    if mise_version_value is not None and (
+        not isinstance(mise_version_value, str) or VERSION.fullmatch(mise_version_value) is None
+    ):
+        fail("invalid mise_version")
+    mise_version = mise_version_value or ""
+    if mise_version and not {"mise", "software-properties-common"} <= set(packages):
+        fail("mise requires its package and repository bootstrap dependency")
 
     missing = [package for package in packages if not package_is_installed(package)]
     if mode == "sites" and missing:
         fail("sites-only reconciliation requires the provisioned package stack")
+    mise_needs_reconcile = bool(mise_version) and installed_mise_version() != mise_version
+    if mode == "sites" and mise_needs_reconcile:
+        fail("sites-only reconciliation requires the configured mise version")
+    if mode == "stack" and mise_needs_reconcile:
+        if not package_is_installed("software-properties-common"):
+            run(["apt-get", "update"])
+            run([
+                "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
+                "--no-install-recommends", "install", "-y", "software-properties-common",
+            ])
+        run(["add-apt-repository", "-y", "ppa:jdxcode/mise"])
+        run(["apt-get", "update"])
+        if "mise" not in missing:
+            missing.append("mise")
     if mode == "stack" and missing:
         run(["apt-get", "update"])
         run(
@@ -380,6 +413,8 @@ def reconcile() -> None:
                 *missing,
             ]
         )
+    if mise_version and installed_mise_version() != mise_version:
+        fail("installed mise version does not match desired state")
 
     for service in services:
         if mode == "sites" and (

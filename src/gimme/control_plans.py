@@ -92,6 +92,7 @@ def target_stack_plan(
             "bootstrap_host": target.bootstrap_hostname,
             "normal_host": target.hostname,
             "network": target.network.model_dump(mode="json"),
+            "runtime_policy": target.runtimes.model_dump(mode="json"),
             "packages": resolution,
             "services": target.stack.services,
             "sites": sites or [],
@@ -102,6 +103,10 @@ def target_stack_plan(
             "privileged_helper": privileged_helper,
             "effects": [
                 "install only declared packages from configured APT sources",
+                *(
+                    ["enable the fixed official ppa:jdxcode/mise source and verify mise exactly"]
+                    if target.runtimes.mise_version is not None else []
+                ),
                 "enable declared services",
                 "reconcile target-specific Caddy sites",
                 (

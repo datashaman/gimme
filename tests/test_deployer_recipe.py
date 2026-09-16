@@ -388,6 +388,16 @@ def test_runtime_inspection_emits_remote_observations_to_the_control_plane() -> 
     assert "writeln(run('bash -c '" in task
 
 
+def test_mise_bootstrap_uses_only_the_fixed_official_ubuntu_ppa() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    helper = (ROOT / "scripts" / "gimme-provision-stack").read_text()
+
+    assert "add-apt-repository -y ppa:jdxcode/mise" in recipe
+    assert '["add-apt-repository", "-y", "ppa:jdxcode/mise"]' in helper
+    assert '"mise": "/usr/bin/mise"' in helper
+    assert "installed mise version does not match desired state" in helper
+
+
 def test_deployment_health_gates_candidate_before_live_activation() -> None:
     plan = rendered_deploy_plan(
         {

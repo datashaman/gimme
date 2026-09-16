@@ -261,3 +261,11 @@ def test_mise_pin_requires_an_exact_target_mise_version() -> None:
             targets={"devbox": devbox}, applications={"example": app},
             resources=resources(), deployments={"example-local": candidate},
         )
+
+
+def test_mise_target_requires_fixed_repository_bootstrap_packages() -> None:
+    with pytest.raises(ValidationError, match="software-properties-common"):
+        TargetConfig.model_validate({
+            **target().model_dump(mode="json"),
+            "runtimes": {"mise_version": "2026.9.9"},
+        })

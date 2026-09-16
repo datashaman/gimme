@@ -121,9 +121,10 @@ Every deployment declares exact runtime versions. A pin has a `provider` and a
   `<apps_root>/.gimme/mise` without shell activation.
 - `bundled` is valid only for npm, whose version is supplied by the selected Node.js.
 
-Set `target.runtimes.mise_version` whenever any deployment uses mise. The exact mise
-binary must first be installed by the target administrator from a trusted package
-source; Gimme does not pipe a remote installer into a privileged shell. Use
+Set `target.runtimes.mise_version` whenever any deployment uses mise and include
+`mise` plus `software-properties-common` in the target stack. On Ubuntu 26.04 Gimme's
+privileged helper enables only the fixed official `ppa:jdxcode/mise` source; it never
+pipes a remote installer into a privileged shell. Use
 `plan_deployment_runtimes` and `apply_deployment_runtimes` to review and install the
 declared mise pins. Multiple Node.js, Bun, pnpm, Yarn, Python, Ruby, Go, and Java
 versions can coexist because each deployment command runs through

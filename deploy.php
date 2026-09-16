@@ -327,6 +327,18 @@ function configured_php_binary(): string
     return "/usr/bin/php{$parts[0]}.{$parts[1]}";
 }
 
+function configured_mise_version(): ?string
+{
+    $version = getenv('GIMME_MISE_VERSION') ?: '';
+    if ($version === '') {
+        return null;
+    }
+    if (!preg_match('/^[0-9]+(?:\.[0-9]+){1,3}$/', $version)) {
+        throw new \RuntimeException('Unsafe mise version');
+    }
+    return $version;
+}
+
 function configured_environment_values(): array
 {
     $raw = getenv('GIMME_VARIABLES_JSON') ?: '{}';
@@ -665,6 +677,7 @@ function stack_state_write_command(
         'remote_user' => $remoteUser,
         'apps_root' => $appsRoot,
         'sites' => configured_sites($appsRoot, $mdnsName),
+        'mise_version' => configured_mise_version(),
     ], JSON_THROW_ON_ERROR);
     $stateEncoded = escapeshellarg(base64_encode($state));
     $stateDirectory = escapeshellarg(dirname($statePath));
@@ -1396,6 +1409,7 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
     writeln('GIMME_HELPER|' . ($helperReady ? 'ready' : 'bootstrap_required'));
     $packages = configured_packages();
     $services = configured_services();
+    $miseVersion = configured_mise_version();
     foreach ($packages as $package) {
         $quoted = escapeshellarg($package);
         $installed = run(
@@ -1405,13 +1419,19 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
             "apt-cache policy {$quoted} | sed -n 's/^  Candidate: //p' | head -n 1"
         );
         if ($candidate === '' || $candidate === '(none)') {
-            $candidate = 'unavailable';
+            $candidate = $package === 'mise' && $miseVersion !== null
+                ? 'official_ppa'
+                : 'unavailable';
         }
         writeln("GIMME_PACKAGE|{$package}|{$installed}|{$candidate}");
     }
+    $simulatedPackages = array_values(array_filter(
+        $packages,
+        static fn (string $package): bool => $package !== 'mise' || $miseVersion === null,
+    ));
     run(
         'apt-get --simulate --no-install-recommends install ' .
-        implode(' ', array_map('escapeshellarg', $packages)) .
+        implode(' ', array_map('escapeshellarg', $simulatedPackages)) .
         ' >/dev/null'
     );
 });
@@ -1487,6 +1507,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
+    $miseVersion = escapeshellarg(configured_mise_version() ?? '');
     $user = escapeshellarg($remoteUser);
     $sudoers = escapeshellarg(
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
@@ -1505,8 +1526,12 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $bootstrap = <<<BASH
 set -euo pipefail
 packages=({$packageWords})
+mise_version={$miseVersion}
 missing=()
 for package in "\${packages[@]}"; do
+    if [ "\$package" = mise ]; then
+        continue
+    fi
     status=\$(dpkg-query -W -f='\${Status}' "\$package" 2>/dev/null || true)
     if [ "\$status" != 'install ok installed' ]; then
         missing+=("\$package")
@@ -1515,6 +1540,11 @@ done
 if (( \${#missing[@]} )); then
     apt-get update
     env DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y "\${missing[@]}"
+fi
+if [ -n "\$mise_version" ]; then
+    add-apt-repository -y ppa:jdxcode/mise
+    apt-get update
+    env DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -y mise
 fi
 
 {$rootWriteState}
