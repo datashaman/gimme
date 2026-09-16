@@ -20,6 +20,7 @@ from gimme.config import (
 )
 from gimme.deployer import DeployerRunner
 from gimme.plans import (
+    application_update_plan,
     app_process_plan,
     app_resource_plan,
     artisan_command_plan,
@@ -28,6 +29,7 @@ from gimme.plans import (
     environment_instance,
     environment_removal_plan,
     environment_site_url,
+    environment_update_plan,
     plan_id as compute_plan_id,
     stack_plan,
 )
@@ -179,6 +181,68 @@ def resolved_deployment_plan(
     }
     resolved["deployer_plan"] = rendered.output
     return {"plan_id": compute_plan_id(resolved), **resolved}
+
+
+def proposed_app_registration(
+    name: str,
+    repository: str,
+    framework: Literal[
+        "common", "laravel", "symfony", "wordpress", "static"
+    ] = "common",
+    branch: str = "main",
+    frontend: FrontendBuildConfig | None = None,
+    artisan: ArtisanConfig | None = None,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: HealthRegistration = None,
+) -> AppConfig:
+    proposed = AppConfig(
+        repository=repository,
+        framework=framework,
+        branch=branch,
+        frontend=frontend,
+        artisan=artisan,
+        workers=workers,
+        scheduler=scheduler,
+        health=health,
+    )
+    try:
+        existing = store.app(name)
+    except KeyError:
+        return proposed
+    return AppConfig.model_validate(
+        {
+            **proposed.model_dump(mode="python"),
+            "environments": {
+                **{
+                    environment: definition
+                    for environment, definition in existing.environments.items()
+                    if environment != "default"
+                },
+                "default": proposed.environment("default"),
+            },
+        }
+    )
+
+
+def proposed_environment_registration(
+    app: AppConfig,
+    environment: str,
+    branch: str,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
+) -> AppConfig:
+    environments = dict(app.environments)
+    environments[environment] = EnvironmentConfig(
+        branch=branch,
+        workers=workers,
+        scheduler=scheduler,
+        health=health,
+    )
+    return AppConfig.model_validate(
+        {**app.model_dump(mode="python"), "environments": environments}
+    )
 
 
 @mcp.resource(
@@ -533,6 +597,13 @@ def register_environment(
         scheduler=scheduler,
         health=health,
     )
+    app = store.app(name)
+    existing = app.environments.get(environment)
+    if existing is not None and existing != definition:
+        raise ValueError(
+            "environment is already registered with a different definition; "
+            "use plan_update_environment and update_environment"
+        )
     changed = store.register_environment(name, environment, definition)
     server = store.server()
     return {
@@ -542,6 +613,81 @@ def register_environment(
         **definition.model_dump(mode="json"),
         "deploy_path": environment_deploy_path(server, name, environment),
         "site_url": environment_site_url(server, name, environment),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Return an exact, read-only plan for changing an existing non-default "
+        "environment's branch or policies while reusing its isolated resources."
+    ),
+    annotations=titled(READ_ONLY, "Plan environment registration update"),
+)
+def plan_update_environment(
+    name: ApplicationName,
+    environment: EnvironmentName,
+    branch: str,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
+) -> dict[str, object]:
+    if environment == "default":
+        raise ValueError("use plan_update_app for the default environment")
+    app = store.app(name)
+    app.environment(environment)
+    proposed = proposed_environment_registration(
+        app, environment, branch, workers, scheduler, health
+    )
+    if proposed == app:
+        raise ValueError("environment registration already matches the proposal")
+    return environment_update_plan(
+        store.server(), name, environment, app, proposed
+    )
+
+
+@mcp.tool(
+    description=(
+        "Apply an exact reviewed environment-registration update locally. Reuses the "
+        "environment's database, cache namespace, storage, and releases; makes no remote "
+        "changes."
+    ),
+    annotations=ToolAnnotations(
+        title="Update environment registration",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+def update_environment(
+    name: ApplicationName,
+    environment: EnvironmentName,
+    branch: str,
+    plan_id: PlanIdentifier,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
+) -> dict[str, object]:
+    if environment == "default":
+        raise ValueError("use update_app for the default environment")
+    app = store.app(name)
+    app.environment(environment)
+    proposed = proposed_environment_registration(
+        app, environment, branch, workers, scheduler, health
+    )
+    expected = environment_update_plan(
+        store.server(), name, environment, app, proposed
+    )
+    if plan_id != expected["plan_id"]:
+        raise ValueError(
+            "plan_id is invalid or stale; call plan_update_environment again"
+        )
+    store.register_app(name, proposed)
+    return {
+        "application": name,
+        "environment": environment,
+        "changed": True,
+        **proposed.environment(environment).model_dump(mode="json"),
     }
 
 
@@ -652,7 +798,9 @@ def remove_environment(
 
 @mcp.tool(
     description=(
-        "Register or update a PHP application's allowlisted deployment definition. "
+        "Register a new PHP application's allowlisted deployment definition, or confirm "
+        "an identical registration. Existing definitions must use plan_update_app and "
+        "update_app. "
         "Laravel definitions may override the default Artisan command allowlist and declare "
         "process and deployment-health policies. Changes only the local registry; it does "
         "not connect to or modify the host."
@@ -678,36 +826,115 @@ def register_app(
     scheduler: SchedulerRegistration = None,
     health: HealthRegistration = None,
 ) -> dict[str, object]:
-    app = AppConfig(
-        repository=repository,
-        framework=framework,
-        branch=branch,
-        frontend=frontend,
-        artisan=artisan,
-        workers=workers,
-        scheduler=scheduler,
-        health=health,
+    app = proposed_app_registration(
+        name,
+        repository,
+        framework,
+        branch,
+        frontend,
+        artisan,
+        workers,
+        scheduler,
+        health,
     )
     try:
         existing = store.app(name)
     except KeyError:
         existing = None
-    if existing is not None:
-        app = AppConfig.model_validate(
-            {
-                **app.model_dump(mode="python"),
-                "environments": {
-                    **{
-                        environment: definition
-                        for environment, definition in existing.environments.items()
-                        if environment != "default"
-                    },
-                    "default": app.environment("default"),
-                },
-            }
+    if existing is not None and existing != app:
+        raise ValueError(
+            "application is already registered with a different definition; "
+            "use plan_update_app and update_app"
         )
     changed = store.register_app(name, app)
-    return {"application": name, "changed": changed, **app.model_dump()}
+    return {"application": name, "changed": changed, **app.model_dump(mode="json")}
+
+
+@mcp.tool(
+    description=(
+        "Return an exact, read-only plan for replacing an existing application's local "
+        "registration. Additional environment registrations are preserved."
+    ),
+    annotations=titled(READ_ONLY, "Plan application registration update"),
+)
+def plan_update_app(
+    name: ApplicationName,
+    repository: str,
+    framework: Literal[
+        "common", "laravel", "symfony", "wordpress", "static"
+    ] = "common",
+    branch: str = "main",
+    frontend: FrontendBuildConfig | None = None,
+    artisan: ArtisanConfig | None = None,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: HealthRegistration = None,
+) -> dict[str, object]:
+    current = store.app(name)
+    proposed = proposed_app_registration(
+        name,
+        repository,
+        framework,
+        branch,
+        frontend,
+        artisan,
+        workers,
+        scheduler,
+        health,
+    )
+    if proposed == current:
+        raise ValueError("application registration already matches the proposal")
+    return application_update_plan(store.server(), name, current, proposed)
+
+
+@mcp.tool(
+    description=(
+        "Apply an exact reviewed application-registration update locally. Additional "
+        "environment registrations are preserved and no remote host changes are made."
+    ),
+    annotations=ToolAnnotations(
+        title="Update application registration",
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+def update_app(
+    name: ApplicationName,
+    repository: str,
+    plan_id: PlanIdentifier,
+    framework: Literal[
+        "common", "laravel", "symfony", "wordpress", "static"
+    ] = "common",
+    branch: str = "main",
+    frontend: FrontendBuildConfig | None = None,
+    artisan: ArtisanConfig | None = None,
+    workers: WorkerRegistration = None,
+    scheduler: SchedulerRegistration = None,
+    health: HealthRegistration = None,
+) -> dict[str, object]:
+    current = store.app(name)
+    proposed = proposed_app_registration(
+        name,
+        repository,
+        framework,
+        branch,
+        frontend,
+        artisan,
+        workers,
+        scheduler,
+        health,
+    )
+    expected = application_update_plan(store.server(), name, current, proposed)
+    if plan_id != expected["plan_id"]:
+        raise ValueError("plan_id is invalid or stale; call plan_update_app again")
+    store.register_app(name, proposed)
+    return {
+        "application": name,
+        "changed": True,
+        **proposed.model_dump(mode="json"),
+    }
 
 
 @mcp.tool(

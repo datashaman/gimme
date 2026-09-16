@@ -4,7 +4,7 @@ from pathlib import Path
 from fastmcp import Client
 import pytest
 
-from gimme.config import ConfigStore
+from gimme.config import ConfigStore, HealthCheckConfig
 from gimme.deployer import CommandResult
 import gimme.server as server_module
 from gimme.server import mcp
@@ -52,7 +52,7 @@ async def test_tool_surface_and_annotations() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
 
-    assert len(tools) == 24
+    assert len(tools) == 28
     assert {tool.name for tool in tools} >= {
         "inspect_host",
         "plan_stack",
@@ -72,6 +72,10 @@ async def test_tool_surface_and_annotations() -> None:
         "configure_app_health",
         "list_environments",
         "register_environment",
+        "plan_update_environment",
+        "update_environment",
+        "plan_update_app",
+        "update_app",
         "configure_environment_health",
         "plan_remove_environment",
         "remove_environment",
@@ -116,6 +120,84 @@ async def test_register_and_list_isolated_environment(tmp_path, monkeypatch) -> 
     assert listed.data["environments"]["feature-x"]["workers"] is None
 
 
+def test_existing_environment_requires_reviewed_update(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    server_module.register_environment(
+        "example-app", "feature-x", "feature/first"
+    )
+
+    with pytest.raises(ValueError, match="plan_update_environment"):
+        server_module.register_environment(
+            "example-app", "feature-x", "feature/second"
+        )
+
+    plan = server_module.plan_update_environment(
+        "example-app", "feature-x", "feature/second"
+    )
+    result = server_module.update_environment(
+        "example-app", "feature-x", "feature/second", plan["plan_id"]
+    )
+
+    assert result["changed"] is True
+    assert server_module.store.environment("example-app", "feature-x").branch == (
+        "feature/second"
+    )
+
+
+def test_existing_app_requires_reviewed_update_and_preserves_environments(
+    tmp_path, monkeypatch
+) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    server_module.register_environment(
+        "example-app", "feature-x", "feature/first"
+    )
+
+    with pytest.raises(ValueError, match="plan_update_app"):
+        server_module.register_app(
+            "example-app",
+            "git@github.com:example/replacement.git",
+            framework="laravel",
+        )
+
+    plan = server_module.plan_update_app(
+        "example-app",
+        "git@github.com:example/replacement.git",
+        framework="laravel",
+        branch="stable",
+    )
+    result = server_module.update_app(
+        "example-app",
+        "git@github.com:example/replacement.git",
+        plan["plan_id"],
+        framework="laravel",
+        branch="stable",
+    )
+
+    app = server_module.store.app("example-app")
+    assert result["changed"] is True
+    assert app.repository == "git@github.com:example/replacement.git"
+    assert app.environment("default").branch == "stable"
+    assert app.environment("feature-x").branch == "feature/first"
+
+
+def test_registration_updates_reject_stale_plans(tmp_path, monkeypatch) -> None:
+    _use_test_store(tmp_path, monkeypatch)
+    plan = server_module.plan_update_app(
+        "example-app",
+        "git@github.com:example/replacement.git",
+        framework="laravel",
+    )
+    server_module.store.configure_app_health("example-app", HealthCheckConfig())
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.update_app(
+            "example-app",
+            "git@github.com:example/replacement.git",
+            plan["plan_id"],
+            framework="laravel",
+        )
+
+
 def test_remove_environment_requires_exact_plan_and_unregisters_after_cleanup(
     tmp_path, monkeypatch
 ) -> None:
@@ -144,7 +226,9 @@ def test_remove_environment_requires_exact_plan_and_unregisters_after_cleanup(
         "gimme:reconcile:sites",
         "gimme:remove:environment",
     ]
-    assert calls[0][1]["exclude_instance"] == "example-app--feature-x"
+    assert calls[0][1]["exclude_instance"] == (
+        "example-app--feature-x--ef4c19f581"
+    )
 
 
 def test_environment_resource_apply_reconciles_route_before_database(

@@ -1,0 +1,55 @@
+name: Disposable VM integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      GIMME_INTEGRATION_DISPOSABLE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: composer:v2
+      - run: uv sync --frozen
+      - run: composer install --no-interaction --prefer-dist
+      - name: Configure loopback SSH
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sudo systemctl enable --now ssh
+          install -d -m 0700 "$HOME/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/gimme-ci"
+          install -m 0600 "$HOME/.ssh/gimme-ci.pub" "$RUNNER_TEMP/gimme-ci.pub"
+          cat "$RUNNER_TEMP/gimme-ci.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 0600 "$HOME/.ssh/authorized_keys"
+          ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
+          {
+            echo 'Host 127.0.0.1 gimme-ci.local'
+            echo '  HostName 127.0.0.1'
+            echo "  User $USER"
+            echo "  IdentityFile $HOME/.ssh/gimme-ci"
+            echo '  IdentitiesOnly yes'
+            echo '  HostKeyAlias 127.0.0.1'
+          } > "$HOME/.ssh/config"
+          chmod 0600 "$HOME/.ssh/config"
+          ssh -o BatchMode=yes 127.0.0.1 true
+      - name: Write disposable manifests
+        run: uv run python tests/integration/disposable_vm_smoke.py setup
+      - name: Bootstrap stack and database administration
+        run: |
+          GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:provision:stack integration
+          GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:bootstrap:database-admin integration
+      - name: Exercise isolated resources and host services
+        run: uv run python tests/integration/disposable_vm_smoke.py verify

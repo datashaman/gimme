@@ -22,7 +22,10 @@ def environment_site_url(
 
 
 def environment_instance(name: str, environment: str = "default") -> str:
-    return name if environment == "default" else f"{name}--{environment}"
+    if environment == "default":
+        return name
+    digest = hashlib.sha256(f"{name}\0{environment}".encode()).hexdigest()[:10]
+    return f"{name}--{environment}--{digest}"
 
 
 def environment_database_identifier(name: str, environment: str = "default") -> str:
@@ -30,10 +33,59 @@ def environment_database_identifier(name: str, environment: str = "default") -> 
     if environment != "default":
         parts.append(environment.replace("-", "_"))
     candidate = "_".join(parts)
-    if len(candidate) <= 63:
+    if environment == "default" and len(candidate) <= 63:
         return candidate
     digest = hashlib.sha256(f"{name}\0{environment}".encode()).hexdigest()[:10]
     return f"{candidate[:52]}_{digest}"
+
+
+def application_update_plan(
+    server: ServerConfig,
+    name: str,
+    current: AppConfig,
+    proposed: AppConfig,
+) -> dict[str, Any]:
+    plan: dict[str, Any] = {
+        "kind": "application_registration_update",
+        "host": server.hostname,
+        "application": name,
+        "current": current.model_dump(mode="json"),
+        "proposed": proposed.model_dump(mode="json"),
+        "affected_environments": sorted(current.environments),
+        "effects": [
+            "replace the local application registration only",
+            "use the proposed repository and default-environment branch in future plans",
+            "preserve additional environment registrations",
+            "make no remote host changes",
+        ],
+    }
+    return {"plan_id": plan_id(plan), **plan}
+
+
+def environment_update_plan(
+    server: ServerConfig,
+    name: str,
+    environment: str,
+    current: AppConfig,
+    proposed: AppConfig,
+) -> dict[str, Any]:
+    if environment == "default":
+        raise ValueError("use plan_update_app for the default environment")
+    plan: dict[str, Any] = {
+        "kind": "environment_registration_update",
+        "host": server.hostname,
+        "application": name,
+        "environment": environment,
+        "current": current.environment(environment).model_dump(mode="json"),
+        "proposed": proposed.environment(environment).model_dump(mode="json"),
+        "effects": [
+            "replace the local environment registration only",
+            "use the proposed branch and policies in future plans",
+            "reuse the environment database, cache namespace, storage, and releases",
+            "make no remote host changes",
+        ],
+    }
+    return {"plan_id": plan_id(plan), **plan}
 
 
 def plan_id(plan: dict[str, Any]) -> str:
@@ -395,8 +447,8 @@ def app_process_plan(
             "disable obsolete Gimme-managed process units for this application",
             *(
                 [
-                    "set QUEUE_CONNECTION=redis in the protected shared environment "
-                    "and clear cached Laravel configuration"
+                    "set QUEUE_CONNECTION=redis and an isolated HORIZON_PREFIX in the "
+                    "protected shared environment, then clear cached Laravel configuration"
                 ]
                 if worker is not None and worker["driver"] == "horizon"
                 else []

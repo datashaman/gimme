@@ -8,6 +8,7 @@ only this argument-free executable; desired state is read from one fixed path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -26,7 +27,7 @@ from typing import Any
 STATE_PATH = Path("__GIMME_STATE_PATH__")
 EXPECTED_APPS_ROOT = STATE_PATH.parents[1]
 APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
-INSTANCE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,81}$")
+INSTANCE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
 ENVIRONMENT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 MDNS_NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
@@ -225,8 +226,11 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
         environment = require_string(
             definition["environment"], "environment name", ENVIRONMENT_NAME
         )
+        digest = hashlib.sha256(f"{application}\0{environment}".encode()).hexdigest()[:10]
         expected_instance = (
-            application if environment == "default" else f"{application}--{environment}"
+            application
+            if environment == "default"
+            else f"{application}--{environment}--{digest}"
         )
         if instance != expected_instance:
             fail(f"site identity mismatch for {instance}")

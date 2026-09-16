@@ -204,7 +204,7 @@ def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch
     )
 
     assert captured["GIMME_ENVIRONMENT"] == "feature-x"
-    assert captured["GIMME_INSTANCE"] == "example-app--feature-x"
+    assert captured["GIMME_INSTANCE"] == "example-app--feature-x--ef4c19f581"
     assert captured["GIMME_DEPLOY_PATH"] == (
         "/srv/gimme/apps/example-app/environments/feature-x"
     )

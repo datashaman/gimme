@@ -107,7 +107,7 @@ def test_helper_accepts_isolated_environment_site() -> None:
     helper = load_helper()
     sites = helper["validate_sites"](
         {
-            "example-app--feature-x": {
+            "example-app--feature-x--ef4c19f581": {
                 "application": "example-app",
                 "environment": "feature-x",
                 "framework": "laravel",
@@ -118,7 +118,7 @@ def test_helper_accepts_isolated_environment_site() -> None:
             }
         }
     )
-    site = sites["example-app--feature-x"]
+    site = sites["example-app--feature-x--ef4c19f581"]
 
     assert site["site_host"] == "feature-x.example-app.devbox.local"
     assert site["document_root"] == Path(
@@ -132,7 +132,7 @@ def test_helper_rejects_environment_document_root_escape() -> None:
     with pytest.raises(RuntimeError, match="escapes applications root"):
         helper["validate_sites"](
             {
-                "example-app--feature-x": {
+                "example-app--feature-x--ef4c19f581": {
                     "application": "example-app",
                     "environment": "feature-x",
                     "framework": "laravel",

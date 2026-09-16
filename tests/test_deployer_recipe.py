@@ -157,11 +157,23 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "APP_ENV=production" in task
     assert "APP_DEBUG=false" in task
     assert "APP_URL=https://{$siteHost}" in task
+    assert "HORIZON_PREFIX={$cachePrefix}horizon:" in task
+    assert "grep -q '^HORIZON_PREFIX='" in task
     assert "grep -q '^APP_KEY='" in task
     assert "php artisan optimize:clear" in task
     assert "php artisan optimize" in task
     assert 'if [ -L "\\$env_path" ]' in task
     assert 'chmod 0600 "\\$env_path"' in task
+
+
+def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    configured_sites = recipe.split("function configured_sites", 1)[1].split(
+        "function stack_state_write_command", 1
+    )[0]
+
+    assert 'hash(\'sha256\', "{$name}\\0{$environment}")' in configured_sites
+    assert '"{$name}--{$environment}--"' in configured_sites
 
 
 def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:

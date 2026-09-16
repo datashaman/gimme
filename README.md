@@ -208,6 +208,9 @@ Example MCP client configuration:
 4. `register_app`
 5. For concurrent branches, call `register_environment` with an explicit environment
    slug and remote branch
+   Existing registrations cannot be silently retargeted: use `plan_update_app` /
+   `update_app` or `plan_update_environment` / `update_environment` and review the
+   complete before/after definition.
 6. `plan_app_resources`, then approve `provision_app_resources` for the selected
    environment; this also reconciles its HTTPS route and mDNS alias
 7. Complete framework-specific values in the environment's remote `shared/.env`
@@ -266,6 +269,10 @@ Each non-default environment receives an isolated PostgreSQL database and role, 
 runtime storage, release history, and Valkey prefix. Workers and the scheduler are disabled
 unless explicitly configured. Health checks inherit the application policy by default and
 may be overridden or disabled per environment.
+
+Internal database, process, Caddy, and Avahi identifiers include a deterministic digest;
+human-readable application and environment names therefore cannot alias one another even
+when their hyphens and separators would otherwise normalize to the same value.
 
 ```json
 {
@@ -406,8 +413,10 @@ Horizon must already be installed in the application with `composer require
 laravel/horizon`, and its production environment must be configured in
 `config/horizon.php`. Horizon requires a Redis queue connection; Gimme uses the
 provisioned local Valkey service through the Redis protocol, sets the protected
-`QUEUE_CONNECTION=redis` value during process provisioning, and clears cached Laravel
-configuration without returning environment contents.
+`QUEUE_CONNECTION=redis` value and an environment-specific `HORIZON_PREFIX` during
+resource and process provisioning, and clears cached Laravel configuration without
+returning environment contents. Multiple environments of the same application therefore
+do not share Horizon metadata or control state.
 
 Gimme generates hardened systemd services running as the deployment user, with no
 new privileges, an empty capability set, read-only system paths, and write access
@@ -454,3 +463,9 @@ instances or containers.
 uv run pytest
 vendor/bin/dep --file=deploy.php gimme:inspect devbox --no-interaction
 ```
+
+The manually triggered `Disposable VM integration` GitHub Actions workflow starts from
+an ephemeral Ubuntu runner, bootstraps the complete package stack over loopback SSH, and
+verifies real PostgreSQL, Valkey-backed environment configuration, Caddy, Avahi, sudo,
+and collision-safe site identities. Its test harness refuses to run unless both `CI=true`
+and `GIMME_INTEGRATION_DISPOSABLE=1` are set; never bypass that guard on a persistent host.

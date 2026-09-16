@@ -20,7 +20,7 @@ from typing import Any
 
 EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
 STATE_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "processes"
-APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,81}$")
+APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 UNIX_GROUP = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")
 QUEUE_CONNECTION = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")

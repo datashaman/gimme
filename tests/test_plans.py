@@ -16,6 +16,8 @@ from gimme.plans import (
     app_resource_plan,
     artisan_command_plan,
     deployment_plan,
+    environment_database_identifier,
+    environment_instance,
     stack_plan,
 )
 
@@ -178,8 +180,8 @@ def test_additional_environment_has_isolated_paths_url_database_and_cache() -> N
 
     assert plan["environment"] == "feature-x"
     assert plan["branch"] == "feature/worktrees"
-    assert plan["database"] == "gimme_my_app_feature_x"
-    assert plan["database_role"] == "gimme_my_app_feature_x"
+    assert plan["database"] == "gimme_my_app_feature_x_a98b6c775d"
+    assert plan["database_role"] == "gimme_my_app_feature_x_a98b6c775d"
     assert plan["cache"]["prefix"] == "gimme:my-app:feature-x:"
     assert plan["environment_file"] == (
         "/srv/gimme/apps/my-app/environments/feature-x/shared/.env"
@@ -205,6 +207,15 @@ def test_long_environment_database_identifiers_are_bounded_and_collision_safe() 
     assert len(first["database"]) <= 63
     assert len(first["database_role"]) <= 63
     assert first["database"] != second["database"]
+
+
+def test_internal_environment_identifiers_cannot_alias_other_applications() -> None:
+    assert environment_instance("foo--bar", "baz") != environment_instance(
+        "foo", "bar--baz"
+    )
+    assert environment_database_identifier(
+        "foo-bar", "default"
+    ) != environment_database_identifier("foo", "bar")
 
 
 def test_app_plan_changes_when_deployment_definition_changes() -> None:
@@ -453,7 +464,9 @@ def test_environment_processes_use_isolated_units_and_working_directory() -> Non
     assert plan["working_directory"] == (
         "/srv/gimme/apps/my-app/environments/feature-x/current"
     )
-    assert plan["worker"]["unit"] == "gimme-horizon-my-app--feature-x.service"
+    assert plan["worker"]["unit"] == (
+        "gimme-horizon-my-app--feature-x--a98b6c775d.service"
+    )
     assert plan["scheduler"]["timer"] == (
-        "gimme-scheduler-my-app--feature-x.timer"
+        "gimme-scheduler-my-app--feature-x--a98b6c775d.timer"
     )

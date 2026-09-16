@@ -394,7 +394,11 @@ function configured_sites(string $appsRoot, string $mdnsName): array
             }
             $instance = $environment === 'default'
                 ? $name
-                : "{$name}--{$environment}";
+                : "{$name}--{$environment}--" . substr(
+                    hash('sha256', "{$name}\0{$environment}"),
+                    0,
+                    10,
+                );
             if ((getenv('GIMME_EXCLUDE_INSTANCE') ?: '') === $instance) {
                 continue;
             }
@@ -543,13 +547,17 @@ if ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,47}$/', $app)) {
     throw new \RuntimeException('Unsafe application name');
 }
 if (!preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environmentName) ||
-    !preg_match('/^[a-z][a-z0-9-]{0,81}$/', $instance)) {
+    !preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance)) {
     throw new \RuntimeException('Unsafe environment identity');
 }
 if ($app !== '') {
     $expectedInstance = $environmentName === 'default'
         ? $app
-        : "{$app}--{$environmentName}";
+        : "{$app}--{$environmentName}--" . substr(
+            hash('sha256', "{$app}\0{$environmentName}"),
+            0,
+            10,
+        );
     $expectedDeployPath = $environmentName === 'default'
         ? "{$appsRoot}/{$app}"
         : "{$appsRoot}/{$app}/environments/{$environmentName}";
@@ -1139,6 +1147,11 @@ BASH;
 if ! grep -q '^APP_NAME=' "\$env_path"; then
     printf 'APP_NAME=%s\n' '{$app}' >> "\$env_path"
 fi
+if grep -q '^HORIZON_PREFIX=' "\$env_path"; then
+    sed -i 's|^HORIZON_PREFIX=.*|HORIZON_PREFIX={$cachePrefix}horizon:|' "\$env_path"
+else
+    printf 'HORIZON_PREFIX=%s\n' '{$cachePrefix}horizon:' >> "\$env_path"
+fi
 if ! grep -q '^APP_ENV=' "\$env_path"; then
     printf 'APP_ENV=production\n' >> "\$env_path"
 fi
@@ -1260,6 +1273,7 @@ task('gimme:provision:processes', function () use ($app, $instance, $appsRoot, $
     $workers = configured_workers();
     if (is_array($workers) && ($workers['enabled'] ?? null) === true &&
         ($workers['driver'] ?? null) === 'horizon') {
+        $cachePrefix = required_env('GIMME_CACHE_PREFIX');
         $deployPath = get('deploy_path');
         $envPath = "{$deployPath}/shared/.env";
         $currentPath = "{$deployPath}/current";
@@ -1275,6 +1289,11 @@ if grep -q '^QUEUE_CONNECTION=' "\$env_path"; then
     sed -i 's/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=redis/' "\$env_path"
 else
     printf '\nQUEUE_CONNECTION=redis\n' >> "\$env_path"
+fi
+if grep -q '^HORIZON_PREFIX=' "\$env_path"; then
+    sed -i 's|^HORIZON_PREFIX=.*|HORIZON_PREFIX={$cachePrefix}horizon:|' "\$env_path"
+else
+    printf 'HORIZON_PREFIX=%s\n' '{$cachePrefix}horizon:' >> "\$env_path"
 fi
 chmod 0600 "\$env_path"
 BASH;
