@@ -47,6 +47,8 @@ Record reaches `completed`.
 - Bucket versioning is mandatory; Object Lock remains optional operator hardening.
 - Deployment-changing operations must serialize with backup and restore.
 - Retention may prune only verified, unprotected recovery points after a replacement verifies.
+- `retain_last` is an automatic-pruning ceiling, not a minimum guarantee after manual deletion;
+  protected Safety Recovery Points do not satisfy it.
 - A Safety Recovery Point remains protected until its authoritative Restore Record is completed.
 - PostgreSQL Restore never streams an unverified dump directly into the live database identity.
 - Gimme does not provide an MCP force-online bypass after failed restore verification.

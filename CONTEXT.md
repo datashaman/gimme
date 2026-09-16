@@ -45,10 +45,12 @@ PostgreSQL participates by default; Valkey participation is opt-in. Its cadence 
 hourly, daily, or weekly, and on-demand Recovery Points remain available at every cadence.
 Scheduled times are expressed in UTC: hourly selects a minute, daily selects a time, and
 weekly selects a weekday and time.
-It retains the most recent 1 to 365 verified Recovery Points, defaulting to 7; pruning occurs
-only after a replacement has been verified. It selects exactly one named Backup Destination;
-many Deployments may share that destination, but one Recovery Point is not replicated across
-destinations.
+Its `retain_last` value is an automatic-pruning ceiling from 1 to 365, defaulting to 7; pruning
+occurs only after a replacement has been verified and never reduces eligible points below that
+count. Manual deletion may reduce the count further, with stronger confirmation for the final
+verified point. Protected Safety Recovery Points do not satisfy the retention count. The policy
+selects exactly one named Backup Destination; many Deployments may share that destination, but
+one Recovery Point is not replicated across destinations.
 _Avoid_: Resource backup policy
 
 **Backup Destination**:
