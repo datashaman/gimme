@@ -41,6 +41,8 @@
       "environments": {
         "default": {
           "branch": "main",
+          "app_env": "production",
+          "app_debug": false,
           "health": "inherit",
           "workers": {
             "driver": "horizon",
@@ -53,6 +55,8 @@
         },
         "feature-example": {
           "branch": "feature/example",
+          "app_env": "local",
+          "app_debug": true,
           "health": "inherit",
           "workers": null,
           "scheduler": null

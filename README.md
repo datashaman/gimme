@@ -147,7 +147,9 @@ GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:bootstrap:databa
 ```
 
 Run the stack task again after registering an application so its Caddy site and Avahi
-alias are reconciled. On a macOS client, trust this VM's Caddy root once:
+alias are reconciled. Also rerun it after upgrading Gimme: the transaction refreshes
+the privileged stack and process helpers before later MCP operations use them. On a
+macOS client, trust this VM's Caddy root once:
 
 ```bash
 scp devbox.local:/srv/gimme/apps/.caddy-local-root.crt /tmp/gimme-caddy-root.crt
@@ -205,9 +207,9 @@ Example MCP client configuration:
 1. `inspect_host`
 2. Review `config/stack.json`
 3. `plan_stack`; resolve unavailable packages, then approve `provision_stack`
-4. `register_app`
+4. `register_app`, choosing `app_env` explicitly (and `app_debug`, which defaults false)
 5. For concurrent branches, call `register_environment` with an explicit environment
-   slug and remote branch
+   slug, remote branch, and Laravel runtime environment
    Existing registrations cannot be silently retargeted: use `plan_update_app` /
    `update_app` or `plan_update_environment` / `update_environment` and review the
    complete before/after definition.
@@ -270,6 +272,17 @@ runtime storage, release history, and Valkey prefix. Workers and the scheduler a
 unless explicitly configured. Health checks inherit the application policy by default and
 may be overridden or disabled per environment.
 
+Laravel runtime mode is likewise explicit per environment. Gimme never infers `APP_ENV`
+or `APP_DEBUG` from a branch name: `main` is not inherently production, and a feature
+branch is not inherently local. Choose a short runtime label such as `production`,
+`staging`, or `local`; debug defaults to false and plans show a warning whenever it is
+enabled. Resource provisioning atomically reconciles only `APP_ENV`, `APP_DEBUG`, and
+Gimme's protected cache/queue values in the shared `.env`, preserving secrets and other
+application settings. A runtime-mode change clears Laravel's cached configuration and
+gracefully refreshes managed workers or Horizon. Existing manifests without these fields
+load conservatively as `production` with debug disabled and are normalized on their next
+registry mutation.
+
 Internal database, process, Caddy, and Avahi identifiers include a deterministic digest;
 human-readable application and environment names therefore cannot alias one another even
 when their hyphens and separators would otherwise normalize to the same value.
@@ -282,12 +295,16 @@ when their hyphens and separators would otherwise normalize to the same value.
   "environments": {
     "default": {
       "branch": "main",
+      "app_env": "production",
+      "app_debug": false,
       "health": "inherit",
       "workers": {"driver": "horizon", "enabled": true},
       "scheduler": {"enabled": true}
     },
     "feature-x": {
       "branch": "feature/x",
+      "app_env": "local",
+      "app_debug": true,
       "health": "inherit",
       "workers": null,
       "scheduler": null
@@ -296,10 +313,10 @@ when their hyphens and separators would otherwise normalize to the same value.
 }
 ```
 
-Legacy top-level `branch`, `workers`, and `scheduler` fields remain accepted and are
-written back in nested form on the next registry mutation. Exact-plan environment removal
-deletes only that environment's route, processes, database, Valkey keys, releases, and
-storage; it never modifies the Git branch or repository.
+Legacy top-level `branch`, `workers`, `scheduler`, `app_env`, and `app_debug` fields remain
+accepted and are written back in nested form on the next registry mutation. Exact-plan
+environment removal deletes only that environment's route, processes, database, Valkey
+keys, releases, and storage; it never modifies the Git branch or repository.
 
 ## Deployment health gates
 
@@ -346,7 +363,9 @@ commands:
 {
   "repository": "git@github.com:example/application.git",
   "framework": "laravel",
-  "environments": {"default": {"branch": "main"}},
+  "environments": {
+    "default": {"branch": "main", "app_env": "production", "app_debug": false}
+  },
   "artisan": {
     "allowed_commands": [
       "about",
@@ -410,7 +429,7 @@ single Horizon master process:
 ```
 
 Horizon must already be installed in the application with `composer require
-laravel/horizon`, and its production environment must be configured in
+laravel/horizon`, and the selected `app_env` must be configured in
 `config/horizon.php`. Horizon requires a Redis queue connection; Gimme uses the
 provisioned local Valkey service through the Redis protocol, sets the protected
 `QUEUE_CONNECTION=redis` value and an environment-specific `HORIZON_PREFIX` during
@@ -422,7 +441,8 @@ Gimme generates hardened systemd services running as the deployment user, with n
 new privileges, an empty capability set, read-only system paths, and write access
 limited to the application's shared runtime and bootstrap cache. The scheduler is a
 persistent every-minute systemd timer invoking `schedule:run`. Raw journals remain
-excluded from MCP responses.
+excluded from MCP responses. systemd does not override `APP_ENV`; every process reads
+the same shared `.env` policy used by web requests and Artisan.
 
 After a successful deployment or rollback symlink switch, Gimme runs `queue:restart`
 for standard workers or `horizon:terminate` for Horizon. Active jobs finish gracefully,
@@ -438,7 +458,9 @@ Example Vite/static application entry in `config/apps.json`:
 {
   "repository": "git@github.com:example/dashboard.git",
   "framework": "static",
-  "environments": {"default": {"branch": "main"}},
+  "environments": {
+    "default": {"branch": "main", "app_env": "production", "app_debug": false}
+  },
   "frontend": {
     "package_manager": "npm",
     "build_script": "build",

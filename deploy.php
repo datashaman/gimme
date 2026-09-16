@@ -345,6 +345,73 @@ try {
 PHP;
 }
 
+function laravel_environment_reconcile_script(): string
+{
+    return <<<'PYTHON'
+import base64
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+updates = json.loads(base64.b64decode(sys.argv[2]).decode())
+details = path.lstat()
+if path.is_symlink() or not stat.S_ISREG(details.st_mode):
+    raise RuntimeError("refusing to reconcile a non-regular environment file")
+
+runtime_keys = {"APP_ENV", "APP_DEBUG"}
+seen = set()
+rendered = []
+runtime_changed = False
+original = path.read_text()
+for line in original.splitlines():
+    key = line.split("=", 1)[0]
+    if key not in updates:
+        rendered.append(line)
+        continue
+    if key in seen:
+        if key in runtime_keys:
+            runtime_changed = True
+        continue
+    desired = f"{key}={updates[key]}"
+    if line != desired and key in runtime_keys:
+        runtime_changed = True
+    rendered.append(desired)
+    seen.add(key)
+
+for key, value in updates.items():
+    if key in seen:
+        continue
+    rendered.append(f"{key}={value}")
+    if key in runtime_keys:
+        runtime_changed = True
+
+desired_content = "\n".join(rendered) + "\n"
+if desired_content == original:
+    print("GIMME_RUNTIME_CHANGED|no")
+    raise SystemExit(0)
+
+descriptor, temporary = tempfile.mkstemp(prefix=".env.", dir=path.parent)
+temporary_path = Path(temporary)
+try:
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(desired_content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary_path, 0o600)
+    os.chown(temporary_path, details.st_uid, details.st_gid)
+    os.replace(temporary_path, path)
+except BaseException:
+    temporary_path.unlink(missing_ok=True)
+    raise
+
+print("GIMME_RUNTIME_CHANGED|" + ("yes" if runtime_changed else "no"))
+PYTHON;
+}
+
 function configured_workers(): ?array
 {
     return configured_process_object('GIMME_WORKERS_JSON');
@@ -1083,7 +1150,15 @@ BASH;
     run("{$sudo} -u postgres bash -c " . escapeshellarg($script));
 });
 
-task('gimme:provision:app', function () use ($app, $siteHost): void {
+task('gimme:provision:app', function () use (
+    $app,
+    $siteHost,
+    $instance,
+    $appsRoot,
+    $hostname,
+    $mdnsName,
+    $remoteUser,
+): void {
     if ($app === '') {
         throw new \RuntimeException('Application context is required');
     }
@@ -1102,6 +1177,33 @@ task('gimme:provision:app', function () use ($app, $siteHost): void {
     $deployPath = get('deploy_path');
     $sharedPath = "{$deployPath}/shared";
     $envPath = "{$sharedPath}/.env";
+    $framework = getenv('GIMME_FRAMEWORK') ?: 'common';
+    $processStatePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
+    $hasProcessState = $framework === 'laravel' && test(
+        '[ -f ' . escapeshellarg($processStatePath) . ' ]'
+    );
+    if ($hasProcessState) {
+        $policy = privileged_helper_policy(
+            configured_packages(),
+            configured_services(),
+            $hostname,
+            $mdnsName,
+            $remoteUser,
+            $appsRoot,
+        );
+        $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
+        $helperReady = test(
+            '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+            "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+            'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
+        );
+        if (!$helperReady) {
+            throw new \RuntimeException(
+                'Managed processes require the current privileged helper; ' .
+                'run the documented interactive stack bootstrap first'
+            );
+        }
+    }
 
     run('install -d -m 0700 ' . escapeshellarg($sharedPath));
     run('setfacl -m u:www-data:x ' . escapeshellarg($sharedPath));
@@ -1141,22 +1243,24 @@ fi
 chmod 0600 "\$env_path"
 BASH;
 
-    if ((getenv('GIMME_FRAMEWORK') ?: 'common') === 'laravel') {
+    if ($framework === 'laravel') {
+        $appEnv = required_env('GIMME_APP_ENV');
+        $appDebug = required_env('GIMME_APP_DEBUG');
+        if (!preg_match('/^[a-z][a-z0-9_-]{0,31}$/', $appEnv) ||
+            !in_array($appDebug, ['true', 'false'], true)) {
+            throw new \RuntimeException('Unsafe Laravel runtime environment policy');
+        }
+        $runtimeValues = json_encode([
+            'HORIZON_PREFIX' => "{$cachePrefix}horizon:",
+            'APP_ENV' => $appEnv,
+            'APP_DEBUG' => $appDebug,
+        ], JSON_THROW_ON_ERROR);
+        $runtimeProgram = escapeshellarg(base64_encode(laravel_environment_reconcile_script()));
+        $runtimeEncoded = escapeshellarg(base64_encode($runtimeValues));
         $script .= <<<BASH
 
 if ! grep -q '^APP_NAME=' "\$env_path"; then
     printf 'APP_NAME=%s\n' '{$app}' >> "\$env_path"
-fi
-if grep -q '^HORIZON_PREFIX=' "\$env_path"; then
-    sed -i 's|^HORIZON_PREFIX=.*|HORIZON_PREFIX={$cachePrefix}horizon:|' "\$env_path"
-else
-    printf 'HORIZON_PREFIX=%s\n' '{$cachePrefix}horizon:' >> "\$env_path"
-fi
-if ! grep -q '^APP_ENV=' "\$env_path"; then
-    printf 'APP_ENV=production\n' >> "\$env_path"
-fi
-if ! grep -q '^APP_DEBUG=' "\$env_path"; then
-    printf 'APP_DEBUG=false\n' >> "\$env_path"
 fi
 if ! grep -q '^APP_URL=' "\$env_path"; then
     printf 'APP_URL=https://{$siteHost}\n' >> "\$env_path"
@@ -1165,17 +1269,36 @@ if ! grep -q '^APP_KEY=' "\$env_path"; then
     app_key=\$(openssl rand -base64 32 | tr -d '\n')
     printf 'APP_KEY=base64:%s\n' "\$app_key" >> "\$env_path"
 fi
+runtime_output=\$(printf %s {$runtimeProgram} | base64 -d | python3 - "\$env_path" {$runtimeEncoded})
+printf '%s\n' "\$runtime_output"
 BASH;
     }
 
-    run('bash -c ' . escapeshellarg($script));
-    if ((getenv('GIMME_FRAMEWORK') ?: 'common') === 'laravel') {
+    $resourceOutput = run('bash -c ' . escapeshellarg($script));
+    $runtimeChanged = str_contains($resourceOutput, 'GIMME_RUNTIME_CHANGED|yes');
+    if ($framework === 'laravel') {
         $currentPath = get('deploy_path') . '/current';
-        if (test('[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]')) {
+        $hasCurrentRelease = test(
+            '[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]'
+        );
+        if ($hasCurrentRelease) {
             run(
                 'cd ' . escapeshellarg($currentPath) .
                 ' && php artisan optimize:clear && php artisan optimize'
             );
+        }
+        $unitsChanged = false;
+        if ($hasProcessState) {
+            $processOutput = run(
+                'sudo -n /usr/local/sbin/gimme-provision-processes ' .
+                escapeshellarg($instance),
+                forceOutput: true,
+                timeout: 1800,
+            );
+            $unitsChanged = str_contains($processOutput, 'process.units_changed=yes');
+        }
+        if ($hasCurrentRelease && $runtimeChanged && !$unitsChanged) {
+            invoke('gimme:restart:workers');
         }
     }
 });

@@ -38,9 +38,11 @@ def queue_config() -> dict[str, object]:
 
 def test_queue_worker_unit_is_bounded_and_hardened(monkeypatch) -> None:
     helper = helper_namespace()
-    monkeypatch.setitem(helper["service_header"].__globals__, "grp", SimpleNamespace(
-        getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer")
-    ))
+    monkeypatch.setitem(
+        helper["service_header"].__globals__,
+        "grp",
+        SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer")),
+    )
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
 
     unit = helper["render_queue_worker_unit"](
@@ -58,13 +60,16 @@ def test_queue_worker_unit_is_bounded_and_hardened(monkeypatch) -> None:
     assert "CapabilityBoundingSet=" in unit
     assert "ReadWritePaths=" in unit
     assert 'ReadWritePaths="' not in unit
+    assert "Environment=APP_ENV=" not in unit
 
 
 def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None:
     helper = helper_namespace()
-    monkeypatch.setitem(helper["service_header"].__globals__, "grp", SimpleNamespace(
-        getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer")
-    ))
+    monkeypatch.setitem(
+        helper["service_header"].__globals__,
+        "grp",
+        SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer")),
+    )
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
     root = Path("/srv/gimme/apps/example-app")
 
@@ -80,6 +85,7 @@ def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None
     assert 'ExecStart="/usr/bin/php" "artisan" "horizon"' in horizon
     assert "Restart=always" in horizon
     assert "TimeoutStopSec=3600" in horizon
+    assert "Environment=APP_ENV=" not in horizon
     assert '"--no-interaction" "schedule:run"' in scheduler
     assert "Type=oneshot" in scheduler
     assert "OnCalendar=*-*-* *:*:00" in timer
@@ -90,13 +96,13 @@ def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None
     shutil.which("systemd-analyze") is None,
     reason="systemd-analyze is available on Linux CI",
 )
-def test_rendered_process_units_pass_systemd_verification(
-    tmp_path, monkeypatch
-) -> None:
+def test_rendered_process_units_pass_systemd_verification(tmp_path, monkeypatch) -> None:
     helper = helper_namespace()
-    monkeypatch.setitem(helper["service_header"].__globals__, "grp", SimpleNamespace(
-        getgrgid=lambda _gid: SimpleNamespace(gr_name="root")
-    ))
+    monkeypatch.setitem(
+        helper["service_header"].__globals__,
+        "grp",
+        SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="root")),
+    )
     account = SimpleNamespace(pw_name="root", pw_gid=0)
     app_root = tmp_path / "apps" / "example-app"
     (app_root / "current" / "bootstrap" / "cache").mkdir(parents=True)
@@ -111,9 +117,7 @@ def test_rendered_process_units_pass_systemd_verification(
         "gimme-scheduler-example-app.service": helper["render_scheduler_service"](
             "example-app", account, app_root
         ),
-        "gimme-scheduler-example-app.timer": helper["render_scheduler_timer"](
-            "example-app"
-        ),
+        "gimme-scheduler-example-app.timer": helper["render_scheduler_timer"]("example-app"),
     }
     paths = []
     for name, content in units.items():
@@ -149,7 +153,7 @@ def test_process_helper_rejects_unknown_or_injected_configuration() -> None:
 
 
 def test_reconcile_writes_and_starts_only_declared_queue_instances(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ) -> None:
     helper = helper_namespace()
     apps_root = tmp_path / "apps"
@@ -164,19 +168,21 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
 
     monkeypatch.setitem(helper, "EXPECTED_APPS_ROOT", apps_root)
     monkeypatch.setitem(helper, "SYSTEMD_ROOT", systemd_root)
-    monkeypatch.setitem(helper, "load_state", lambda *_args: {
-        "deploy_path": apps_root / "example-app",
-        "workers": queue_config(),
-        "scheduler": {"enabled": True},
-    })
+    monkeypatch.setitem(
+        helper,
+        "load_state",
+        lambda *_args: {
+            "deploy_path": apps_root / "example-app",
+            "workers": queue_config(),
+            "scheduler": {"enabled": True},
+        },
+    )
     monkeypatch.setitem(helper, "listed_worker_instances", lambda _app: set())
     monkeypatch.setitem(helper, "succeeds", lambda _command: False)
     monkeypatch.setitem(helper, "run", lambda command, **_kwargs: commands.append(command))
     monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
     monkeypatch.setattr(helper["pwd"], "getpwnam", lambda _user: account)
-    monkeypatch.setattr(helper["grp"], "getgrgid", lambda _gid: SimpleNamespace(
-        gr_name="deployer"
-    ))
+    monkeypatch.setattr(helper["grp"], "getgrgid", lambda _gid: SimpleNamespace(gr_name="deployer"))
     monkeypatch.setattr(helper["sys"], "argv", ["gimme-provision-processes", "example-app"])
     monkeypatch.setenv("SUDO_USER", "deployer")
 
@@ -187,6 +193,10 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
     assert ["systemctl", "enable", "gimme-worker-example-app@1.service"] in commands
     assert ["systemctl", "restart", "gimme-worker-example-app@2.service"] in commands
     assert ["systemctl", "enable", "gimme-scheduler-example-app.timer"] in commands
+    assert "process.units_changed=yes" in capsys.readouterr().out
+
+    helper["reconcile"]()
+    assert "process.units_changed=no" in capsys.readouterr().out
 
 
 def test_teardown_does_not_require_a_current_release(tmp_path, monkeypatch) -> None:
@@ -214,10 +224,14 @@ def test_teardown_does_not_require_a_current_release(tmp_path, monkeypatch) -> N
     monkeypatch.setitem(helper, "run", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
     monkeypatch.setattr(helper["pwd"], "getpwnam", lambda _user: account)
-    monkeypatch.setattr(helper["sys"], "argv", [
-        "gimme-provision-processes",
-        "example-app--feature-x",
-    ])
+    monkeypatch.setattr(
+        helper["sys"],
+        "argv",
+        [
+            "gimme-provision-processes",
+            "example-app--feature-x",
+        ],
+    )
     monkeypatch.setenv("SUDO_USER", "deployer")
 
     helper["reconcile"]()

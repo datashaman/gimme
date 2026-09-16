@@ -33,9 +33,7 @@ def runner(tmp_path: Path) -> DeployerRunner:
     return DeployerRunner(tmp_path)
 
 
-def test_normal_tasks_connect_to_advertised_hostname(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_normal_tasks_connect_to_advertised_hostname(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, str] = {}
 
     def fake_run(*args, **kwargs):
@@ -102,9 +100,7 @@ def test_macos_runner_replaces_an_empty_agent_with_the_launchd_agent(
     assert captured["SSH_AUTH_SOCK"] == str(launchd_path)
 
 
-def test_stack_tasks_can_connect_to_bootstrap_hostname(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_stack_tasks_can_connect_to_bootstrap_hostname(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, str] = {}
 
     def fake_run(*args, **kwargs):
@@ -161,9 +157,7 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
         health=HealthCheckConfig(path="/up", attempts=5),
     )
 
-    runner(tmp_path).run(
-        "gimme:preflight:processes", server(), app_name="example-app", app=app
-    )
+    runner(tmp_path).run("gimme:preflight:processes", server(), app_name="example-app", app=app)
 
     assert json.loads(captured["GIMME_WORKERS_JSON"])["driver"] == "horizon"
     assert json.loads(captured["GIMME_SCHEDULER_JSON"]) == {"enabled": True}
@@ -190,7 +184,9 @@ def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch
         health=HealthCheckConfig(path="/up"),
         environments={
             "default": EnvironmentConfig(branch="main"),
-            "feature-x": EnvironmentConfig(branch="feature/x", health=None),
+            "feature-x": EnvironmentConfig(
+                branch="feature/x", app_env="local", app_debug=True, health=None
+            ),
         },
     )
 
@@ -205,10 +201,10 @@ def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch
 
     assert captured["GIMME_ENVIRONMENT"] == "feature-x"
     assert captured["GIMME_INSTANCE"] == "example-app--feature-x--ef4c19f581"
-    assert captured["GIMME_DEPLOY_PATH"] == (
-        "/srv/gimme/apps/example-app/environments/feature-x"
-    )
+    assert captured["GIMME_DEPLOY_PATH"] == ("/srv/gimme/apps/example-app/environments/feature-x")
     assert captured["GIMME_SITE_HOST"] == "feature-x.example-app.devbox.local"
     assert captured["GIMME_BRANCH"] == "feature/x"
+    assert captured["GIMME_APP_ENV"] == "local"
+    assert captured["GIMME_APP_DEBUG"] == "true"
     assert captured["GIMME_REVISION"] == "a" * 40
     assert json.loads(captured["GIMME_HEALTH_JSON"]) is None

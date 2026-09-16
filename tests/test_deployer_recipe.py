@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import subprocess
@@ -5,6 +6,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def laravel_environment_reconciler() -> str:
+    recipe = (ROOT / "deploy.php").read_text()
+    return recipe.split("return <<<'PYTHON'", 1)[1].split("\nPYTHON;", 1)[0]
 
 
 def rendered_deploy_plan(health: dict[str, object]) -> str:
@@ -108,9 +114,7 @@ def test_database_bootstrap_exposes_sudo_to_deployer() -> None:
 
 def test_host_inspection_reports_application_reachability() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:inspect'", 1)[1].split(
-        "task('gimme:preflight:stack'", 1
-    )[0]
+    task = recipe.split("task('gimme:inspect'", 1)[1].split("task('gimme:preflight:stack'", 1)[0]
 
     assert "'.mdns_local_resolution='" in task
     assert "'.mdns_client_resolution=not_observable'" in task
@@ -139,9 +143,9 @@ def test_host_inspection_reports_application_reachability() -> None:
 
 def test_app_role_can_become_database_owner() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:provision:app'", 1)[1].split(
-        "task('gimme:service:status'", 1
-    )[0]
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
+        0
+    ]
 
     grant = "GRANT {$role} TO CURRENT_USER WITH SET TRUE, INHERIT FALSE"
     assert grant in task
@@ -150,21 +154,102 @@ def test_app_role_can_become_database_owner() -> None:
 
 def test_laravel_resources_include_required_application_environment() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:provision:app'", 1)[1].split(
-        "task('gimme:service:status'", 1
-    )[0]
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
+        0
+    ]
 
     assert "APP_KEY=base64:" in task
-    assert "APP_ENV=production" in task
-    assert "APP_DEBUG=false" in task
+    assert "GIMME_APP_ENV" in task
+    assert "GIMME_APP_DEBUG" in task
     assert "APP_URL=https://{$siteHost}" in task
     assert "HORIZON_PREFIX={$cachePrefix}horizon:" in task
-    assert "grep -q '^HORIZON_PREFIX='" in task
+    assert "laravel_environment_reconcile_script" in task
+    assert "GIMME_RUNTIME_CHANGED|yes" in task
     assert "grep -q '^APP_KEY='" in task
     assert "php artisan optimize:clear" in task
     assert "php artisan optimize" in task
     assert 'if [ -L "\\$env_path" ]' in task
     assert 'chmod 0600 "\\$env_path"' in task
+
+
+def test_laravel_runtime_reconciliation_is_atomic_and_process_aware() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    reconciler = recipe.split("function laravel_environment_reconcile_script", 1)[1].split(
+        "function configured_workers", 1
+    )[0]
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
+        0
+    ]
+
+    assert "tempfile.mkstemp" in reconciler
+    assert "os.fsync" in reconciler
+    assert "os.replace" in reconciler
+    assert "path.is_symlink()" in reconciler
+    assert "process.units_changed=yes" in task
+    assert "invoke('gimme:restart:workers')" in task
+
+
+def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "APP_KEY=secret-value\nAPP_ENV=production\nAPP_DEBUG=false\n"
+        "HORIZON_PREFIX=old:\nDB_PASSWORD=another-secret\n"
+    )
+    updates = base64.b64encode(
+        json.dumps(
+            {
+                "APP_ENV": "local",
+                "APP_DEBUG": "true",
+                "HORIZON_PREFIX": "gimme:example:preview:horizon:",
+            }
+        ).encode()
+    ).decode()
+
+    changed = subprocess.run(
+        ["python3", "-c", laravel_environment_reconciler(), str(env_path), updates],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    first_inode = env_path.stat().st_ino
+    unchanged = subprocess.run(
+        ["python3", "-c", laravel_environment_reconciler(), str(env_path), updates],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    content = env_path.read_text()
+    assert changed.stdout.strip() == "GIMME_RUNTIME_CHANGED|yes"
+    assert unchanged.stdout.strip() == "GIMME_RUNTIME_CHANGED|no"
+    assert env_path.stat().st_ino == first_inode
+    assert env_path.stat().st_mode & 0o777 == 0o600
+    assert "APP_KEY=secret-value" in content
+    assert "DB_PASSWORD=another-secret" in content
+    assert "APP_ENV=local" in content
+    assert "APP_DEBUG=true" in content
+    assert "secret-value" not in changed.stdout
+
+
+def test_laravel_runtime_reconciler_rejects_symlinks(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_text("APP_ENV=production\n")
+    env_path = tmp_path / ".env"
+    env_path.symlink_to(target)
+    updates = base64.b64encode(b'{"APP_ENV":"local","APP_DEBUG":"false"}').decode()
+
+    result = subprocess.run(
+        ["python3", "-c", laravel_environment_reconciler(), str(env_path), updates],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "non-regular environment file" in result.stderr
+    assert target.read_text() == "APP_ENV=production\n"
 
 
 def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> None:
@@ -173,15 +258,15 @@ def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> N
         "function stack_state_write_command", 1
     )[0]
 
-    assert 'hash(\'sha256\', "{$name}\\0{$environment}")' in configured_sites
+    assert "hash('sha256', \"{$name}\\0{$environment}\")" in configured_sites
     assert '"{$name}--{$environment}--"' in configured_sites
 
 
 def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:provision:app'", 1)[1].split(
-        "task('gimme:service:status'", 1
-    )[0]
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[
+        0
+    ]
 
     assert "setfacl -m u:www-data:x" in task
     assert "install -d -m 0700" in task
@@ -213,9 +298,9 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
 
 def test_environment_removal_is_bounded_to_non_default_environment_root() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:remove:environment'", 1)[1].split(
-        "if ($health === null)", 1
-    )[0]
+    task = recipe.split("task('gimme:remove:environment'", 1)[1].split("if ($health === null)", 1)[
+        0
+    ]
 
     assert "$environmentName === 'default'" in task
     assert '"{$appsRoot}/{$app}/environments/{$environmentName}"' in task
@@ -237,9 +322,7 @@ def test_frontend_build_runs_after_composer_dependencies() -> None:
 
 def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:artisan'", 1)[1].split(
-        "task('gimme:service:status'", 1
-    )[0]
+    task = recipe.split("task('gimme:artisan'", 1)[1].split("task('gimme:service:status'", 1)[0]
 
     assert "Application context is required" in task
     assert "Laravel application" in task

@@ -80,6 +80,18 @@ EnvironmentName = Annotated[
         description="Registered environment slug from list_environments.",
     ),
 ]
+LaravelAppEnvironment = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z][a-z0-9_-]{0,31}$",
+        description=(
+            "Explicit Laravel APP_ENV value for this deployment environment; never "
+            "inferred from its Git branch."
+        ),
+    ),
+]
 ArtisanCommand = Annotated[
     str,
     Field(
@@ -161,9 +173,7 @@ def resolved_deployment_plan(
         line = raw_line.split("] ", 1)[-1].strip()
         if line.startswith("GIMME_REVISION|"):
             revision = line.split("|", 1)[1]
-    if len(revision) not in {40, 64} or any(
-        char not in "0123456789abcdef" for char in revision
-    ):
+    if len(revision) not in {40, 64} or any(char not in "0123456789abcdef" for char in revision):
         raise RuntimeError("remote branch resolution did not return a valid Git revision")
     definition = deployment_plan(server, name, app, environment, revision=revision)
     rendered = runner.run(
@@ -176,9 +186,7 @@ def resolved_deployment_plan(
         arguments=("--plan",),
         timeout=60,
     )
-    resolved = {
-        key: value for key, value in definition.items() if key != "plan_id"
-    }
+    resolved = {key: value for key, value in definition.items() if key != "plan_id"}
     resolved["deployer_plan"] = rendered.output
     return {"plan_id": compute_plan_id(resolved), **resolved}
 
@@ -186,10 +194,10 @@ def resolved_deployment_plan(
 def proposed_app_registration(
     name: str,
     repository: str,
-    framework: Literal[
-        "common", "laravel", "symfony", "wordpress", "static"
-    ] = "common",
+    app_env: str,
+    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
     branch: str = "main",
+    app_debug: bool = False,
     frontend: FrontendBuildConfig | None = None,
     artisan: ArtisanConfig | None = None,
     workers: WorkerRegistration = None,
@@ -200,6 +208,8 @@ def proposed_app_registration(
         repository=repository,
         framework=framework,
         branch=branch,
+        app_env=app_env,
+        app_debug=app_debug,
         frontend=frontend,
         artisan=artisan,
         workers=workers,
@@ -229,6 +239,8 @@ def proposed_environment_registration(
     app: AppConfig,
     environment: str,
     branch: str,
+    app_env: str,
+    app_debug: bool = False,
     workers: WorkerRegistration = None,
     scheduler: SchedulerRegistration = None,
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
@@ -236,13 +248,13 @@ def proposed_environment_registration(
     environments = dict(app.environments)
     environments[environment] = EnvironmentConfig(
         branch=branch,
+        app_env=app_env,
+        app_debug=app_debug,
         workers=workers,
         scheduler=scheduler,
         health=health,
     )
-    return AppConfig.model_validate(
-        {**app.model_dump(mode="python"), "environments": environments}
-    )
+    return AppConfig.model_validate({**app.model_dump(mode="python"), "environments": environments})
 
 
 @mcp.resource(
@@ -250,8 +262,7 @@ def proposed_environment_registration(
     name="server_manifest",
     title="Server manifest",
     description=(
-        "Validated desired server identity, bootstrap endpoint, SSH user, and "
-        "application root."
+        "Validated desired server identity, bootstrap endpoint, SSH user, and application root."
     ),
     mime_type="application/json",
 )
@@ -285,9 +296,7 @@ def application_registry() -> dict[str, object]:
     "gimme://apps/{name}",
     name="application_detail",
     title="Application detail",
-    description=(
-        "Registration, deployment path, and HTTPS URL for one registered application."
-    ),
+    description=("Registration, deployment path, and HTTPS URL for one registered application."),
     mime_type="application/json",
 )
 def application_detail(name: str) -> dict[str, object]:
@@ -375,9 +384,7 @@ def application_environment_detail(name: str, environment: str) -> dict[str, obj
     description="Read-only Deployer release history for one environment.",
     mime_type="application/json",
 )
-def application_environment_releases(
-    name: str, environment: str
-) -> dict[str, object]:
+def application_environment_releases(name: str, environment: str) -> dict[str, object]:
     server = store.server()
     app = store.app(name)
     app.environment(environment)
@@ -394,9 +401,7 @@ def application_environment_releases(
 def resolved_stack_plan() -> dict[str, object]:
     server = store.server()
     stack = store.stack()
-    result = runner.run(
-        "gimme:preflight:stack", server, stack=stack, timeout=60, bootstrap=True
-    )
+    result = runner.run("gimme:preflight:stack", server, stack=stack, timeout=60, bootstrap=True)
     resolution: dict[str, dict[str, str]] = {}
     package_manager_processes: list[int] = []
     privileged_helper = "unknown"
@@ -434,9 +439,7 @@ def resolved_app_process_plan(name: str) -> dict[str, object]:
     return resolved_environment_process_plan(name, "default")
 
 
-def resolved_environment_process_plan(
-    name: str, environment: str
-) -> dict[str, object]:
+def resolved_environment_process_plan(name: str, environment: str) -> dict[str, object]:
     server = store.server()
     stack = store.stack()
     app = store.app(name)
@@ -485,9 +488,7 @@ def resolved_environment_process_plan(
     annotations=titled(READ_ONLY, "Inspect host"),
 )
 def inspect_host() -> dict[str, object]:
-    return runner.run(
-        "gimme:inspect", store.server(), stack=store.stack(), timeout=30
-    ).as_dict()
+    return runner.run("gimme:inspect", store.server(), stack=store.stack(), timeout=30).as_dict()
 
 
 @mcp.tool(
@@ -531,9 +532,7 @@ def provision_stack(plan_id: str) -> dict[str, object]:
             "privileged helper is not bootstrapped; run the documented one-time "
             "GIMME_INTERACTIVE_SUDO=1 stack provisioning command"
         )
-    return runner.run(
-        "gimme:provision:stack", server, stack=stack, bootstrap=True
-    ).as_dict()
+    return runner.run("gimme:provision:stack", server, stack=stack, bootstrap=True).as_dict()
 
 
 @mcp.tool(
@@ -572,6 +571,7 @@ def list_environments(name: ApplicationName) -> dict[str, object]:
 @mcp.tool(
     description=(
         "Register or update one non-default branch environment for an existing application. "
+        "app_env is explicit and is never inferred from the branch; app_debug defaults false. "
         "The environment has isolated resources and no workers or scheduler unless explicitly "
         "configured. Changes only the local registry."
     ),
@@ -587,12 +587,16 @@ def register_environment(
     name: ApplicationName,
     environment: EnvironmentName,
     branch: str,
+    app_env: LaravelAppEnvironment,
+    app_debug: bool = False,
     workers: WorkerRegistration = None,
     scheduler: SchedulerRegistration = None,
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
 ) -> dict[str, object]:
     definition = EnvironmentConfig(
         branch=branch,
+        app_env=app_env,
+        app_debug=app_debug,
         workers=workers,
         scheduler=scheduler,
         health=health,
@@ -619,7 +623,8 @@ def register_environment(
 @mcp.tool(
     description=(
         "Return an exact, read-only plan for changing an existing non-default "
-        "environment's branch or policies while reusing its isolated resources."
+        "environment's branch or policies, including its explicit Laravel runtime mode, "
+        "while reusing its isolated resources."
     ),
     annotations=titled(READ_ONLY, "Plan environment registration update"),
 )
@@ -627,6 +632,8 @@ def plan_update_environment(
     name: ApplicationName,
     environment: EnvironmentName,
     branch: str,
+    app_env: LaravelAppEnvironment,
+    app_debug: bool = False,
     workers: WorkerRegistration = None,
     scheduler: SchedulerRegistration = None,
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
@@ -636,13 +643,11 @@ def plan_update_environment(
     app = store.app(name)
     app.environment(environment)
     proposed = proposed_environment_registration(
-        app, environment, branch, workers, scheduler, health
+        app, environment, branch, app_env, app_debug, workers, scheduler, health
     )
     if proposed == app:
         raise ValueError("environment registration already matches the proposal")
-    return environment_update_plan(
-        store.server(), name, environment, app, proposed
-    )
+    return environment_update_plan(store.server(), name, environment, app, proposed)
 
 
 @mcp.tool(
@@ -663,7 +668,9 @@ def update_environment(
     name: ApplicationName,
     environment: EnvironmentName,
     branch: str,
+    app_env: LaravelAppEnvironment,
     plan_id: PlanIdentifier,
+    app_debug: bool = False,
     workers: WorkerRegistration = None,
     scheduler: SchedulerRegistration = None,
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
@@ -673,15 +680,11 @@ def update_environment(
     app = store.app(name)
     app.environment(environment)
     proposed = proposed_environment_registration(
-        app, environment, branch, workers, scheduler, health
+        app, environment, branch, app_env, app_debug, workers, scheduler, health
     )
-    expected = environment_update_plan(
-        store.server(), name, environment, app, proposed
-    )
+    expected = environment_update_plan(store.server(), name, environment, app, proposed)
     if plan_id != expected["plan_id"]:
-        raise ValueError(
-            "plan_id is invalid or stale; call plan_update_environment again"
-        )
+        raise ValueError("plan_id is invalid or stale; call plan_update_environment again")
     store.register_app(name, proposed)
     return {
         "application": name,
@@ -739,9 +742,7 @@ def configure_environment_health(
 def plan_remove_environment(
     name: ApplicationName, environment: EnvironmentName
 ) -> dict[str, object]:
-    return environment_removal_plan(
-        store.server(), name, store.app(name), environment
-    )
+    return environment_removal_plan(store.server(), name, store.app(name), environment)
 
 
 @mcp.tool(
@@ -767,16 +768,12 @@ def remove_environment(
     if environment == "default":
         raise ValueError("the default environment cannot be removed")
     if confirmation != f"REMOVE {name}/{environment}":
-        raise ValueError(
-            f"confirmation must exactly equal 'REMOVE {name}/{environment}'"
-        )
+        raise ValueError(f"confirmation must exactly equal 'REMOVE {name}/{environment}'")
     server = store.server()
     app = store.app(name)
     expected = environment_removal_plan(server, name, app, environment)
     if plan_id != expected["plan_id"]:
-        raise ValueError(
-            "plan_id is invalid or stale; call plan_remove_environment again"
-        )
+        raise ValueError("plan_id is invalid or stale; call plan_remove_environment again")
     runner.run(
         "gimme:reconcile:sites",
         server,
@@ -802,7 +799,9 @@ def remove_environment(
         "an identical registration. Existing definitions must use plan_update_app and "
         "update_app. "
         "Laravel definitions may override the default Artisan command allowlist and declare "
-        "process and deployment-health policies. Changes only the local registry; it does "
+        "an explicit app_env and app_debug policy; these are never inferred from the branch. "
+        "Definitions may also declare process and deployment-health policies. Changes only "
+        "the local registry; it does "
         "not connect to or modify the host."
     ),
     annotations=ToolAnnotations(
@@ -816,10 +815,10 @@ def remove_environment(
 def register_app(
     name: str,
     repository: str,
-    framework: Literal[
-        "common", "laravel", "symfony", "wordpress", "static"
-    ] = "common",
+    app_env: LaravelAppEnvironment,
+    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
     branch: str = "main",
+    app_debug: bool = False,
     frontend: FrontendBuildConfig | None = None,
     artisan: ArtisanConfig | None = None,
     workers: WorkerRegistration = None,
@@ -829,8 +828,10 @@ def register_app(
     app = proposed_app_registration(
         name,
         repository,
+        app_env,
         framework,
         branch,
+        app_debug,
         frontend,
         artisan,
         workers,
@@ -853,17 +854,18 @@ def register_app(
 @mcp.tool(
     description=(
         "Return an exact, read-only plan for replacing an existing application's local "
-        "registration. Additional environment registrations are preserved."
+        "registration, including its explicit Laravel runtime mode. Additional environment "
+        "registrations are preserved."
     ),
     annotations=titled(READ_ONLY, "Plan application registration update"),
 )
 def plan_update_app(
     name: ApplicationName,
     repository: str,
-    framework: Literal[
-        "common", "laravel", "symfony", "wordpress", "static"
-    ] = "common",
+    app_env: LaravelAppEnvironment,
+    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
     branch: str = "main",
+    app_debug: bool = False,
     frontend: FrontendBuildConfig | None = None,
     artisan: ArtisanConfig | None = None,
     workers: WorkerRegistration = None,
@@ -874,8 +876,10 @@ def plan_update_app(
     proposed = proposed_app_registration(
         name,
         repository,
+        app_env,
         framework,
         branch,
+        app_debug,
         frontend,
         artisan,
         workers,
@@ -903,11 +907,11 @@ def plan_update_app(
 def update_app(
     name: ApplicationName,
     repository: str,
+    app_env: LaravelAppEnvironment,
     plan_id: PlanIdentifier,
-    framework: Literal[
-        "common", "laravel", "symfony", "wordpress", "static"
-    ] = "common",
+    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
     branch: str = "main",
+    app_debug: bool = False,
     frontend: FrontendBuildConfig | None = None,
     artisan: ArtisanConfig | None = None,
     workers: WorkerRegistration = None,
@@ -918,8 +922,10 @@ def update_app(
     proposed = proposed_app_registration(
         name,
         repository,
+        app_env,
         framework,
         branch,
+        app_debug,
         frontend,
         artisan,
         workers,
@@ -958,22 +964,16 @@ def configure_app_processes(
     scheduler: SchedulerRegistration = None,
     environment: EnvironmentName = "default",
 ) -> dict[str, object]:
-    changed = store.configure_environment_processes(
-        name, environment, workers, scheduler
-    )
+    changed = store.configure_environment_processes(name, environment, workers, scheduler)
     app = store.app(name)
     definition = app.environment(environment)
     return {
         "application": name,
         "environment": environment,
         "changed": changed,
-        "workers": (
-            definition.workers.model_dump() if definition.workers is not None else None
-        ),
+        "workers": (definition.workers.model_dump() if definition.workers is not None else None),
         "scheduler": (
-            definition.scheduler.model_dump()
-            if definition.scheduler is not None
-            else None
+            definition.scheduler.model_dump() if definition.scheduler is not None else None
         ),
     }
 
@@ -1149,9 +1149,7 @@ def rollback_app(
     environment: EnvironmentName = "default",
 ) -> dict[str, object]:
     expected_confirmation = (
-        f"ROLLBACK {name}"
-        if environment == "default"
-        else f"ROLLBACK {name}/{environment}"
+        f"ROLLBACK {name}" if environment == "default" else f"ROLLBACK {name}/{environment}"
     )
     if confirmation != expected_confirmation:
         raise ValueError(f"confirmation must exactly equal '{expected_confirmation}'")
@@ -1205,9 +1203,7 @@ def run_artisan(
     server = store.server()
     app = store.app(name)
     normalized_arguments = arguments or []
-    expected = artisan_command_plan(
-        server, name, app, command, normalized_arguments, environment
-    )
+    expected = artisan_command_plan(server, name, app, command, normalized_arguments, environment)
     if plan_id != expected["plan_id"]:
         raise ValueError("plan_id is invalid or stale; call plan_artisan again")
     if app.artisan is None:

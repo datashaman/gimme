@@ -58,9 +58,7 @@ def test_stack_plan_reports_mcp_privilege_readiness() -> None:
     stack = StackConfig(package_manager="apt", packages=["caddy"], services=["caddy"])
     resolution = {"caddy": {"installed": "2.6.2", "candidate": "2.6.2"}}
 
-    before = stack_plan(
-        server(), stack, resolution, privileged_helper="bootstrap_required"
-    )
+    before = stack_plan(server(), stack, resolution, privileged_helper="bootstrap_required")
     after = stack_plan(server(), stack, resolution, privileged_helper="ready")
 
     assert before["ready"] is True
@@ -112,9 +110,7 @@ def test_stack_plan_includes_each_registered_environment_site() -> None:
 
     assert plan["sites"]["example-app/feature-x"] == {
         "url": "https://feature-x.example-app.devbox.local",
-        "document_root": (
-            "/srv/gimme/apps/example-app/environments/feature-x/current/public"
-        ),
+        "document_root": ("/srv/gimme/apps/example-app/environments/feature-x/current/public"),
         "tls": "caddy-local-ca",
     }
 
@@ -172,7 +168,9 @@ def test_additional_environment_has_isolated_paths_url_database_and_cache() -> N
         framework="laravel",
         environments={
             "default": EnvironmentConfig(branch="main"),
-            "feature-x": EnvironmentConfig(branch="feature/worktrees"),
+            "feature-x": EnvironmentConfig(
+                branch="feature/worktrees", app_env="local", app_debug=True
+            ),
         },
     )
 
@@ -183,10 +181,33 @@ def test_additional_environment_has_isolated_paths_url_database_and_cache() -> N
     assert plan["database"] == "gimme_my_app_feature_x_a98b6c775d"
     assert plan["database_role"] == "gimme_my_app_feature_x_a98b6c775d"
     assert plan["cache"]["prefix"] == "gimme:my-app:feature-x:"
-    assert plan["environment_file"] == (
-        "/srv/gimme/apps/my-app/environments/feature-x/shared/.env"
-    )
+    assert plan["environment_file"] == ("/srv/gimme/apps/my-app/environments/feature-x/shared/.env")
     assert plan["site_url"] == "https://feature-x.my-app.devbox.local"
+    assert plan["runtime"] == {
+        "app_env": "local",
+        "app_debug": True,
+        "warning": ("APP_DEBUG=true can expose sensitive diagnostics to the local network"),
+    }
+
+
+def test_app_resource_plan_changes_with_runtime_policy() -> None:
+    production = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        environments={"default": EnvironmentConfig(app_env="production", app_debug=False)},
+    )
+    local = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        environments={"default": EnvironmentConfig(app_env="local", app_debug=True)},
+    )
+
+    production_plan = app_resource_plan(server(), "my-app", production)
+    local_plan = app_resource_plan(server(), "my-app", local)
+
+    assert production_plan["plan_id"] != local_plan["plan_id"]
+    assert production_plan["runtime"]["warning"] is None
+    assert local_plan["runtime"]["warning"].startswith("APP_DEBUG=true")
 
 
 def test_long_environment_database_identifiers_are_bounded_and_collision_safe() -> None:
@@ -210,12 +231,10 @@ def test_long_environment_database_identifiers_are_bounded_and_collision_safe() 
 
 
 def test_internal_environment_identifiers_cannot_alias_other_applications() -> None:
-    assert environment_instance("foo--bar", "baz") != environment_instance(
-        "foo", "bar--baz"
+    assert environment_instance("foo--bar", "baz") != environment_instance("foo", "bar--baz")
+    assert environment_database_identifier("foo-bar", "default") != environment_database_identifier(
+        "foo", "bar"
     )
-    assert environment_database_identifier(
-        "foo-bar", "default"
-    ) != environment_database_identifier("foo", "bar")
 
 
 def test_app_plan_changes_when_deployment_definition_changes() -> None:
@@ -292,16 +311,12 @@ def test_environment_deployment_plan_uses_branch_url_and_health_override() -> No
         },
     )
 
-    plan = deployment_plan(
-        server(), "my-app", app, "feature-x", revision="a" * 40
-    )
+    plan = deployment_plan(server(), "my-app", app, "feature-x", revision="a" * 40)
 
     assert plan["environment"] == "feature-x"
     assert plan["branch"] == "feature/x"
     assert plan["revision"] == "a" * 40
-    assert plan["deploy_path"] == (
-        "/srv/gimme/apps/my-app/environments/feature-x"
-    )
+    assert plan["deploy_path"] == ("/srv/gimme/apps/my-app/environments/feature-x")
     assert plan["site_url"] == "https://feature-x.my-app.devbox.local"
     assert plan["health"]["pre_activation"]["path"] == "/health"
     assert plan["health"]["post_activation"]["target"] == (
@@ -461,12 +476,6 @@ def test_environment_processes_use_isolated_units_and_working_directory() -> Non
         horizon="ready",
     )
 
-    assert plan["working_directory"] == (
-        "/srv/gimme/apps/my-app/environments/feature-x/current"
-    )
-    assert plan["worker"]["unit"] == (
-        "gimme-horizon-my-app--feature-x--a98b6c775d.service"
-    )
-    assert plan["scheduler"]["timer"] == (
-        "gimme-scheduler-my-app--feature-x--a98b6c775d.timer"
-    )
+    assert plan["working_directory"] == ("/srv/gimme/apps/my-app/environments/feature-x/current")
+    assert plan["worker"]["unit"] == ("gimme-horizon-my-app--feature-x--a98b6c775d.service")
+    assert plan["scheduler"]["timer"] == ("gimme-scheduler-my-app--feature-x--a98b6c775d.timer")

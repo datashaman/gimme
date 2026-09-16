@@ -89,6 +89,10 @@ async def test_tool_surface_and_annotations() -> None:
     register = next(tool for tool in tools if tool.name == "register_app")
     worker_schema = register.inputSchema["properties"]["workers"]
     assert "standard queue worker or Horizon" in worker_schema["description"]
+    assert "app_env" in register.inputSchema["required"]
+    assert register.inputSchema["properties"]["app_debug"]["default"] is False
+    register_environment_tool = next(tool for tool in tools if tool.name == "register_environment")
+    assert "app_env" in register_environment_tool.inputSchema["required"]
 
 
 async def test_register_and_list_isolated_environment(tmp_path, monkeypatch) -> None:
@@ -101,73 +105,72 @@ async def test_register_and_list_isolated_environment(tmp_path, monkeypatch) -> 
                 "name": "example-app",
                 "environment": "feature-x",
                 "branch": "feature/worktrees",
+                "app_env": "local",
             },
         )
-        listed = await client.call_tool(
-            "list_environments", {"name": "example-app"}
-        )
+        listed = await client.call_tool("list_environments", {"name": "example-app"})
 
-    assert registered.data["site_url"] == (
-        "https://feature-x.example-app.devbox.local"
-    )
-    assert registered.data["deploy_path"] == (
-        "/srv/gimme/apps/example-app/environments/feature-x"
-    )
+    assert registered.data["site_url"] == ("https://feature-x.example-app.devbox.local")
+    assert registered.data["deploy_path"] == ("/srv/gimme/apps/example-app/environments/feature-x")
     assert listed.data["environments"]["default"]["branch"] == "main"
-    assert listed.data["environments"]["feature-x"]["branch"] == (
-        "feature/worktrees"
-    )
+    assert listed.data["environments"]["feature-x"]["branch"] == ("feature/worktrees")
+    assert listed.data["environments"]["feature-x"]["app_env"] == "local"
+    assert listed.data["environments"]["feature-x"]["app_debug"] is False
     assert listed.data["environments"]["feature-x"]["workers"] is None
 
 
 def test_existing_environment_requires_reviewed_update(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
-    server_module.register_environment(
-        "example-app", "feature-x", "feature/first"
-    )
+    server_module.register_environment("example-app", "feature-x", "feature/first", "local")
 
     with pytest.raises(ValueError, match="plan_update_environment"):
-        server_module.register_environment(
-            "example-app", "feature-x", "feature/second"
-        )
+        server_module.register_environment("example-app", "feature-x", "feature/second", "local")
 
     plan = server_module.plan_update_environment(
-        "example-app", "feature-x", "feature/second"
+        "example-app", "feature-x", "feature/second", "preview", app_debug=True
     )
     result = server_module.update_environment(
-        "example-app", "feature-x", "feature/second", plan["plan_id"]
+        "example-app",
+        "feature-x",
+        "feature/second",
+        "preview",
+        plan["plan_id"],
+        app_debug=True,
     )
 
     assert result["changed"] is True
-    assert server_module.store.environment("example-app", "feature-x").branch == (
-        "feature/second"
-    )
+    assert server_module.store.environment("example-app", "feature-x").branch == ("feature/second")
+    assert plan["warnings"] == [
+        "APP_DEBUG=true can expose sensitive diagnostics to the local network "
+        "for environment feature-x"
+    ]
 
 
 def test_existing_app_requires_reviewed_update_and_preserves_environments(
     tmp_path, monkeypatch
 ) -> None:
     _use_test_store(tmp_path, monkeypatch)
-    server_module.register_environment(
-        "example-app", "feature-x", "feature/first"
-    )
+    server_module.register_environment("example-app", "feature-x", "feature/first", "local")
 
     with pytest.raises(ValueError, match="plan_update_app"):
         server_module.register_app(
             "example-app",
             "git@github.com:example/replacement.git",
+            "production",
             framework="laravel",
         )
 
     plan = server_module.plan_update_app(
         "example-app",
         "git@github.com:example/replacement.git",
+        "staging",
         framework="laravel",
         branch="stable",
     )
     result = server_module.update_app(
         "example-app",
         "git@github.com:example/replacement.git",
+        "staging",
         plan["plan_id"],
         framework="laravel",
         branch="stable",
@@ -185,6 +188,7 @@ def test_registration_updates_reject_stale_plans(tmp_path, monkeypatch) -> None:
     plan = server_module.plan_update_app(
         "example-app",
         "git@github.com:example/replacement.git",
+        "production",
         framework="laravel",
     )
     server_module.store.configure_app_health("example-app", HealthCheckConfig())
@@ -193,6 +197,7 @@ def test_registration_updates_reject_stale_plans(tmp_path, monkeypatch) -> None:
         server_module.update_app(
             "example-app",
             "git@github.com:example/replacement.git",
+            "production",
             plan["plan_id"],
             framework="laravel",
         )
@@ -202,9 +207,7 @@ def test_remove_environment_requires_exact_plan_and_unregisters_after_cleanup(
     tmp_path, monkeypatch
 ) -> None:
     _use_test_store(tmp_path, monkeypatch)
-    server_module.register_environment(
-        "example-app", "feature-x", "feature/worktrees"
-    )
+    server_module.register_environment("example-app", "feature-x", "feature/worktrees", "local")
     plan = server_module.plan_remove_environment("example-app", "feature-x")
     calls: list[tuple[str, dict[str, object]]] = []
 
@@ -226,16 +229,12 @@ def test_remove_environment_requires_exact_plan_and_unregisters_after_cleanup(
         "gimme:reconcile:sites",
         "gimme:remove:environment",
     ]
-    assert calls[0][1]["exclude_instance"] == (
-        "example-app--feature-x--ef4c19f581"
-    )
+    assert calls[0][1]["exclude_instance"] == ("example-app--feature-x--ef4c19f581")
 
 
-def test_environment_resource_apply_reconciles_route_before_database(
-    tmp_path, monkeypatch
-) -> None:
+def test_environment_resource_apply_reconciles_route_before_database(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
-    server_module.register_environment("example-app", "feature-x", "feature/x")
+    server_module.register_environment("example-app", "feature-x", "feature/x", "local")
     plan = server_module.plan_app_resources("example-app", "feature-x")
     calls: list[tuple[str, dict[str, object]]] = []
 
@@ -244,9 +243,7 @@ def test_environment_resource_apply_reconciles_route_before_database(
         return CommandResult(["dep", task, "devbox"], 0, "ok")
 
     monkeypatch.setattr("gimme.server.runner.run", fake_run)
-    server_module.provision_app_resources(
-        "example-app", plan["plan_id"], "feature-x"
-    )
+    server_module.provision_app_resources("example-app", plan["plan_id"], "feature-x")
 
     assert [task for task, _kwargs in calls] == [
         "gimme:reconcile:sites",
@@ -368,6 +365,7 @@ async def test_static_resource_catalog_and_contents(tmp_path, monkeypatch) -> No
 
 async def test_application_resource_templates(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
+
     def fake_run(*args, **kwargs) -> CommandResult:
         return CommandResult(["dep", "releases", "devbox"], 0, "release 8 (current)")
 
@@ -376,15 +374,11 @@ async def test_application_resource_templates(tmp_path, monkeypatch) -> None:
     async with Client(mcp) as client:
         templates = await client.list_resource_templates()
         app_contents = await client.read_resource("gimme://apps/example-app")
-        environments_contents = await client.read_resource(
-            "gimme://apps/example-app/environments"
-        )
+        environments_contents = await client.read_resource("gimme://apps/example-app/environments")
         environment_contents = await client.read_resource(
             "gimme://apps/example-app/environments/default"
         )
-        release_contents = await client.read_resource(
-            "gimme://apps/example-app/releases"
-        )
+        release_contents = await client.read_resource("gimme://apps/example-app/releases")
 
     assert {template.uriTemplate for template in templates} == {
         "gimme://apps/{name}",
@@ -422,9 +416,7 @@ def test_artisan_tools_require_an_exact_plan_and_pass_structured_context(
 
     monkeypatch.setattr("gimme.server.runner.run", fake_run)
 
-    result = server_module.run_artisan(
-        "example-app", "migrate", plan["plan_id"], ["--force"]
-    )
+    result = server_module.run_artisan("example-app", "migrate", plan["plan_id"], ["--force"])
 
     assert result["output"] == "Migrated"
     assert captured["args"][0] == "gimme:artisan"
@@ -448,9 +440,7 @@ def test_deploy_plan_includes_both_health_gates(tmp_path, monkeypatch) -> None:
 
     def fake_run(task, *args, **kwargs) -> CommandResult:
         output = (
-            "GIMME_REVISION|" + "a" * 40
-            if task == "gimme:resolve-revision"
-            else "deployment tasks"
+            "GIMME_REVISION|" + "a" * 40 if task == "gimme:resolve-revision" else "deployment tasks"
         )
         return CommandResult(["dep", task, "devbox"], 0, output)
 
@@ -459,12 +449,8 @@ def test_deploy_plan_includes_both_health_gates(tmp_path, monkeypatch) -> None:
     plan = server_module.plan_deploy("example-app")
 
     assert plan["kind"] == "application_deploy"
-    assert plan["health"]["pre_activation"]["failure"] == (
-        "prevent_symlink_switch"
-    )
-    assert plan["health"]["post_activation"]["failure"] == (
-        "rollback_previous_release"
-    )
+    assert plan["health"]["pre_activation"]["failure"] == ("prevent_symlink_switch")
+    assert plan["health"]["post_activation"]["failure"] == ("rollback_previous_release")
     assert plan["deployer_plan"] == "deployment tasks"
 
 
@@ -493,9 +479,7 @@ def test_deploy_rejects_plan_after_health_policy_changes(tmp_path, monkeypatch) 
     ]
 
 
-def test_deploy_rejects_plan_when_deployer_task_graph_changes(
-    tmp_path, monkeypatch
-) -> None:
+def test_deploy_rejects_plan_when_deployer_task_graph_changes(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
     rendered_plans = iter(["candidate -> symlink -> live", "symlink -> live"])
     calls: list[tuple[str, tuple[str, ...]]] = []
@@ -504,13 +488,9 @@ def test_deploy_rejects_plan_when_deployer_task_graph_changes(
         arguments = tuple(kwargs.get("arguments", ()))
         calls.append((task, arguments))
         if task == "gimme:resolve-revision":
-            return CommandResult(
-                ["dep", task, "devbox"], 0, "GIMME_REVISION|" + "a" * 40
-            )
+            return CommandResult(["dep", task, "devbox"], 0, "GIMME_REVISION|" + "a" * 40)
         if arguments == ("--plan",):
-            return CommandResult(
-                ["dep", task, "devbox", "--plan"], 0, next(rendered_plans)
-            )
+            return CommandResult(["dep", task, "devbox", "--plan"], 0, next(rendered_plans))
         return CommandResult(["dep", task, "devbox"], 0, "deployed")
 
     monkeypatch.setattr("gimme.server.runner.run", fake_run)
@@ -536,9 +516,7 @@ def test_deploy_rejects_plan_when_remote_branch_moves(tmp_path, monkeypatch) -> 
     def fake_run(task, *args, **kwargs) -> CommandResult:
         calls.append(task)
         if task == "gimme:resolve-revision":
-            return CommandResult(
-                ["dep", task, "devbox"], 0, f"GIMME_REVISION|{next(revisions)}"
-            )
+            return CommandResult(["dep", task, "devbox"], 0, f"GIMME_REVISION|{next(revisions)}")
         if kwargs.get("arguments") == ("--plan",):
             return CommandResult(["dep", task, "devbox"], 0, "same graph")
         raise AssertionError("stale revision must prevent deployment")
@@ -561,7 +539,7 @@ def test_environment_deploy_uses_exact_revision_and_environment_context(
     tmp_path, monkeypatch
 ) -> None:
     _use_test_store(tmp_path, monkeypatch)
-    server_module.register_environment("example-app", "feature-x", "feature/x")
+    server_module.register_environment("example-app", "feature-x", "feature/x", "local")
     calls: list[tuple[str, dict[str, object]]] = []
 
     def fake_run(task, *args, **kwargs) -> CommandResult:
@@ -576,9 +554,7 @@ def test_environment_deploy_uses_exact_revision_and_environment_context(
 
     monkeypatch.setattr("gimme.server.runner.run", fake_run)
     plan = server_module.plan_deploy("example-app", "feature-x")
-    result = server_module.deploy_app(
-        "example-app", plan["plan_id"], "feature-x"
-    )
+    result = server_module.deploy_app("example-app", plan["plan_id"], "feature-x")
 
     assert result["output"] == "deployed"
     deploy_call = calls[-1]
@@ -587,9 +563,7 @@ def test_environment_deploy_uses_exact_revision_and_environment_context(
     assert deploy_call[1]["revision"] == "c" * 40
 
 
-def test_run_artisan_rejects_stale_plan_before_remote_execution(
-    tmp_path, monkeypatch
-) -> None:
+def test_run_artisan_rejects_stale_plan_before_remote_execution(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
 
     def unexpected_run(*args, **kwargs) -> CommandResult:
@@ -601,9 +575,7 @@ def test_run_artisan_rejects_stale_plan_before_remote_execution(
         server_module.run_artisan("example-app", "about", "plan_invented", [])
 
 
-def test_horizon_process_plan_and_apply_use_preflight_and_exact_plan(
-    tmp_path, monkeypatch
-) -> None:
+def test_horizon_process_plan_and_apply_use_preflight_and_exact_plan(tmp_path, monkeypatch) -> None:
     _use_test_store(tmp_path, monkeypatch)
     _write_json(
         tmp_path / "config" / "apps.json",

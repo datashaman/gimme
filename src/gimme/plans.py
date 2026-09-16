@@ -7,16 +7,12 @@ from typing import Any
 from gimme.config import AppConfig, ArtisanInvocation, ServerConfig, StackConfig
 
 
-def environment_deploy_path(
-    server: ServerConfig, name: str, environment: str = "default"
-) -> str:
+def environment_deploy_path(server: ServerConfig, name: str, environment: str = "default") -> str:
     base = f"{server.apps_root}/{name}"
     return base if environment == "default" else f"{base}/environments/{environment}"
 
 
-def environment_site_url(
-    server: ServerConfig, name: str, environment: str = "default"
-) -> str:
+def environment_site_url(server: ServerConfig, name: str, environment: str = "default") -> str:
     prefix = name if environment == "default" else f"{environment}.{name}"
     return f"https://{prefix}.{server.mdns_name}.local"
 
@@ -52,6 +48,14 @@ def application_update_plan(
         "current": current.model_dump(mode="json"),
         "proposed": proposed.model_dump(mode="json"),
         "affected_environments": sorted(current.environments),
+        "warnings": (
+            [
+                "APP_DEBUG=true can expose sensitive diagnostics to the local network "
+                "for the default environment"
+            ]
+            if proposed.environment("default").app_debug
+            else []
+        ),
         "effects": [
             "replace the local application registration only",
             "use the proposed repository and default-environment branch in future plans",
@@ -78,6 +82,14 @@ def environment_update_plan(
         "environment": environment,
         "current": current.environment(environment).model_dump(mode="json"),
         "proposed": proposed.environment(environment).model_dump(mode="json"),
+        "warnings": (
+            [
+                "APP_DEBUG=true can expose sensitive diagnostics to the local network "
+                f"for environment {environment}"
+            ]
+            if proposed.environment(environment).app_debug
+            else []
+        ),
         "effects": [
             "replace the local environment registration only",
             "use the proposed branch and policies in future plans",
@@ -139,9 +151,7 @@ def stack_plan(
         "package_manager_processes": package_manager_processes,
         "privileged_helper": privileged_helper,
         "mcp_apply_ready": (
-            unavailable == []
-            and package_manager_processes == []
-            and privileged_helper == "ready"
+            unavailable == [] and package_manager_processes == [] and privileged_helper == "ready"
         ),
         "effects": [
             "update APT package indexes",
@@ -179,18 +189,25 @@ def app_resource_plan(
             "engine": "valkey",
             "endpoint": "127.0.0.1:6379",
             "prefix": (
-                f"gimme:{name}:"
-                if environment == "default"
-                else f"gimme:{name}:{environment}:"
+                f"gimme:{name}:" if environment == "default" else f"gimme:{name}:{environment}:"
             ),
             "isolation": "namespace only",
         },
-        "environment_file": None
-        if is_static
-        else f"{deploy_path}/shared/.env",
+        "environment_file": None if is_static else f"{deploy_path}/shared/.env",
         "repository": app.repository,
         "framework": app.framework,
         "branch": definition.branch,
+        "runtime": None
+        if app.framework != "laravel"
+        else {
+            "app_env": definition.app_env,
+            "app_debug": definition.app_debug,
+            "warning": (
+                "APP_DEBUG=true can expose sensitive diagnostics to the local network"
+                if definition.app_debug
+                else None
+            ),
+        },
         "frontend": app.frontend.model_dump() if app.frontend is not None else None,
         "site_url": environment_site_url(server, name, environment),
         "effects": [
@@ -202,6 +219,16 @@ def app_resource_plan(
                     "create the isolated PostgreSQL database and role",
                     "write the protected shared environment file",
                     "assign an isolated Valkey key prefix",
+                    *(
+                        [
+                            "atomically reconcile the declared Laravel APP_ENV and "
+                            "APP_DEBUG values",
+                            "refresh cached Laravel configuration and gracefully refresh "
+                            "managed processes when runtime values change",
+                        ]
+                        if app.framework == "laravel"
+                        else []
+                    ),
                 ]
             ),
         ],
@@ -254,9 +281,7 @@ def deployment_plan(
         "deploy_path": deploy_path,
         "framework": app.framework,
         "frontend": app.frontend.model_dump() if app.frontend is not None else None,
-        "workers": (
-            definition.workers.model_dump() if definition.workers is not None else None
-        ),
+        "workers": (definition.workers.model_dump() if definition.workers is not None else None),
         "site_url": site_url,
         "health": health,
         "effects": [
@@ -288,9 +313,7 @@ def environment_removal_plan(
         "deploy_path": environment_deploy_path(server, name, environment),
         "database": None if app.framework == "static" else identifier,
         "database_role": None if app.framework == "static" else identifier,
-        "cache_prefix": (
-            None if app.framework == "static" else f"gimme:{name}:{environment}:"
-        ),
+        "cache_prefix": (None if app.framework == "static" else f"gimme:{name}:{environment}:"),
         "effects": [
             "remove the environment Caddy route and Avahi publisher",
             "stop and remove environment worker and scheduler units",
@@ -322,8 +345,7 @@ def artisan_command_plan(
     invocation = ArtisanInvocation(command=command, arguments=arguments or [])
     if invocation.command not in app.artisan.allowed_commands:
         raise ValueError(
-            f"Artisan command '{invocation.command}' is not allowlisted for application "
-            f"'{name}'"
+            f"Artisan command '{invocation.command}' is not allowlisted for application '{name}'"
         )
     app.environment(environment)
     working_directory = f"{environment_deploy_path(server, name, environment)}/current"

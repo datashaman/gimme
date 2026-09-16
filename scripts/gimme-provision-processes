@@ -269,7 +269,6 @@ def service_header(description: str, account: pwd.struct_passwd, current: Path) 
         f"User={account.pw_name}\n"
         f"Group={group_name}\n"
         f"WorkingDirectory={unit_path(current)}\n"
-        "Environment=APP_ENV=production\n"
     )
 
 
@@ -491,6 +490,8 @@ def reconcile() -> None:
             ["systemctl", "is-active", "--quiet", scheduler_timer.name]
         ):
             run(["systemctl", "restart", scheduler_timer.name])
+
+    print("process.units_changed=" + ("yes" if changed else "no"))
 
 
 if __name__ == "__main__":

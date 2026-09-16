@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+
 # Deployer is invoked through a fixed argv vector and never through a shell.
 import subprocess  # nosec B404
 import sys
@@ -129,9 +130,7 @@ class DeployerRunner:
             *arguments,
         ]
         environment = {
-            name: os.environ[name]
-            for name in PASSTHROUGH_ENVIRONMENT
-            if name in os.environ
+            name: os.environ[name] for name in PASSTHROUGH_ENVIRONMENT if name in os.environ
         }
         environment.setdefault("PATH", os.defpath)
         preferred_agent = _preferred_ssh_auth_sock(environment.get("SSH_AUTH_SOCK"))
@@ -142,9 +141,7 @@ class DeployerRunner:
                 "GIMME_HOSTNAME": server.hostname,
                 "GIMME_HOST_ALIAS": server.host_alias,
                 "GIMME_BOOTSTRAP_HOSTNAME": server.bootstrap_hostname,
-                "GIMME_SSH_HOSTNAME": (
-                    server.bootstrap_hostname if bootstrap else server.hostname
-                ),
+                "GIMME_SSH_HOSTNAME": (server.bootstrap_hostname if bootstrap else server.hostname),
                 "GIMME_MDNS_NAME": server.mdns_name,
                 "GIMME_REMOTE_USER": server.remote_user,
                 "GIMME_APPS_ROOT": server.apps_root,
@@ -184,10 +181,10 @@ class DeployerRunner:
                     "GIMME_REPOSITORY": app.repository,
                     "GIMME_FRAMEWORK": app.framework,
                     "GIMME_BRANCH": definition.branch,
+                    "GIMME_APP_ENV": definition.app_env,
+                    "GIMME_APP_DEBUG": "true" if definition.app_debug else "false",
                     "GIMME_WORKERS_JSON": json.dumps(
-                        definition.workers.model_dump()
-                        if definition.workers is not None
-                        else None
+                        definition.workers.model_dump() if definition.workers is not None else None
                     ),
                     "GIMME_SCHEDULER_JSON": json.dumps(
                         definition.scheduler.model_dump()
@@ -225,9 +222,7 @@ class DeployerRunner:
                 {
                     "GIMME_ARTISAN_COMMAND": artisan_command,
                     "GIMME_ARTISAN_ARGS_JSON": json.dumps(list(artisan_arguments or [])),
-                    "GIMME_ARTISAN_ALLOWED_JSON": json.dumps(
-                        list(artisan_allowed_commands or [])
-                    ),
+                    "GIMME_ARTISAN_ALLOWED_JSON": json.dumps(list(artisan_allowed_commands or [])),
                 }
             )
 

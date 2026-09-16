@@ -16,9 +16,7 @@ HOSTNAME = "gimme-ci.local"
 
 def require_disposable_host() -> None:
     if os.environ.get("GIMME_INTEGRATION_DISPOSABLE") != "1" or not os.environ.get("CI"):
-        raise RuntimeError(
-            "refusing to run without CI=true and GIMME_INTEGRATION_DISPOSABLE=1"
-        )
+        raise RuntimeError("refusing to run without CI=true and GIMME_INTEGRATION_DISPOSABLE=1")
 
 
 def write_json(path: Path, value: object) -> None:
@@ -52,23 +50,49 @@ def setup() -> None:
                     "repository": repository,
                     "framework": "laravel",
                     "environments": {
-                        "default": {"branch": "main"},
-                        "app": {"branch": "feature/database-identity"},
-                        "branch--preview": {"branch": "feature/instance-b"},
+                        "default": {
+                            "branch": "main",
+                            "app_env": "production",
+                            "app_debug": False,
+                        },
+                        "app": {
+                            "branch": "feature/database-identity",
+                            "app_env": "local",
+                            "app_debug": False,
+                        },
+                        "branch--preview": {
+                            "branch": "feature/instance-b",
+                            "app_env": "preview",
+                            "app_debug": False,
+                        },
                     },
                 },
                 "smoke--branch": {
                     "repository": repository,
                     "framework": "laravel",
                     "environments": {
-                        "default": {"branch": "main"},
-                        "preview": {"branch": "feature/instance-a"},
+                        "default": {
+                            "branch": "main",
+                            "app_env": "production",
+                            "app_debug": False,
+                        },
+                        "preview": {
+                            "branch": "feature/instance-a",
+                            "app_env": "preview",
+                            "app_debug": False,
+                        },
                     },
                 },
                 "smoke-app": {
                     "repository": repository,
                     "framework": "laravel",
-                    "environments": {"default": {"branch": "main"}},
+                    "environments": {
+                        "default": {
+                            "branch": "main",
+                            "app_env": "production",
+                            "app_debug": False,
+                        }
+                    },
                 },
             }
         },
@@ -111,9 +135,7 @@ def verify() -> None:
         if database not in databases:
             raise AssertionError(f"missing PostgreSQL database {database}")
 
-    default_prefix = ssh(
-        "grep", "^HORIZON_PREFIX=", f"{APPS_ROOT}/smoke-app/shared/.env"
-    )
+    default_prefix = ssh("grep", "^HORIZON_PREFIX=", f"{APPS_ROOT}/smoke-app/shared/.env")
     branch_prefix = ssh(
         "grep",
         "^HORIZON_PREFIX=",
@@ -123,6 +145,20 @@ def verify() -> None:
         raise AssertionError("default Horizon prefix is not isolated")
     if branch_prefix != "HORIZON_PREFIX=gimme:smoke:app:horizon:":
         raise AssertionError("branch Horizon prefix is not isolated")
+
+    default_runtime = ssh(
+        "grep", "-E", "^(APP_ENV|APP_DEBUG)=", f"{APPS_ROOT}/smoke-app/shared/.env"
+    ).splitlines()
+    branch_runtime = ssh(
+        "grep",
+        "-E",
+        "^(APP_ENV|APP_DEBUG)=",
+        f"{APPS_ROOT}/smoke/environments/app/shared/.env",
+    ).splitlines()
+    if default_runtime != ["APP_ENV=production", "APP_DEBUG=false"]:
+        raise AssertionError("default Laravel runtime policy was not reconciled")
+    if branch_runtime != ["APP_ENV=local", "APP_DEBUG=false"]:
+        raise AssertionError("branch Laravel runtime policy was not reconciled")
 
     inspection = gimme.inspect_host()["output"]
     for instance in (first_instance, second_instance):

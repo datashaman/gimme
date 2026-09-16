@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 ENVIRONMENT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+LARAVEL_APP_ENV = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SSH_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
 SERVICE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@_.:-]{0,79}$")
@@ -21,9 +22,7 @@ DNS_NAME = re.compile(
     r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
 )
-SCP_REPOSITORY = re.compile(
-    r"^git@(?P<host>[a-zA-Z0-9.-]+):(?P<path>[a-zA-Z0-9._~/-]+)$"
-)
+SCP_REPOSITORY = re.compile(r"^git@(?P<host>[a-zA-Z0-9.-]+):(?P<path>[a-zA-Z0-9._~/-]+)$")
 REPOSITORY_PATH = re.compile(r"^[a-zA-Z0-9._~/-]+$")
 RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
 ABSOLUTE_DIRECTORY = re.compile(r"^/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+$")
@@ -83,10 +82,7 @@ def _valid_git_branch(value: str) -> bool:
         or "@{" in value
         or "//" in value
         or any(
-            char.isspace()
-            or ord(char) < 32
-            or ord(char) == 127
-            or char in "~^:?*[\\"
+            char.isspace() or ord(char) < 32 or ord(char) == 127 or char in "~^:?*[\\"
             for char in value
         )
     )
@@ -125,8 +121,7 @@ class ServerConfig(BaseModel):
         if ABSOLUTE_DIRECTORY.fullmatch(str(normalized)) is None:
             raise ValueError("apps_root contains unsafe path characters")
         if not any(
-            normalized != root and normalized.is_relative_to(root)
-            for root in SAFE_APPS_ROOTS
+            normalized != root and normalized.is_relative_to(root) for root in SAFE_APPS_ROOTS
         ):
             raise ValueError("apps_root must be beneath /srv, /var/www, /opt, or /home")
         return str(normalized)
@@ -328,8 +323,7 @@ class HealthCheckConfig(BaseModel):
             raise ValueError("health path must not contain query, fragment, or escapes")
         segments = value.strip("/").split("/") if value != "/" else []
         if any(
-            segment in {"", ".", ".."}
-            or re.fullmatch(r"[a-zA-Z0-9._~-]+", segment) is None
+            segment in {"", ".", ".."} or re.fullmatch(r"[a-zA-Z0-9._~-]+", segment) is None
             for segment in segments
         ):
             raise ValueError("health path contains unsafe path segments")
@@ -340,6 +334,8 @@ class EnvironmentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     branch: str = Field(default="main", min_length=1, max_length=120)
+    app_env: str = "production"
+    app_debug: bool = Field(default=False, strict=True)
     health: Literal["inherit"] | HealthCheckConfig | None = "inherit"
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
@@ -349,6 +345,16 @@ class EnvironmentConfig(BaseModel):
     def valid_branch(cls, value: str) -> str:
         if not _valid_git_branch(value):
             raise ValueError("branch is not a safe Git branch name")
+        return value
+
+    @field_validator("app_env")
+    @classmethod
+    def valid_app_env(cls, value: str) -> str:
+        if LARAVEL_APP_ENV.fullmatch(value) is None:
+            raise ValueError(
+                "app_env must start with a letter and contain only lowercase "
+                "letters, digits, underscores, and hyphens (maximum 32 characters)"
+            )
         return value
 
 
@@ -369,7 +375,7 @@ class AppConfig(BaseModel):
             return value
         migrated = dict(value)
         legacy_present = any(
-            key in migrated for key in ("branch", "workers", "scheduler")
+            key in migrated for key in ("branch", "app_env", "app_debug", "workers", "scheduler")
         )
         environments = migrated.get("environments")
         if environments is None:
@@ -381,6 +387,8 @@ class AppConfig(BaseModel):
         if "default" not in environments:
             environments["default"] = {
                 "branch": migrated.pop("branch", "main"),
+                "app_env": migrated.pop("app_env", "production"),
+                "app_debug": migrated.pop("app_debug", False),
                 "workers": migrated.pop("workers", None),
                 "scheduler": migrated.pop("scheduler", None),
             }
@@ -444,8 +452,7 @@ class AppConfig(BaseModel):
         if parsed.scheme == "https" and parsed.username is not None:
             raise ValueError("HTTPS repository must not contain credentials")
         if parsed.username is not None and (
-            parsed.username.startswith("-")
-            or SSH_NAME.fullmatch(parsed.username) is None
+            parsed.username.startswith("-") or SSH_NAME.fullmatch(parsed.username) is None
         ):
             raise ValueError("SSH repository contains an unsafe user name")
         if port is not None and parsed.scheme != "ssh":
@@ -582,9 +589,7 @@ class ConfigStore:
         workers: WorkerConfig | None,
         scheduler: SchedulerConfig | None,
     ) -> bool:
-        return self.configure_environment_processes(
-            name, "default", workers, scheduler
-        )
+        return self.configure_environment_processes(name, "default", workers, scheduler)
 
     def configure_environment_processes(
         self,

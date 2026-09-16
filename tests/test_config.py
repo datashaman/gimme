@@ -64,10 +64,31 @@ def test_legacy_app_definition_becomes_a_default_environment() -> None:
     )
 
     assert app.environment("default").branch == "stable"
+    assert app.environment("default").app_env == "production"
+    assert app.environment("default").app_debug is False
     assert app.environment("default").workers.driver == "horizon"
     assert app.environment("default").scheduler.enabled is True
     assert "branch" not in app.model_dump()
     assert app.model_dump()["environments"]["default"]["branch"] == "stable"
+
+
+@pytest.mark.parametrize("app_env", ["", "Production", "preview.env", "-local", "x" * 33])
+def test_laravel_app_environment_is_a_safe_bounded_slug(app_env: str) -> None:
+    with pytest.raises(ValidationError, match="app_env"):
+        EnvironmentConfig(app_env=app_env)
+
+
+def test_explicit_laravel_runtime_policy_round_trips() -> None:
+    environment = EnvironmentConfig(app_env="feature_preview", app_debug=True)
+
+    assert environment.model_dump()["app_env"] == "feature_preview"
+    assert environment.model_dump()["app_debug"] is True
+
+
+@pytest.mark.parametrize("app_debug", ["true", "false", 0, 1])
+def test_laravel_debug_policy_requires_a_json_boolean(app_debug: object) -> None:
+    with pytest.raises(ValidationError, match="app_debug"):
+        EnvironmentConfig(app_debug=app_debug)
 
 
 def test_register_additional_environment_is_idempotent_and_preserves_default(
@@ -93,9 +114,7 @@ def test_register_additional_environment_is_idempotent_and_preserves_default(
 
 
 @pytest.mark.parametrize("name", ["default", "../bad", "Bad", "bad_name", "x" * 33])
-def test_rejects_reserved_or_unsafe_additional_environment_names(
-    tmp_path: Path, name: str
-) -> None:
+def test_rejects_reserved_or_unsafe_additional_environment_names(tmp_path: Path, name: str) -> None:
     store = make_store(tmp_path)
     store.register_app("acme", AppConfig(repository="https://example.test/app.git"))
 
@@ -112,9 +131,7 @@ def test_configure_app_processes_preserves_the_deployment_definition(tmp_path: P
     )
     store.register_app("acme", original)
 
-    changed = store.configure_app_processes(
-        "acme", HorizonWorkerConfig(), SchedulerConfig()
-    )
+    changed = store.configure_app_processes("acme", HorizonWorkerConfig(), SchedulerConfig())
     updated = store.app("acme")
 
     assert changed is True
