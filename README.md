@@ -61,6 +61,8 @@ elsewhere; the directory contains:
 state.json          # schema-v3 targets, applications, resources, deployments, pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
+operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence
+.gimme-journal.lock # local journal append lock
 ```
 
 Operational state and encrypted secrets are ignored in this public source repository
@@ -210,10 +212,17 @@ Laravel's graceful restart model and avoiding a PHP-FPM reload.
 Read-only resources:
 
 - `gimme://state`
+- `gimme://operations`
 - `gimme://targets/{name}`
 - `gimme://applications/{name}`
 - `gimme://resources/{name}`
 - `gimme://deployments/{name}`
+- `gimme://operations/{correlation_id}`
+
+`list_operations` and the operation resources expose a separate append-only audit
+journal. It contains bounded object names, plan and correlation IDs, timestamps, phases,
+classified outcomes, and safe error codes. Definitions, command arguments and output,
+environment values, secret references, and exception text are never recorded.
 
 See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the complete tool and resource
 catalog. Runtime schemas returned by `tools/list`, `resources/list`, and

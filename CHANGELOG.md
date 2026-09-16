@@ -5,6 +5,8 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added a private append-only, secret-safe operation journal with correlated plan/apply
+  outcomes, classified failures, an MCP resource, trace template, and filtered read tool.
 - Added fixed official Ubuntu PPA bootstrap for an exact mise version.
 - Added a complete MCP primitive reference and manifest validation documentation.
 - Consolidated local and CI verification into one command that covers every Deployer

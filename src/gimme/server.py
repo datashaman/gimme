@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 import socket
+from contextvars import ContextVar
+from functools import wraps
+from inspect import signature
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal, ParamSpec, TypeVar, cast
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -19,6 +22,7 @@ from gimme.control_plans import (
     exact_plan, migration_plan, registration_update_plan, target_stack_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
+from gimme.journal import OperationJournal
 from gimme.secrets import SecretError, protected_secret_file, resolve_secret_references
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +44,106 @@ CHANGE = ToolAnnotations(title="Apply a non-idempotent Gimme change", readOnlyHi
                          destructiveHint=True, idempotentHint=False, openWorldHint=True)
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$", min_length=1, max_length=64)]
 PlanId = Annotated[str, Field(pattern=r"^plan_[a-f0-9]{20}$")]
+CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
+OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
+P = ParamSpec("P")
+R = TypeVar("R", bound=dict[str, object])
+_suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", default=False)
+
+
+def _journal() -> OperationJournal:
+    return OperationJournal(store.root)
+
+
+def _subjects(function: Callable[..., object], fields: tuple[str, ...],
+              args: tuple[object, ...], kwargs: dict[str, object]) -> dict[str, str]:
+    bound = signature(function).bind_partial(*args, **kwargs)
+    return {field: str(bound.arguments[field]) for field in fields if field in bound.arguments}
+
+
+def _journal_plan(operation: str, *subject_fields: str
+                  ) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def decorate(function: Callable[P, R]) -> Callable[P, R]:
+        @wraps(function)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            if _suppress_plan_journal.get():
+                return function(*args, **kwargs)
+            correlation_id = OperationJournal.correlation_id()
+            subjects = _subjects(
+                function, subject_fields, cast(tuple[object, ...], args),
+                cast(dict[str, object], kwargs),
+            )
+            try:
+                result = function(*args, **kwargs)
+            except Exception as exc:
+                status, error_code = _classified_failure(exc)
+                _journal().append(
+                    correlation_id=correlation_id, operation=operation, phase="plan",
+                    status=status, subjects=subjects, error_code=error_code,
+                )
+                raise
+            plan_id = result.get("plan_id")
+            _journal().append(
+                correlation_id=correlation_id, operation=operation, phase="plan",
+                status="succeeded", subjects=subjects,
+                plan_id=str(plan_id) if plan_id is not None else None,
+            )
+            return cast(R, {**result, "correlation_id": correlation_id})
+
+        return wrapped
+    return decorate
+
+
+def _journal_apply(operation: str, *subject_fields: str
+                   ) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def decorate(function: Callable[P, R]) -> Callable[P, R]:
+        @wraps(function)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            bound = signature(function).bind_partial(*args, **kwargs)
+            plan_id_value = bound.arguments.get("plan_id")
+            plan_id = str(plan_id_value) if plan_id_value is not None else None
+            journal = _journal()
+            correlation_id = OperationJournal.correlation_id()
+            subjects = _subjects(
+                function, subject_fields, cast(tuple[object, ...], args),
+                cast(dict[str, object], kwargs),
+            )
+            plan_correlation_id = journal.plan_correlation(plan_id, operation)
+            journal.append(
+                correlation_id=correlation_id, operation=operation, phase="apply",
+                status="started", subjects=subjects, plan_id=plan_id,
+                plan_correlation_id=plan_correlation_id,
+            )
+            token = _suppress_plan_journal.set(True)
+            try:
+                result = function(*args, **kwargs)
+            except Exception as exc:
+                status, error_code = _classified_failure(exc)
+                journal.append(
+                    correlation_id=correlation_id, operation=operation, phase="outcome",
+                    status=status, subjects=subjects, plan_id=plan_id,
+                    plan_correlation_id=plan_correlation_id, error_code=error_code,
+                )
+                raise
+            finally:
+                _suppress_plan_journal.reset(token)
+            journal.append(
+                correlation_id=correlation_id, operation=operation, phase="outcome",
+                status="succeeded", subjects=subjects, plan_id=plan_id,
+                plan_correlation_id=plan_correlation_id,
+            )
+            return cast(R, {**result, "correlation_id": correlation_id})
+
+        return wrapped
+    return decorate
+
+
+def _classified_failure(error: Exception) -> tuple[Literal["failed", "rejected", "stale"], str]:
+    if isinstance(error, ValueError) and "invalid or stale" in str(error):
+        return "stale", "stale_plan"
+    if isinstance(error, (KeyError, ValueError)):
+        return "rejected", "policy_rejected"
+    return "failed", "operation_failed"
 
 
 def _result(result: CommandResult) -> dict[str, object]:
@@ -281,7 +385,22 @@ def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
 
 
+@mcp.resource("gimme://operations")
+def recent_operations_resource() -> dict[str, object]:
+    """The 50 most recent secret-safe operation journal events."""
+    return {"events": [event.model_dump(mode="json") for event in _journal().list()]}
+
+
+@mcp.resource("gimme://operations/{correlation_id}")
+def operation_trace_resource(correlation_id: str) -> dict[str, object]:
+    """Every retained event for one operation correlation ID."""
+    events = _journal().list(limit=200, correlation_id=correlation_id)
+    return {"correlation_id": correlation_id,
+            "events": [event.model_dump(mode="json") for event in reversed(events)]}
+
+
 @mcp.tool(annotations=READ)
+@_journal_plan("state_migration")
 def plan_state_migration() -> dict[str, object]:
     """Inspect exact installed versions and plan migration to schema-v3 state."""
     if store.exists() and store.raw_state().get("schema_version") == 3:
@@ -291,6 +410,7 @@ def plan_state_migration() -> dict[str, object]:
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("state_migration")
 def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
     """Atomically write schema-v3 state after re-observing exact installed versions."""
     observations = _migration_observations()
@@ -331,7 +451,18 @@ def list_deployments(target: Name | None = None) -> dict[str, object]:
     return {"deployments": values}
 
 
+@mcp.tool(annotations=READ)
+def list_operations(limit: int = 50, operation: OperationName | None = None,
+                    subject: Name | None = None,
+                    correlation_id: CorrelationId | None = None) -> dict[str, object]:
+    """List secret-safe journal events, newest first, with optional exact filters."""
+    events = _journal().list(limit=limit, operation=operation, subject=subject,
+                             correlation_id=correlation_id)
+    return {"events": [event.model_dump(mode="json") for event in events]}
+
+
 @mcp.tool(annotations=WRITE)
+@_journal_apply("register_target", "name")
 def register_target(name: Name, definition: TargetConfig) -> dict[str, object]:
     """Register a new target locally without contacting it."""
     state = store.load()
@@ -342,6 +473,7 @@ def register_target(name: Name, definition: TargetConfig) -> dict[str, object]:
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("update_target", "name")
 def plan_update_target(name: Name, definition: TargetConfig) -> dict[str, object]:
     """Show the exact before/after state for a target update."""
     state = store.load()
@@ -350,6 +482,7 @@ def plan_update_target(name: Name, definition: TargetConfig) -> dict[str, object
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("update_target", "name")
 def update_target(name: Name, definition: TargetConfig, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed target update to local desired state."""
     expected = plan_update_target(name, definition)
@@ -359,6 +492,7 @@ def update_target(name: Name, definition: TargetConfig, plan_id: PlanId) -> dict
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("register_application", "name")
 def register_application(name: Name, definition: ApplicationConfig) -> dict[str, object]:
     """Register reusable application source and build metadata locally."""
     state = store.load()
@@ -369,6 +503,7 @@ def register_application(name: Name, definition: ApplicationConfig) -> dict[str,
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("update_application", "name")
 def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[str, object]:
     """Show the exact before/after state for an application update."""
     state = store.load()
@@ -379,6 +514,7 @@ def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[s
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("update_application", "name")
 def update_application(name: Name, definition: ApplicationConfig,
                        plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed application update to local desired state."""
@@ -389,6 +525,7 @@ def update_application(name: Name, definition: ApplicationConfig,
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("register_resource", "name")
 def register_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
     """Register a named, exact-version infrastructure resource locally."""
     state = store.load()
@@ -399,6 +536,7 @@ def register_resource(name: Name, definition: ResourceConfig) -> dict[str, objec
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("update_resource", "name")
 def plan_update_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
     """Show the exact before/after state for a resource update."""
     state = store.load()
@@ -407,6 +545,7 @@ def plan_update_resource(name: Name, definition: ResourceConfig) -> dict[str, ob
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("update_resource", "name")
 def update_resource(name: Name, definition: ResourceConfig, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed resource update to local desired state."""
     expected = plan_update_resource(name, definition)
@@ -416,6 +555,7 @@ def update_resource(name: Name, definition: ResourceConfig, plan_id: PlanId) -> 
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("register_deployment", "name")
 def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[str, object]:
     """Register a deployment and allocate its immutable placement identities."""
     state = store.load()
@@ -429,6 +569,7 @@ def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("update_deployment", "name")
 def plan_update_deployment(name: Name,
                            definition: DeploymentRegistration) -> dict[str, object]:
     """Show a deployment update while preserving immutable placement fields."""
@@ -443,6 +584,7 @@ def plan_update_deployment(name: Name,
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("update_deployment", "name")
 def update_deployment(name: Name, definition: DeploymentRegistration,
                       plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed deployment update to local desired state."""
@@ -464,12 +606,14 @@ def inspect_target(name: Name) -> dict[str, object]:
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("target_stack", "name")
 def plan_target_stack(name: Name) -> dict[str, object]:
     """Preflight packages and helpers and return the exact target stack plan."""
     return _resolved_stack_plan(name)
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("target_stack", "name")
 def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile a target stack through its bootstrapped privileged helper."""
     expected = _resolved_stack_plan(name)
@@ -485,6 +629,7 @@ def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("deployment_runtimes", "name")
 def plan_deployment_runtimes(name: Name) -> dict[str, object]:
     """Plan exact runtime and extension reconciliation for one deployment."""
     state, deployment, target, application = _context(name)
@@ -507,6 +652,7 @@ def plan_deployment_runtimes(name: Name) -> dict[str, object]:
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("deployment_runtimes", "name")
 def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Install mise pins and verify system runtimes for one deployment."""
     expected = plan_deployment_runtimes(name)
@@ -517,12 +663,14 @@ def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("deployment_resources", "name")
 def plan_deployment_resources(name: Name) -> dict[str, object]:
     """Plan routing, database, cache, runtime values, secrets, and processes."""
     return _resource_plan(name)
 
 
 @mcp.tool(annotations=WRITE)
+@_journal_apply("deployment_resources", "name")
 def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile one deployment's route and target-local runtime resources."""
     expected = _resource_plan(name)
@@ -541,12 +689,14 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("deployment", "name")
 def plan_deployment(name: Name) -> dict[str, object]:
     """Resolve source and pinned runtimes and render the exact Deployer task graph."""
     return _release_plan(name)
 
 
 @mcp.tool(annotations=CHANGE)
+@_journal_apply("deployment", "name")
 def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Deploy an exact reviewed revision with health gates and worker refresh."""
     expected = _release_plan(name)
@@ -568,6 +718,7 @@ def list_releases(name: Name) -> dict[str, object]:
 
 
 @mcp.tool(annotations=CHANGE)
+@_journal_apply("rollback_deployment", "name")
 def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
     """Restore a deployment's prior retained release after exact confirmation."""
     expected = f"ROLLBACK {name}"
@@ -577,6 +728,7 @@ def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("promotion", "source", "destination")
 def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
     """Plan deploying the source deployment's exact live commit to a destination."""
     state, source_deployment, _, _ = _context(source)
@@ -596,6 +748,7 @@ def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
 
 
 @mcp.tool(annotations=CHANGE)
+@_journal_apply("promotion", "source", "destination")
 def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict[str, object]:
     """Promote an exact reviewed live commit and pin the destination after success."""
     expected = plan_promotion(source, destination)
@@ -615,6 +768,7 @@ def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("remove_deployment", "name")
 def plan_remove_deployment(name: Name) -> dict[str, object]:
     """Plan complete cleanup of one deployment and its isolated resources."""
     _, deployment, target, _ = _context(name)
@@ -622,6 +776,7 @@ def plan_remove_deployment(name: Name) -> dict[str, object]:
 
 
 @mcp.tool(annotations=CHANGE)
+@_journal_apply("remove_deployment", "name")
 def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Remove a deployment after exact plan and confirmation checks."""
     expected = plan_remove_deployment(name)
@@ -640,6 +795,7 @@ def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[st
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("artisan", "name")
 def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -> dict[str, object]:
     """Plan an allowlisted structured Artisan invocation in one deployment."""
     _, _, _, application = _context(name)
@@ -654,6 +810,7 @@ def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -
 
 
 @mcp.tool(annotations=CHANGE)
+@_journal_apply("artisan", "name")
 def run_artisan(name: Name, command: str, plan_id: PlanId,
                 arguments: list[str] | None = None) -> dict[str, object]:
     """Run an exact reviewed allowlisted Artisan invocation."""

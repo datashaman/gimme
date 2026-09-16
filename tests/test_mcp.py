@@ -105,13 +105,17 @@ async def test_hard_v3_tool_surface() -> None:
         "promote_deployment",
         "plan_artisan",
         "run_artisan",
+        "list_operations",
     }
-    assert {str(resource.uri) for resource in resources} == {"gimme://state"}
+    assert {str(resource.uri) for resource in resources} == {
+        "gimme://state", "gimme://operations"
+    }
     assert {template.uriTemplate for template in templates} == {
         "gimme://targets/{name}",
         "gimme://applications/{name}",
         "gimme://resources/{name}",
         "gimme://deployments/{name}",
+        "gimme://operations/{correlation_id}",
     }
     assert all(tool.annotations is not None for tool in tools)
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
@@ -149,6 +153,35 @@ def test_deployment_update_rejects_stale_plan(tmp_path, monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="invalid or stale"):
         server_module.update_deployment("example-app", definition, "plan_" + "0" * 20)
+
+    events = server_module.list_operations(operation="update_deployment")["events"]
+    assert events[0]["status"] == "stale"
+    assert events[0]["error_code"] == "stale_plan"
+    assert events[1]["phase"] == "apply"
+
+
+def test_plan_and_apply_have_linked_secret_safe_journal_events(tmp_path, monkeypatch) -> None:
+    use_store(tmp_path, monkeypatch)
+    current = server_module.store.deployment("example-app")
+    definition = DeploymentRegistration.from_deployment(current).model_copy(
+        update={
+            "source": DeploymentSource(kind="branch", ref="secret-client-branch"),
+            "variables": {"PRIVATE_MARKER": "do-not-journal-this"},
+        }
+    )
+
+    plan = server_module.plan_update_deployment("example-app", definition)
+    result = server_module.update_deployment("example-app", definition, str(plan["plan_id"]))
+    events = server_module.list_operations(operation="update_deployment")["events"]
+
+    assert result["correlation_id"] == events[0]["correlation_id"]
+    assert events[0]["phase"] == "outcome"
+    assert events[0]["plan_correlation_id"] == plan["correlation_id"]
+    assert events[1]["phase"] == "apply"
+    assert events[2]["phase"] == "plan"
+    journal = (tmp_path / "state" / "operations.jsonl").read_text()
+    assert "secret-client-branch" not in journal
+    assert "do-not-journal-this" not in journal
 
 
 def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> None:

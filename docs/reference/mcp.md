@@ -22,13 +22,15 @@ stable intent, mutation boundary, and pairing of each primitive.
 | URI | Contents |
 | --- | --- |
 | `gimme://state` | Complete desired state without decrypted secret values |
+| `gimme://operations` | The 50 most recent secret-safe operation events, newest first |
 | `gimme://targets/{name}` | One target and its network, stack, and runtime policy |
 | `gimme://applications/{name}` | One reusable application definition |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
+| `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The four parameterized URIs are resource templates. `gimme://state` is a concrete
-resource.
+The five parameterized URIs are resource templates. `gimme://state` and
+`gimme://operations` are concrete resources.
 
 ## State and inventory tools
 
@@ -40,6 +42,25 @@ resource.
 | `list_applications` | Read | List application source/build definitions |
 | `list_resources` | Read | List named resources, optionally filtered by target |
 | `list_deployments` | Read | List deployments, optionally filtered by target |
+| `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
+
+## Operation journal
+
+Gimme appends control-plane evidence to `operations.jsonl` beside desired state. Plan
+calls record a `plan` event and return its `correlation_id`. Mutation calls record an
+`apply` event before work starts and an `outcome` event afterward under a new correlation
+ID. When the supplied plan was previously observed, `plan_correlation_id` links the apply
+trace to it. Stale plans and policy rejections are classified without copying exception
+text into the journal.
+
+Each JSONL record contains only its schema version, event and correlation IDs, UTC
+timestamp, fixed operation name, phase, status, bounded registered object names, optional
+plan ID/link, and an optional safe error code. Gimme never journals definitions, command
+arguments or output, environment values, secret references, or exception messages.
+Correlation IDs are generated after a plan is hashed, so they do not alter `plan_id` or
+make otherwise identical plans differ. Journal files and locks use mode `0600`; reads fail
+closed if a record does not validate. `list_operations` returns newest events first and is
+bounded to 200 records per call.
 
 ## Registration and update tools
 

@@ -12,6 +12,8 @@ config/server.json
 config/stack.json
 config/apps.json
 config/.gimme.lock
+config/.gimme-journal.lock
 config/state.json
 config/secrets*.json
+config/operations.jsonl
 !config/secrets.enc.example.json
