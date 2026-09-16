@@ -146,15 +146,18 @@ def verify() -> None:
     if branch_prefix != "HORIZON_PREFIX=gimme:smoke:app:horizon:":
         raise AssertionError("branch Horizon prefix is not isolated")
 
-    default_runtime = ssh(
-        "grep", "-E", "^(APP_ENV|APP_DEBUG)=", f"{APPS_ROOT}/smoke-app/shared/.env"
-    ).splitlines()
-    branch_runtime = ssh(
-        "grep",
-        "-E",
-        "^(APP_ENV|APP_DEBUG)=",
-        f"{APPS_ROOT}/smoke/environments/app/shared/.env",
-    ).splitlines()
+    default_runtime = [
+        line
+        for line in ssh("cat", f"{APPS_ROOT}/smoke-app/shared/.env").splitlines()
+        if line.startswith(("APP_ENV=", "APP_DEBUG="))
+    ]
+    branch_runtime = [
+        line
+        for line in ssh(
+            "cat", f"{APPS_ROOT}/smoke/environments/app/shared/.env"
+        ).splitlines()
+        if line.startswith(("APP_ENV=", "APP_DEBUG="))
+    ]
     if default_runtime != ["APP_ENV=production", "APP_DEBUG=false"]:
         raise AssertionError("default Laravel runtime policy was not reconciled")
     if branch_runtime != ["APP_ENV=local", "APP_DEBUG=false"]:
