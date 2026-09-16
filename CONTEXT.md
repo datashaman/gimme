@@ -55,7 +55,8 @@ _Avoid_: Resource backup policy
 A named, versioned S3-compatible object-storage location where Recovery Points are retained independently
 of their Target. A Backup Destination belongs to control-plane policy, not to a Deployment;
 transfers and stored objects are encrypted, and every Component Backup has verified integrity.
-Its Target authentication is either ambient workload identity or encrypted secret references.
+It is accessed from a Deployment's current Target using either that Target's ambient workload
+identity or encrypted secret references.
 _Avoid_: Backup path, upload directory
 
 **Recovery Manifest**:
