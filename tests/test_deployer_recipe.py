@@ -99,6 +99,35 @@ def test_deployer_recipe_passes_static_analysis() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_empty_environment_object_is_valid_but_empty_list_is_not() -> None:
+    script = (
+        "require 'deploy/configuration.php'; "
+        "echo json_encode(Deployer\\configured_environment_values(), JSON_THROW_ON_ERROR);"
+    )
+
+    accepted = subprocess.run(
+        ["php", "-r", script],
+        cwd=ROOT,
+        env={**os.environ, "GIMME_VARIABLES_JSON": "{}"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    rejected = subprocess.run(
+        ["php", "-r", script],
+        cwd=ROOT,
+        env={**os.environ, "GIMME_VARIABLES_JSON": "[]"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert accepted.stdout == "[]"
+    assert rejected.returncode != 0
+    assert "must be a bounded object" in rejected.stdout + rejected.stderr
+
+
 def test_stack_includes_deployer_acl_dependency() -> None:
     state = json.loads((ROOT / "config" / "state.example.json").read_text())
     stack = state["targets"]["devbox"]["stack"]

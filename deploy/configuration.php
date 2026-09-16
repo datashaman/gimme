@@ -327,7 +327,9 @@ function configured_environment_values(): array
 {
     $raw = getenv('GIMME_VARIABLES_JSON') ?: '{}';
     $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
-    if (!is_array($decoded) || array_is_list($decoded) || count($decoded) > 128) {
+    if (!is_array($decoded) ||
+        (array_is_list($decoded) && trim($raw) !== '{}') ||
+        count($decoded) > 128) {
         throw new \RuntimeException('GIMME_VARIABLES_JSON must be a bounded object');
     }
     foreach ($decoded as $key => $value) {

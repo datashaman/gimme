@@ -5,6 +5,7 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed empty deployment environment objects being misclassified as JSON lists by PHP.
 - Fixed the bootstrap CLI to inherit all terminal streams so Deployer's hidden sudo
   prompt is displayed live instead of being buffered with captured task output.
 - Blocked deployments with managed processes before activation when the target-bound
