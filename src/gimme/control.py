@@ -87,21 +87,60 @@ class TargetNetwork(BaseModel):
         return self
 
 
-class TargetToolchains(BaseModel):
+RuntimeName = Literal[
+    "php", "composer", "node", "npm", "pnpm", "yarn", "bun",
+    "python", "ruby", "go", "java",
+]
+
+
+class RuntimePin(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    node: str | None = None
-    npm: str | None = None
-    pnpm: str | None = None
-    yarn: str | None = None
-    bun: str | None = None
+    provider: Literal["system", "mise", "bundled"]
+    version: str
 
-    @field_validator("node", "npm", "pnpm", "yarn", "bun")
+    @field_validator("version")
     @classmethod
-    def exact_version(cls, value: str | None) -> str | None:
-        if value is not None and VERSION.fullmatch(value) is None:
-            raise ValueError("toolchain versions must be exact bounded version strings")
+    def exact_version(cls, value: str) -> str:
+        if VERSION.fullmatch(value) is None:
+            raise ValueError("runtime versions must be exact bounded version strings")
         return value
+
+
+class TargetRuntimePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mise_version: str | None = None
+
+    @field_validator("mise_version")
+    @classmethod
+    def exact_mise_version(cls, value: str | None) -> str | None:
+        if value is not None and VERSION.fullmatch(value) is None:
+            raise ValueError("mise_version must be an exact version")
+        return value
+
+
+class ResourceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: str = Field(pattern=TARGET_NAME.pattern)
+    kind: Literal["postgres", "valkey"]
+    provider: Literal["target_local"] = "target_local"
+    version: str
+
+    @field_validator("version")
+    @classmethod
+    def exact_version(cls, value: str) -> str:
+        if VERSION.fullmatch(value) is None:
+            raise ValueError("resource versions must be exact bounded version strings")
+        return value
+
+
+class ResourceBindings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    database: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
+    cache: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
 
 
 class TargetConfig(BaseModel):
@@ -116,7 +155,7 @@ class TargetConfig(BaseModel):
     keep_releases: int = Field(default=5, ge=2, le=20)
     network: TargetNetwork
     stack: StackConfig
-    toolchains: TargetToolchains = Field(default_factory=TargetToolchains)
+    runtimes: TargetRuntimePolicy = Field(default_factory=TargetRuntimePolicy)
 
     @field_validator("bootstrap_hostname", "hostname")
     @classmethod
@@ -149,6 +188,17 @@ class ApplicationConfig(BaseModel):
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
     default_health: HealthCheckConfig | None = None
+    php_extensions: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("php_extensions")
+    @classmethod
+    def safe_php_extensions(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            re.fullmatch(r"[a-z][a-z0-9_]{0,47}", extension) is None
+            for extension in value
+        ):
+            raise ValueError("php_extensions must be unique safe extension names")
+        return sorted(value)
 
     @model_validator(mode="after")
     def coherent(self) -> "ApplicationConfig":
@@ -226,6 +276,8 @@ class DeploymentConfig(BaseModel):
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
     secrets: dict[str, str] = Field(default_factory=dict, max_length=128)
+    runtimes: dict[RuntimeName, RuntimePin]
+    resources: ResourceBindings = Field(default_factory=ResourceBindings)
     placement: Placement
 
     @field_validator("app_env")
@@ -280,6 +332,8 @@ class DeploymentRegistration(BaseModel):
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
     secrets: dict[str, str] = Field(default_factory=dict, max_length=128)
+    runtimes: dict[RuntimeName, RuntimePin]
+    resources: ResourceBindings = Field(default_factory=ResourceBindings)
 
     def materialize(self, placement: Placement) -> DeploymentConfig:
         return DeploymentConfig(**self.model_dump(), placement=placement)
@@ -319,9 +373,10 @@ class DeploymentRegistration(BaseModel):
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     applications: dict[str, ApplicationConfig] = Field(default_factory=dict)
+    resources: dict[str, ResourceConfig] = Field(default_factory=dict)
     deployments: dict[str, DeploymentConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -332,6 +387,19 @@ class ControlState(BaseModel):
         for name in self.applications:
             if APP_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid application name: {name}")
+        target_resource_versions: dict[tuple[str, str], str] = {}
+        for name, resource in self.resources.items():
+            if DEPLOYMENT_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid resource name: {name}")
+            if resource.target not in self.targets:
+                raise ValueError(f"resource {name} references an unknown target")
+            key = (resource.target, resource.kind)
+            previous = target_resource_versions.setdefault(key, resource.version)
+            if previous != resource.version:
+                raise ValueError(
+                    f"target-local {resource.kind} resources on {resource.target} "
+                    "must use one version"
+                )
         for name, deployment in self.deployments.items():
             if DEPLOYMENT_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid deployment name: {name}")
@@ -344,7 +412,62 @@ class ControlState(BaseModel):
                 self.targets[deployment.target],
                 self.applications[deployment.application],
             )
+            validate_runtime_policy(
+                deployment,
+                self.targets[deployment.target],
+                self.applications[deployment.application],
+            )
+            for binding, kind in (
+                (deployment.resources.database, "postgres"),
+                (deployment.resources.cache, "valkey"),
+            ):
+                if binding is None:
+                    continue
+                resource = self.resources.get(binding)
+                if resource is None:
+                    raise ValueError(f"deployment {name} references unknown resource {binding}")
+                if resource.target != deployment.target or resource.kind != kind:
+                    raise ValueError(f"deployment {name} has an incompatible {kind} binding")
+            is_static = self.applications[deployment.application].framework == "static"
+            has_database = deployment.resources.database is not None
+            has_cache = deployment.resources.cache is not None
+            if is_static and (has_database or has_cache):
+                raise ValueError(f"static deployment {name} cannot bind database or cache")
+            if not is_static and (
+                not has_database or not has_cache
+            ):
+                raise ValueError(f"deployment {name} requires database and cache bindings")
         return self
+
+
+def validate_runtime_policy(
+    deployment: DeploymentConfig,
+    target: TargetConfig,
+    application: ApplicationConfig,
+) -> None:
+    pins = deployment.runtimes
+    if application.framework != "static":
+        if "php" not in pins or "composer" not in pins:
+            raise ValueError("non-static deployments require php and composer runtime pins")
+        if pins["php"].provider != "system":
+            raise ValueError("PHP-FPM deployments currently require the system PHP provider")
+        if pins["composer"].provider != "system":
+            raise ValueError("Composer currently requires the system provider")
+    frontend = application.frontend
+    if frontend is not None:
+        manager = frontend.package_manager
+        if manager in {"npm", "pnpm", "yarn"} and "node" not in pins:
+            raise ValueError(f"{manager} deployments require a node runtime pin")
+        if manager not in pins:
+            raise ValueError(f"frontend package manager {manager} requires a runtime pin")
+        if manager == "npm" and pins["npm"].provider != "bundled":
+            raise ValueError("npm must use the bundled provider from the selected Node runtime")
+    uses_mise = any(pin.provider == "mise" for pin in pins.values())
+    if uses_mise and target.runtimes.mise_version is None:
+        raise ValueError("mise runtime pins require target.runtimes.mise_version")
+    for name, pin in pins.items():
+        if pin.provider == "bundled" and name != "npm":
+            raise ValueError("only npm supports the bundled runtime provider")
 
 
 def validate_stage_policy(
@@ -411,7 +534,18 @@ class StateStore:
     def load(self) -> ControlState:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
-        return ControlState.model_validate_json(self.state_path.read_text())
+        document = self.raw_state()
+        if document.get("schema_version") != 3:
+            raise RuntimeError("state migration required; call plan_state_migration")
+        return ControlState.model_validate(document)
+
+    def raw_state(self) -> dict[str, object]:
+        if not self.exists():
+            raise RuntimeError("desired state does not exist")
+        value = json.loads(self.state_path.read_text())
+        if not isinstance(value, dict):
+            raise RuntimeError("desired state must be a JSON object")
+        return value
 
     def save(self, state: ControlState) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -437,7 +571,9 @@ class StateStore:
         except KeyError as exc:
             raise KeyError(f"deployment '{name}' is not registered") from exc
 
-    def legacy_migration(self) -> ControlState:
+    def legacy_migration(
+        self, observations: dict[str, dict[str, str]]
+    ) -> ControlState:
         legacy = ConfigStore(self.legacy_root)
         server = legacy.server()
         stack = legacy.stack()
@@ -455,6 +591,7 @@ class StateStore:
             stack=stack,
         )
         applications: dict[str, ApplicationConfig] = {}
+        resources: dict[str, ResourceConfig] = {}
         deployments: dict[str, DeploymentConfig] = {}
         from gimme.plans import (
             environment_database_identifier,
@@ -495,6 +632,15 @@ class StateStore:
                     health=definition.health,
                     workers=definition.workers,
                     scheduler=definition.scheduler,
+                    runtimes=self._observed_runtime_pins(
+                        observations[target_name], app.frontend.package_manager
+                        if app.frontend is not None else None,
+                        backend=app.framework != "static",
+                    ),
+                    resources=ResourceBindings(
+                        database=f"{target_name}-postgres",
+                        cache=f"{target_name}-valkey",
+                    ) if app.framework != "static" else ResourceBindings(),
                     placement=Placement(
                         instance=environment_instance(app_name, environment),
                         relative_path=relative_path,
@@ -509,11 +655,137 @@ class StateStore:
                         ),
                     ),
                 )
+                if app.framework != "static":
+                    resources[f"{target_name}-postgres"] = ResourceConfig(
+                        target=target_name,
+                        kind="postgres",
+                        version=self._observed(observations[target_name], "postgres"),
+                    )
+                    resources[f"{target_name}-valkey"] = ResourceConfig(
+                        target=target_name,
+                        kind="valkey",
+                        version=self._observed(observations[target_name], "valkey"),
+                    )
         return ControlState(
             targets={target_name: target},
             applications=applications,
+            resources=resources,
             deployments=deployments,
         )
+
+    def state_migration(
+        self, observations: dict[str, dict[str, str]]
+    ) -> ControlState:
+        if not self.exists():
+            return self.legacy_migration(observations)
+        document = self.raw_state()
+        if document.get("schema_version") == 3:
+            raise ValueError("schema-v3 state already exists")
+        if document.get("schema_version") != 2:
+            raise ValueError("only schema-v2 state can be migrated")
+        targets = document.get("targets")
+        applications = document.get("applications")
+        deployments = document.get("deployments")
+        if not all(isinstance(value, dict) for value in (targets, applications, deployments)):
+            raise ValueError("schema-v2 state collections are invalid")
+        migrated = json.loads(json.dumps(document))
+        migrated["schema_version"] = 3
+        migrated["resources"] = {}
+        for target_name, target in migrated["targets"].items():
+            if not isinstance(target, dict):
+                raise ValueError(f"target {target_name} is invalid")
+            old_toolchains = target.pop("toolchains", {})
+            observed = observations.get(target_name)
+            if observed is None:
+                raise ValueError(f"runtime observations are missing for target {target_name}")
+            target["runtimes"] = {
+                "mise_version": observed.get("mise") or None,
+            }
+            target["_gimme_old_toolchains"] = old_toolchains
+        for deployment_name, deployment in migrated["deployments"].items():
+            if not isinstance(deployment, dict):
+                raise ValueError(f"deployment {deployment_name} is invalid")
+            target_name = deployment["target"]
+            application_name = deployment["application"]
+            target = migrated["targets"][target_name]
+            old_toolchains = target.pop("_gimme_old_toolchains", {})
+            target["_gimme_old_toolchains"] = old_toolchains
+            application = migrated["applications"][application_name]
+            manager = None
+            if isinstance(application, dict) and isinstance(application.get("frontend"), dict):
+                manager = application["frontend"].get("package_manager")
+            deployment["runtimes"] = {
+                name: pin.model_dump(mode="json")
+                for name, pin in self._observed_runtime_pins(
+                    observations[target_name], manager, old_toolchains,
+                    backend=application.get("framework") != "static"
+                ).items()
+            }
+            if isinstance(application, dict) and application.get("framework") != "static":
+                database_resource = f"{target_name}-postgres"
+                cache_resource = f"{target_name}-valkey"
+                deployment["resources"] = {
+                    "database": database_resource,
+                    "cache": cache_resource,
+                }
+                migrated["resources"][database_resource] = {
+                    "target": target_name,
+                    "kind": "postgres",
+                    "provider": "target_local",
+                    "version": self._observed(observations[target_name], "postgres"),
+                }
+                migrated["resources"][cache_resource] = {
+                    "target": target_name,
+                    "kind": "valkey",
+                    "provider": "target_local",
+                    "version": self._observed(observations[target_name], "valkey"),
+                }
+            else:
+                deployment["resources"] = {"database": None, "cache": None}
+        for target in migrated["targets"].values():
+            target.pop("_gimme_old_toolchains", None)
+        return ControlState.model_validate(migrated)
+
+    @staticmethod
+    def _observed(observations: dict[str, str], name: str) -> str:
+        version = observations.get(name, "")
+        if VERSION.fullmatch(version) is None:
+            raise ValueError(f"an exact observed {name} version is required for migration")
+        return version
+
+    @classmethod
+    def _observed_runtime_pins(
+        cls,
+        observations: dict[str, str],
+        package_manager: str | None,
+        old_toolchains: object = None,
+        *,
+        backend: bool = True,
+    ) -> dict[RuntimeName, RuntimePin]:
+        pins: dict[RuntimeName, RuntimePin] = {}
+        if backend:
+            pins.update({
+                "php": RuntimePin(
+                    provider="system", version=cls._observed(observations, "php")
+                ),
+                "composer": RuntimePin(
+                    provider="system", version=cls._observed(observations, "composer")
+                ),
+            })
+        if package_manager is None:
+            return pins
+        previous = old_toolchains if isinstance(old_toolchains, dict) else {}
+        if package_manager in {"npm", "pnpm", "yarn"}:
+            node_version = str(previous.get("node") or observations.get("node") or "")
+            pins["node"] = RuntimePin(provider="system", version=node_version)
+        manager_version = str(
+            previous.get(package_manager) or observations.get(package_manager) or ""
+        )
+        pins[package_manager] = RuntimePin(
+            provider="bundled" if package_manager == "npm" else "system",
+            version=manager_version,
+        )
+        return pins
 
     @staticmethod
     def digest(value: object) -> str:
@@ -594,6 +866,15 @@ def target_sites(state: ControlState, target_name: str) -> list[dict[str, str]]:
         )
         if relative_root:
             document_root += f"/{relative_root}"
+        php_socket = ""
+        if application.framework != "static":
+            php = deployment.runtimes.get("php")
+            if php is None:
+                raise ValueError(f"deployment {deployment_name} has no PHP runtime")
+            parts = php.version.split(".")
+            if len(parts) < 2:
+                raise ValueError("PHP runtime versions must include major and minor")
+            php_socket = f"/run/php/php{parts[0]}.{parts[1]}-fpm.sock"
         sites.append(
             {
                 "deployment": deployment_name,
@@ -601,6 +882,7 @@ def target_sites(state: ControlState, target_name: str) -> list[dict[str, str]]:
                 "framework": application.framework,
                 "site_host": deployment.placement.site_host,
                 "document_root": document_root,
+                "php_fpm_socket": php_socket,
             }
         )
     return sites

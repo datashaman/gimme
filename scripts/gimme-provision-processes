@@ -25,6 +25,7 @@ UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 UNIX_GROUP = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")
 QUEUE_CONNECTION = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
 QUEUE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
+PHP_BINARY = re.compile(r"^/usr/bin/php[0-9]+\.[0-9]+$")
 MAX_STATE_BYTES = 64 * 1024
 SYSTEMD_ROOT = Path("/etc/systemd/system")
 EXECUTABLES = {"systemctl": "/usr/bin/systemctl"}
@@ -197,6 +198,7 @@ def load_state(application: str, sudo_user: str, sudo_uid: int) -> dict[str, Any
         "deploy_path",
         "workers",
         "scheduler",
+        "php_binary",
     }:
         fail("invalid process desired-state document")
     if state["version"] != 1 or state["application"] != application:
@@ -214,6 +216,7 @@ def load_state(application: str, sudo_user: str, sudo_uid: int) -> dict[str, Any
         fail("process deploy_path escapes applications root")
     return {
         "deploy_path": deploy_path,
+        "php_binary": require_string(state["php_binary"], "php_binary", PHP_BINARY),
         "workers": validate_workers(state["workers"]),
         "scheduler": validate_scheduler(state["scheduler"]),
     }
@@ -277,10 +280,11 @@ def render_queue_worker_unit(
     account: pwd.struct_passwd,
     application_root: Path,
     config: dict[str, Any],
+    php_binary: str,
 ) -> str:
     current = application_root / "current"
     arguments = [
-        "/usr/bin/php",
+        php_binary,
         "artisan",
         "queue:work",
         config["connection"],
@@ -310,11 +314,12 @@ def render_horizon_unit(
     account: pwd.struct_passwd,
     application_root: Path,
     config: dict[str, Any],
+    php_binary: str,
 ) -> str:
     current = application_root / "current"
     return (
         service_header(f"Gimme Laravel Horizon {application}", account, current)
-        + 'ExecStart="/usr/bin/php" "artisan" "horizon"\n'
+        + f'ExecStart={quote(php_binary)} "artisan" "horizon"\n'
         + "Restart=always\nRestartSec=5\nKillSignal=SIGTERM\n"
         + f"TimeoutStopSec={config['stop_wait_seconds']}\n"
         + hardening(application_root)
@@ -323,12 +328,12 @@ def render_horizon_unit(
 
 
 def render_scheduler_service(
-    application: str, account: pwd.struct_passwd, application_root: Path
+    application: str, account: pwd.struct_passwd, application_root: Path, php_binary: str
 ) -> str:
     current = application_root / "current"
     return (
         service_header(f"Gimme Laravel scheduler {application}", account, current)
-        + 'Type=oneshot\nExecStart="/usr/bin/php" "artisan" "--no-interaction" '
+        + f'Type=oneshot\nExecStart={quote(php_binary)} "artisan" "--no-interaction" '
         '"schedule:run"\n'
         + hardening(application_root)
     )
@@ -399,6 +404,7 @@ def reconcile() -> None:
     state = load_state(application, sudo_user, account.pw_uid)
     application_root = state["deploy_path"]
     current = application_root / "current"
+    php_binary = state["php_binary"]
 
     worker = state["workers"]
     scheduler = state["scheduler"]
@@ -421,7 +427,7 @@ def reconcile() -> None:
     if worker is not None and worker["enabled"] and worker["driver"] == "queue":
         if atomic_write_if_changed(
             queue_template,
-            render_queue_worker_unit(application, account, application_root, worker),
+            render_queue_worker_unit(application, account, application_root, worker, php_binary),
         ):
             changed = True
             changed_units.update(existing_instances)
@@ -434,7 +440,7 @@ def reconcile() -> None:
     elif worker is not None and worker["enabled"] and worker["driver"] == "horizon":
         if atomic_write_if_changed(
             horizon_unit,
-            render_horizon_unit(application, account, application_root, worker),
+            render_horizon_unit(application, account, application_root, worker, php_binary),
         ):
             changed = True
             changed_units.add(horizon_unit.name)
@@ -454,7 +460,7 @@ def reconcile() -> None:
     if scheduler is not None and scheduler["enabled"]:
         if atomic_write_if_changed(
             scheduler_service,
-            render_scheduler_service(application, account, application_root),
+            render_scheduler_service(application, account, application_root, php_binary),
         ):
             changed = True
         if atomic_write_if_changed(scheduler_timer, render_scheduler_timer(application)):

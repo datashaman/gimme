@@ -46,7 +46,8 @@ def test_queue_worker_unit_is_bounded_and_hardened(monkeypatch) -> None:
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
 
     unit = helper["render_queue_worker_unit"](
-        "example-app", account, Path("/srv/gimme/apps/example-app"), queue_config()
+        "example-app", account, Path("/srv/gimme/apps/example-app"), queue_config(),
+        "/usr/bin/php8.4",
     )
 
     assert "WorkingDirectory=/srv/gimme/apps/example-app/current" in unit
@@ -78,11 +79,14 @@ def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None
         account,
         root,
         {"driver": "horizon", "enabled": True, "stop_wait_seconds": 3600},
+        "/usr/bin/php8.4",
     )
-    scheduler = helper["render_scheduler_service"]("example-app", account, root)
+    scheduler = helper["render_scheduler_service"](
+        "example-app", account, root, "/usr/bin/php8.4"
+    )
     timer = helper["render_scheduler_timer"]("example-app")
 
-    assert 'ExecStart="/usr/bin/php" "artisan" "horizon"' in horizon
+    assert 'ExecStart="/usr/bin/php8.4" "artisan" "horizon"' in horizon
     assert "Restart=always" in horizon
     assert "TimeoutStopSec=3600" in horizon
     assert "Environment=APP_ENV=" not in horizon
@@ -113,9 +117,10 @@ def test_rendered_process_units_pass_systemd_verification(tmp_path, monkeypatch)
             account,
             app_root,
             {"driver": "horizon", "enabled": True, "stop_wait_seconds": 3600},
+            "/usr/bin/php8.4",
         ),
         "gimme-scheduler-example-app.service": helper["render_scheduler_service"](
-            "example-app", account, app_root
+            "example-app", account, app_root, "/usr/bin/php8.4"
         ),
         "gimme-scheduler-example-app.timer": helper["render_scheduler_timer"]("example-app"),
     }
@@ -175,6 +180,7 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
             "deploy_path": apps_root / "example-app",
             "workers": queue_config(),
             "scheduler": {"enabled": True},
+            "php_binary": "/usr/bin/php8.4",
         },
     )
     monkeypatch.setitem(helper, "listed_worker_instances", lambda _app: set())
@@ -217,6 +223,7 @@ def test_teardown_does_not_require_a_current_release(tmp_path, monkeypatch) -> N
             "deploy_path": deploy_path,
             "workers": None,
             "scheduler": None,
+            "php_binary": "/usr/bin/php8.4",
         },
     )
     monkeypatch.setitem(helper, "listed_worker_instances", lambda _app: set())

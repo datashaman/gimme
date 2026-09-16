@@ -20,10 +20,11 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "state_migration",
-            "schema_version": 2,
+            "schema_version": 3,
             "state_directory": state_directory,
             "targets": state.model_dump(mode="json")["targets"],
             "applications": sorted(state.applications),
+            "resources": state.model_dump(mode="json")["resources"],
             "deployments": {
                 name: {
                     "application": deployment.application,
@@ -32,11 +33,17 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
                     "source": deployment.source.model_dump(mode="json"),
                     "site_host": deployment.placement.site_host,
                     "relative_path": deployment.placement.relative_path,
+                    "runtimes": {
+                        key: value.model_dump(mode="json")
+                        for key, value in deployment.runtimes.items()
+                    },
+                    "resources": deployment.resources.model_dump(mode="json"),
                 }
                 for name, deployment in sorted(state.deployments.items())
             },
             "effects": [
-                "write one atomic schema-v2 desired-state document",
+                "write one atomic schema-v3 desired-state document",
+                "pin observed runtime and target-local resource versions explicitly",
                 "preserve existing remote paths, identities, databases, cache prefixes, and URLs",
                 "leave legacy manifests and every remote target unchanged",
             ],
@@ -133,7 +140,12 @@ def deployment_resource_plan(
             "runtime": {
                 "app_env": deployment.app_env,
                 "app_debug": deployment.app_debug,
+                "pins": {
+                    key: value.model_dump(mode="json")
+                    for key, value in deployment.runtimes.items()
+                },
             },
+            "resource_bindings": deployment.resources.model_dump(mode="json"),
             "secret_references": sorted(deployment.secrets.values()),
             "missing_secret_references": missing,
             "ready": not missing,
@@ -174,7 +186,7 @@ def deployment_release_plan(
                 if application.frontend is not None
                 else None
             ),
-            "toolchain": toolchain,
+            "runtimes": toolchain,
             "deployer_plan": rendered_tasks,
             "effects": [
                 "deploy the exact resolved revision",

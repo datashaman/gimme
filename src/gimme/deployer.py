@@ -118,7 +118,10 @@ class DeployerRunner:
         source_kind: str = "branch",
         sites: Sequence[dict[str, str]] | None = None,
         network_mode: str = "local_mdns",
-        toolchains: dict[str, str | None] | None = None,
+        runtimes: dict[str, dict[str, str]] | None = None,
+        resources: dict[str, dict[str, str]] | None = None,
+        mise_version: str | None = None,
+        php_extensions: Sequence[str] = (),
         variables: dict[str, str] | None = None,
         secret_file: Path | None = None,
         timeout: int = 900,
@@ -159,7 +162,10 @@ class DeployerRunner:
                 "GIMME_APPS_ROOT": server.apps_root,
                 "GIMME_KEEP_RELEASES": str(server.keep_releases),
                 "GIMME_NETWORK_MODE": network_mode,
-                "GIMME_TOOLCHAINS_JSON": json.dumps(toolchains or {}),
+                "GIMME_RUNTIMES_JSON": json.dumps(runtimes or {}),
+                "GIMME_RESOURCES_JSON": json.dumps(resources or {}),
+                "GIMME_MISE_VERSION": mise_version or "",
+                "GIMME_PHP_EXTENSIONS_JSON": json.dumps(list(php_extensions)),
                 "GIMME_VARIABLES_JSON": json.dumps(variables or {}),
             }
         )
@@ -185,7 +191,7 @@ class DeployerRunner:
                     cache_prefix,
                 )
             ):
-                environment["GIMME_CONTROL_V2"] = "1"
+                environment["GIMME_CONTROL_V3"] = "1"
         if secret_file is not None:
             if secret_file.is_symlink():
                 raise ValueError("secret_file must be a regular local file")

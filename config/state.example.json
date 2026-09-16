@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "targets": {
     "devbox": {
       "host_alias": "devbox",
@@ -44,12 +44,8 @@
         ],
         "services": ["avahi-daemon", "caddy", "postgresql", "valkey-server"]
       },
-      "toolchains": {
-        "node": "22.12.0",
-        "npm": "10.9.0",
-        "pnpm": null,
-        "yarn": null,
-        "bun": null
+      "runtimes": {
+        "mise_version": "2026.9.3"
       }
     }
   },
@@ -71,7 +67,22 @@
         "attempts": 10,
         "delay_seconds": 2,
         "timeout_seconds": 5
-      }
+      },
+      "php_extensions": ["bcmath", "curl", "gd", "intl", "mbstring", "pdo_pgsql", "redis", "xml", "zip"]
+    }
+  },
+  "resources": {
+    "devbox-postgres": {
+      "target": "devbox",
+      "kind": "postgres",
+      "provider": "target_local",
+      "version": "17.2"
+    },
+    "devbox-valkey": {
+      "target": "devbox",
+      "kind": "valkey",
+      "provider": "target_local",
+      "version": "8.0.1"
     }
   },
   "deployments": {
@@ -88,6 +99,16 @@
       "scheduler": null,
       "variables": {"LOG_CHANNEL": "stack"},
       "secrets": {"MAIL_PASSWORD": "example-local/MAIL_PASSWORD"},
+      "runtimes": {
+        "php": {"provider": "system", "version": "8.4.1"},
+        "composer": {"provider": "system", "version": "2.8.4"},
+        "node": {"provider": "mise", "version": "22.12.0"},
+        "npm": {"provider": "bundled", "version": "10.9.0"}
+      },
+      "resources": {
+        "database": "devbox-postgres",
+        "cache": "devbox-valkey"
+      },
       "placement": {
         "instance": "example-local",
         "relative_path": "deployments/example-local",

@@ -49,10 +49,11 @@ def test_php_site_resolves_deployer_current_symlink() -> None:
         "devbox",
         Path("/srv/gimme/apps/example-app/current/public"),
         "laravel",
+        php_fpm_socket="/run/php/php8.4-fpm.sock",
     )
 
     assert (
-        "php_fastcgi unix//run/php/php-fpm.sock {\n"
+        "php_fastcgi unix//run/php/php8.4-fpm.sock {\n"
         "        resolve_root_symlink\n"
         "    }"
     ) in site
@@ -66,6 +67,7 @@ def test_caddy_site_hides_repository_and_environment_files() -> None:
         "devbox",
         Path("/srv/gimme/apps/example-app/current"),
         "common",
+        php_fpm_socket="/run/php/php8.4-fpm.sock",
     )
 
     assert "file_server {\n" in site
@@ -114,6 +116,7 @@ def test_helper_accepts_isolated_environment_site() -> None:
                 "document_root": (
                     "/srv/gimme/apps/example-app/environments/feature-x/current/public"
                 ),
+                "php_fpm_socket": "/run/php/php8.4-fpm.sock",
             }
         }
     )
@@ -136,6 +139,7 @@ def test_helper_rejects_environment_document_root_escape() -> None:
                     "framework": "laravel",
                     "site_host": "feature-x.example-app.devbox.local",
                     "document_root": "/etc/current/public",
+                    "php_fpm_socket": "/run/php/php8.4-fpm.sock",
                 }
             }
         )

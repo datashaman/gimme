@@ -232,21 +232,99 @@ function configured_process_object(string $environment): ?array
     return $decoded;
 }
 
-function configured_toolchains(): array
+function configured_runtimes(): array
 {
-    $raw = getenv('GIMME_TOOLCHAINS_JSON') ?: '{}';
+    $raw = getenv('GIMME_RUNTIMES_JSON') ?: '{}';
     $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
-    if (!is_array($decoded) || array_is_list($decoded)) {
-        throw new \RuntimeException('GIMME_TOOLCHAINS_JSON must be an object');
+    if (!is_array($decoded) || (array_is_list($decoded) && trim($raw) !== '{}')) {
+        throw new \RuntimeException('GIMME_RUNTIMES_JSON must be an object');
     }
-    foreach ($decoded as $name => $version) {
-        if (!in_array($name, ['node', 'npm', 'pnpm', 'yarn', 'bun'], true) ||
-            ($version !== null && (!is_string($version) ||
-                !preg_match('/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$/', $version)))) {
-            throw new \RuntimeException('Unsafe frontend toolchain declaration');
+    foreach ($decoded as $name => $pin) {
+        if (!in_array($name, [
+            'php', 'composer', 'node', 'npm', 'pnpm', 'yarn', 'bun',
+            'python', 'ruby', 'go', 'java',
+        ], true) || !is_array($pin) || array_is_list($pin) ||
+            array_diff(array_keys($pin), ['provider', 'version']) !== [] ||
+            count($pin) !== 2 ||
+            !in_array($pin['provider'] ?? null, ['system', 'mise', 'bundled'], true) ||
+            !is_string($pin['version'] ?? null) ||
+            !preg_match('/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$/', $pin['version'])) {
+            throw new \RuntimeException('Unsafe runtime declaration');
         }
     }
     return $decoded;
+}
+
+function configured_php_extensions(): array
+{
+    $decoded = json_decode(getenv('GIMME_PHP_EXTENSIONS_JSON') ?: '[]', true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($decoded) || !array_is_list($decoded) || count($decoded) > 64) {
+        throw new \RuntimeException('GIMME_PHP_EXTENSIONS_JSON must be a bounded list');
+    }
+    foreach ($decoded as $extension) {
+        if (!is_string($extension) || !preg_match('/^[a-z][a-z0-9_]{0,47}$/', $extension)) {
+            throw new \RuntimeException('Unsafe PHP extension name');
+        }
+    }
+    return $decoded;
+}
+
+function configured_resources(): array
+{
+    $raw = getenv('GIMME_RESOURCES_JSON') ?: '{}';
+    $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($decoded) || (array_is_list($decoded) && trim($raw) !== '{}')) {
+        throw new \RuntimeException('GIMME_RESOURCES_JSON must be an object');
+    }
+    foreach ($decoded as $binding => $resource) {
+        if (!in_array($binding, ['database', 'cache'], true) || !is_array($resource) ||
+            array_diff(array_keys($resource), ['target', 'kind', 'provider', 'version']) !== [] ||
+            count($resource) !== 4 ||
+            !is_string($resource['target'] ?? null) ||
+            !preg_match('/^[a-z][a-z0-9-]{0,31}$/', $resource['target']) ||
+            !in_array($resource['kind'] ?? null, ['postgres', 'valkey'], true) ||
+            ($binding === 'database' && $resource['kind'] !== 'postgres') ||
+            ($binding === 'cache' && $resource['kind'] !== 'valkey') ||
+            ($resource['provider'] ?? null) !== 'target_local' ||
+            !is_string($resource['version'] ?? null) ||
+            !preg_match('/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$/', $resource['version'])) {
+            throw new \RuntimeException('Unsafe resource declaration');
+        }
+    }
+    return $decoded;
+}
+
+function runtime_command(array $runtimes, array $names, string $appsRoot, array $command): string
+{
+    $mise = [];
+    foreach ($names as $name) {
+        $pin = $runtimes[$name] ?? null;
+        if (!is_array($pin)) {
+            throw new \RuntimeException("Missing runtime pin for {$name}");
+        }
+        if ($pin['provider'] === 'mise') {
+            $mise[] = "{$name}@{$pin['version']}";
+        }
+    }
+    $rendered = implode(' ', array_map('escapeshellarg', $command));
+    if ($mise === []) {
+        return $rendered;
+    }
+    return 'MISE_DATA_DIR=' . escapeshellarg("{$appsRoot}/.gimme/mise") .
+        ' mise exec ' . implode(' ', array_map('escapeshellarg', $mise)) . ' -- ' . $rendered;
+}
+
+function configured_php_binary(): string
+{
+    $php = configured_runtimes()['php'] ?? null;
+    if (!is_array($php) || $php['provider'] !== 'system') {
+        throw new \RuntimeException('A system PHP runtime pin is required');
+    }
+    $parts = explode('.', $php['version']);
+    if (count($parts) < 2) {
+        throw new \RuntimeException('PHP version must include major and minor');
+    }
+    return "/usr/bin/php{$parts[0]}.{$parts[1]}";
 }
 
 function configured_environment_values(): array
@@ -611,6 +689,7 @@ function process_state_write_command(
     string $remoteUser,
     ?array $workers,
     ?array $scheduler,
+    string $phpBinary,
 ): string {
     $state = json_encode([
         'version' => 1,
@@ -621,6 +700,7 @@ function process_state_write_command(
         'deploy_path' => $deployPath,
         'workers' => $workers,
         'scheduler' => $scheduler,
+        'php_binary' => $phpBinary,
     ], JSON_THROW_ON_ERROR);
     $encoded = escapeshellarg(base64_encode($state));
     $directory = escapeshellarg(dirname($statePath));
@@ -720,7 +800,7 @@ if (!preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environmentName) ||
     throw new \RuntimeException('Unsafe environment identity');
 }
 if ($app !== '') {
-    $controlV2 = getenv('GIMME_CONTROL_V2') === '1';
+    $controlV3 = getenv('GIMME_CONTROL_V3') === '1';
     $expectedInstance = $environmentName === 'default'
         ? $app
         : "{$app}--{$environmentName}--" . substr(
@@ -734,7 +814,7 @@ if ($app !== '') {
     $expectedSiteHost = $environmentName === 'default'
         ? "{$app}.{$mdnsName}.local"
         : "{$environmentName}.{$app}.{$mdnsName}.local";
-    $safeV2Boundary = $controlV2 &&
+    $safeV3Boundary = $controlV3 &&
         preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance) &&
         str_starts_with($deployPath, "{$appsRoot}/") &&
         !str_starts_with($deployPath, "{$appsRoot}/.") &&
@@ -742,12 +822,12 @@ if ($app !== '') {
         !str_contains($deployPath, '..') &&
         preg_match('#^/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+$#', $deployPath) &&
         valid_endpoint($siteHost);
-    $safeLegacyBoundary = !$controlV2 &&
+    $safeLegacyBoundary = !$controlV3 &&
         $instance === $expectedInstance &&
         $deployPath === $expectedDeployPath &&
         $siteHost === $expectedSiteHost &&
         valid_endpoint($siteHost);
-    if (!$safeV2Boundary && !$safeLegacyBoundary) {
+    if (!$safeV3Boundary && !$safeLegacyBoundary) {
         throw new \RuntimeException('Unsafe environment deployment boundary');
     }
 }
@@ -784,6 +864,19 @@ if ($app !== '') {
             ...get('shared_files', []),
             '.env',
         ])));
+        $runtimes = configured_runtimes();
+        $php = $runtimes['php'] ?? null;
+        $composer = $runtimes['composer'] ?? null;
+        if (!is_array($php) || $php['provider'] !== 'system' ||
+            !preg_match('/^(\d+)\.(\d+)\./', $php['version'], $phpParts) ||
+            !is_array($composer)) {
+            throw new \RuntimeException('PHP applications require exact PHP and Composer pins');
+        }
+        set('php_version', "{$phpParts[1]}.{$phpParts[2]}");
+        if ($composer['provider'] !== 'system') {
+            throw new \RuntimeException('Composer currently requires the system provider');
+        }
+        set('composer_version', $composer['version']);
     }
 }
 
@@ -807,12 +900,17 @@ if ($hasFrontend) {
         set('public_path', $outputDir);
     }
 
-    $toolchains = configured_toolchains();
-    $managerVersion = $toolchains[$packageManager] ?? null;
-    $nodeVersion = $toolchains['node'] ?? null;
-    if (!is_string($managerVersion) || ($packageManager !== 'bun' && !is_string($nodeVersion))) {
-        throw new \RuntimeException('Target must declare exact frontend toolchain versions');
+    $runtimes = configured_runtimes();
+    $managerPin = $runtimes[$packageManager] ?? null;
+    $nodePin = $runtimes['node'] ?? null;
+    if (!is_array($managerPin) || ($packageManager !== 'bun' && !is_array($nodePin))) {
+        throw new \RuntimeException('Deployment must declare exact frontend runtime pins');
     }
+    $managerVersion = $managerPin['version'];
+    $nodeVersion = $nodePin['version'] ?? null;
+    $runtimeNames = $packageManager === 'bun'
+        ? ['bun']
+        : ['node', $packageManager];
     $install = match ($packageManager) {
         'npm' => ['npm', 'ci', '--no-audit', '--no-fund'],
         'pnpm' => ['pnpm', 'install', '--frozen-lockfile'],
@@ -838,27 +936,34 @@ if ($hasFrontend) {
         $quotedAll,
         $quotedAllowed,
         $installCommand,
+        $runtimeNames,
+        $runtimes,
+        $appsRoot,
     ): void {
-        $verify = 'set -eu; cd {{release_path}}; ' .
+        $script = 'set -eu; cd {{release_path}}; ' .
             'command -v ' . escapeshellarg($packageManager) . ' >/dev/null; ' .
             'test "$(' . escapeshellarg($packageManager) . ' --version)" = ' .
             escapeshellarg($managerVersion) . '; ';
         if ($packageManager !== 'bun') {
-            $verify .= 'command -v node >/dev/null; ' .
+            $script .= 'command -v node >/dev/null; ' .
                 'test "$(node --version | sed s/^v//)" = ' . escapeshellarg((string) $nodeVersion) . '; ';
         }
-        $verify .= 'test "$(for f in ' . $quotedAll .
+        $script .= 'test "$(for f in ' . $quotedAll .
             '; do test -f "$f" && printf x; done)" = x; ' .
             'found=0; for f in ' . $quotedAllowed .
             '; do test -f "$f" && found=$((found + 1)); done; test "$found" = 1; ' .
             $installCommand;
-        run('bash -c ' . escapeshellarg($verify));
+        run(runtime_command($runtimes, $runtimeNames, $appsRoot, [
+            'bash', '-c', $script,
+        ]));
     });
-    task('gimme:frontend:build', function () use ($packageManager, $buildScript): void {
-        run(
-            'cd {{release_path}} && ' . escapeshellarg($packageManager) .
-            ' run ' . escapeshellarg($buildScript)
-        );
+    task('gimme:frontend:build', function () use (
+        $packageManager, $buildScript, $runtimeNames, $runtimes, $appsRoot,
+    ): void {
+        run('cd {{release_path}} && ' . runtime_command(
+            $runtimes, $runtimeNames, $appsRoot,
+            [$packageManager, 'run', $buildScript],
+        ));
     });
     task('gimme:frontend', [
         'gimme:frontend:install',
@@ -895,32 +1000,93 @@ task('gimme:resolve-revision', function (): void {
     writeln("GIMME_REVISION|{$revision}");
 });
 
-task('gimme:preflight:frontend', function () use ($hasFrontend): void {
-    if (!$hasFrontend) {
-        writeln('GIMME_FRONTEND_PREFLIGHT|not_required');
+task('gimme:preflight:runtimes', function () use ($appsRoot): void {
+    $runtimes = configured_runtimes();
+    $miseVersion = getenv('GIMME_MISE_VERSION') ?: '';
+    if (array_filter($runtimes, static fn (array $pin): bool => $pin['provider'] === 'mise')) {
+        $actualMise = trim(run('mise --version'));
+        if (!preg_match('/(?:^|\s)v?([0-9]+(?:\.[0-9]+){1,3})/', $actualMise, $match) ||
+            $match[1] !== $miseVersion) {
+            throw new \RuntimeException('mise version does not match desired state');
+        }
+        writeln("GIMME_RUNTIME|mise|{$match[1]}");
+    }
+    foreach ($runtimes as $name => $pin) {
+        $names = $pin['provider'] === 'bundled' && $name === 'npm' ? ['node'] : [$name];
+        $command = match ($name) {
+            'php' => ['/usr/bin/php' . implode('.', array_slice(explode('.', $pin['version']), 0, 2)), '-r', 'echo PHP_VERSION;'],
+            'composer' => ['composer', '--version', '--no-ansi'],
+            'node' => ['node', '--version'],
+            'npm', 'pnpm', 'yarn', 'bun', 'python', 'ruby', 'java' => [$name, '--version'],
+            'go' => ['go', 'version'],
+            default => throw new \RuntimeException('Unsupported runtime'),
+        };
+        $output = trim(run(runtime_command($runtimes, $names, $appsRoot, $command)));
+        if ($name === 'composer' && preg_match('/Composer version ([^ ]+)/', $output, $match)) {
+            $actual = $match[1];
+        } elseif ($name === 'ruby' && preg_match('/ruby ([^ ]+)/', $output, $match)) {
+            $actual = $match[1];
+        } elseif ($name === 'python' && preg_match('/Python ([^ ]+)/', $output, $match)) {
+            $actual = $match[1];
+        } elseif ($name === 'go' && preg_match('/go version go([^ ]+)/', $output, $match)) {
+            $actual = $match[1];
+        } elseif ($name === 'java' && preg_match('/^[^ ]+ ([^ ]+)/', $output, $match)) {
+            $actual = $match[1];
+        } else {
+            $actual = ltrim($output, 'v');
+        }
+        if ($actual !== $pin['version']) {
+            throw new \RuntimeException("{$name} version does not match desired state");
+        }
+        writeln("GIMME_RUNTIME|{$name}|{$actual}");
+    }
+    $php = $runtimes['php'] ?? null;
+    if (is_array($php)) {
+        $phpBinary = '/usr/bin/php' . implode('.', array_slice(explode('.', $php['version']), 0, 2));
+        foreach (configured_php_extensions() as $extension) {
+            run($phpBinary . ' -r ' . escapeshellarg(
+                "exit(extension_loaded('{$extension}') ? 0 : 1);",
+            ));
+            writeln("GIMME_PHP_EXTENSION|{$extension}|ready");
+        }
+    }
+    foreach (configured_resources() as $resource) {
+        $kind = $resource['kind'];
+        $command = $kind === 'postgres' ? 'psql --version' : 'valkey-server --version';
+        $output = trim(run($command));
+        if (!preg_match('/(?:PostgreSQL\)? |v=)([0-9]+(?:\.[0-9]+){0,3})/', $output, $match) ||
+            $match[1] !== $resource['version']) {
+            throw new \RuntimeException("{$kind} version does not match desired state");
+        }
+        writeln("GIMME_RESOURCE|{$kind}|{$match[1]}");
+    }
+});
+
+task('gimme:preflight:frontend', ['gimme:preflight:runtimes']);
+
+task('gimme:provision:runtimes', function () use ($appsRoot): void {
+    $runtimes = configured_runtimes();
+    $pins = [];
+    foreach ($runtimes as $name => $pin) {
+        if ($pin['provider'] === 'mise') {
+            $pins[] = "{$name}@{$pin['version']}";
+        }
+    }
+    if ($pins === []) {
+        writeln('GIMME_RUNTIME_PROVISION|not_required');
         return;
     }
-    $manager = required_env('GIMME_FRONTEND_PACKAGE_MANAGER');
-    $toolchains = configured_toolchains();
-    $managerVersion = $toolchains[$manager] ?? null;
-    if (!is_string($managerVersion)) {
-        throw new \RuntimeException("Target requires an exact {$manager} version");
+    $miseVersion = getenv('GIMME_MISE_VERSION') ?: '';
+    $actualMise = trim(run('mise --version'));
+    if (!preg_match('/(?:^|\s)v?([0-9]+(?:\.[0-9]+){1,3})/', $actualMise, $match) ||
+        $match[1] !== $miseVersion) {
+        throw new \RuntimeException('mise version does not match desired state');
     }
-    $actualManager = trim(run(escapeshellarg($manager) . ' --version'));
-    if ($actualManager !== $managerVersion) {
-        throw new \RuntimeException("Target {$manager} version does not match desired state");
-    }
-    writeln("GIMME_FRONTEND_TOOL|{$manager}|{$actualManager}");
-    if ($manager !== 'bun') {
-        $nodeVersion = $toolchains['node'] ?? null;
-        if (!is_string($nodeVersion)) {
-            throw new \RuntimeException('Target requires an exact Node.js version');
-        }
-        $actualNode = ltrim(trim(run('node --version')), 'v');
-        if ($actualNode !== $nodeVersion) {
-            throw new \RuntimeException('Target Node.js version does not match desired state');
-        }
-        writeln("GIMME_FRONTEND_TOOL|node|{$actualNode}");
+    run('mkdir -p ' . escapeshellarg("{$appsRoot}/.gimme/mise"));
+    foreach ($pins as $pin) {
+        run('MISE_DATA_DIR=' . escapeshellarg("{$appsRoot}/.gimme/mise") .
+            ' mise install ' . escapeshellarg($pin));
+        writeln("GIMME_RUNTIME_PROVISION|{$pin}|ready");
     }
 });
 
@@ -948,7 +1114,7 @@ if ($health !== null) {
             'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
             '/usr/bin/timeout --signal=TERM ' .
             escapeshellarg((string) $health['timeout_seconds']) . 's ' .
-            'php -d display_errors=0 -r %health_script% 2>/dev/null || true';
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
         for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
             $output = run(
                 $command,
@@ -985,7 +1151,7 @@ if ($health !== null) {
             'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
             'GIMME_HEALTH_TIMEOUT=' .
             escapeshellarg((string) $health['timeout_seconds']) . ' ' .
-            'php -d display_errors=0 -r %health_script% 2>/dev/null || true';
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
         for ($attempt = 1; $attempt <= $health['attempts']; $attempt++) {
             $output = run(
                 $command,
@@ -1164,6 +1330,39 @@ BASH;
         }
         writeln("toolchain.{$tool}={$version}");
     }
+});
+
+task('gimme:inspect:runtimes', function (): void {
+    $script = <<<'BASH'
+set -eu
+emit() { test -n "$2" && printf 'GIMME_RUNTIME|%s|%s\n' "$1" "$2"; }
+if command -v php >/dev/null 2>&1; then emit php "$(php -r 'echo PHP_VERSION;')"; fi
+if command -v composer >/dev/null 2>&1; then
+    emit composer "$(composer --version --no-ansi | awk '{print $3}')"
+fi
+if command -v node >/dev/null 2>&1; then emit node "$(node --version | sed 's/^v//')"; fi
+for tool in npm pnpm yarn bun; do
+    if command -v "$tool" >/dev/null 2>&1; then emit "$tool" "$($tool --version)"; fi
+done
+if command -v python >/dev/null 2>&1; then emit python "$(python --version | awk '{print $2}')"; fi
+if command -v ruby >/dev/null 2>&1; then emit ruby "$(ruby --version | awk '{print $2}')"; fi
+if command -v go >/dev/null 2>&1; then
+    emit go "$(go version | sed -E 's/.* go([^ ]+).*/\1/')"
+fi
+if command -v java >/dev/null 2>&1; then
+    emit java "$(java --version 2>&1 | head -n 1 | awk '{print $2}')"
+fi
+if command -v mise >/dev/null 2>&1; then
+    emit mise "$(mise --version | sed -E 's/.*v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+fi
+if command -v psql >/dev/null 2>&1; then
+    emit postgres "$(psql --version | sed -E 's/.* ([0-9]+(\.[0-9]+){0,3}).*/\1/')"
+fi
+if command -v valkey-server >/dev/null 2>&1; then
+    emit valkey "$(valkey-server --version | sed -E 's/.*v=([0-9]+(\.[0-9]+){0,3}).*/\1/')"
+fi
+BASH;
+    run('bash -c ' . escapeshellarg($script));
 });
 
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
@@ -1444,6 +1643,7 @@ task('gimme:provision:app', function () use (
             $remoteUser,
             configured_workers(),
             configured_scheduler(),
+            configured_php_binary(),
         )));
     }
 
@@ -1544,7 +1744,7 @@ BASH;
         if ($hasCurrentRelease) {
             run(
                 'cd ' . escapeshellarg($currentPath) .
-                ' && php artisan optimize:clear && php artisan optimize'
+                ' && {{bin/php}} artisan optimize:clear && {{bin/php}} artisan optimize'
             );
         }
         $unitsChanged = false;
@@ -1582,7 +1782,7 @@ task('gimme:artisan', function () use ($app): void {
         throw new \RuntimeException('Current release does not contain an Artisan executable');
     }
     $arguments = [
-        'php',
+        configured_php_binary(),
         'artisan',
         '--no-interaction',
         $command,
@@ -1625,10 +1825,10 @@ task('gimme:preflight:processes', function () use (
     $workersEnabled = is_array($workers) && ($workers['enabled'] ?? null) === true;
     $horizonRequired = $workersEnabled && ($workers['driver'] ?? null) === 'horizon';
     $pcntlReady = !$workersEnabled || test(
-        "/usr/bin/php -r 'exit(extension_loaded(\"pcntl\") ? 0 : 1);'"
+        escapeshellarg(configured_php_binary()) . " -r 'exit(extension_loaded(\"pcntl\") ? 0 : 1);'"
     );
     $posixReady = !$horizonRequired || test(
-        "/usr/bin/php -r 'exit(extension_loaded(\"posix\") ? 0 : 1);'"
+        escapeshellarg(configured_php_binary()) . " -r 'exit(extension_loaded(\"posix\") ? 0 : 1);'"
     );
     $horizonReady = !$horizonRequired || test(
         '[ -d ' . escapeshellarg("{$currentPath}/vendor/laravel/horizon") . ' ] && ' .
@@ -1683,7 +1883,8 @@ BASH;
         run('bash -c ' . escapeshellarg($configureRedis));
         run(
             'cd ' . escapeshellarg($currentPath) .
-            ' && php artisan --no-interaction config:clear'
+            ' && ' . escapeshellarg(configured_php_binary()) .
+            ' artisan --no-interaction config:clear'
         );
     }
     $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
@@ -1695,6 +1896,7 @@ BASH;
         $remoteUser,
         $workers,
         configured_scheduler(),
+        configured_php_binary(),
     )));
     run(
         'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
@@ -1769,7 +1971,8 @@ task('gimme:restart:workers', function (): void {
     };
     $currentPath = get('deploy_path') . '/current';
     run(
-        'cd ' . escapeshellarg($currentPath) . ' && php artisan --no-interaction ' .
+        'cd ' . escapeshellarg($currentPath) . ' && ' .
+        escapeshellarg(configured_php_binary()) . ' artisan --no-interaction ' .
         escapeshellarg($command)
     );
 });
@@ -1799,6 +2002,7 @@ task('gimme:remove:environment', function () use (
         'deploy_path' => $expectedPath,
         'workers' => null,
         'scheduler' => null,
+        'php_binary' => configured_php_binary(),
     ], JSON_THROW_ON_ERROR);
     $encoded = escapeshellarg(base64_encode($state));
     $stateDirectory = escapeshellarg(dirname($statePath));
@@ -1875,8 +2079,8 @@ task('gimme:remove:deployment', function () use (
     $appsRoot,
     $remoteUser,
 ): void {
-    if ($app === '' || getenv('GIMME_CONTROL_V2') !== '1') {
-        throw new \RuntimeException('Deployment removal requires v2 placement context');
+    if ($app === '' || getenv('GIMME_CONTROL_V3') !== '1') {
+        throw new \RuntimeException('Deployment removal requires v3 placement context');
     }
     $deployPath = get('deploy_path');
     if (!str_starts_with($deployPath, "{$appsRoot}/") || str_contains($deployPath, '..')) {
@@ -1892,6 +2096,7 @@ task('gimme:remove:deployment', function () use (
         'deploy_path' => $deployPath,
         'workers' => null,
         'scheduler' => null,
+        'php_binary' => configured_php_binary(),
     ], JSON_THROW_ON_ERROR);
     $encoded = escapeshellarg(base64_encode($state));
     $stateDirectory = escapeshellarg(dirname($statePath));

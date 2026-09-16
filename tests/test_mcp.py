@@ -11,6 +11,9 @@ from gimme.control import (
     DeploymentRegistration,
     DeploymentSource,
     Placement,
+    ResourceBindings,
+    ResourceConfig,
+    RuntimePin,
     StateStore,
     TargetConfig,
     TargetNetwork,
@@ -43,6 +46,11 @@ def sample_state() -> ControlState:
         stage="local",
         source=DeploymentSource(kind="branch", ref="main"),
         app_env="local",
+        runtimes={
+            "php": RuntimePin(provider="system", version="8.4.1"),
+            "composer": RuntimePin(provider="system", version="2.8.4"),
+        },
+        resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey"),
         placement=Placement(
             instance="example-app",
             relative_path="deployments/example-app",
@@ -54,6 +62,10 @@ def sample_state() -> ControlState:
     return ControlState(
         targets={"devbox": target},
         applications={"example-app": application},
+        resources={
+            "devbox-postgres": ResourceConfig(target="devbox", kind="postgres", version="17.2"),
+            "devbox-valkey": ResourceConfig(target="devbox", kind="valkey", version="8.0.1"),
+        },
         deployments={"example-app": deployment},
     )
 
@@ -65,7 +77,7 @@ def use_store(tmp_path: Path, monkeypatch) -> StateStore:
     return selected
 
 
-async def test_hard_v2_tool_surface() -> None:
+async def test_hard_v3_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
         resources = await client.list_resources()
@@ -79,9 +91,12 @@ async def test_hard_v2_tool_surface() -> None:
         "apply_state_migration",
         "register_target",
         "register_application",
+        "register_resource",
         "register_deployment",
         "plan_target_stack",
         "apply_target_stack",
+        "plan_deployment_runtimes",
+        "apply_deployment_runtimes",
         "plan_deployment_resources",
         "apply_deployment_resources",
         "plan_deployment",
@@ -95,6 +110,7 @@ async def test_hard_v2_tool_surface() -> None:
     assert {template.uriTemplate for template in templates} == {
         "gimme://targets/{name}",
         "gimme://applications/{name}",
+        "gimme://resources/{name}",
         "gimme://deployments/{name}",
     }
     assert all(tool.annotations is not None for tool in tools)
@@ -108,6 +124,8 @@ def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch
         stage="preview",
         source=DeploymentSource(kind="branch", ref="feature/demo"),
         app_env="local",
+        runtimes=sample_state().deployments["example-app"].runtimes,
+        resources=sample_state().deployments["example-app"].resources,
     )
     result = server_module.register_deployment("example-preview", definition)
     placement = selected.deployment("example-preview").placement
@@ -186,5 +204,5 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 2
+    assert value["schema_version"] == 3
     assert "deployments" in value

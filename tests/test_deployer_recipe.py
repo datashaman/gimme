@@ -31,6 +31,12 @@ def rendered_deploy_plan(health: dict[str, object]) -> str:
         "GIMME_WORKERS_JSON": "null",
         "GIMME_SCHEDULER_JSON": "null",
         "GIMME_HEALTH_JSON": json.dumps(health),
+        "GIMME_RUNTIMES_JSON": json.dumps({
+            "php": {"provider": "system", "version": "8.4.1"},
+            "composer": {"provider": "system", "version": "2.8.4"},
+        }),
+        "GIMME_RESOURCES_JSON": "{}",
+        "GIMME_PHP_EXTENSIONS_JSON": "[]",
     }
     result = subprocess.run(
         [
@@ -170,8 +176,8 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "laravel_environment_reconcile_script" in task
     assert "GIMME_RUNTIME_CHANGED|yes" in task
     assert "grep -q '^APP_KEY='" in task
-    assert "php artisan optimize:clear" in task
-    assert "php artisan optimize" in task
+    assert "{{bin/php}} artisan optimize:clear" in task
+    assert "{{bin/php}} artisan optimize" in task
     assert 'if [ -L "\\$env_path" ]' in task
     assert 'chmod 0600 "\\$env_path"' in task
 
@@ -295,7 +301,7 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
     )[0]
 
     assert "tls internal" in helper
-    assert "php_fastcgi unix//run/php/php-fpm.sock" in helper
+    assert "php_fastcgi unix/{php_fpm_socket}" in helper
     assert "resolve_root_symlink" in helper
     assert "/etc/caddy/gimme" in helper
     assert '"caddy", "validate"' in helper
@@ -369,7 +375,7 @@ def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
     assert "after('deploy:symlink', 'gimme:restart:workers')" in recipe
     assert "after('rollback', 'gimme:restart:workers')" in recipe
     assert "QUEUE_CONNECTION=redis" in recipe
-    assert "php artisan --no-interaction config:clear" in recipe
+    assert "artisan --no-interaction config:clear" in recipe
 
 
 def test_deployment_health_gates_candidate_before_live_activation() -> None:

@@ -4,15 +4,16 @@ Gimme is an alpha MCP deployment control plane for Ubuntu targets. It keeps desi
 state locally, provisions a target through a narrowly scoped privileged helper, and
 deploys PHP/Laravel or static applications through Deployer.
 
-Version 0.5 has three explicit resources:
+Version 0.6 has four explicit resources:
 
 - a **target** is an independently provisioned Ubuntu machine;
 - an **application** is reusable source/build metadata;
+- a **resource** is a named, version-pinned PostgreSQL or Valkey service;
 - a **deployment** places one application revision on one target at one stage.
 
-This is a hard API break from 0.4. There are no `app`/`environment` compatibility
+This is alpha software and 0.6 is a hard state/API break. There are no compatibility
 tools. The migration preserves existing remote paths, database identities, cache
-prefixes, and URLs, but writes them into the new model.
+prefixes, and URLs while recording observed runtime and service versions explicitly.
 
 ## Safety model
 
@@ -56,7 +57,7 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v2 targets, applications, deployments, secret references
+state.json          # schema-v3 targets, applications, resources, deployments, pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 ```
@@ -65,7 +66,7 @@ Operational state and encrypted secrets are ignored in this public source reposi
 because even encrypted documents, hostnames, repository URLs, and secret key names can
 reveal private inventory. To make state Git-backed, point `GIMME_STATE_DIR` at a
 separate private repository. Legacy 0.4 manifests remain ignored for the same reason.
-Copy the example for a new installation, or use the migration tools for a 0.4 installation:
+Copy the example for a new installation, or use the migration tools for an older installation:
 
 1. call `plan_state_migration`;
 2. review its preserved placements and effects;
@@ -110,10 +111,40 @@ scp devbox.local:/srv/gimme/apps/.caddy-local-root.crt /tmp/gimme-caddy-root.crt
 
 Trust only a CA retrieved from a target you control.
 
+## Runtime versions
+
+Every deployment declares exact runtime versions. A pin has a `provider` and a
+`version`; Gimme never resolves ranges such as `latest`, `^22`, or `8.4.*`.
+
+- `system` selects an exact host binary and verifies its full version.
+- `mise` installs and executes that exact user-space runtime from
+  `<apps_root>/.gimme/mise` without shell activation.
+- `bundled` is valid only for npm, whose version is supplied by the selected Node.js.
+
+Set `target.runtimes.mise_version` whenever any deployment uses mise. The exact mise
+binary must first be installed by the target administrator from a trusted package
+source; Gimme does not pipe a remote installer into a privileged shell. Use
+`plan_deployment_runtimes` and `apply_deployment_runtimes` to review and install the
+declared mise pins. Multiple Node.js, Bun, pnpm, Yarn, Python, Ruby, Go, and Java
+versions can coexist because each deployment command runs through
+`mise exec tool@version`.
+
+PHP web deployments deliberately use the `system` provider: the exact PHP patch is
+verified, Deployer uses `/usr/bin/phpX.Y`, Caddy uses
+`/run/php/phpX.Y-fpm.sock`, and queue/Horizon/scheduler units use that same CLI.
+Composer is also system-pinned so it cannot silently execute under another PHP.
+Application `php_extensions` are exact required capabilities checked before deploy;
+their packages remain part of the target's reviewed APT stack.
+
+PostgreSQL and Valkey are named resources with explicit versions and deployment
+bindings. The current `target_local` provider permits one version of each service per
+target; the model leaves room for external or isolated providers later without
+changing deployment identity.
+
 ## Frontend builds
 
-Applications may select `npm`, `pnpm`, `yarn`, or `bun`. The target declares exact
-toolchain versions and deployment verifies them before running a build. Gimme accepts
+Applications may select `npm`, `pnpm`, `yarn`, or `bun`. The deployment declares exact
+runtime versions and verifies them before running a build. Gimme accepts
 only a validated script name, never a free-form command, and requires exactly one
 matching lockfile with no conflicting package-manager lockfiles.
 
@@ -125,8 +156,7 @@ matching lockfile with no conflicting package-manager lockfiles.
 | Yarn 2+ | `yarn install --immutable` |
 | Bun | `bun install --frozen-lockfile` |
 
-The target administrator owns installation of those exact binaries. Gimme will not
-silently substitute a package manager or update a lockfile.
+Gimme will not silently substitute a package manager or update a lockfile.
 
 ## Run
 
@@ -149,17 +179,18 @@ Example stdio client configuration:
 
 ## Workflow
 
-1. Register or migrate targets, applications, and deployments.
+1. Register or migrate targets, applications, resources, and deployments.
 2. `inspect_target`, then `plan_target_stack` / `apply_target_stack`.
-3. `plan_deployment_resources` / `apply_deployment_resources` to reconcile routing,
+3. `plan_deployment_runtimes` / `apply_deployment_runtimes` to install and verify pins.
+4. `plan_deployment_resources` / `apply_deployment_resources` to reconcile routing,
    PostgreSQL, Valkey, runtime values, workers, Horizon, and the scheduler.
-4. `plan_deployment` to review the resolved commit and Deployer task graph, then
+5. `plan_deployment` to review the resolved commit and Deployer task graph, then
    `apply_deployment` with the exact plan.
-5. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools, and
+6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools, and
    `deployment_process_status` for operations.
-6. Use `plan_promotion` / `promote_deployment` to deploy the exact current commit from
+7. Use `plan_promotion` / `promote_deployment` to deploy the exact current commit from
    one deployment to another. The destination source is pinned only after success.
-7. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
+8. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
 
 Laravel candidate health runs inside the release before activation. The live HTTPS
 health gate runs after activation and automatically restores the prior release on
@@ -173,6 +204,7 @@ Read-only resources:
 - `gimme://state`
 - `gimme://targets/{name}`
 - `gimme://applications/{name}`
+- `gimme://resources/{name}`
 - `gimme://deployments/{name}`
 
 The tools cover state migration, registration and reviewed updates, target inspection
@@ -183,7 +215,7 @@ authoritative schemas.
 
 ## Current scope
 
-Gimme 0.5 provides the multi-target foundation and strong production invariants. It
+Gimme 0.6 provides the multi-target foundation and strong production invariants. It
 still provisions target-local PostgreSQL and Valkey. Managed cloud databases, backups,
 HA, external secret stores, immutable build artifacts, traffic splitting, and fleet
 scheduling are intentionally future work rather than implied production guarantees.

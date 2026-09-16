@@ -11,7 +11,7 @@ from pydantic import Field
 
 from gimme.control import (
     ApplicationConfig, ControlState, DeploymentConfig, DeploymentRegistration,
-    DeploymentSource, StateStore, TargetConfig, legacy_app, legacy_server,
+    DeploymentSource, ResourceConfig, StateStore, TargetConfig, legacy_app, legacy_server,
     new_placement, target_sites,
 )
 from gimme.control_plans import (
@@ -81,6 +81,14 @@ def _run_deployment(
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
+    bound_resources = {
+        kind: state.resources[resource_name].model_dump(mode="json")
+        for kind, resource_name in (
+            ("database", deployment.resources.database),
+            ("cache", deployment.resources.cache),
+        )
+        if resource_name is not None
+    }
     return runner.run(
         task, legacy_server(target), stack=target.stack,
         app_name=deployment.application, app=legacy_app(application, deployment),
@@ -91,7 +99,10 @@ def _run_deployment(
         database_identifier=deployment.placement.database_identifier,
         cache_prefix=deployment.placement.cache_prefix,
         source_kind=deployment.source.kind, sites=target_sites(state, deployment.target),
-        network_mode=target.network.mode, toolchains=target.toolchains.model_dump(),
+        network_mode=target.network.mode,
+        runtimes={key: value.model_dump(mode="json") for key, value in deployment.runtimes.items()},
+        resources=bound_resources, mise_version=target.runtimes.mise_version,
+        php_extensions=application.php_extensions,
         variables=deployment.variables, secret_file=secret_file,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
@@ -144,7 +155,8 @@ def _resolved_stack_plan(name: str) -> dict[str, Any]:
     target = state.targets[name]
     result = runner.run("gimme:preflight:stack", legacy_server(target), stack=target.stack,
                         sites=target_sites(state, name), network_mode=target.network.mode,
-                        toolchains=target.toolchains.model_dump(), timeout=60, bootstrap=True)
+                        mise_version=target.runtimes.mise_version,
+                        timeout=60, bootstrap=True)
     resolution: dict[str, dict[str, str]] = {}
     busy: list[int] = []
     helper = "unknown"
@@ -181,13 +193,66 @@ def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
     if issues:
         raise ValueError("deployment is not ready: " + "; ".join(issues))
     selected = revision or _revision(name)
-    preflight = _run_deployment("gimme:preflight:frontend", name, revision=selected,
+    preflight = _run_deployment("gimme:preflight:runtimes", name, revision=selected,
                                 timeout=60)
     rendered = _run_deployment("deploy", name, revision=selected,
                                arguments=("--plan",), timeout=60)
     return deployment_release_plan(name, deployment, target, application, selected,
-                                   rendered.output, {"declared": target.toolchains.model_dump(),
+                                   rendered.output, {"declared": {
+                                       key: value.model_dump(mode="json")
+                                       for key, value in deployment.runtimes.items()
+                                   },
                                                      "preflight": preflight.output})
+
+
+def _migration_targets() -> dict[str, TargetConfig]:
+    if store.exists():
+        document = store.raw_state()
+        targets = document.get("targets", {})
+        if not isinstance(targets, dict):
+            raise ValueError("state targets are invalid")
+        result: dict[str, TargetConfig] = {}
+        for name, value in targets.items():
+            if not isinstance(name, str) or not isinstance(value, dict):
+                raise ValueError("state target is invalid")
+            migrated = dict(value)
+            migrated.pop("toolchains", None)
+            migrated.setdefault("runtimes", {"mise_version": None})
+            result[name] = TargetConfig.model_validate(migrated)
+        return result
+    from gimme.config import ConfigStore
+
+    legacy = ConfigStore(store.legacy_root)
+    server = legacy.server()
+    return {
+        server.host_alias: TargetConfig(
+            host_alias=server.host_alias,
+            bootstrap_hostname=server.bootstrap_hostname,
+            hostname=server.hostname,
+            system_hostname=server.mdns_name,
+            remote_user=server.remote_user,
+            apps_root=server.apps_root,
+            keep_releases=server.keep_releases,
+            network={"mode": "local_mdns", "mdns_name": server.mdns_name},
+            stack=legacy.stack(),
+        )
+    }
+
+
+def _migration_observations() -> dict[str, dict[str, str]]:
+    observations: dict[str, dict[str, str]] = {}
+    for name, target in _migration_targets().items():
+        result = runner.run(
+            "gimme:inspect:runtimes", legacy_server(target), stack=target.stack, timeout=60
+        )
+        versions: dict[str, str] = {}
+        for raw in result.output.splitlines():
+            line = raw.split("] ", 1)[-1].strip()
+            if line.startswith("GIMME_RUNTIME|"):
+                _, runtime, version = line.split("|", 2)
+                versions[runtime] = version
+        observations[name] = versions
+    return observations
 
 
 @mcp.resource("gimme://state")
@@ -206,6 +271,11 @@ def application_resource(name: str) -> dict[str, object]:
     return store.application(name).model_dump(mode="json")
 
 
+@mcp.resource("gimme://resources/{name}")
+def managed_resource(name: str) -> dict[str, object]:
+    return store.load().resources[name].model_dump(mode="json")
+
+
 @mcp.resource("gimme://deployments/{name}")
 def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
@@ -213,19 +283,22 @@ def deployment_resource(name: str) -> dict[str, object]:
 
 @mcp.tool(annotations=READ)
 def plan_state_migration() -> dict[str, object]:
-    """Plan the one-time legacy manifest to schema-v2 state migration."""
-    if store.exists():
-        raise ValueError("schema-v2 state already exists")
-    return migration_plan(store.legacy_migration(), str(store.root))
+    """Inspect exact installed versions and plan migration to schema-v3 state."""
+    if store.exists() and store.raw_state().get("schema_version") == 3:
+        raise ValueError("schema-v3 state already exists")
+    observations = _migration_observations()
+    return migration_plan(store.state_migration(observations), str(store.root))
 
 
 @mcp.tool(annotations=WRITE)
 def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
-    """Atomically write schema-v2 state after verifying its exact migration plan."""
-    expected = plan_state_migration()
+    """Atomically write schema-v3 state after re-observing exact installed versions."""
+    observations = _migration_observations()
+    state = store.state_migration(observations)
+    expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
-    store.save(store.legacy_migration())
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 2}
+    store.save(state)
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 3}
 
 
 @mcp.tool(annotations=READ)
@@ -238,6 +311,15 @@ def list_targets() -> dict[str, object]:
 def list_applications() -> dict[str, object]:
     """List reusable registered application source and build definitions."""
     return {"applications": store.load().model_dump(mode="json")["applications"]}
+
+
+@mcp.tool(annotations=READ)
+def list_resources(target: Name | None = None) -> dict[str, object]:
+    """List named, version-pinned infrastructure resources."""
+    values = store.load().model_dump(mode="json")["resources"]
+    if target is not None:
+        values = {name: item for name, item in values.items() if item["target"] == target}
+    return {"resources": values}
 
 
 @mcp.tool(annotations=READ)
@@ -307,6 +389,33 @@ def update_application(name: Name, definition: ApplicationConfig,
 
 
 @mcp.tool(annotations=WRITE)
+def register_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
+    """Register a named, exact-version infrastructure resource locally."""
+    state = store.load()
+    if name in state.resources:
+        raise ValueError("resource already exists; use plan_update_resource")
+    store.save(_replace(state, "resources", name, definition))
+    return {"changed": True, "resource": name}
+
+
+@mcp.tool(annotations=READ)
+def plan_update_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
+    """Show the exact before/after state for a resource update."""
+    state = store.load()
+    _replace(state, "resources", name, definition)
+    return registration_update_plan("resource_update", name, state.resources[name], definition)
+
+
+@mcp.tool(annotations=WRITE)
+def update_resource(name: Name, definition: ResourceConfig, plan_id: PlanId) -> dict[str, object]:
+    """Apply an exact reviewed resource update to local desired state."""
+    expected = plan_update_resource(name, definition)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "resources", name, definition))
+    return {"changed": True, "resource": name}
+
+
+@mcp.tool(annotations=WRITE)
 def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[str, object]:
     """Register a deployment and allocate its immutable placement identities."""
     state = store.load()
@@ -351,7 +460,7 @@ def inspect_target(name: Name) -> dict[str, object]:
     return _result(runner.run("gimme:inspect", legacy_server(target), stack=target.stack,
                               sites=target_sites(store.load(), name),
                               network_mode=target.network.mode,
-                              toolchains=target.toolchains.model_dump(), timeout=60))
+                              mise_version=target.runtimes.mise_version, timeout=60))
 
 
 @mcp.tool(annotations=READ)
@@ -372,7 +481,39 @@ def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
     return _result(runner.run("gimme:provision:stack", legacy_server(target),
                               stack=target.stack, sites=target_sites(state, name),
                               network_mode=target.network.mode,
-                              toolchains=target.toolchains.model_dump(), timeout=1800))
+                              mise_version=target.runtimes.mise_version, timeout=1800))
+
+
+@mcp.tool(annotations=READ)
+def plan_deployment_runtimes(name: Name) -> dict[str, object]:
+    """Plan exact runtime and extension reconciliation for one deployment."""
+    state, deployment, target, application = _context(name)
+    return exact_plan({
+        "kind": "deployment_runtimes",
+        "deployment": name,
+        "target": deployment.target,
+        "mise_version": target.runtimes.mise_version,
+        "runtimes": {
+            key: value.model_dump(mode="json")
+            for key, value in deployment.runtimes.items()
+        },
+        "php_extensions": application.php_extensions,
+        "effects": [
+            "install only declared mise-managed runtime versions",
+            "verify exact system and bundled runtime versions",
+            "leave every other installed runtime version available",
+        ],
+    })
+
+
+@mcp.tool(annotations=WRITE)
+def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Install mise pins and verify system runtimes for one deployment."""
+    expected = plan_deployment_runtimes(name)
+    _assert_plan(expected, plan_id)
+    result = _run_deployment("gimme:provision:runtimes", name, timeout=1800)
+    _run_deployment("gimme:preflight:runtimes", name, timeout=120)
+    return _result(result)
 
 
 @mcp.tool(annotations=READ)
@@ -391,7 +532,7 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
     state, deployment, target, _ = _context(name)
     runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
                sites=target_sites(state, deployment.target), network_mode=target.network.mode,
-               toolchains=target.toolchains.model_dump(), timeout=1800)
+               mise_version=target.runtimes.mise_version, timeout=1800)
     resolved = resolve_secret_references(store.secrets_path, deployment.secrets)
     with protected_secret_file(resolved) as secret_file:
         result = _run_deployment("gimme:provision:app", name, secret_file=secret_file,
@@ -401,7 +542,7 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
 
 @mcp.tool(annotations=READ)
 def plan_deployment(name: Name) -> dict[str, object]:
-    """Resolve source and toolchains and render the exact Deployer task graph."""
+    """Resolve source and pinned runtimes and render the exact Deployer task graph."""
     return _release_plan(name)
 
 
@@ -494,7 +635,7 @@ def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[st
     runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
                sites=target_sites(state, str(expected["target"])),
                network_mode=target.network.mode,
-               toolchains=target.toolchains.model_dump(), timeout=1800)
+               mise_version=target.runtimes.mise_version, timeout=1800)
     return _result(result)
 
 

@@ -32,6 +32,7 @@ MDNS_NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
 RELATIVE_DIRECTORY = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
+PHP_FPM_SOCKET = re.compile(r"^/run/php/php[0-9]+\.[0-9]+-fpm\.sock$")
 DNS_NAME = re.compile(
     r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
     r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
@@ -216,6 +217,7 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
             "framework",
             "site_host",
             "document_root",
+            "php_fpm_socket",
         }:
             fail(f"invalid site definition for {instance}")
         deployment = require_string(
@@ -233,11 +235,18 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
         resolved_parent = document_root.parent.resolve(strict=False)
         if resolved_parent != root and not resolved_parent.is_relative_to(root):
             fail(f"document root escapes applications root for {instance}")
+        php_fpm_socket = definition["php_fpm_socket"]
+        if framework == "static":
+            if php_fpm_socket != "":
+                fail(f"static site {instance} cannot declare a PHP-FPM socket")
+        elif not isinstance(php_fpm_socket, str) or PHP_FPM_SOCKET.fullmatch(php_fpm_socket) is None:
+            fail(f"invalid PHP-FPM socket for {instance}")
         validated[instance] = {
             "deployment": deployment,
             "framework": framework,
             "site_host": site_host,
             "document_root": document_root,
+            "php_fpm_socket": php_fpm_socket,
         }
     return validated
 
@@ -249,13 +258,14 @@ def render_caddy_site(
     framework: str,
     site_host: str | None = None,
     internal_tls: bool = True,
+    php_fpm_socket: str = "",
 ) -> str:
     site_host = site_host or f"{name}.{mdns_name}.local"
     php_handler = (
         ""
         if framework == "static"
         else (
-            "    php_fastcgi unix//run/php/php-fpm.sock {\n"
+            f"    php_fastcgi unix/{php_fpm_socket} {{\n"
             "        resolve_root_symlink\n"
             "    }\n"
         )
@@ -417,6 +427,7 @@ def reconcile() -> None:
             framework,
             site_host=site_host,
             internal_tls=network_mode == "local_mdns",
+            php_fpm_socket=definition["php_fpm_socket"],
         )
         site_path = caddy_directory / f"{name}.caddy"
         atomic_write(site_path, site)

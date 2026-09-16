@@ -25,7 +25,7 @@ def bootstrap_target() -> None:
         stack=target.stack,
         sites=target_sites(state, arguments.target),
         network_mode=target.network.mode,
-        toolchains=target.toolchains.model_dump(),
+        mise_version=target.runtimes.mise_version,
         timeout=1800,
         bootstrap=True,
         interactive_sudo=True,
