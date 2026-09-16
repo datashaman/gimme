@@ -378,6 +378,16 @@ def test_process_tasks_are_planned_reconciled_and_restarted_safely() -> None:
     assert "artisan --no-interaction config:clear" in recipe
 
 
+def test_runtime_inspection_emits_remote_observations_to_the_control_plane() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:inspect:runtimes'", 1)[1].split(
+        "task('gimme:preflight:stack'", 1
+    )[0]
+
+    assert "GIMME_RUNTIME|%s|%s" in task
+    assert "writeln(run('bash -c '" in task
+
+
 def test_deployment_health_gates_candidate_before_live_activation() -> None:
     plan = rendered_deploy_plan(
         {

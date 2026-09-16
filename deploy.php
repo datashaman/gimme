@@ -1362,7 +1362,7 @@ if command -v valkey-server >/dev/null 2>&1; then
     emit valkey "$(valkey-server --version | sed -E 's/.*v=([0-9]+(\.[0-9]+){0,3}).*/\1/')"
 fi
 BASH;
-    run('bash -c ' . escapeshellarg($script));
+    writeln(run('bash -c ' . escapeshellarg($script)));
 });
 
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
