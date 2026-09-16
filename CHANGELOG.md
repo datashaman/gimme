@@ -7,6 +7,8 @@ may contain deliberate schema and MCP API breaks.
 
 - Added fixed official Ubuntu PPA bootstrap for an exact mise version.
 - Added a complete MCP primitive reference and manifest validation documentation.
+- Consolidated local and CI verification into one command that covers every Deployer
+  module, and migrated the scheduled disposable-host smoke test to schema v3.
 
 ## [0.6.0] - 2026-09-16
 
@@ -34,4 +36,3 @@ may contain deliberate schema and MCP API breaks.
 [Unreleased]: https://github.com/datashaman/gimme/compare/main...HEAD
 [0.6.0]: https://github.com/datashaman/gimme/compare/4fb0e97...a9ed1a3
 [0.5.0]: https://github.com/datashaman/gimme/commits/4fb0e97
-

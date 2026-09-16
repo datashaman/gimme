@@ -20,12 +20,7 @@ Run the complete local verification suite before opening a pull request:
 
 ```bash
 # From the repository root:
-uv run ruff check .
-uv run pytest -q
-vendor/bin/phpstan analyse deploy.php deploy --level=5
-uv run bandit -q -r src scripts
-uv run pip-audit
-git diff --check
+bash scripts/gimme-verify
 ```
 
 Changes to `deploy.php`, `deploy/*.php`, either privileged helper, or desired-state

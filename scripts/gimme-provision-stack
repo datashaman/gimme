@@ -250,7 +250,10 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
         if framework == "static":
             if php_fpm_socket != "":
                 fail(f"static site {instance} cannot declare a PHP-FPM socket")
-        elif not isinstance(php_fpm_socket, str) or PHP_FPM_SOCKET.fullmatch(php_fpm_socket) is None:
+        elif (
+            not isinstance(php_fpm_socket, str)
+            or PHP_FPM_SOCKET.fullmatch(php_fpm_socket) is None
+        ):
             fail(f"invalid PHP-FPM socket for {instance}")
         validated[instance] = {
             "deployment": deployment,

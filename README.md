@@ -230,11 +230,7 @@ scheduling are intentionally future work rather than implied production guarante
 
 ```bash
 # From the repository root:
-uv run ruff check src tests scripts/gimme-provision-stack
-uv run pytest
-vendor/bin/phpstan analyse deploy.php deploy --level=5
-uv run bandit -q -r src scripts
-uv run pip-audit
+bash scripts/gimme-verify
 ```
 
 The project is licensed under the MIT License.

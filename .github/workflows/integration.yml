@@ -2,6 +2,8 @@ name: Disposable VM integration
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -15,6 +17,8 @@ jobs:
       GIMME_INTEGRATION_DISPOSABLE: "1"
     steps:
       - uses: actions/checkout@v7
+      - name: Configure isolated state directory
+        run: echo "GIMME_STATE_DIR=$RUNNER_TEMP/gimme-state" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
@@ -29,6 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-server
           sudo systemctl enable --now ssh
+          printf '127.0.0.1 gimme-ci.local\n' | sudo tee -a /etc/hosts >/dev/null
           install -d -m 0700 "$HOME/.ssh"
           ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/gimme-ci"
           install -m 0600 "$HOME/.ssh/gimme-ci.pub" "$RUNNER_TEMP/gimme-ci.pub"
@@ -45,11 +50,13 @@ jobs:
           } > "$HOME/.ssh/config"
           chmod 0600 "$HOME/.ssh/config"
           ssh -o BatchMode=yes 127.0.0.1 true
-      - name: Write disposable manifests
+      - name: Write disposable desired state
         run: uv run python tests/integration/disposable_vm_smoke.py setup
       - name: Bootstrap stack and database administration
         run: |
-          GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:provision:stack integration
-          GIMME_INTERACTIVE_SUDO=1 vendor/bin/dep --file=deploy.php gimme:bootstrap:database-admin integration
+          uv run gimme-bootstrap-target integration
+          uv run gimme-bootstrap-database integration
+      - name: Pin observed resource versions
+        run: uv run python tests/integration/disposable_vm_smoke.py pin-resources
       - name: Exercise isolated resources and host services
         run: uv run python tests/integration/disposable_vm_smoke.py verify
