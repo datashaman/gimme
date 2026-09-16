@@ -102,6 +102,8 @@ def test_horizon_and_scheduler_units_have_correct_lifecycle(monkeypatch) -> None
 )
 def test_rendered_process_units_pass_systemd_verification(tmp_path, monkeypatch) -> None:
     helper = helper_namespace()
+    php_binary = shutil.which("php")
+    assert php_binary is not None
     monkeypatch.setitem(
         helper["service_header"].__globals__,
         "grp",
@@ -117,10 +119,10 @@ def test_rendered_process_units_pass_systemd_verification(tmp_path, monkeypatch)
             account,
             app_root,
             {"driver": "horizon", "enabled": True, "stop_wait_seconds": 3600},
-            "/usr/bin/php8.4",
+            php_binary,
         ),
         "gimme-scheduler-example-app.service": helper["render_scheduler_service"](
-            "example-app", account, app_root, "/usr/bin/php8.4"
+            "example-app", account, app_root, php_binary
         ),
         "gimme-scheduler-example-app.timer": helper["render_scheduler_timer"]("example-app"),
     }
