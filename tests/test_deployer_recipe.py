@@ -70,7 +70,8 @@ def test_deployer_recipe_passes_static_analysis() -> None:
 
 
 def test_stack_includes_deployer_acl_dependency() -> None:
-    stack = json.loads((ROOT / "config" / "stack.example.json").read_text())
+    state = json.loads((ROOT / "config" / "state.example.json").read_text())
+    stack = state["targets"]["devbox"]["stack"]
 
     assert "acl" in stack["packages"]
     assert "avahi-utils" in stack["packages"]
@@ -87,7 +88,8 @@ def test_stack_bootstrap_uses_bootstrap_hostname() -> None:
 
 
 def test_stack_includes_laravel_php_extensions() -> None:
-    stack = json.loads((ROOT / "config" / "stack.example.json").read_text())
+    state = json.loads((ROOT / "config" / "state.example.json").read_text())
+    stack = state["targets"]["devbox"]["stack"]
 
     assert "php-gd" in stack["packages"]
     assert "python3" in stack["packages"]

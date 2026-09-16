@@ -5,5 +5,13 @@ __pycache__/
 *.pyc
 vendor/
 .env
-config/*.json
-!config/*.example.json
+.env.*
+!.env.example
+# Legacy 0.4 manifests may contain machine/client identifiers and are migration input only.
+config/server.json
+config/stack.json
+config/apps.json
+config/.gimme.lock
+config/secrets*.json
+!config/secrets.enc.json
+!config/secrets.enc.example.json

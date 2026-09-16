@@ -130,7 +130,7 @@ class ServerConfig(BaseModel):
 class FrontendBuildConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    package_manager: Literal["npm"] = "npm"
+    package_manager: Literal["npm", "pnpm", "yarn", "bun"] = "npm"
     build_script: str = Field(default="build", pattern=r"^[a-zA-Z0-9:_-]{1,64}$")
     output_dir: str = Field(default="dist", min_length=1, max_length=160)
 

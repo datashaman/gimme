@@ -1,0 +1,100 @@
+{
+  "schema_version": 2,
+  "targets": {
+    "devbox": {
+      "host_alias": "devbox",
+      "bootstrap_hostname": "192.0.2.10",
+      "hostname": "devbox.local",
+      "system_hostname": "devbox",
+      "remote_user": "deployer",
+      "apps_root": "/srv/gimme/apps",
+      "keep_releases": 5,
+      "network": {
+        "mode": "local_mdns",
+        "mdns_name": "devbox",
+        "expected_addresses": []
+      },
+      "stack": {
+        "package_manager": "apt",
+        "packages": [
+          "acl",
+          "git",
+          "unzip",
+          "avahi-daemon",
+          "avahi-utils",
+          "caddy",
+          "nodejs",
+          "npm",
+          "postgresql",
+          "python3",
+          "valkey-server",
+          "valkey-tools",
+          "php-cli",
+          "php-fpm",
+          "php-gd",
+          "php-pgsql",
+          "php-curl",
+          "php-mbstring",
+          "php-xml",
+          "php-zip",
+          "php-intl",
+          "php-bcmath",
+          "php-redis",
+          "composer"
+        ],
+        "services": ["avahi-daemon", "caddy", "postgresql", "valkey-server"]
+      },
+      "toolchains": {
+        "node": "22.12.0",
+        "npm": "10.9.0",
+        "pnpm": null,
+        "yarn": null,
+        "bun": null
+      }
+    }
+  },
+  "applications": {
+    "example": {
+      "repository": "git@github.com:example/example.git",
+      "framework": "laravel",
+      "frontend": {
+        "package_manager": "npm",
+        "build_script": "build",
+        "output_dir": "public/build"
+      },
+      "artisan": {
+        "allowed_commands": ["about", "migrate", "migrate:status", "queue:restart"]
+      },
+      "default_health": {
+        "path": "/up",
+        "expected_status": 200,
+        "attempts": 10,
+        "delay_seconds": 2,
+        "timeout_seconds": 5
+      }
+    }
+  },
+  "deployments": {
+    "example-local": {
+      "application": "example",
+      "target": "devbox",
+      "stage": "local",
+      "source": {"kind": "branch", "ref": "main"},
+      "app_env": "local",
+      "app_debug": true,
+      "domain": null,
+      "health": "inherit",
+      "workers": null,
+      "scheduler": null,
+      "variables": {"LOG_CHANNEL": "stack"},
+      "secrets": {"MAIL_PASSWORD": "example-local/MAIL_PASSWORD"},
+      "placement": {
+        "instance": "example-local",
+        "relative_path": "deployments/example-local",
+        "database_identifier": "gimme_example_local",
+        "cache_prefix": "gimme:example-local:",
+        "site_host": "example-local.devbox.local"
+      }
+    }
+  }
+}

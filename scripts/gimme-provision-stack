@@ -8,7 +8,6 @@ only this argument-free executable; desired state is read from one fixed path.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import pwd
@@ -213,27 +212,15 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
     for instance, definition in value.items():
         require_string(instance, "site instance", INSTANCE_NAME)
         if not isinstance(definition, dict) or set(definition) != {
-            "application",
-            "environment",
+            "deployment",
             "framework",
             "site_host",
             "document_root",
         }:
             fail(f"invalid site definition for {instance}")
-        application = require_string(
-            definition["application"], "application name", APP_NAME
+        deployment = require_string(
+            definition["deployment"], "deployment name", INSTANCE_NAME
         )
-        environment = require_string(
-            definition["environment"], "environment name", ENVIRONMENT_NAME
-        )
-        digest = hashlib.sha256(f"{application}\0{environment}".encode()).hexdigest()[:10]
-        expected_instance = (
-            application
-            if environment == "default"
-            else f"{application}--{environment}--{digest}"
-        )
-        if instance != expected_instance:
-            fail(f"site identity mismatch for {instance}")
         framework = definition["framework"]
         if framework not in ALLOWED_FRAMEWORKS:
             fail(f"invalid framework for {instance}")
@@ -247,8 +234,7 @@ def validate_sites(value: Any) -> dict[str, dict[str, Any]]:
         if resolved_parent != root and not resolved_parent.is_relative_to(root):
             fail(f"document root escapes applications root for {instance}")
         validated[instance] = {
-            "application": application,
-            "environment": environment,
+            "deployment": deployment,
             "framework": framework,
             "site_host": site_host,
             "document_root": document_root,
@@ -262,6 +248,7 @@ def render_caddy_site(
     document_root: Path,
     framework: str,
     site_host: str | None = None,
+    internal_tls: bool = True,
 ) -> str:
     site_host = site_host or f"{name}.{mdns_name}.local"
     php_handler = (
@@ -273,9 +260,10 @@ def render_caddy_site(
             "    }\n"
         )
     )
+    tls = "    tls internal\n" if internal_tls else ""
     return (
         f"{site_host} {{\n"
-        "    tls internal\n"
+        f"{tls}"
         f"    root * {json.dumps(str(document_root))}\n"
         "    encode zstd gzip\n"
         f"{php_handler}"
@@ -359,6 +347,9 @@ def reconcile() -> None:
         fail("services are not allowlisted: " + ", ".join(disallowed_services))
     endpoint = validate_endpoint(state.get("hostname"))
     mdns_name = require_string(state.get("mdns_name"), "mdns_name", MDNS_NAME)
+    network_mode = state.get("network_mode", "local_mdns")
+    if network_mode not in {"local_mdns", "public_dns"}:
+        fail("unsupported network mode")
     if endpoint != EXPECTED_HOSTNAME or mdns_name != EXPECTED_MDNS_NAME:
         fail("desired-state host identity does not match the installed helper")
     sites = validate_sites(state.get("sites"))
@@ -396,39 +387,45 @@ def reconcile() -> None:
         fail("sites-only reconciliation requires the configured hostname")
     if mode == "stack" and current_hostname != mdns_name:
         run(["hostnamectl", "set-hostname", mdns_name])
-        run(["systemctl", "restart", "avahi-daemon"])
+        if network_mode == "local_mdns":
+            run(["systemctl", "restart", "avahi-daemon"])
 
     EXPECTED_APPS_ROOT.mkdir(parents=True, exist_ok=True)
     # Group traversal is intentional and further narrowed by explicit ACLs below.
     os.chmod(EXPECTED_APPS_ROOT, 0o750)  # nosec B103
     os.chown(EXPECTED_APPS_ROOT, account.pw_uid, account.pw_gid)
 
-    if not sites:
-        return
-
     caddy_directory = Path("/etc/caddy/gimme")
     caddy_directory.mkdir(parents=True, exist_ok=True)
     desired_site_files: set[Path] = set()
     desired_mdns_units: set[Path] = set()
-    address_output = run(["getent", "ahostsv4", endpoint], capture=True).stdout
-    address = address_output.split()[0] if address_output.split() else ""
-    if not address:
-        fail("could not resolve the configured host endpoint to IPv4")
-    address = validate_ipv4_address(address)
+    address = ""
+    if network_mode == "local_mdns" and sites:
+        address_output = run(["getent", "ahostsv4", endpoint], capture=True).stdout
+        address = address_output.split()[0] if address_output.split() else ""
+        if not address:
+            fail("could not resolve the configured host endpoint to IPv4")
+        address = validate_ipv4_address(address)
     for name, definition in sorted(sites.items()):
         framework = definition["framework"]
         document_root = definition["document_root"]
         site_host = definition["site_host"]
         site = render_caddy_site(
-            name, mdns_name, document_root, framework, site_host=site_host
+            name,
+            mdns_name,
+            document_root,
+            framework,
+            site_host=site_host,
+            internal_tls=network_mode == "local_mdns",
         )
         site_path = caddy_directory / f"{name}.caddy"
         atomic_write(site_path, site)
         desired_site_files.add(site_path)
-        unit_path = Path(f"/etc/systemd/system/gimme-mdns-{name}.service")
-        unit = render_mdns_unit(name, site_host, address)
-        atomic_write(unit_path, unit)
-        desired_mdns_units.add(unit_path)
+        if network_mode == "local_mdns":
+            unit_path = Path(f"/etc/systemd/system/gimme-mdns-{name}.service")
+            unit = render_mdns_unit(name, site_host, address)
+            atomic_write(unit_path, unit)
+            desired_mdns_units.add(unit_path)
 
     for site_path in caddy_directory.glob("*.caddy"):
         if site_path not in desired_site_files:
@@ -465,13 +462,14 @@ def reconcile() -> None:
     )
     run(["caddy", "validate", "--config", str(caddyfile), "--adapter", "caddyfile"])
     run(["systemctl", "reload", "caddy"])
-    run(["systemctl", "restart", "avahi-daemon"])
+    if network_mode == "local_mdns":
+        run(["systemctl", "restart", "avahi-daemon"])
     run(["systemctl", "daemon-reload"])
     for unit_path in sorted(desired_mdns_units):
         run(["systemctl", "enable", unit_path.name])
         run(["systemctl", "restart", unit_path.name])
 
-    if CADDY_ROOT.is_file():
+    if network_mode == "local_mdns" and CADDY_ROOT.is_file():
         exported_root = EXPECTED_APPS_ROOT / ".caddy-local-root.crt"
         shutil.copyfile(CADDY_ROOT, exported_root)
         os.chmod(exported_root, 0o644)

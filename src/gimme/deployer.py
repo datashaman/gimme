@@ -110,8 +110,20 @@ class DeployerRunner:
         artisan_command: str | None = None,
         artisan_arguments: Sequence[str] | None = None,
         artisan_allowed_commands: Sequence[str] | None = None,
+        instance_name: str | None = None,
+        deploy_path: str | None = None,
+        site_host: str | None = None,
+        database_identifier: str | None = None,
+        cache_prefix: str | None = None,
+        source_kind: str = "branch",
+        sites: Sequence[dict[str, str]] | None = None,
+        network_mode: str = "local_mdns",
+        toolchains: dict[str, str | None] | None = None,
+        variables: dict[str, str] | None = None,
+        secret_file: Path | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
+        interactive_sudo: bool = False,
     ) -> CommandResult:
         if not self.binary.is_file():
             raise DeployerError(
@@ -126,7 +138,7 @@ class DeployerRunner:
             str(self.recipe),
             task,
             server.host_alias,
-            "--no-interaction",
+            *([] if interactive_sudo else ["--no-interaction"]),
             *arguments,
         ]
         environment = {
@@ -146,8 +158,15 @@ class DeployerRunner:
                 "GIMME_REMOTE_USER": server.remote_user,
                 "GIMME_APPS_ROOT": server.apps_root,
                 "GIMME_KEEP_RELEASES": str(server.keep_releases),
+                "GIMME_NETWORK_MODE": network_mode,
+                "GIMME_TOOLCHAINS_JSON": json.dumps(toolchains or {}),
+                "GIMME_VARIABLES_JSON": json.dumps(variables or {}),
             }
         )
+        if sites is not None:
+            environment["GIMME_SITES_JSON"] = json.dumps(list(sites))
+        if interactive_sudo:
+            environment["GIMME_INTERACTIVE_SUDO"] = "1"
         if stack is not None:
             environment.update(
                 {
@@ -156,24 +175,47 @@ class DeployerRunner:
                     "GIMME_SERVICES_JSON": json.dumps(stack.services),
                 }
             )
+            if any(
+                value is not None
+                for value in (
+                    instance_name,
+                    deploy_path,
+                    site_host,
+                    database_identifier,
+                    cache_prefix,
+                )
+            ):
+                environment["GIMME_CONTROL_V2"] = "1"
+        if secret_file is not None:
+            if secret_file.is_symlink():
+                raise ValueError("secret_file must be a regular local file")
+            resolved_secret_file = secret_file.resolve()
+            if not resolved_secret_file.is_file():
+                raise ValueError("secret_file must be a regular local file")
+            environment["GIMME_SECRET_FILE"] = str(resolved_secret_file)
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if app_name is not None and app is not None:
             definition = app.environment(environment_name)
             site_url = environment_site_url(server, app_name, environment_name)
+            selected_site_host = site_host or site_url.removeprefix("https://")
+            selected_deploy_path = deploy_path or environment_deploy_path(
+                server, app_name, environment_name
+            )
+            selected_database = database_identifier or environment_database_identifier(
+                app_name, environment_name
+            )
             environment.update(
                 {
                     "GIMME_APP": app_name,
                     "GIMME_ENVIRONMENT": environment_name,
-                    "GIMME_INSTANCE": environment_instance(app_name, environment_name),
-                    "GIMME_DEPLOY_PATH": environment_deploy_path(
-                        server, app_name, environment_name
-                    ),
-                    "GIMME_SITE_HOST": site_url.removeprefix("https://"),
-                    "GIMME_DATABASE_IDENTIFIER": environment_database_identifier(
-                        app_name, environment_name
-                    ),
-                    "GIMME_CACHE_PREFIX": (
+                    "GIMME_INSTANCE": instance_name
+                    or environment_instance(app_name, environment_name),
+                    "GIMME_DEPLOY_PATH": selected_deploy_path,
+                    "GIMME_SITE_HOST": selected_site_host,
+                    "GIMME_DATABASE_IDENTIFIER": selected_database,
+                    "GIMME_CACHE_PREFIX": cache_prefix
+                    or (
                         f"gimme:{app_name}:"
                         if environment_name == "default"
                         else f"gimme:{app_name}:{environment_name}:"
@@ -181,6 +223,7 @@ class DeployerRunner:
                     "GIMME_REPOSITORY": app.repository,
                     "GIMME_FRAMEWORK": app.framework,
                     "GIMME_BRANCH": definition.branch,
+                    "GIMME_SOURCE_KIND": source_kind,
                     "GIMME_APP_ENV": definition.app_env,
                     "GIMME_APP_DEBUG": "true" if definition.app_debug else "false",
                     "GIMME_WORKERS_JSON": json.dumps(
@@ -232,7 +275,7 @@ class DeployerRunner:
                 command,
                 cwd=self.root,
                 env=environment,
-                stdin=subprocess.DEVNULL,
+                stdin=None if interactive_sudo else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

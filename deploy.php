@@ -232,6 +232,39 @@ function configured_process_object(string $environment): ?array
     return $decoded;
 }
 
+function configured_toolchains(): array
+{
+    $raw = getenv('GIMME_TOOLCHAINS_JSON') ?: '{}';
+    $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($decoded) || array_is_list($decoded)) {
+        throw new \RuntimeException('GIMME_TOOLCHAINS_JSON must be an object');
+    }
+    foreach ($decoded as $name => $version) {
+        if (!in_array($name, ['node', 'npm', 'pnpm', 'yarn', 'bun'], true) ||
+            ($version !== null && (!is_string($version) ||
+                !preg_match('/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$/', $version)))) {
+            throw new \RuntimeException('Unsafe frontend toolchain declaration');
+        }
+    }
+    return $decoded;
+}
+
+function configured_environment_values(): array
+{
+    $raw = getenv('GIMME_VARIABLES_JSON') ?: '{}';
+    $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($decoded) || array_is_list($decoded) || count($decoded) > 128) {
+        throw new \RuntimeException('GIMME_VARIABLES_JSON must be a bounded object');
+    }
+    foreach ($decoded as $key => $value) {
+        if (!is_string($key) || !preg_match('/^[A-Z][A-Z0-9_]{0,63}$/', $key) ||
+            !is_string($value) || strlen($value) > 4096 || preg_match('/[\x00\r\n]/', $value)) {
+            throw new \RuntimeException('Unsafe declared environment value');
+        }
+    }
+    return $decoded;
+}
+
 function configured_health(): ?array
 {
     $decoded = json_decode(required_env('GIMME_HEALTH_JSON'), true, flags: JSON_THROW_ON_ERROR);
@@ -324,15 +357,18 @@ try {
     if ($handle === false) {
         throw new \RuntimeException('curl initialization failed');
     }
-    curl_setopt_array($handle, [
-        CURLOPT_CAINFO => $ca,
+    $options = [
         CURLOPT_CONNECTTIMEOUT => $timeout,
         CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_RESOLVE => ["{$host}:443:127.0.0.1"],
         CURLOPT_RETURNTRANSFER => false,
         CURLOPT_TIMEOUT => $timeout,
         CURLOPT_WRITEFUNCTION => static fn ($curl, string $body): int => strlen($body),
-    ]);
+    ];
+    if (is_string($ca) && $ca !== '' && is_file($ca)) {
+        $options[CURLOPT_CAINFO] = $ca;
+    }
+    curl_setopt_array($handle, $options);
     $ok = curl_exec($handle);
     $status = curl_getinfo($handle, CURLINFO_RESPONSE_CODE);
     curl_close($handle);
@@ -358,6 +394,18 @@ import tempfile
 
 path = Path(sys.argv[1])
 updates = json.loads(base64.b64decode(sys.argv[2]).decode())
+if len(sys.argv) == 4:
+    secret_path = Path(sys.argv[3])
+    secret_details = secret_path.lstat()
+    if secret_path.is_symlink() or not stat.S_ISREG(secret_details.st_mode):
+        raise RuntimeError("refusing to read a non-regular secret document")
+    secrets = json.loads(secret_path.read_text())
+    if not isinstance(secrets, dict):
+        raise RuntimeError("secret document must be an object")
+    for key, value in secrets.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise RuntimeError("secret document contains an invalid value")
+    updates.update(secrets)
 details = path.lstat()
 if path.is_symlink() or not stat.S_ISREG(details.st_mode):
     raise RuntimeError("refusing to reconcile a non-regular environment file")
@@ -443,6 +491,25 @@ function configured_apps(): array
 
 function configured_sites(string $appsRoot, string $mdnsName): array
 {
+    $configured = getenv('GIMME_SITES_JSON');
+    if ($configured !== false && $configured !== '') {
+        $decoded = json_decode($configured, true, flags: JSON_THROW_ON_ERROR);
+        if (!is_array($decoded) || !array_is_list($decoded)) {
+            throw new \RuntimeException('GIMME_SITES_JSON must be a list');
+        }
+        $sites = [];
+        foreach ($decoded as $definition) {
+            if (!is_array($definition) || !isset($definition['instance']) ||
+                !is_string($definition['instance'])) {
+                throw new \RuntimeException('Invalid configured deployment site');
+            }
+            $instance = $definition['instance'];
+            unset($definition['instance']);
+            $sites[$instance] = $definition;
+        }
+        ksort($sites);
+        return $sites;
+    }
     $sites = [];
     foreach (configured_apps() as $name => $definition) {
         $framework = $definition['framework'] ?? 'common';
@@ -516,6 +583,7 @@ function stack_state_write_command(
         'services' => configured_services(),
         'hostname' => $hostname,
         'mdns_name' => $mdnsName,
+        'network_mode' => getenv('GIMME_NETWORK_MODE') ?: 'local_mdns',
         'remote_user' => $remoteUser,
         'apps_root' => $appsRoot,
         'sites' => configured_sites($appsRoot, $mdnsName),
@@ -652,6 +720,7 @@ if (!preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environmentName) ||
     throw new \RuntimeException('Unsafe environment identity');
 }
 if ($app !== '') {
+    $controlV2 = getenv('GIMME_CONTROL_V2') === '1';
     $expectedInstance = $environmentName === 'default'
         ? $app
         : "{$app}--{$environmentName}--" . substr(
@@ -665,8 +734,20 @@ if ($app !== '') {
     $expectedSiteHost = $environmentName === 'default'
         ? "{$app}.{$mdnsName}.local"
         : "{$environmentName}.{$app}.{$mdnsName}.local";
-    if ($instance !== $expectedInstance || $deployPath !== $expectedDeployPath ||
-        $siteHost !== $expectedSiteHost || !valid_endpoint($siteHost)) {
+    $safeV2Boundary = $controlV2 &&
+        preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance) &&
+        str_starts_with($deployPath, "{$appsRoot}/") &&
+        !str_starts_with($deployPath, "{$appsRoot}/.") &&
+        $deployPath !== "{$appsRoot}/deployments" &&
+        !str_contains($deployPath, '..') &&
+        preg_match('#^/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+$#', $deployPath) &&
+        valid_endpoint($siteHost);
+    $safeLegacyBoundary = !$controlV2 &&
+        $instance === $expectedInstance &&
+        $deployPath === $expectedDeployPath &&
+        $siteHost === $expectedSiteHost &&
+        valid_endpoint($siteHost);
+    if (!$safeV2Boundary && !$safeLegacyBoundary) {
         throw new \RuntimeException('Unsafe environment deployment boundary');
     }
 }
@@ -711,7 +792,7 @@ if ($hasFrontend) {
     $packageManager = required_env('GIMME_FRONTEND_PACKAGE_MANAGER');
     $buildScript = required_env('GIMME_FRONTEND_BUILD_SCRIPT');
     $outputDir = required_env('GIMME_FRONTEND_OUTPUT_DIR');
-    if ($packageManager !== 'npm') {
+    if (!in_array($packageManager, ['npm', 'pnpm', 'yarn', 'bun'], true)) {
         throw new \RuntimeException('Unsupported frontend package manager');
     }
     if (!preg_match('/^[a-zA-Z0-9:_-]{1,64}$/', $buildScript)) {
@@ -726,11 +807,58 @@ if ($hasFrontend) {
         set('public_path', $outputDir);
     }
 
-    task('gimme:frontend:install', function (): void {
-        run('cd {{release_path}} && npm ci --no-audit --no-fund');
+    $toolchains = configured_toolchains();
+    $managerVersion = $toolchains[$packageManager] ?? null;
+    $nodeVersion = $toolchains['node'] ?? null;
+    if (!is_string($managerVersion) || ($packageManager !== 'bun' && !is_string($nodeVersion))) {
+        throw new \RuntimeException('Target must declare exact frontend toolchain versions');
+    }
+    $install = match ($packageManager) {
+        'npm' => ['npm', 'ci', '--no-audit', '--no-fund'],
+        'pnpm' => ['pnpm', 'install', '--frozen-lockfile'],
+        'yarn' => ((int) explode('.', $managerVersion)[0]) === 1
+            ? ['yarn', 'install', '--frozen-lockfile', '--non-interactive']
+            : ['yarn', 'install', '--immutable'],
+        'bun' => ['bun', 'install', '--frozen-lockfile'],
+    };
+    $lockfiles = match ($packageManager) {
+        'npm' => ['package-lock.json'],
+        'pnpm' => ['pnpm-lock.yaml'],
+        'yarn' => ['yarn.lock'],
+        'bun' => ['bun.lock', 'bun.lockb'],
+    };
+    $allLockfiles = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'];
+    $quotedAll = implode(' ', array_map('escapeshellarg', $allLockfiles));
+    $quotedAllowed = implode(' ', array_map('escapeshellarg', $lockfiles));
+    $installCommand = implode(' ', array_map('escapeshellarg', $install));
+    task('gimme:frontend:install', function () use (
+        $packageManager,
+        $managerVersion,
+        $nodeVersion,
+        $quotedAll,
+        $quotedAllowed,
+        $installCommand,
+    ): void {
+        $verify = 'set -eu; cd {{release_path}}; ' .
+            'command -v ' . escapeshellarg($packageManager) . ' >/dev/null; ' .
+            'test "$(' . escapeshellarg($packageManager) . ' --version)" = ' .
+            escapeshellarg($managerVersion) . '; ';
+        if ($packageManager !== 'bun') {
+            $verify .= 'command -v node >/dev/null; ' .
+                'test "$(node --version | sed s/^v//)" = ' . escapeshellarg((string) $nodeVersion) . '; ';
+        }
+        $verify .= 'test "$(for f in ' . $quotedAll .
+            '; do test -f "$f" && printf x; done)" = x; ' .
+            'found=0; for f in ' . $quotedAllowed .
+            '; do test -f "$f" && found=$((found + 1)); done; test "$found" = 1; ' .
+            $installCommand;
+        run('bash -c ' . escapeshellarg($verify));
     });
-    task('gimme:frontend:build', function () use ($buildScript): void {
-        run('cd {{release_path}} && npm run ' . escapeshellarg($buildScript));
+    task('gimme:frontend:build', function () use ($packageManager, $buildScript): void {
+        run(
+            'cd {{release_path}} && ' . escapeshellarg($packageManager) .
+            ' run ' . escapeshellarg($buildScript)
+        );
     });
     task('gimme:frontend', [
         'gimme:frontend:install',
@@ -743,17 +871,71 @@ if ($hasFrontend) {
 task('gimme:resolve-revision', function (): void {
     $repository = required_env('GIMME_REPOSITORY');
     $branch = required_env('GIMME_BRANCH');
+    $kind = getenv('GIMME_SOURCE_KIND') ?: 'branch';
+    if (!in_array($kind, ['branch', 'tag'], true)) {
+        throw new \RuntimeException('Revision resolution requires a branch or tag source');
+    }
+    $reference = $kind === 'branch' ? "refs/heads/{$branch}" : "refs/tags/{$branch}";
+    $references = escapeshellarg($reference);
+    if ($kind === 'tag') {
+        $references .= ' ' . escapeshellarg("{$reference}^{}");
+    }
     $output = run(
         'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=' .
         escapeshellarg('ssh -o StrictHostKeyChecking=accept-new') .
         ' git ls-remote --exit-code ' . escapeshellarg($repository) . ' ' .
-        escapeshellarg("refs/heads/{$branch}") . ' 2>/dev/null'
+        $references . ' 2>/dev/null'
     );
-    $revision = preg_split('/\s+/', trim($output))[0] ?? '';
+    $lines = array_values(array_filter(explode("\n", trim($output))));
+    $selected = end($lines);
+    $revision = is_string($selected) ? (preg_split('/\s+/', $selected)[0] ?? '') : '';
     if (!preg_match('/^[0-9a-f]{40,64}$/', $revision)) {
         throw new \RuntimeException('Remote branch did not resolve to one Git revision');
     }
     writeln("GIMME_REVISION|{$revision}");
+});
+
+task('gimme:preflight:frontend', function () use ($hasFrontend): void {
+    if (!$hasFrontend) {
+        writeln('GIMME_FRONTEND_PREFLIGHT|not_required');
+        return;
+    }
+    $manager = required_env('GIMME_FRONTEND_PACKAGE_MANAGER');
+    $toolchains = configured_toolchains();
+    $managerVersion = $toolchains[$manager] ?? null;
+    if (!is_string($managerVersion)) {
+        throw new \RuntimeException("Target requires an exact {$manager} version");
+    }
+    $actualManager = trim(run(escapeshellarg($manager) . ' --version'));
+    if ($actualManager !== $managerVersion) {
+        throw new \RuntimeException("Target {$manager} version does not match desired state");
+    }
+    writeln("GIMME_FRONTEND_TOOL|{$manager}|{$actualManager}");
+    if ($manager !== 'bun') {
+        $nodeVersion = $toolchains['node'] ?? null;
+        if (!is_string($nodeVersion)) {
+            throw new \RuntimeException('Target requires an exact Node.js version');
+        }
+        $actualNode = ltrim(trim(run('node --version')), 'v');
+        if ($actualNode !== $nodeVersion) {
+            throw new \RuntimeException('Target Node.js version does not match desired state');
+        }
+        writeln("GIMME_FRONTEND_TOOL|node|{$actualNode}");
+    }
+});
+
+task('gimme:current-revision', function (): void {
+    $currentPath = get('deploy_path') . '/current';
+    if (!test('[ -d ' . escapeshellarg($currentPath) . ' ]')) {
+        throw new \RuntimeException('Current release is missing');
+    }
+    $revision = trim(run(
+        'cd ' . escapeshellarg($currentPath) . ' && git rev-parse --verify HEAD'
+    ));
+    if (!preg_match('/^[0-9a-f]{40,64}$/', $revision)) {
+        throw new \RuntimeException('Current release has no valid Git revision');
+    }
+    writeln("GIMME_CURRENT_REVISION|{$revision}");
 });
 
 if ($health !== null) {
@@ -1212,6 +1394,8 @@ task('gimme:provision:app', function () use (
     $sharedPath = "{$deployPath}/shared";
     $envPath = "{$sharedPath}/.env";
     $framework = getenv('GIMME_FRAMEWORK') ?: 'common';
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    $remoteSecretFile = "{$sharedPath}/.gimme-secrets-" . bin2hex(random_bytes(8)) . '.json';
     $processStatePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
     $hasProcessState = $framework === 'laravel' && test(
         '[ -f ' . escapeshellarg($processStatePath) . ' ]'
@@ -1250,6 +1434,13 @@ task('gimme:provision:app', function () use (
 
     run('install -d -m 0700 ' . escapeshellarg($sharedPath));
     run('setfacl -m u:www-data:x ' . escapeshellarg($sharedPath));
+    if ($localSecretFile !== '') {
+        if (!is_file($localSecretFile) || is_link($localSecretFile)) {
+            throw new \RuntimeException('Unsafe local secret transfer file');
+        }
+        upload($localSecretFile, $remoteSecretFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile));
+    }
 
     $script = <<<BASH
 set -eu
@@ -1294,12 +1485,14 @@ BASH;
             throw new \RuntimeException('Unsafe Laravel runtime environment policy');
         }
         $runtimeValues = json_encode([
+            ...configured_environment_values(),
             'HORIZON_PREFIX' => "{$cachePrefix}horizon:",
             'APP_ENV' => $appEnv,
             'APP_DEBUG' => $appDebug,
         ], JSON_THROW_ON_ERROR);
         $runtimeProgram = escapeshellarg(base64_encode(laravel_environment_reconcile_script()));
         $runtimeEncoded = escapeshellarg(base64_encode($runtimeValues));
+        $secretArgument = $localSecretFile === '' ? '' : ' ' . escapeshellarg($remoteSecretFile);
         $script .= <<<BASH
 
 if ! grep -q '^APP_NAME=' "\$env_path"; then
@@ -1312,12 +1505,21 @@ if ! grep -q '^APP_KEY=' "\$env_path"; then
     app_key=\$(openssl rand -base64 32 | tr -d '\n')
     printf 'APP_KEY=base64:%s\n' "\$app_key" >> "\$env_path"
 fi
-runtime_output=\$(printf %s {$runtimeProgram} | base64 -d | python3 - "\$env_path" {$runtimeEncoded})
+runtime_output=\$(printf %s {$runtimeProgram} | base64 -d | python3 - "\$env_path" {$runtimeEncoded}{$secretArgument})
 printf '%s\n' "\$runtime_output"
 BASH;
     }
 
-    $resourceOutput = run('bash -c ' . escapeshellarg($script));
+    try {
+        $resourceOutput = run(
+            'flock -w 300 ' . escapeshellarg("{$sharedPath}/.gimme-resource.lock") .
+            ' bash -c ' . escapeshellarg($script)
+        );
+    } finally {
+        if ($localSecretFile !== '') {
+            run('rm -f ' . escapeshellarg($remoteSecretFile));
+        }
+    }
     $runtimeChanged = str_contains($resourceOutput, 'GIMME_RUNTIME_CHANGED|yes');
     if ($framework === 'laravel') {
         $currentPath = get('deploy_path') . '/current';
@@ -1647,6 +1849,85 @@ if [ -e "\$path" ]; then
     fi
     rm -rf -- "\$path"
 fi
+BASH;
+    run('bash -c ' . escapeshellarg($remove));
+    run('rm -f -- ' . escapeshellarg($statePath));
+});
+
+task('gimme:remove:deployment', function () use (
+    $app,
+    $instance,
+    $appsRoot,
+    $remoteUser,
+): void {
+    if ($app === '' || getenv('GIMME_CONTROL_V2') !== '1') {
+        throw new \RuntimeException('Deployment removal requires v2 placement context');
+    }
+    $deployPath = get('deploy_path');
+    if (!str_starts_with($deployPath, "{$appsRoot}/") || str_contains($deployPath, '..')) {
+        throw new \RuntimeException('Deployment removal path escapes the applications root');
+    }
+    $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
+    $state = json_encode([
+        'version' => 1,
+        'application' => $instance,
+        'framework' => 'laravel',
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'deploy_path' => $deployPath,
+        'workers' => null,
+        'scheduler' => null,
+    ], JSON_THROW_ON_ERROR);
+    $encoded = escapeshellarg(base64_encode($state));
+    $stateDirectory = escapeshellarg(dirname($statePath));
+    $quotedStatePath = escapeshellarg($statePath);
+    $writeState = <<<BASH
+set -eu
+install -d -m 0700 {$stateDirectory}
+temporary={$quotedStatePath}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$encoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$quotedStatePath}
+trap - EXIT
+BASH;
+    run('bash -c ' . escapeshellarg($writeState));
+    run(
+        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
+        forceOutput: true,
+        timeout: 1800,
+    );
+    if ((getenv('GIMME_FRAMEWORK') ?: 'common') !== 'static') {
+        $database = required_env('GIMME_DATABASE_IDENTIFIER');
+        $cachePrefix = required_env('GIMME_CACHE_PREFIX');
+        $lua = <<<'LUA'
+local cursor = "0"
+repeat
+    local result = redis.call("SCAN", cursor, "MATCH", ARGV[1] .. "*", "COUNT", 500)
+    cursor = result[1]
+    if #result[2] > 0 then redis.call("UNLINK", unpack(result[2])) end
+until cursor == "0"
+return 1
+LUA;
+        run('valkey-cli --raw EVAL ' . escapeshellarg($lua) . ' 0 ' .
+            escapeshellarg($cachePrefix) . ' >/dev/null');
+        run('dropdb --if-exists --force ' . escapeshellarg($database));
+        run('dropuser --if-exists ' . escapeshellarg($database));
+    }
+    $quotedPath = escapeshellarg($deployPath);
+    $quotedRoot = escapeshellarg($appsRoot);
+    $remove = <<<BASH
+set -eu
+path={$quotedPath}
+root={$quotedRoot}
+if [ -L "\$path" ]; then
+    printf 'Refusing to remove a symlinked deployment root\n' >&2
+    exit 1
+fi
+resolved_root=\$(readlink -f -- "\$root")
+resolved_parent=\$(readlink -f -- "\$(dirname -- "\$path")")
+case "\$resolved_parent/" in "\$resolved_root/"*) ;; *) exit 1 ;; esac
+rm -rf -- "\$path"
 BASH;
     run('bash -c ' . escapeshellarg($remove));
     run('rm -f -- ' . escapeshellarg($statePath));

@@ -1,1310 +1,538 @@
 from __future__ import annotations
 
+import re
+import socket
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from gimme.config import (
-    AppConfig,
-    ArtisanConfig,
-    ConfigStore,
-    EnvironmentConfig,
-    FrontendBuildConfig,
-    HealthCheckConfig,
-    SchedulerConfig,
-    ServerConfig,
-    WorkerConfig,
+from gimme.control import (
+    ApplicationConfig, ControlState, DeploymentConfig, DeploymentRegistration,
+    DeploymentSource, StateStore, TargetConfig, legacy_app, legacy_server,
+    new_placement, target_sites,
 )
-from gimme.deployer import DeployerRunner
-from gimme.plans import (
-    application_update_plan,
-    app_process_plan,
-    app_resource_plan,
-    artisan_command_plan,
-    deployment_plan,
-    environment_deploy_path,
-    environment_instance,
-    environment_removal_plan,
-    environment_site_url,
-    environment_update_plan,
-    plan_id as compute_plan_id,
-    stack_plan,
+from gimme.control_plans import (
+    deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
+    exact_plan, migration_plan, registration_update_plan, target_stack_plan,
 )
-
+from gimme.deployer import CommandResult, DeployerRunner
+from gimme.secrets import SecretError, protected_secret_file, resolve_secret_references
 
 ROOT = Path(__file__).resolve().parents[2]
-store = ConfigStore(ROOT)
+store = StateStore.from_environment(ROOT)
 runner = DeployerRunner(ROOT)
 mcp = FastMCP(
     "Gimme",
     instructions=(
-        "Provision and deploy registered PHP applications on an allowlisted Ubuntu "
-        "host. Read plans before applying them. The server does not accept arbitrary "
-        "shell commands, SQL, hostnames, or filesystem paths. Laravel command execution "
-        "is limited to per-application Artisan allowlists and exact reviewed plans."
+        "Git-backed deployment control plane for explicitly registered Ubuntu targets, "
+        "applications, and deployments. Inspect a plan before every remote mutation and "
+        "pass its exact plan_id to apply. Secrets are SOPS references, never tool arguments."
     ),
 )
+READ = ToolAnnotations(title="Read Gimme control-plane state", readOnlyHint=True,
+                       destructiveHint=False, idempotentHint=True, openWorldHint=True)
+WRITE = ToolAnnotations(title="Apply an idempotent Gimme change", readOnlyHint=False,
+                        destructiveHint=True, idempotentHint=True, openWorldHint=True)
+CHANGE = ToolAnnotations(title="Apply a non-idempotent Gimme change", readOnlyHint=False,
+                         destructiveHint=True, idempotentHint=False, openWorldHint=True)
+Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$", min_length=1, max_length=64)]
+PlanId = Annotated[str, Field(pattern=r"^plan_[a-f0-9]{20}$")]
 
 
-READ_ONLY = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=True,
-)
-IDEMPOTENT_WRITE = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=True,
-    openWorldHint=True,
-)
-
-ApplicationName = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=48,
-        pattern=r"^[a-z][a-z0-9-]{0,47}$",
-        description="Registered application name from list_apps.",
-    ),
-]
-EnvironmentName = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=32,
-        pattern=r"^[a-z][a-z0-9-]{0,31}$",
-        description="Registered environment slug from list_environments.",
-    ),
-]
-LaravelAppEnvironment = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=32,
-        pattern=r"^[a-z][a-z0-9_-]{0,31}$",
-        description=(
-            "Explicit Laravel APP_ENV value for this deployment environment; never "
-            "inferred from its Git branch."
-        ),
-    ),
-]
-ArtisanCommand = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=120,
-        pattern=r"^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$",
-        description="Laravel Artisan command present in the application's allowlist.",
-    ),
-]
-ArtisanArgument = Annotated[
-    str,
-    Field(
-        min_length=1,
-        max_length=256,
-        description="One literal Artisan positional argument or option.",
-    ),
-]
-ArtisanArguments = Annotated[
-    list[ArtisanArgument] | None,
-    Field(
-        max_length=32,
-        description=(
-            "Optional argument vector passed literally to Artisan. Each item is bounded and "
-            "shell-escaped; environment-selection arguments are rejected."
-        ),
-    ),
-]
-WorkerRegistration = Annotated[
-    WorkerConfig | None,
-    Field(
-        description=(
-            "Optional standard queue worker or Horizon process definition. Omit to keep "
-            "application workers unmanaged."
-        )
-    ),
-]
-SchedulerRegistration = Annotated[
-    SchedulerConfig | None,
-    Field(description="Optional every-minute Laravel scheduler definition."),
-]
-HealthRegistration = Annotated[
-    HealthCheckConfig | None,
-    Field(
-        description=(
-            "Optional Laravel health policy used as a candidate-release gate before "
-            "activation and a live HTTPS rollback gate afterward. Null disables it."
-        )
-    ),
-]
-PlanIdentifier = Annotated[
-    str,
-    Field(
-        pattern=r"^plan_[a-f0-9]{20}$",
-        description="Exact plan_id returned by the corresponding planning tool.",
-    ),
-]
+def _result(result: CommandResult) -> dict[str, object]:
+    return result.as_dict()
 
 
-def titled(base: ToolAnnotations, title: str) -> ToolAnnotations:
-    return base.model_copy(update={"title": title})
+def _replace(state: ControlState, collection: str, name: str, value: object) -> ControlState:
+    document = state.model_dump(mode="json")
+    document[collection][name] = value.model_dump(mode="json")  # type: ignore[attr-defined]
+    return ControlState.model_validate(document)
 
 
-def resolved_deployment_plan(
-    server: ServerConfig,
-    name: str,
-    app: AppConfig,
-    environment: str = "default",
-) -> dict[str, object]:
-    revision_result = runner.run(
-        "gimme:resolve-revision",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        timeout=60,
+def _delete(state: ControlState, collection: str, name: str) -> ControlState:
+    document = state.model_dump(mode="json")
+    del document[collection][name]
+    return ControlState.model_validate(document)
+
+
+def _assert_plan(expected: dict[str, Any], plan_id: str) -> None:
+    if plan_id != expected["plan_id"]:
+        raise ValueError("plan_id is invalid or stale; request a fresh plan")
+
+
+def _context(name: str) -> tuple[ControlState, DeploymentConfig, TargetConfig, ApplicationConfig]:
+    state = store.load()
+    try:
+        deployment = state.deployments[name]
+        target = state.targets[deployment.target]
+        application = state.applications[deployment.application]
+    except KeyError as exc:
+        raise KeyError(f"deployment '{name}' is not registered") from exc
+    return state, deployment, target, application
+
+
+def _run_deployment(
+    task: str, name: str, *, revision: str | None = None,
+    arguments: tuple[str, ...] = (), secret_file: Path | None = None,
+    artisan_command: str | None = None, artisan_arguments: list[str] | None = None,
+    timeout: int = 900,
+) -> CommandResult:
+    state, deployment, target, application = _context(name)
+    return runner.run(
+        task, legacy_server(target), stack=target.stack,
+        app_name=deployment.application, app=legacy_app(application, deployment),
+        revision=revision, arguments=arguments,
+        instance_name=deployment.placement.instance,
+        deploy_path=f"{target.apps_root}/{deployment.placement.relative_path}",
+        site_host=deployment.placement.site_host,
+        database_identifier=deployment.placement.database_identifier,
+        cache_prefix=deployment.placement.cache_prefix,
+        source_kind=deployment.source.kind, sites=target_sites(state, deployment.target),
+        network_mode=target.network.mode, toolchains=target.toolchains.model_dump(),
+        variables=deployment.variables, secret_file=secret_file,
+        artisan_command=artisan_command, artisan_arguments=artisan_arguments,
+        artisan_allowed_commands=(application.artisan.allowed_commands
+                                  if application.artisan is not None else None),
+        timeout=timeout,
     )
-    revision = ""
-    for raw_line in revision_result.output.splitlines():
-        line = raw_line.split("] ", 1)[-1].strip()
+
+
+def _revision(name: str) -> str:
+    deployment = store.deployment(name)
+    if deployment.source.kind == "commit":
+        return deployment.source.ref
+    result = _run_deployment("gimme:resolve-revision", name, timeout=60)
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
         if line.startswith("GIMME_REVISION|"):
             revision = line.split("|", 1)[1]
-    if len(revision) not in {40, 64} or any(char not in "0123456789abcdef" for char in revision):
-        raise RuntimeError("remote branch resolution did not return a valid Git revision")
-    definition = deployment_plan(server, name, app, environment, revision=revision)
-    rendered = runner.run(
-        "deploy",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        revision=revision,
-        arguments=("--plan",),
-        timeout=60,
-    )
-    resolved = {key: value for key, value in definition.items() if key != "plan_id"}
-    resolved["deployer_plan"] = rendered.output
-    return {"plan_id": compute_plan_id(resolved), **resolved}
+            if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision):
+                return revision
+    raise RuntimeError("source did not resolve to one exact Git revision")
 
 
-def proposed_app_registration(
-    name: str,
-    repository: str,
-    app_env: str,
-    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
-    branch: str = "main",
-    app_debug: bool = False,
-    frontend: FrontendBuildConfig | None = None,
-    artisan: ArtisanConfig | None = None,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: HealthRegistration = None,
-) -> AppConfig:
-    proposed = AppConfig(
-        repository=repository,
-        framework=framework,
-        branch=branch,
-        app_env=app_env,
-        app_debug=app_debug,
-        frontend=frontend,
-        artisan=artisan,
-        workers=workers,
-        scheduler=scheduler,
-        health=health,
-    )
+def _dns_issues(deployment: DeploymentConfig, target: TargetConfig) -> list[str]:
+    if target.network.mode != "public_dns":
+        return []
     try:
-        existing = store.app(name)
-    except KeyError:
-        return proposed
-    return AppConfig.model_validate(
-        {
-            **proposed.model_dump(mode="python"),
-            "environments": {
-                **{
-                    environment: definition
-                    for environment, definition in existing.environments.items()
-                    if environment != "default"
-                },
-                "default": proposed.environment("default"),
-            },
-        }
-    )
+        actual = {item[4][0] for item in socket.getaddrinfo(
+            deployment.placement.site_host, 443, type=socket.SOCK_STREAM
+        )}
+    except socket.gaierror:
+        return ["domain does not resolve"]
+    return [] if actual & set(target.network.expected_addresses) else [
+        "domain does not resolve to a declared target address"
+    ]
 
 
-def proposed_environment_registration(
-    app: AppConfig,
-    environment: str,
-    branch: str,
-    app_env: str,
-    app_debug: bool = False,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
-) -> AppConfig:
-    environments = dict(app.environments)
-    environments[environment] = EnvironmentConfig(
-        branch=branch,
-        app_env=app_env,
-        app_debug=app_debug,
-        workers=workers,
-        scheduler=scheduler,
-        health=health,
-    )
-    return AppConfig.model_validate({**app.model_dump(mode="python"), "environments": environments})
+def _secret_issues(deployment: DeploymentConfig) -> list[str]:
+    try:
+        resolve_secret_references(store.secrets_path, deployment.secrets)
+    except SecretError as exc:
+        return [str(exc)]
+    return []
 
 
-@mcp.resource(
-    "gimme://config/server",
-    name="server_manifest",
-    title="Server manifest",
-    description=(
-        "Validated desired server identity, bootstrap endpoint, SSH user, and application root."
-    ),
-    mime_type="application/json",
-)
-def server_manifest() -> dict[str, object]:
-    return store.server().model_dump(mode="json")
-
-
-@mcp.resource(
-    "gimme://config/stack",
-    name="stack_manifest",
-    title="Stack manifest",
-    description="Validated desired APT packages and managed systemd services.",
-    mime_type="application/json",
-)
-def stack_manifest() -> dict[str, object]:
-    return store.stack().model_dump(mode="json")
-
-
-@mcp.resource(
-    "gimme://config/apps",
-    name="application_registry",
-    title="Application registry",
-    description="Validated registry of applications available to Gimme.",
-    mime_type="application/json",
-)
-def application_registry() -> dict[str, object]:
-    return store.registry().model_dump(mode="json")
-
-
-@mcp.resource(
-    "gimme://apps/{name}",
-    name="application_detail",
-    title="Application detail",
-    description=("Registration, deployment path, and HTTPS URL for one registered application."),
-    mime_type="application/json",
-)
-def application_detail(name: str) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    return {
-        "name": name,
-        **app.model_dump(mode="json"),
-        "deploy_path": f"{server.apps_root}/{name}",
-        "site_url": f"https://{name}.{server.mdns_name}.local",
-    }
-
-
-@mcp.resource(
-    "gimme://apps/{name}/releases",
-    name="application_releases",
-    title="Application releases",
-    description="Read-only Deployer release history for one registered application.",
-    mime_type="application/json",
-)
-def application_releases(name: str) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    result = runner.run("releases", server, app_name=name, app=app)
-    return {"application": name, **result.as_dict()}
-
-
-@mcp.resource(
-    "gimme://apps/{name}/environments",
-    name="application_environments",
-    title="Application environments",
-    description="Registered isolated branch environments for one application.",
-    mime_type="application/json",
-)
-def application_environments(name: str) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    return {
-        "application": name,
-        "environments": {
-            environment: {
-                **definition.model_dump(mode="json"),
-                "effective_health": (
-                    app.effective_health(environment).model_dump(mode="json")
-                    if app.effective_health(environment) is not None
-                    else None
-                ),
-                "deploy_path": environment_deploy_path(server, name, environment),
-                "site_url": environment_site_url(server, name, environment),
-            }
-            for environment, definition in sorted(app.environments.items())
-        },
-    }
-
-
-@mcp.resource(
-    "gimme://apps/{name}/environments/{environment}",
-    name="application_environment_detail",
-    title="Application environment detail",
-    description="Definition, deployment path, and HTTPS URL for one environment.",
-    mime_type="application/json",
-)
-def application_environment_detail(name: str, environment: str) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    definition = app.environment(environment)
-    return {
-        "application": name,
-        "environment": environment,
-        **definition.model_dump(mode="json"),
-        "effective_health": (
-            app.effective_health(environment).model_dump(mode="json")
-            if app.effective_health(environment) is not None
-            else None
-        ),
-        "deploy_path": environment_deploy_path(server, name, environment),
-        "site_url": environment_site_url(server, name, environment),
-    }
-
-
-@mcp.resource(
-    "gimme://apps/{name}/environments/{environment}/releases",
-    name="application_environment_releases",
-    title="Application environment releases",
-    description="Read-only Deployer release history for one environment.",
-    mime_type="application/json",
-)
-def application_environment_releases(name: str, environment: str) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    app.environment(environment)
-    result = runner.run(
-        "releases",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-    )
-    return {"application": name, "environment": environment, **result.as_dict()}
-
-
-def resolved_stack_plan() -> dict[str, object]:
-    server = store.server()
-    stack = store.stack()
-    result = runner.run("gimme:preflight:stack", server, stack=stack, timeout=60, bootstrap=True)
+def _resolved_stack_plan(name: str) -> dict[str, Any]:
+    state = store.load()
+    target = state.targets[name]
+    result = runner.run("gimme:preflight:stack", legacy_server(target), stack=target.stack,
+                        sites=target_sites(state, name), network_mode=target.network.mode,
+                        toolchains=target.toolchains.model_dump(), timeout=60, bootstrap=True)
     resolution: dict[str, dict[str, str]] = {}
-    package_manager_processes: list[int] = []
-    privileged_helper = "unknown"
-    for raw_line in result.output.splitlines():
-        line = raw_line.strip()
-        if line.startswith("[") and "] " in line:
-            line = line.split("] ", 1)[1]
-        if not line.startswith("GIMME_PACKAGE|"):
-            if line.startswith("GIMME_APT_BUSY|"):
-                value = line.split("|", 1)[1]
-                if value != "no":
-                    package_manager_processes = [int(pid) for pid in value.split(",")]
-            elif line.startswith("GIMME_HELPER|"):
-                privileged_helper = line.split("|", 1)[1]
-            continue
-        _, name, installed, candidate = line.split("|", 3)
-        resolution[name] = {"installed": installed, "candidate": candidate}
-    missing_results = sorted(set(stack.packages) - set(resolution))
-    if missing_results:
-        raise RuntimeError(
-            "preflight did not return results for configured packages: "
-            + ", ".join(missing_results)
-        )
-    return stack_plan(
-        server,
-        stack,
-        resolution,
-        package_manager_processes,
-        apps=store.registry().apps,
-        privileged_helper=privileged_helper,
+    busy: list[int] = []
+    helper = "unknown"
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        if line.startswith("GIMME_PACKAGE|"):
+            _, package, installed, candidate = line.split("|", 3)
+            resolution[package] = {"installed": installed, "candidate": candidate}
+        elif line.startswith("GIMME_APT_BUSY|") and not line.endswith("|no"):
+            busy = [int(value) for value in line.split("|", 1)[1].split(",")]
+        elif line.startswith("GIMME_HELPER|"):
+            helper = line.split("|", 1)[1]
+    missing = sorted(set(target.stack.packages) - set(resolution))
+    if missing:
+        raise RuntimeError("preflight omitted configured packages: " + ", ".join(missing))
+    return target_stack_plan(name, target, resolution, package_manager_processes=busy,
+                             privileged_helper=helper, sites=target_sites(state, name))
+
+
+def _resource_plan(name: str) -> dict[str, Any]:
+    _, deployment, target, application = _context(name)
+    issues = _secret_issues(deployment) + _dns_issues(deployment, target)
+    plan = deployment_resource_plan(name, deployment, target, application,
+                                    missing_secrets=issues)
+    if issues:
+        plan["readiness_issues"] = issues
+        plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})
+    return plan
+
+
+def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
+    _, deployment, target, application = _context(name)
+    issues = _secret_issues(deployment) + _dns_issues(deployment, target)
+    if issues:
+        raise ValueError("deployment is not ready: " + "; ".join(issues))
+    selected = revision or _revision(name)
+    preflight = _run_deployment("gimme:preflight:frontend", name, revision=selected,
+                                timeout=60)
+    rendered = _run_deployment("deploy", name, revision=selected,
+                               arguments=("--plan",), timeout=60)
+    return deployment_release_plan(name, deployment, target, application, selected,
+                                   rendered.output, {"declared": target.toolchains.model_dump(),
+                                                     "preflight": preflight.output})
+
+
+@mcp.resource("gimme://state")
+def desired_state() -> dict[str, object]:
+    """Complete desired state without decrypted secret values."""
+    return store.load().model_dump(mode="json")
+
+
+@mcp.resource("gimme://targets/{name}")
+def target_resource(name: str) -> dict[str, object]:
+    return store.target(name).model_dump(mode="json")
+
+
+@mcp.resource("gimme://applications/{name}")
+def application_resource(name: str) -> dict[str, object]:
+    return store.application(name).model_dump(mode="json")
+
+
+@mcp.resource("gimme://deployments/{name}")
+def deployment_resource(name: str) -> dict[str, object]:
+    return store.deployment(name).model_dump(mode="json")
+
+
+@mcp.tool(annotations=READ)
+def plan_state_migration() -> dict[str, object]:
+    """Plan the one-time legacy manifest to schema-v2 state migration."""
+    if store.exists():
+        raise ValueError("schema-v2 state already exists")
+    return migration_plan(store.legacy_migration(), str(store.root))
+
+
+@mcp.tool(annotations=WRITE)
+def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
+    """Atomically write schema-v2 state after verifying its exact migration plan."""
+    expected = plan_state_migration()
+    _assert_plan(expected, plan_id)
+    store.save(store.legacy_migration())
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 2}
+
+
+@mcp.tool(annotations=READ)
+def list_targets() -> dict[str, object]:
+    """List every registered target and its desired provisioning policy."""
+    return {"targets": store.load().model_dump(mode="json")["targets"]}
+
+
+@mcp.tool(annotations=READ)
+def list_applications() -> dict[str, object]:
+    """List reusable registered application source and build definitions."""
+    return {"applications": store.load().model_dump(mode="json")["applications"]}
+
+
+@mcp.tool(annotations=READ)
+def list_deployments(target: Name | None = None) -> dict[str, object]:
+    """List deployments, optionally restricted to one registered target."""
+    values = store.load().model_dump(mode="json")["deployments"]
+    if target is not None:
+        values = {name: item for name, item in values.items() if item["target"] == target}
+    return {"deployments": values}
+
+
+@mcp.tool(annotations=WRITE)
+def register_target(name: Name, definition: TargetConfig) -> dict[str, object]:
+    """Register a new target locally without contacting it."""
+    state = store.load()
+    if name in state.targets:
+        raise ValueError("target already exists; use plan_update_target")
+    store.save(_replace(state, "targets", name, definition))
+    return {"changed": True, "target": name}
+
+
+@mcp.tool(annotations=READ)
+def plan_update_target(name: Name, definition: TargetConfig) -> dict[str, object]:
+    """Show the exact before/after state for a target update."""
+    state = store.load()
+    _replace(state, "targets", name, definition)
+    return registration_update_plan("target_update", name, state.targets[name], definition)
+
+
+@mcp.tool(annotations=WRITE)
+def update_target(name: Name, definition: TargetConfig, plan_id: PlanId) -> dict[str, object]:
+    """Apply an exact reviewed target update to local desired state."""
+    expected = plan_update_target(name, definition)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "targets", name, definition))
+    return {"changed": True, "target": name}
+
+
+@mcp.tool(annotations=WRITE)
+def register_application(name: Name, definition: ApplicationConfig) -> dict[str, object]:
+    """Register reusable application source and build metadata locally."""
+    state = store.load()
+    if name in state.applications:
+        raise ValueError("application already exists; use plan_update_application")
+    store.save(_replace(state, "applications", name, definition))
+    return {"changed": True, "application": name}
+
+
+@mcp.tool(annotations=READ)
+def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[str, object]:
+    """Show the exact before/after state for an application update."""
+    state = store.load()
+    _replace(state, "applications", name, definition)
+    return registration_update_plan(
+        "application_update", name, state.applications[name], definition
     )
 
 
-def resolved_app_process_plan(name: str) -> dict[str, object]:
-    return resolved_environment_process_plan(name, "default")
+@mcp.tool(annotations=WRITE)
+def update_application(name: Name, definition: ApplicationConfig,
+                       plan_id: PlanId) -> dict[str, object]:
+    """Apply an exact reviewed application update to local desired state."""
+    expected = plan_update_application(name, definition)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "applications", name, definition))
+    return {"changed": True, "application": name}
 
 
-def resolved_environment_process_plan(name: str, environment: str) -> dict[str, object]:
-    server = store.server()
-    stack = store.stack()
-    app = store.app(name)
-    result = runner.run(
-        "gimme:preflight:processes",
-        server,
-        stack=stack,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        timeout=30,
-    )
-    observations = {
-        "helper": "unknown",
-        "current_release": "unknown",
-        "pcntl": "unknown",
-        "posix": "unknown",
-        "horizon": "unknown",
-    }
-    markers = {
-        "GIMME_PROCESS_HELPER": "helper",
-        "GIMME_CURRENT_RELEASE": "current_release",
-        "GIMME_PCNTL": "pcntl",
-        "GIMME_POSIX": "posix",
-        "GIMME_HORIZON": "horizon",
-    }
-    for raw_line in result.output.splitlines():
-        line = raw_line.strip()
-        if line.startswith("[") and "] " in line:
-            line = line.split("] ", 1)[1]
-        if "|" not in line:
-            continue
-        marker, value = line.split("|", 1)
-        if marker in markers:
-            observations[markers[marker]] = value
-    return app_process_plan(server, name, app, environment, **observations)
+@mcp.tool(annotations=WRITE)
+def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[str, object]:
+    """Register a deployment and allocate its immutable placement identities."""
+    state = store.load()
+    if name in state.deployments:
+        raise ValueError("deployment already exists; use plan_update_deployment")
+    target = state.targets[definition.target]
+    deployment = definition.materialize(new_placement(name, target, domain=definition.domain))
+    store.save(_replace(state, "deployments", name, deployment))
+    return {"changed": True, "deployment": name,
+            "placement": deployment.placement.model_dump(mode="json")}
 
 
-@mcp.tool(
-    description=(
-        "Inspect the configured Ubuntu host and report its OS, installed runtime "
-        "commands, service states, mDNS publisher and host-local resolution observations, "
-        "and non-interactive sudo availability. Client-side mDNS resolution is explicitly "
-        "reported as not observable. Makes no changes."
-    ),
-    annotations=titled(READ_ONLY, "Inspect host"),
-)
-def inspect_host() -> dict[str, object]:
-    return runner.run("gimme:inspect", store.server(), stack=store.stack(), timeout=30).as_dict()
+@mcp.tool(annotations=READ)
+def plan_update_deployment(name: Name,
+                           definition: DeploymentRegistration) -> dict[str, object]:
+    """Show a deployment update while preserving immutable placement fields."""
+    state = store.load()
+    current = state.deployments[name]
+    placement = current.placement
+    if definition.domain is not None and definition.domain != placement.site_host:
+        placement = placement.model_copy(update={"site_host": definition.domain})
+    proposed = definition.materialize(placement)
+    _replace(state, "deployments", name, proposed)
+    return registration_update_plan("deployment_update", name, current, proposed)
 
 
-@mcp.tool(
-    description=(
-        "Resolve every desired package against the configured host's current package "
-        "metadata and return an exact provisioning plan. Unavailable packages make the "
-        "plan unready. Makes no changes and returns a plan_id for provision_stack."
-    ),
-    annotations=titled(READ_ONLY, "Plan stack provisioning"),
-)
-def plan_stack() -> dict[str, object]:
-    return resolved_stack_plan()
+@mcp.tool(annotations=WRITE)
+def update_deployment(name: Name, definition: DeploymentRegistration,
+                      plan_id: PlanId) -> dict[str, object]:
+    """Apply an exact reviewed deployment update to local desired state."""
+    expected = plan_update_deployment(name, definition)
+    _assert_plan(expected, plan_id)
+    proposed = DeploymentConfig.model_validate(expected["proposed"])
+    store.save(_replace(store.load(), "deployments", name, proposed))
+    return {"changed": True, "deployment": name}
 
 
-@mcp.tool(
-    description=(
-        "Apply a previously returned stack plan to the configured host. Installs missing "
-        "APT packages and enables PostgreSQL and Valkey; rejects stale or invented plan IDs."
-    ),
-    annotations=titled(IDEMPOTENT_WRITE, "Provision stack"),
-)
-def provision_stack(plan_id: str) -> dict[str, object]:
-    server = store.server()
-    stack = store.stack()
-    expected = resolved_stack_plan()
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_stack again")
-    if expected["package_manager_processes"]:
-        processes = ", ".join(str(pid) for pid in expected["package_manager_processes"])
-        raise ValueError(
-            f"package manager is already active (PID: {processes}); wait for it to "
-            "finish and do not remove its lock files"
-        )
+@mcp.tool(annotations=READ)
+def inspect_target(name: Name) -> dict[str, object]:
+    """Inspect a target's OS, services, helpers, TLS, and SSH-agent readiness."""
+    target = store.target(name)
+    return _result(runner.run("gimme:inspect", legacy_server(target), stack=target.stack,
+                              sites=target_sites(store.load(), name),
+                              network_mode=target.network.mode,
+                              toolchains=target.toolchains.model_dump(), timeout=60))
+
+
+@mcp.tool(annotations=READ)
+def plan_target_stack(name: Name) -> dict[str, object]:
+    """Preflight packages and helpers and return the exact target stack plan."""
+    return _resolved_stack_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Reconcile a target stack through its bootstrapped privileged helper."""
+    expected = _resolved_stack_plan(name)
+    _assert_plan(expected, plan_id)
+    if not expected["mcp_apply_ready"]:
+        raise ValueError("target is not ready for MCP apply; run gimme-bootstrap-target")
+    state = store.load()
+    target = state.targets[name]
+    return _result(runner.run("gimme:provision:stack", legacy_server(target),
+                              stack=target.stack, sites=target_sites(state, name),
+                              network_mode=target.network.mode,
+                              toolchains=target.toolchains.model_dump(), timeout=1800))
+
+
+@mcp.tool(annotations=READ)
+def plan_deployment_resources(name: Name) -> dict[str, object]:
+    """Plan routing, database, cache, runtime values, secrets, and processes."""
+    return _resource_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Reconcile one deployment's route and target-local runtime resources."""
+    expected = _resource_plan(name)
+    _assert_plan(expected, plan_id)
     if not expected["ready"]:
-        raise ValueError(
-            "stack plan contains unavailable packages; update config/stack.json or "
-            "configure an explicitly approved package source"
-        )
-    if expected["privileged_helper"] != "ready":
-        raise ValueError(
-            "privileged helper is not bootstrapped; run the documented one-time "
-            "GIMME_INTERACTIVE_SUDO=1 stack provisioning command"
-        )
-    return runner.run("gimme:provision:stack", server, stack=stack, bootstrap=True).as_dict()
+        raise ValueError("deployment resources are not ready; inspect readiness_issues")
+    state, deployment, target, _ = _context(name)
+    runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
+               sites=target_sites(state, deployment.target), network_mode=target.network.mode,
+               toolchains=target.toolchains.model_dump(), timeout=1800)
+    resolved = resolve_secret_references(store.secrets_path, deployment.secrets)
+    with protected_secret_file(resolved) as secret_file:
+        result = _run_deployment("gimme:provision:app", name, secret_file=secret_file,
+                                 timeout=1800)
+    return _result(result)
 
 
-@mcp.tool(
-    description=(
-        "List locally registered PHP applications and their Git repository, framework "
-        "recipe, branch, and computed deployment path. Does not contact the host."
-    ),
-    annotations=titled(READ_ONLY, "List applications"),
-)
-def list_apps() -> dict[str, object]:
-    server = store.server()
-    registry = store.registry()
-    return {
-        "apps": {
-            name: {
-                **app.model_dump(),
-                "deploy_path": f"{server.apps_root}/{name}",
-            }
-            for name, app in registry.apps.items()
-        }
-    }
+@mcp.tool(annotations=READ)
+def plan_deployment(name: Name) -> dict[str, object]:
+    """Resolve source and toolchains and render the exact Deployer task graph."""
+    return _release_plan(name)
 
 
-@mcp.tool(
-    description=(
-        "List the isolated deployment environments registered for one application, "
-        "including each branch, URL, deploy path, health policy, and process settings. "
-        "Makes no remote changes."
-    ),
-    annotations=titled(READ_ONLY, "List application environments"),
-)
-def list_environments(name: ApplicationName) -> dict[str, object]:
-    return application_environments(name)
+@mcp.tool(annotations=CHANGE)
+def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Deploy an exact reviewed revision with health gates and worker refresh."""
+    expected = _release_plan(name)
+    _assert_plan(expected, plan_id)
+    result = _run_deployment("deploy", name, revision=str(expected["revision"]),
+                             timeout=1800)
+    _, deployment, _, application = _context(name)
+    if application.framework == "laravel" and (
+        deployment.workers is not None or deployment.scheduler is not None
+    ):
+        _run_deployment("gimme:provision:processes", name, timeout=1800)
+    return _result(result)
 
 
-@mcp.tool(
-    description=(
-        "Register or update one non-default branch environment for an existing application. "
-        "app_env is explicit and is never inferred from the branch; app_debug defaults false. "
-        "The environment has isolated resources and no workers or scheduler unless explicitly "
-        "configured. Changes only the local registry."
-    ),
-    annotations=ToolAnnotations(
-        title="Register application environment",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-def register_environment(
-    name: ApplicationName,
-    environment: EnvironmentName,
-    branch: str,
-    app_env: LaravelAppEnvironment,
-    app_debug: bool = False,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
-) -> dict[str, object]:
-    definition = EnvironmentConfig(
-        branch=branch,
-        app_env=app_env,
-        app_debug=app_debug,
-        workers=workers,
-        scheduler=scheduler,
-        health=health,
-    )
-    app = store.app(name)
-    existing = app.environments.get(environment)
-    if existing is not None and existing != definition:
-        raise ValueError(
-            "environment is already registered with a different definition; "
-            "use plan_update_environment and update_environment"
-        )
-    changed = store.register_environment(name, environment, definition)
-    server = store.server()
-    return {
-        "application": name,
-        "environment": environment,
-        "changed": changed,
-        **definition.model_dump(mode="json"),
-        "deploy_path": environment_deploy_path(server, name, environment),
-        "site_url": environment_site_url(server, name, environment),
-    }
+@mcp.tool(annotations=READ)
+def list_releases(name: Name) -> dict[str, object]:
+    """List retained releases for one deployment and identify the current release."""
+    return _result(_run_deployment("releases", name))
 
 
-@mcp.tool(
-    description=(
-        "Return an exact, read-only plan for changing an existing non-default "
-        "environment's branch or policies, including its explicit Laravel runtime mode, "
-        "while reusing its isolated resources."
-    ),
-    annotations=titled(READ_ONLY, "Plan environment registration update"),
-)
-def plan_update_environment(
-    name: ApplicationName,
-    environment: EnvironmentName,
-    branch: str,
-    app_env: LaravelAppEnvironment,
-    app_debug: bool = False,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
-) -> dict[str, object]:
-    if environment == "default":
-        raise ValueError("use plan_update_app for the default environment")
-    app = store.app(name)
-    app.environment(environment)
-    proposed = proposed_environment_registration(
-        app, environment, branch, app_env, app_debug, workers, scheduler, health
-    )
-    if proposed == app:
-        raise ValueError("environment registration already matches the proposal")
-    return environment_update_plan(store.server(), name, environment, app, proposed)
+@mcp.tool(annotations=CHANGE)
+def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
+    """Restore a deployment's prior retained release after exact confirmation."""
+    expected = f"ROLLBACK {name}"
+    if confirmation != expected:
+        raise ValueError(f"confirmation must exactly equal '{expected}'")
+    return _result(_run_deployment("rollback", name))
 
 
-@mcp.tool(
-    description=(
-        "Apply an exact reviewed environment-registration update locally. Reuses the "
-        "environment's database, cache namespace, storage, and releases; makes no remote "
-        "changes."
-    ),
-    annotations=ToolAnnotations(
-        title="Update environment registration",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
-    ),
-)
-def update_environment(
-    name: ApplicationName,
-    environment: EnvironmentName,
-    branch: str,
-    app_env: LaravelAppEnvironment,
-    plan_id: PlanIdentifier,
-    app_debug: bool = False,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
-) -> dict[str, object]:
-    if environment == "default":
-        raise ValueError("use update_app for the default environment")
-    app = store.app(name)
-    app.environment(environment)
-    proposed = proposed_environment_registration(
-        app, environment, branch, app_env, app_debug, workers, scheduler, health
-    )
-    expected = environment_update_plan(store.server(), name, environment, app, proposed)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_update_environment again")
-    store.register_app(name, proposed)
-    return {
-        "application": name,
-        "environment": environment,
-        "changed": True,
-        **proposed.environment(environment).model_dump(mode="json"),
-    }
+@mcp.tool(annotations=READ)
+def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
+    """Plan deploying the source deployment's exact live commit to a destination."""
+    state, source_deployment, _, _ = _context(source)
+    destination_deployment = state.deployments[destination]
+    if source_deployment.application != destination_deployment.application:
+        raise ValueError("promotion requires deployments of the same application")
+    current = _run_deployment("gimme:current-revision", source, timeout=60)
+    revision = ""
+    for raw in current.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        if line.startswith("GIMME_CURRENT_REVISION|"):
+            revision = line.split("|", 1)[1]
+    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision) is None:
+        raise RuntimeError("source deployment has no exact current revision")
+    return exact_plan({"kind": "promotion", "source": source, "destination": destination,
+                       "revision": revision, "release": _release_plan(destination, revision)})
 
 
-@mcp.tool(
-    description=(
-        "Set one environment's Laravel health policy to inherit the application policy, "
-        "disable health gates, or use a complete override. Makes no remote changes."
-    ),
-    annotations=ToolAnnotations(
-        title="Configure environment health",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-def configure_environment_health(
-    name: ApplicationName,
-    environment: EnvironmentName,
-    health: Literal["inherit"] | HealthCheckConfig | None = "inherit",
-) -> dict[str, object]:
-    changed = store.configure_environment_health(name, environment, health)
-    app = store.app(name)
-    definition = app.environment(environment)
-    return {
-        "application": name,
-        "environment": environment,
-        "changed": changed,
-        "health": (
-            definition.health.model_dump(mode="json")
-            if isinstance(definition.health, HealthCheckConfig)
-            else definition.health
-        ),
-        "effective_health": (
-            app.effective_health(environment).model_dump(mode="json")
-            if app.effective_health(environment) is not None
-            else None
-        ),
-    }
+@mcp.tool(annotations=CHANGE)
+def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict[str, object]:
+    """Promote an exact reviewed live commit and pin the destination after success."""
+    expected = plan_promotion(source, destination)
+    _assert_plan(expected, plan_id)
+    revision = str(expected["revision"])
+    result = _run_deployment("deploy", destination, revision=revision, timeout=1800)
+    state = store.load()
+    deployment = state.deployments[destination].model_copy(
+        update={"source": DeploymentSource(kind="commit", ref=revision)})
+    application = state.applications[deployment.application]
+    if application.framework == "laravel" and (
+        deployment.workers is not None or deployment.scheduler is not None
+    ):
+        _run_deployment("gimme:provision:processes", destination, timeout=1800)
+    store.save(_replace(state, "deployments", destination, deployment))
+    return _result(result)
 
 
-@mcp.tool(
-    description=(
-        "Return the exact destructive teardown plan for one non-default environment. "
-        "Makes no changes and returns the plan_id required by remove_environment."
-    ),
-    annotations=titled(READ_ONLY, "Plan environment removal"),
-)
-def plan_remove_environment(
-    name: ApplicationName, environment: EnvironmentName
-) -> dict[str, object]:
-    return environment_removal_plan(store.server(), name, store.app(name), environment)
+@mcp.tool(annotations=READ)
+def plan_remove_deployment(name: Name) -> dict[str, object]:
+    """Plan complete cleanup of one deployment and its isolated resources."""
+    _, deployment, target, _ = _context(name)
+    return deployment_removal_plan(name, deployment, target)
 
 
-@mcp.tool(
-    description=(
-        "Destroy one non-default environment after exact plan review. Removes its route, "
-        "processes, isolated database, Valkey keys, releases, storage, and registry entry. "
-        "Never modifies the Git branch or repository."
-    ),
-    annotations=ToolAnnotations(
-        title="Remove application environment",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=False,
-    ),
-)
-def remove_environment(
-    name: ApplicationName,
-    environment: EnvironmentName,
-    plan_id: PlanIdentifier,
-    confirmation: str,
-) -> dict[str, object]:
-    if environment == "default":
-        raise ValueError("the default environment cannot be removed")
-    if confirmation != f"REMOVE {name}/{environment}":
-        raise ValueError(f"confirmation must exactly equal 'REMOVE {name}/{environment}'")
-    server = store.server()
-    app = store.app(name)
-    expected = environment_removal_plan(server, name, app, environment)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_remove_environment again")
-    runner.run(
-        "gimme:reconcile:sites",
-        server,
-        stack=store.stack(),
-        exclude_instance=environment_instance(name, environment),
-        timeout=1800,
-    )
-    result = runner.run(
-        "gimme:remove:environment",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        timeout=1800,
-    ).as_dict()
-    store.remove_environment(name, environment)
-    return {**result, "application": name, "environment": environment, "removed": True}
+@mcp.tool(annotations=CHANGE)
+def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
+    """Remove a deployment after exact plan and confirmation checks."""
+    expected = plan_remove_deployment(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
+    state = _delete(store.load(), "deployments", name)
+    store.save(state)
+    target = state.targets[expected["target"]]
+    runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
+               sites=target_sites(state, str(expected["target"])),
+               network_mode=target.network.mode,
+               toolchains=target.toolchains.model_dump(), timeout=1800)
+    return _result(result)
 
 
-@mcp.tool(
-    description=(
-        "Register a new PHP application's allowlisted deployment definition, or confirm "
-        "an identical registration. Existing definitions must use plan_update_app and "
-        "update_app. "
-        "Laravel definitions may override the default Artisan command allowlist and declare "
-        "an explicit app_env and app_debug policy; these are never inferred from the branch. "
-        "Definitions may also declare process and deployment-health policies. Changes only "
-        "the local registry; it does "
-        "not connect to or modify the host."
-    ),
-    annotations=ToolAnnotations(
-        title="Register application",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-def register_app(
-    name: str,
-    repository: str,
-    app_env: LaravelAppEnvironment,
-    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
-    branch: str = "main",
-    app_debug: bool = False,
-    frontend: FrontendBuildConfig | None = None,
-    artisan: ArtisanConfig | None = None,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: HealthRegistration = None,
-) -> dict[str, object]:
-    app = proposed_app_registration(
-        name,
-        repository,
-        app_env,
-        framework,
-        branch,
-        app_debug,
-        frontend,
-        artisan,
-        workers,
-        scheduler,
-        health,
-    )
-    try:
-        existing = store.app(name)
-    except KeyError:
-        existing = None
-    if existing is not None and existing != app:
-        raise ValueError(
-            "application is already registered with a different definition; "
-            "use plan_update_app and update_app"
-        )
-    changed = store.register_app(name, app)
-    return {"application": name, "changed": changed, **app.model_dump(mode="json")}
+@mcp.tool(annotations=READ)
+def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -> dict[str, object]:
+    """Plan an allowlisted structured Artisan invocation in one deployment."""
+    _, _, _, application = _context(name)
+    allowed = application.artisan.allowed_commands if application.artisan is not None else []
+    if command not in allowed:
+        raise ValueError("Artisan command is not allowlisted")
+    args = arguments or []
+    if len(args) > 32 or any(not value or len(value) > 256 for value in args):
+        raise ValueError("Artisan arguments are invalid")
+    return exact_plan({"kind": "artisan", "deployment": name,
+                       "argv": ["php", "artisan", "--no-interaction", command, *args]})
 
 
-@mcp.tool(
-    description=(
-        "Return an exact, read-only plan for replacing an existing application's local "
-        "registration, including its explicit Laravel runtime mode. Additional environment "
-        "registrations are preserved."
-    ),
-    annotations=titled(READ_ONLY, "Plan application registration update"),
-)
-def plan_update_app(
-    name: ApplicationName,
-    repository: str,
-    app_env: LaravelAppEnvironment,
-    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
-    branch: str = "main",
-    app_debug: bool = False,
-    frontend: FrontendBuildConfig | None = None,
-    artisan: ArtisanConfig | None = None,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: HealthRegistration = None,
-) -> dict[str, object]:
-    current = store.app(name)
-    proposed = proposed_app_registration(
-        name,
-        repository,
-        app_env,
-        framework,
-        branch,
-        app_debug,
-        frontend,
-        artisan,
-        workers,
-        scheduler,
-        health,
-    )
-    if proposed == current:
-        raise ValueError("application registration already matches the proposal")
-    return application_update_plan(store.server(), name, current, proposed)
+@mcp.tool(annotations=CHANGE)
+def run_artisan(name: Name, command: str, plan_id: PlanId,
+                arguments: list[str] | None = None) -> dict[str, object]:
+    """Run an exact reviewed allowlisted Artisan invocation."""
+    expected = plan_artisan(name, command, arguments)
+    _assert_plan(expected, plan_id)
+    return _result(_run_deployment("gimme:artisan", name, artisan_command=command,
+                                   artisan_arguments=arguments or []))
 
 
-@mcp.tool(
-    description=(
-        "Apply an exact reviewed application-registration update locally. Additional "
-        "environment registrations are preserved and no remote host changes are made."
-    ),
-    annotations=ToolAnnotations(
-        title="Update application registration",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=False,
-        openWorldHint=False,
-    ),
-)
-def update_app(
-    name: ApplicationName,
-    repository: str,
-    app_env: LaravelAppEnvironment,
-    plan_id: PlanIdentifier,
-    framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common",
-    branch: str = "main",
-    app_debug: bool = False,
-    frontend: FrontendBuildConfig | None = None,
-    artisan: ArtisanConfig | None = None,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    health: HealthRegistration = None,
-) -> dict[str, object]:
-    current = store.app(name)
-    proposed = proposed_app_registration(
-        name,
-        repository,
-        app_env,
-        framework,
-        branch,
-        app_debug,
-        frontend,
-        artisan,
-        workers,
-        scheduler,
-        health,
-    )
-    expected = application_update_plan(store.server(), name, current, proposed)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_update_app again")
-    store.register_app(name, proposed)
-    return {
-        "application": name,
-        "changed": True,
-        **proposed.model_dump(mode="json"),
-    }
+@mcp.tool(annotations=READ)
+def deployment_process_status(name: Name) -> dict[str, object]:
+    """Inspect managed queue, Horizon, and scheduler units for one deployment."""
+    return _result(_run_deployment("gimme:processes:status", name, timeout=60))
 
 
-@mcp.tool(
-    description=(
-        "Replace only the local worker/Horizon and scheduler definition for an existing "
-        "Laravel application while preserving its repository, branch, frontend, and Artisan "
-        "settings. Null values disable management; makes no remote changes. Use register_app "
-        "for the initial application definition."
-    ),
-    annotations=ToolAnnotations(
-        title="Configure application processes",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-def configure_app_processes(
-    name: ApplicationName,
-    workers: WorkerRegistration = None,
-    scheduler: SchedulerRegistration = None,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    changed = store.configure_environment_processes(name, environment, workers, scheduler)
-    app = store.app(name)
-    definition = app.environment(environment)
-    return {
-        "application": name,
-        "environment": environment,
-        "changed": changed,
-        "workers": (definition.workers.model_dump() if definition.workers is not None else None),
-        "scheduler": (
-            definition.scheduler.model_dump() if definition.scheduler is not None else None
-        ),
-    }
-
-
-@mcp.tool(
-    description=(
-        "Replace only the local Laravel deployment health policy while preserving the "
-        "application's repository, branch, frontend, Artisan, worker, and scheduler "
-        "settings. The policy gates candidate activation and rolls back a failed live "
-        "HTTPS check; null disables it. Makes no remote changes."
-    ),
-    annotations=ToolAnnotations(
-        title="Configure application health",
-        readOnlyHint=False,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=False,
-    ),
-)
-def configure_app_health(
-    name: ApplicationName,
-    health: HealthRegistration = None,
-) -> dict[str, object]:
-    changed = store.configure_app_health(name, health)
-    app = store.app(name)
-    return {
-        "application": name,
-        "changed": changed,
-        "health": app.health.model_dump() if app.health is not None else None,
-    }
-
-
-@mcp.tool(
-    description=(
-        "Plan a registered application's PostgreSQL database, database role, Valkey "
-        "namespace, and protected remote environment file. Makes no changes."
-    ),
-    annotations=titled(READ_ONLY, "Plan application resources"),
-)
-def plan_app_resources(
-    name: ApplicationName, environment: EnvironmentName = "default"
-) -> dict[str, object]:
-    return app_resource_plan(store.server(), name, store.app(name), environment)
-
-
-@mcp.tool(
-    description=(
-        "Create a registered application's PostgreSQL database and role, generate its "
-        "password on the host, and write PostgreSQL and Valkey settings to shared/.env. "
-        "Requires a matching plan from plan_app_resources."
-    ),
-    annotations=titled(IDEMPOTENT_WRITE, "Provision application resources"),
-)
-def provision_app_resources(
-    name: ApplicationName,
-    plan_id: PlanIdentifier,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    expected = app_resource_plan(server, name, app, environment)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_app_resources again")
-    runner.run(
-        "gimme:reconcile:sites",
-        server,
-        stack=store.stack(),
-        timeout=1800,
-    )
-    if app.framework == "static":
-        return {
-            "application": name,
-            "environment": environment,
-            "changed": False,
-            "message": (
-                "environment route reconciled; static frontend applications require "
-                "no database or cache"
-            ),
-        }
-    return runner.run(
-        "gimme:provision:app",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Return the exact deployment definition and Deployer task order for a registered "
-        "application, including configured pre-activation and live rollback health gates. "
-        "Makes no remote changes and returns the plan_id required by deploy_app."
-    ),
-    annotations=titled(READ_ONLY, "Plan application deployment"),
-)
-def plan_deploy(
-    name: ApplicationName, environment: EnvironmentName = "default"
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    return resolved_deployment_plan(server, name, app, environment)
-
-
-@mcp.tool(
-    description=(
-        "Deploy a registered application from Git using its pinned Deployer recipe. "
-        "Requires the current plan_id and may run framework migrations. Configured health "
-        "checks gate the candidate before symlink activation and restore the previous release "
-        "if the subsequent live HTTPS check fails."
-    ),
-    annotations=ToolAnnotations(
-        title="Deploy application",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    ),
-)
-def deploy_app(
-    name: ApplicationName,
-    plan_id: PlanIdentifier,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    expected = resolved_deployment_plan(server, name, app, environment)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_deploy again")
-    return runner.run(
-        "deploy",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        revision=str(expected["revision"]),
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "List retained releases for a registered application and identify the current "
-        "release. Makes no changes."
-    ),
-    annotations=titled(READ_ONLY, "List application releases"),
-)
-def list_releases(
-    name: ApplicationName, environment: EnvironmentName = "default"
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    return runner.run(
-        "releases", server, app_name=name, app=app, environment_name=environment
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Roll a registered application back to its previous good Deployer release. "
-        "Changes the live current symlink and marks the replaced release as bad."
-    ),
-    annotations=ToolAnnotations(
-        title="Rollback application",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    ),
-)
-def rollback_app(
-    name: ApplicationName,
-    confirmation: str,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    expected_confirmation = (
-        f"ROLLBACK {name}" if environment == "default" else f"ROLLBACK {name}/{environment}"
-    )
-    if confirmation != expected_confirmation:
-        raise ValueError(f"confirmation must exactly equal '{expected_confirmation}'")
-    server = store.server()
-    app = store.app(name)
-    return runner.run(
-        "rollback", server, app_name=name, app=app, environment_name=environment
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Plan one allowlisted Laravel Artisan command in a registered application's current "
-        "release. Validates the command and literal argument vector, makes no changes, and "
-        "returns the exact argv plus a plan_id for run_artisan."
-    ),
-    annotations=titled(READ_ONLY, "Plan Artisan command"),
-)
-def plan_artisan(
-    name: ApplicationName,
-    command: ArtisanCommand,
-    arguments: ArtisanArguments = None,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    return artisan_command_plan(
-        store.server(), name, store.app(name), command, arguments, environment
-    )
-
-
-@mcp.tool(
-    description=(
-        "Execute a previously planned, allowlisted Laravel Artisan command inside the current "
-        "release and return capped combined output. Executes application code and may mutate "
-        "application, database, cache, queue, or filesystem state; rejects stale plan IDs."
-    ),
-    annotations=ToolAnnotations(
-        title="Run Artisan command",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    ),
-)
-def run_artisan(
-    name: ApplicationName,
-    command: ArtisanCommand,
-    plan_id: PlanIdentifier,
-    arguments: ArtisanArguments = None,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    normalized_arguments = arguments or []
-    expected = artisan_command_plan(server, name, app, command, normalized_arguments, environment)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_artisan again")
-    if app.artisan is None:
-        raise ValueError("Artisan commands require a registered Laravel application")
-    return runner.run(
-        "gimme:artisan",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        artisan_command=command,
-        artisan_arguments=normalized_arguments,
-        artisan_allowed_commands=app.artisan.allowed_commands,
-        timeout=300,
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Inspect prerequisites and return the exact systemd worker, Horizon, and scheduler "
-        "process plan for one registered Laravel application. Makes no changes and returns "
-        "a plan_id for provision_app_processes."
-    ),
-    annotations=titled(READ_ONLY, "Plan application processes"),
-)
-def plan_app_processes(
-    name: ApplicationName, environment: EnvironmentName = "default"
-) -> dict[str, object]:
-    return resolved_environment_process_plan(name, environment)
-
-
-@mcp.tool(
-    description=(
-        "Apply a reviewed application process plan by reconciling narrowly generated systemd "
-        "queue worker or Horizon units and an optional scheduler timer. Requires an exact, "
-        "ready plan from plan_app_processes and never runs processes as root."
-    ),
-    annotations=titled(IDEMPOTENT_WRITE, "Provision application processes"),
-)
-def provision_app_processes(
-    name: ApplicationName,
-    plan_id: PlanIdentifier,
-    environment: EnvironmentName = "default",
-) -> dict[str, object]:
-    expected = resolved_environment_process_plan(name, environment)
-    if plan_id != expected["plan_id"]:
-        raise ValueError("plan_id is invalid or stale; call plan_app_processes again")
-    if not expected["ready"]:
-        blockers = ", ".join(str(value) for value in expected["blockers"])
-        raise ValueError(f"application process plan is not ready; blockers: {blockers}")
-    server = store.server()
-    app = store.app(name)
-    return runner.run(
-        "gimme:provision:processes",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        timeout=1800,
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Report systemd load, active state, substate, PID, and restart count for the configured "
-        "queue workers or Horizon master and scheduler timer of one Laravel application. "
-        "Returns no journal or application log content and makes no changes."
-    ),
-    annotations=titled(READ_ONLY, "Get application process status"),
-)
-def app_process_status(
-    name: ApplicationName, environment: EnvironmentName = "default"
-) -> dict[str, object]:
-    server = store.server()
-    app = store.app(name)
-    return runner.run(
-        "gimme:processes:status",
-        server,
-        app_name=name,
-        app=app,
-        environment_name=environment,
-        timeout=30,
-    ).as_dict()
-
-
-@mcp.tool(
-    description=(
-        "Report systemd status for PostgreSQL, Valkey, or Caddy on the configured host. "
-        "The service name is restricted to this allowlist and no changes are made."
-    ),
-    annotations=titled(READ_ONLY, "Get service status"),
-)
-def service_status(
-    service: Literal["postgresql", "valkey-server", "caddy"],
-) -> dict[str, object]:
-    return runner.run(
-        "gimme:service:status",
-        store.server(),
-        arguments=("-o", f"gimme_service={service}"),
-        timeout=30,
-    ).as_dict()
+@mcp.tool(annotations=READ)
+def target_service_status(name: Name,
+                          service: Literal["postgresql", "valkey-server", "caddy"]
+                          ) -> dict[str, object]:
+    """Read status for one allowlisted service on a registered target."""
+    target = store.target(name)
+    return _result(runner.run("gimme:service:status", legacy_server(target),
+                              stack=target.stack, arguments=(f"service={service}",), timeout=60))
 
 
 def main() -> None:

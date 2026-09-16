@@ -108,8 +108,7 @@ def test_helper_accepts_isolated_environment_site() -> None:
     sites = helper["validate_sites"](
         {
             "example-app--feature-x--ef4c19f581": {
-                "application": "example-app",
-                "environment": "feature-x",
+                "deployment": "example-app-feature-x",
                 "framework": "laravel",
                 "site_host": "feature-x.example-app.devbox.local",
                 "document_root": (
@@ -133,8 +132,7 @@ def test_helper_rejects_environment_document_root_escape() -> None:
         helper["validate_sites"](
             {
                 "example-app--feature-x--ef4c19f581": {
-                    "application": "example-app",
-                    "environment": "feature-x",
+                    "deployment": "example-app-feature-x",
                     "framework": "laravel",
                     "site_host": "feature-x.example-app.devbox.local",
                     "document_root": "/etc/current/public",

@@ -1,7 +1,7 @@
 [project]
 name = "gimme-mcp"
-version = "0.4.0"
-description = "A local MCP server for provisioning and deploying PHP applications"
+version = "0.5.0"
+description = "An MCP deployment control plane for provisioning and deploying PHP applications"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,6 +11,8 @@ dependencies = [
 
 [project.scripts]
 gimme-mcp = "gimme.server:main"
+gimme-bootstrap-target = "gimme.cli:bootstrap_target"
+gimme-bootstrap-database = "gimme.cli:bootstrap_database"
 
 [dependency-groups]
 dev = [
