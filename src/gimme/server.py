@@ -94,8 +94,11 @@ def _run_deployment(
         network_mode=target.network.mode, toolchains=target.toolchains.model_dump(),
         variables=deployment.variables, secret_file=secret_file,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
-        artisan_allowed_commands=(application.artisan.allowed_commands
-                                  if application.artisan is not None else None),
+        artisan_allowed_commands=(
+            application.artisan.allowed_commands
+            if artisan_command is not None and application.artisan is not None
+            else None
+        ),
         timeout=timeout,
     )
 

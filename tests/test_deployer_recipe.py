@@ -133,6 +133,8 @@ def test_host_inspection_reports_application_reachability() -> None:
     assert "xargs -0 tail -n 30" not in task
     assert "site.{$instance}.runtime_path_permissions=" in task
     assert "php_fpm_socket=" in task
+    assert "toolchain.{$tool}={$version}" in task
+    assert "['node', 'npm', 'pnpm', 'yarn', 'bun']" in task
     assert "php_fpm_recent_log=" not in task
     assert "ssh_agent=forwarded" in task
     assert "ssh_agent=missing" in task

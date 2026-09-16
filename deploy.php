@@ -1149,6 +1149,21 @@ else
 fi
 BASH;
     writeln(run('bash -c ' . escapeshellarg($agentScript)));
+    foreach (['node', 'npm', 'pnpm', 'yarn', 'bun'] as $tool) {
+        if (!test('command -v ' . escapeshellarg($tool) . ' >/dev/null 2>&1')) {
+            writeln("toolchain.{$tool}=missing");
+            continue;
+        }
+        $version = trim(run(escapeshellarg($tool) . ' --version 2>/dev/null'));
+        if ($tool === 'node') {
+            $version = ltrim($version, 'v');
+        }
+        if (!preg_match('/^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$/', $version)) {
+            writeln("toolchain.{$tool}=unrecognized");
+            continue;
+        }
+        writeln("toolchain.{$tool}={$version}");
+    }
 });
 
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {

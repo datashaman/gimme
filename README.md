@@ -61,10 +61,11 @@ secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 ```
 
-Schema-v2 `state.json` and SOPS-encrypted `secrets.enc.json` are intentionally
-Git-trackable; plaintext secrets are not. Legacy 0.4 manifests remain ignored because
-they may contain machine or client identifiers. Copy the example for a new installation,
-or use the migration tools for a 0.4 installation:
+Operational state and encrypted secrets are ignored in this public source repository
+because even encrypted documents, hostnames, repository URLs, and secret key names can
+reveal private inventory. To make state Git-backed, point `GIMME_STATE_DIR` at a
+separate private repository. Legacy 0.4 manifests remain ignored for the same reason.
+Copy the example for a new installation, or use the migration tools for a 0.4 installation:
 
 1. call `plan_state_migration`;
 2. review its preserved placements and effects;

@@ -166,6 +166,23 @@ def test_artisan_is_deployment_scoped_and_plan_gated(tmp_path, monkeypatch) -> N
     assert calls[-1]["artisan_arguments"] == ["--force"]
 
 
+def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
+    tmp_path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    captured: dict = {}
+
+    def fake_run(task, *args, **kwargs):
+        captured.update(kwargs)
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    server_module._run_deployment("gimme:preflight:frontend", "example-app")
+    assert captured["artisan_command"] is None
+    assert captured["artisan_arguments"] is None
+    assert captured["artisan_allowed_commands"] is None
+
+
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
