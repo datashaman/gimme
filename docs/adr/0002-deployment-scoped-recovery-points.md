@@ -15,6 +15,21 @@ Valkey-inclusive recovery point briefly quiesces only its Deployment to produce 
 Transfers require TLS, server-side encryption, integrity verification, and either ambient Target
 identity or encrypted secret references.
 
+Schedules use persistent UTC systemd timers. After downtime, only the most recent missed slot
+runs; its scheduled UTC instant participates in a deterministic request identity so delayed starts
+and retries cannot publish duplicate Recovery Points. A stable Deployment-derived delay of up to
+five minutes spreads Target load without changing that logical slot or serializing independent
+Deployments behind a Target-global lock.
+
+Scheduled transfers prefer ambient Target workload identity. When a Backup Destination uses
+encrypted secret references, resource reconciliation installs a root-owned credential consumed
+through systemd's credential mechanism; secrets never appear in unit configuration or status.
+Policy reapplication rotates it, and disabling scheduling or removing the Deployment removes it.
+
+Each scheduled Deployment exposes bounded Recovery Schedule Status from atomic Target-local
+observations. It reports timer and latest-attempt outcomes without raw system output; S3 Recovery
+Manifests remain authoritative inventory when that Target is unavailable.
+
 Restore remains bound to the owning Deployment but may target empty replacement Resources after
 Target loss when provider, kind, and exact version match. It runs inside a maintenance window,
 protects existing data with a Safety Recovery Point, and fails closed until integrity, database,
@@ -49,6 +64,9 @@ Record reaches `completed`.
 - Retention may prune only verified, unprotected recovery points after a replacement verifies.
 - `retain_last` is an automatic-pruning ceiling, not a minimum guarantee after manual deletion;
   protected Safety Recovery Points do not satisfy it.
+- A verified new Recovery Point remains successful if later pruning fails. Retention stops at the
+  first failed oldest candidate, reports degraded status, and retries only after a later successful
+  capture or an explicit manual deletion.
 - A Safety Recovery Point remains protected until its authoritative Restore Record is completed.
 - PostgreSQL Restore never streams an unverified dump directly into the live database identity.
 - Gimme does not provide an MCP force-online bypass after failed restore verification.

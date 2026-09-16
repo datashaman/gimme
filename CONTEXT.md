@@ -44,7 +44,11 @@ A Deployment-owned declaration of which bound data components participate in Rec
 PostgreSQL participates by default; Valkey participation is opt-in. Its cadence is manual,
 hourly, daily, or weekly, and on-demand Recovery Points remain available at every cadence.
 Scheduled times are expressed in UTC: hourly selects a minute, daily selects a time, and
-weekly selects a weekday and time.
+weekly selects a weekday and time. Cadence defaults to manual; hourly defaults to minute 0,
+daily to 02:00, and weekly to Sunday at 02:00. Persistent timers run only the most recent
+missed slot after downtime, using that exact scheduled slot as part of the idempotent request
+identity. Scheduled execution adds a stable Deployment-derived delay of up to five minutes to
+spread Target load; the configured UTC slot remains the logical schedule.
 Its `retain_last` value is an automatic-pruning ceiling from 1 to 365, defaulting to 7; pruning
 occurs only after a replacement has been verified and never reduces eligible points below that
 count. Manual deletion may reduce the count further, with stronger confirmation for the final
@@ -87,6 +91,12 @@ Destination. It is authoritative across controller or Target loss and records bo
 transitions from start through verification or failure. A Safety Recovery Point remains protected
 until its Restore Record reaches `completed`; target-local status is only a resumable cache.
 _Avoid_: Restore log, local restore status
+
+**Recovery Schedule Status**:
+The secret-free observed state of one Deployment's target-side recovery timer and latest scheduled
+attempt, including its logical slot, effective execution time, bounded outcome, and retention result.
+It is unavailable with its Target and is never authoritative Recovery Point inventory.
+_Avoid_: Backup history, recovery inventory
 
 ## Example dialogue
 
