@@ -4,6 +4,7 @@ from pathlib import Path
 
 from gimme.config import (
     AppConfig,
+    EnvironmentConfig,
     HealthCheckConfig,
     HorizonWorkerConfig,
     SchedulerConfig,
@@ -173,3 +174,41 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
         "delay_seconds": 2,
         "timeout_seconds": 5,
     }
+
+
+def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        health=HealthCheckConfig(path="/up"),
+        environments={
+            "default": EnvironmentConfig(branch="main"),
+            "feature-x": EnvironmentConfig(branch="feature/x", health=None),
+        },
+    )
+
+    runner(tmp_path).run(
+        "deploy",
+        server(),
+        app_name="example-app",
+        app=app,
+        environment_name="feature-x",
+        revision="a" * 40,
+    )
+
+    assert captured["GIMME_ENVIRONMENT"] == "feature-x"
+    assert captured["GIMME_INSTANCE"] == "example-app--feature-x"
+    assert captured["GIMME_DEPLOY_PATH"] == (
+        "/srv/gimme/apps/example-app/environments/feature-x"
+    )
+    assert captured["GIMME_SITE_HOST"] == "feature-x.example-app.devbox.local"
+    assert captured["GIMME_BRANCH"] == "feature/x"
+    assert captured["GIMME_REVISION"] == "a" * 40
+    assert json.loads(captured["GIMME_HEALTH_JSON"]) is None

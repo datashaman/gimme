@@ -374,6 +374,96 @@ function configured_apps(): array
     return $apps;
 }
 
+function configured_sites(string $appsRoot, string $mdnsName): array
+{
+    $sites = [];
+    foreach (configured_apps() as $name => $definition) {
+        $framework = $definition['framework'] ?? 'common';
+        $environments = $definition['environments'] ?? [
+            'default' => ['branch' => $definition['branch'] ?? 'main'],
+        ];
+        if (!is_array($environments) || array_is_list($environments) ||
+            !array_key_exists('default', $environments)) {
+            throw new \RuntimeException("Invalid environments for {$name}");
+        }
+        foreach ($environments as $environment => $environmentDefinition) {
+            if (!is_string($environment) ||
+                !preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environment) ||
+                !is_array($environmentDefinition)) {
+                throw new \RuntimeException("Invalid environment for {$name}");
+            }
+            $instance = $environment === 'default'
+                ? $name
+                : "{$name}--{$environment}";
+            if ((getenv('GIMME_EXCLUDE_INSTANCE') ?: '') === $instance) {
+                continue;
+            }
+            $deployPath = $environment === 'default'
+                ? "{$appsRoot}/{$name}"
+                : "{$appsRoot}/{$name}/environments/{$environment}";
+            $siteHost = $environment === 'default'
+                ? "{$name}.{$mdnsName}.local"
+                : "{$environment}.{$name}.{$mdnsName}.local";
+            $relativeRoot = match ($framework) {
+                'laravel', 'symfony' => 'public',
+                'static' => $definition['frontend']['output_dir'] ?? 'dist',
+                default => '',
+            };
+            $documentRoot = "{$deployPath}/current";
+            if ($relativeRoot !== '') {
+                $documentRoot .= "/{$relativeRoot}";
+            }
+            $sites[$instance] = [
+                'application' => $name,
+                'environment' => $environment,
+                'framework' => $framework,
+                'site_host' => $siteHost,
+                'document_root' => $documentRoot,
+            ];
+        }
+    }
+    ksort($sites);
+    return $sites;
+}
+
+function stack_state_write_command(
+    string $mode,
+    string $statePath,
+    string $appsRoot,
+    string $hostname,
+    string $mdnsName,
+    string $remoteUser,
+): string {
+    if (!in_array($mode, ['stack', 'sites'], true)) {
+        throw new \RuntimeException('Invalid stack reconciliation mode');
+    }
+    $state = json_encode([
+        'version' => 1,
+        'mode' => $mode,
+        'package_manager' => 'apt',
+        'packages' => configured_packages(),
+        'services' => configured_services(),
+        'hostname' => $hostname,
+        'mdns_name' => $mdnsName,
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'sites' => configured_sites($appsRoot, $mdnsName),
+    ], JSON_THROW_ON_ERROR);
+    $stateEncoded = escapeshellarg(base64_encode($state));
+    $stateDirectory = escapeshellarg(dirname($statePath));
+    $quotedStatePath = escapeshellarg($statePath);
+    return <<<BASH
+set -eu
+install -d -m 0700 {$stateDirectory}
+temporary={$quotedStatePath}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$stateEncoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$quotedStatePath}
+trap - EXIT
+BASH;
+}
+
 function privileged_helper_source_hashes(): array
 {
     $hashes = [];
@@ -421,6 +511,10 @@ $mdnsName = (string) env_or_config('GIMME_MDNS_NAME', 'server', 'mdns_name');
 $remoteUser = (string) env_or_config('GIMME_REMOTE_USER', 'server', 'remote_user');
 $appsRoot = rtrim((string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/');
 $app = getenv('GIMME_APP') ?: '';
+$environmentName = getenv('GIMME_ENVIRONMENT') ?: 'default';
+$instance = getenv('GIMME_INSTANCE') ?: $app;
+$deployPath = getenv('GIMME_DEPLOY_PATH') ?: ($app === '' ? $appsRoot : "{$appsRoot}/{$app}");
+$siteHost = getenv('GIMME_SITE_HOST') ?: ($app === '' ? '' : "{$app}.{$mdnsName}.local");
 $health = $app === '' ? null : configured_health();
 
 if (!valid_endpoint($hostname) || !valid_endpoint($bootstrapHostname) || !valid_endpoint($sshHostname)) {
@@ -448,6 +542,25 @@ if (
 if ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,47}$/', $app)) {
     throw new \RuntimeException('Unsafe application name');
 }
+if (!preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environmentName) ||
+    !preg_match('/^[a-z][a-z0-9-]{0,81}$/', $instance)) {
+    throw new \RuntimeException('Unsafe environment identity');
+}
+if ($app !== '') {
+    $expectedInstance = $environmentName === 'default'
+        ? $app
+        : "{$app}--{$environmentName}";
+    $expectedDeployPath = $environmentName === 'default'
+        ? "{$appsRoot}/{$app}"
+        : "{$appsRoot}/{$app}/environments/{$environmentName}";
+    $expectedSiteHost = $environmentName === 'default'
+        ? "{$app}.{$mdnsName}.local"
+        : "{$environmentName}.{$app}.{$mdnsName}.local";
+    if ($instance !== $expectedInstance || $deployPath !== $expectedDeployPath ||
+        $siteHost !== $expectedSiteHost || !valid_endpoint($siteHost)) {
+        throw new \RuntimeException('Unsafe environment deployment boundary');
+    }
+}
 if ($health !== null && $framework !== 'laravel') {
     throw new \RuntimeException('Deployment health gates require a Laravel application');
 }
@@ -455,7 +568,7 @@ if ($health !== null && $framework !== 'laravel') {
 host($hostAlias)
     ->setHostname($sshHostname)
     ->setRemoteUser($remoteUser)
-    ->setDeployPath($app === '' ? $appsRoot : "{$appsRoot}/{$app}");
+    ->setDeployPath($deployPath);
 
 set('keep_releases', (int) env_or_config('GIMME_KEEP_RELEASES', 'server', 'keep_releases'));
 set('ssh_multiplexing', true);
@@ -464,14 +577,18 @@ if ($app !== '') {
     set('application', $app);
     $repository = required_env('GIMME_REPOSITORY');
     $branch = required_env('GIMME_BRANCH');
+    $revision = getenv('GIMME_REVISION') ?: '';
     if (!valid_repository($repository)) {
         throw new \RuntimeException('Unsafe Git repository URL');
     }
     if (!valid_git_branch($branch)) {
         throw new \RuntimeException('Unsafe Git branch name');
     }
+    if ($revision !== '' && !preg_match('/^[0-9a-f]{40,64}$/', $revision)) {
+        throw new \RuntimeException('Unsafe Git revision');
+    }
     set('repository', $repository);
-    set('branch', $branch);
+    set('branch', $revision !== '' ? $revision : $branch);
     if ($framework !== 'static') {
         set('shared_files', array_values(array_unique([
             ...get('shared_files', []),
@@ -514,9 +631,25 @@ if ($hasFrontend) {
     after('deploy:vendors', 'gimme:frontend:build');
 }
 
+task('gimme:resolve-revision', function (): void {
+    $repository = required_env('GIMME_REPOSITORY');
+    $branch = required_env('GIMME_BRANCH');
+    $output = run(
+        'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=' .
+        escapeshellarg('ssh -o StrictHostKeyChecking=accept-new') .
+        ' git ls-remote --exit-code ' . escapeshellarg($repository) . ' ' .
+        escapeshellarg("refs/heads/{$branch}") . ' 2>/dev/null'
+    );
+    $revision = preg_split('/\s+/', trim($output))[0] ?? '';
+    if (!preg_match('/^[0-9a-f]{40,64}$/', $revision)) {
+        throw new \RuntimeException('Remote branch did not resolve to one Git revision');
+    }
+    writeln("GIMME_REVISION|{$revision}");
+});
+
 if ($health !== null) {
-    task('gimme:health:candidate', function () use ($health, $app, $mdnsName): void {
-        $host = "{$app}.{$mdnsName}.local";
+    task('gimme:health:candidate', function () use ($health, $siteHost): void {
+        $host = $siteHost;
         $expected = $health['expected_status'];
         $command = 'cd {{release_path}} && ' .
             'GIMME_HEALTH_PATH=' . escapeshellarg($health['path']) . ' ' .
@@ -548,11 +681,10 @@ if ($health !== null) {
 
     task('gimme:health:live', function () use (
         $health,
-        $app,
-        $mdnsName,
+        $siteHost,
         $appsRoot,
     ): void {
-        $host = "{$app}.{$mdnsName}.local";
+        $host = $siteHost;
         $url = "https://{$host}{$health['path']}";
         $expected = $health['expected_status'];
         $command =
@@ -624,21 +756,13 @@ BASH;
     }
     $resolved = run('getent hosts ' . escapeshellarg("{$mdnsName}.local") . ' 2>/dev/null || true');
     writeln('mdns=' . ($resolved === '' ? 'unresolved' : $resolved));
-    foreach (configured_apps() as $name => $definition) {
-        $framework = $definition['framework'] ?? 'common';
-        $relativeRoot = match ($framework) {
-            'laravel', 'symfony' => 'public',
-            'static' => $definition['frontend']['output_dir'] ?? 'dist',
-            default => '',
-        };
-        $documentRoot = get('deploy_path') === ''
-            ? ''
-            : rtrim((string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/') .
-                "/{$name}/current";
-        if ($relativeRoot !== '') {
-            $documentRoot .= "/{$relativeRoot}";
-        }
-        $siteHost = "{$name}.{$mdnsName}.local";
+    $configuredAppsRoot = rtrim(
+        (string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/'
+    );
+    foreach (configured_sites($configuredAppsRoot, $mdnsName) as $instance => $site) {
+        $framework = $site['framework'];
+        $documentRoot = $site['document_root'];
+        $siteHost = $site['site_host'];
         // Local resolver behaviour is not authoritative for an Avahi record published
         // by this same host. Report it as a separate observation and allow IPv6-only
         // mDNS results; client resolution cannot be observed from the VM.
@@ -655,27 +779,25 @@ BASH;
             escapeshellarg("https://{$siteHost}/") . ' 2>/dev/null || true'
         );
         $publisher = run(
-            'systemctl is-active ' . escapeshellarg("gimme-mdns-{$name}.service") .
+            'systemctl is-active ' . escapeshellarg("gimme-mdns-{$instance}.service") .
             ' 2>/dev/null || true'
         );
-        writeln("site.{$name}.hostname={$siteHost}");
+        writeln("site.{$instance}.hostname={$siteHost}");
         writeln(
-            'site.' . $name . '.mdns_publisher=' .
+            'site.' . $instance . '.mdns_publisher=' .
             ($publisher === '' ? 'missing' : $publisher)
         );
         writeln(
-            'site.' . $name . '.mdns_local_resolution=' .
+            'site.' . $instance . '.mdns_local_resolution=' .
             ($localResolution === '' ? 'unavailable' : $localResolution)
         );
-        writeln('site.' . $name . '.mdns_client_resolution=not_observable');
-        writeln("site.{$name}.document_root={$documentRoot}");
-        writeln('site.' . $name . '.index=' . ($index ? 'present' : 'missing'));
-        writeln("site.{$name}.https_status=" . ($http === '' ? 'unreachable' : $http));
-        writeln("site.{$name}.path_permissions=\n{$path}");
+        writeln('site.' . $instance . '.mdns_client_resolution=not_observable');
+        writeln("site.{$instance}.document_root={$documentRoot}");
+        writeln('site.' . $instance . '.index=' . ($index ? 'present' : 'missing'));
+        writeln("site.{$instance}.https_status=" . ($http === '' ? 'unreachable' : $http));
+        writeln("site.{$instance}.path_permissions=\n{$path}");
         if ($framework === 'laravel') {
-            $deployPath = rtrim(
-                (string) env_or_config('GIMME_APPS_ROOT', 'server', 'apps_root'), '/'
-            ) . "/{$name}";
+            $deployPath = dirname(dirname($documentRoot));
             $envKeys = run(
                 "sed -n 's/^\\([A-Z][A-Z0-9_]*\\)=.*/\\1/p' " .
                 escapeshellarg("{$deployPath}/shared/.env") . ' 2>/dev/null || true'
@@ -693,9 +815,9 @@ BASH;
                 escapeshellarg("{$deployPath}/current/bootstrap/cache") .
                 '; do namei -l "$path" 2>/dev/null || true; done'
             );
-            writeln("site.{$name}.env_keys=\n{$envKeys}");
-            writeln("site.{$name}.laravel_log_files={$laravelLogFiles}");
-            writeln("site.{$name}.runtime_path_permissions=\n{$runtimePaths}");
+            writeln("site.{$instance}.env_keys=\n{$envKeys}");
+            writeln("site.{$instance}.laravel_log_files={$laravelLogFiles}");
+            writeln("site.{$instance}.runtime_path_permissions=\n{$runtimePaths}");
         }
     }
     $fpmSocket = run('readlink -f /run/php/php-fpm.sock 2>/dev/null || true');
@@ -797,30 +919,9 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $packages = configured_packages();
     $services = configured_services();
     $statePath = "{$appsRoot}/.gimme/stack.json";
-    $state = json_encode([
-        'version' => 1,
-        'package_manager' => 'apt',
-        'packages' => $packages,
-        'services' => $services,
-        'hostname' => $hostname,
-        'mdns_name' => $mdnsName,
-        'remote_user' => $remoteUser,
-        'apps_root' => $appsRoot,
-        'apps' => configured_apps(),
-    ], JSON_THROW_ON_ERROR);
-    $stateEncoded = escapeshellarg(base64_encode($state));
-    $stateDirectory = escapeshellarg(dirname($statePath));
-    $quotedStatePath = escapeshellarg($statePath);
-    $writeState = <<<BASH
-set -eu
-install -d -m 0700 {$stateDirectory}
-temporary={$quotedStatePath}.tmp.\$\$
-trap 'rm -f "\$temporary"' EXIT
-printf %s {$stateEncoded} | base64 -d > "\$temporary"
-chmod 0600 "\$temporary"
-mv "\$temporary" {$quotedStatePath}
-trap - EXIT
-BASH;
+    $writeState = stack_state_write_command(
+        'stack', $statePath, $appsRoot, $hostname, $mdnsName, $remoteUser
+    );
 
     if (getenv("GIMME_INTERACTIVE_SUDO") !== '1') {
         run('bash -c ' . escapeshellarg($writeState));
@@ -941,6 +1042,24 @@ BASH;
     );
 });
 
+task('gimme:reconcile:sites', function () use (
+    $appsRoot,
+    $hostname,
+    $remoteUser,
+    $mdnsName,
+): void {
+    $statePath = "{$appsRoot}/.gimme/stack.json";
+    $writeState = stack_state_write_command(
+        'sites', $statePath, $appsRoot, $hostname, $mdnsName, $remoteUser
+    );
+    run('bash -c ' . escapeshellarg($writeState));
+    run(
+        'sudo -n /usr/local/sbin/gimme-provision-stack',
+        forceOutput: true,
+        timeout: 1800,
+    );
+});
+
 task('gimme:bootstrap:database-admin', function () use ($remoteUser): void {
     $sudo = sudo_prefix();
     $user = escapeshellarg($remoteUser);
@@ -956,7 +1075,7 @@ BASH;
     run("{$sudo} -u postgres bash -c " . escapeshellarg($script));
 });
 
-task('gimme:provision:app', function () use ($app, $mdnsName): void {
+task('gimme:provision:app', function () use ($app, $siteHost): void {
     if ($app === '') {
         throw new \RuntimeException('Application context is required');
     }
@@ -965,9 +1084,13 @@ task('gimme:provision:app', function () use ($app, $mdnsName): void {
         return;
     }
 
-    $identifier = str_replace('-', '_', $app);
-    $database = "gimme_{$identifier}";
-    $role = "gimme_{$identifier}";
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    $role = $database;
+    $cachePrefix = required_env('GIMME_CACHE_PREFIX');
+    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[a-zA-Z0-9:_-]{1,160}$/', $cachePrefix)) {
+        throw new \RuntimeException('Unsafe environment resource identity');
+    }
     $deployPath = get('deploy_path');
     $sharedPath = "{$deployPath}/shared";
     $envPath = "{$sharedPath}/.env";
@@ -1004,7 +1127,7 @@ if [ ! -f "\$env_path" ]; then
         printf 'CACHE_STORE=redis\n'
         printf 'REDIS_HOST=127.0.0.1\n'
         printf 'REDIS_PORT=6379\n'
-        printf 'REDIS_PREFIX=%s\n' 'gimme:{$app}:'
+        printf 'REDIS_PREFIX=%s\n' '{$cachePrefix}'
     } > "\$env_path"
 fi
 chmod 0600 "\$env_path"
@@ -1023,7 +1146,7 @@ if ! grep -q '^APP_DEBUG=' "\$env_path"; then
     printf 'APP_DEBUG=false\n' >> "\$env_path"
 fi
 if ! grep -q '^APP_URL=' "\$env_path"; then
-    printf 'APP_URL=https://{$app}.{$mdnsName}.local\n' >> "\$env_path"
+    printf 'APP_URL=https://{$siteHost}\n' >> "\$env_path"
 fi
 if ! grep -q '^APP_KEY=' "\$env_path"; then
     app_key=\$(openssl rand -base64 32 | tr -d '\n')
@@ -1130,7 +1253,7 @@ task('gimme:preflight:processes', function () use (
     );
 });
 
-task('gimme:provision:processes', function () use ($app, $appsRoot, $remoteUser): void {
+task('gimme:provision:processes', function () use ($app, $instance, $appsRoot, $remoteUser): void {
     if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
         throw new \RuntimeException('Process management requires a Laravel application');
     }
@@ -1161,13 +1284,14 @@ BASH;
             ' && php artisan --no-interaction config:clear'
         );
     }
-    $statePath = "{$appsRoot}/.gimme/processes/{$app}.json";
+    $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
     $state = json_encode([
         'version' => 1,
-        'application' => $app,
+        'application' => $instance,
         'framework' => 'laravel',
         'remote_user' => $remoteUser,
         'apps_root' => $appsRoot,
+        'deploy_path' => get('deploy_path'),
         'workers' => $workers,
         'scheduler' => configured_scheduler(),
     ], JSON_THROW_ON_ERROR);
@@ -1186,13 +1310,13 @@ trap - EXIT
 BASH;
     run('bash -c ' . escapeshellarg($script));
     run(
-        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($app),
+        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
         forceOutput: true,
         timeout: 1800,
     );
 });
 
-task('gimme:processes:status', function () use ($app): void {
+task('gimme:processes:status', function () use ($app, $instance): void {
     if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
         throw new \RuntimeException('Process management requires a Laravel application');
     }
@@ -1229,17 +1353,17 @@ task('gimme:processes:status', function () use ($app): void {
             throw new \RuntimeException('Invalid queue worker process count');
         }
         for ($index = 1; $index <= $processes; $index++) {
-            $unit = "gimme-worker-{$app}@{$index}.service";
+            $unit = "gimme-worker-{$instance}@{$index}.service";
             writeln("process.worker.{$index}=" . $status($unit));
         }
     } elseif (($workers['driver'] ?? null) === 'horizon') {
-        writeln('process.horizon=' . $status("gimme-horizon-{$app}.service"));
+        writeln('process.horizon=' . $status("gimme-horizon-{$instance}.service"));
     } else {
         throw new \RuntimeException('Invalid worker driver');
     }
     $scheduler = configured_scheduler();
     if (is_array($scheduler) && ($scheduler['enabled'] ?? null) === true) {
-        writeln('process.scheduler=' . $status("gimme-scheduler-{$app}.timer"));
+        writeln('process.scheduler=' . $status("gimme-scheduler-{$instance}.timer"));
     } else {
         writeln('process.scheduler=disabled');
     }
@@ -1261,6 +1385,101 @@ task('gimme:restart:workers', function (): void {
         'cd ' . escapeshellarg($currentPath) . ' && php artisan --no-interaction ' .
         escapeshellarg($command)
     );
+});
+
+task('gimme:remove:environment', function () use (
+    $app,
+    $environmentName,
+    $instance,
+    $appsRoot,
+    $remoteUser,
+): void {
+    if ($app === '' || $environmentName === 'default') {
+        throw new \RuntimeException('Only non-default environments may be removed');
+    }
+    $expectedPath = "{$appsRoot}/{$app}/environments/{$environmentName}";
+    if (get('deploy_path') !== $expectedPath) {
+        throw new \RuntimeException('Environment removal path mismatch');
+    }
+
+    $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
+    $state = json_encode([
+        'version' => 1,
+        'application' => $instance,
+        'framework' => 'laravel',
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'deploy_path' => $expectedPath,
+        'workers' => null,
+        'scheduler' => null,
+    ], JSON_THROW_ON_ERROR);
+    $encoded = escapeshellarg(base64_encode($state));
+    $stateDirectory = escapeshellarg(dirname($statePath));
+    $quotedStatePath = escapeshellarg($statePath);
+    $writeState = <<<BASH
+set -eu
+install -d -m 0700 {$stateDirectory}
+temporary={$quotedStatePath}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$encoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$quotedStatePath}
+trap - EXIT
+BASH;
+    run('bash -c ' . escapeshellarg($writeState));
+    run(
+        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
+        forceOutput: true,
+        timeout: 1800,
+    );
+
+    if ((getenv('GIMME_FRAMEWORK') ?: 'common') !== 'static') {
+        $database = required_env('GIMME_DATABASE_IDENTIFIER');
+        $cachePrefix = required_env('GIMME_CACHE_PREFIX');
+        if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+            !preg_match('/^[a-zA-Z0-9:_-]{1,160}$/', $cachePrefix)) {
+            throw new \RuntimeException('Unsafe environment resource identity');
+        }
+        $lua = <<<'LUA'
+local cursor = "0"
+repeat
+    local result = redis.call("SCAN", cursor, "MATCH", ARGV[1] .. "*", "COUNT", 500)
+    cursor = result[1]
+    if #result[2] > 0 then redis.call("UNLINK", unpack(result[2])) end
+until cursor == "0"
+return 1
+LUA;
+        run(
+            'valkey-cli --raw EVAL ' . escapeshellarg($lua) . ' 0 ' .
+            escapeshellarg($cachePrefix) . ' >/dev/null'
+        );
+        run('dropdb --if-exists --force ' . escapeshellarg($database));
+        run('dropuser --if-exists ' . escapeshellarg($database));
+    }
+
+    $quotedPath = escapeshellarg($expectedPath);
+    $quotedParent = escapeshellarg("{$appsRoot}/{$app}/environments");
+    $remove = <<<BASH
+set -eu
+path={$quotedPath}
+expected_parent={$quotedParent}
+if [ -L "\$path" ]; then
+    printf 'Refusing to remove a symlinked environment root\n' >&2
+    exit 1
+fi
+if [ -e "\$path" ]; then
+    resolved_parent=\$(readlink -f -- "\$(dirname -- "\$path")")
+    expected_resolved_parent=\$(readlink -f -- "\$expected_parent")
+    if [ "\$resolved_parent" != "\$expected_parent" ] || \
+       [ "\$expected_resolved_parent" != "\$expected_parent" ]; then
+        printf 'Refusing to remove an environment through a symlinked parent\n' >&2
+        exit 1
+    fi
+    rm -rf -- "\$path"
+fi
+BASH;
+    run('bash -c ' . escapeshellarg($remove));
+    run('rm -f -- ' . escapeshellarg($statePath));
 });
 
 if ($health === null) {

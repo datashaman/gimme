@@ -206,16 +206,21 @@ Example MCP client configuration:
 2. Review `config/stack.json`
 3. `plan_stack`; resolve unavailable packages, then approve `provision_stack`
 4. `register_app`
-5. `plan_app_resources`, then approve and call `provision_app_resources`
-6. Complete framework-specific values in the remote `shared/.env`
-7. For Laravel, optionally call `configure_app_health` to gate release activation
-8. `plan_deploy`, review both health gates, then approve and call `deploy_app`
-9. Use `list_releases` and `rollback_app` for release operations
-10. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
+5. For concurrent branches, call `register_environment` with an explicit environment
+   slug and remote branch
+6. `plan_app_resources`, then approve `provision_app_resources` for the selected
+   environment; this also reconciles its HTTPS route and mDNS alias
+7. Complete framework-specific values in the environment's remote `shared/.env`
+8. Configure inherited or environment-specific Laravel health gates as needed
+9. `plan_deploy`, review the exact commit and health gates, then approve `deploy_app`
+10. Use `list_releases` and `rollback_app` for environment-scoped releases
+11. For Laravel maintenance, call `plan_artisan`, review its exact argv, then pass its
    `plan_id` unchanged to `run_artisan`
-11. For background execution, call `configure_app_processes`, then
+12. For background execution, call `configure_app_processes`, then
     `plan_app_processes`, approve `provision_app_processes`, and inspect it later with
     `app_process_status`
+13. Remove a non-default environment only through `plan_remove_environment` followed by
+    `remove_environment` with its exact plan and confirmation phrase
 
 ## Resources
 
@@ -227,16 +232,67 @@ Gimme exposes its validated desired state as browsable, read-only JSON resources
 | `gimme://config/stack` | Desired APT packages and managed systemd services |
 | `gimme://config/apps` | Registered application definitions |
 
-It also exposes two resource templates for registered applications:
+It also exposes environment-aware resource templates:
 
 | URI template | Content |
 | --- | --- |
 | `gimme://apps/{name}` | Registration, deployment path, and HTTPS URL |
 | `gimme://apps/{name}/releases` | Live read-only Deployer release history |
+| `gimme://apps/{name}/environments` | All registered environments for an application |
+| `gimme://apps/{name}/environments/{environment}` | Environment branch, policy, path, and URL |
+| `gimme://apps/{name}/environments/{environment}/releases` | Environment release history |
 
 Template parameters are validated as registered application names. They cannot select
 arbitrary hosts or filesystem paths. The release resource contacts the configured
 host when read; the three manifest resources and application detail are local.
+
+## Concurrent branch environments
+
+One application can expose multiple remote branches concurrently. The reserved `default`
+environment preserves the original deployment path and hostname. Additional environments
+use isolated Deployer roots and exact Avahi aliases:
+
+| Environment | Deployment root | HTTPS URL |
+| --- | --- | --- |
+| `default` | `/srv/gimme/apps/example` | `https://example.devbox.local` |
+| `feature-x` | `/srv/gimme/apps/example/environments/feature-x` | `https://feature-x.example.devbox.local` |
+
+These are worktree-style environments backed by independent immutable Deployer releases,
+not mutable Git worktree checkouts. Branches must exist on the remote. `plan_deploy`
+resolves the branch to an exact commit; `deploy_app` rejects the plan if the branch head
+or rendered task graph changes before apply.
+
+Each non-default environment receives an isolated PostgreSQL database and role, `.env`,
+runtime storage, release history, and Valkey prefix. Workers and the scheduler are disabled
+unless explicitly configured. Health checks inherit the application policy by default and
+may be overridden or disabled per environment.
+
+```json
+{
+  "repository": "git@github.com:example/application.git",
+  "framework": "laravel",
+  "health": {"path": "/up"},
+  "environments": {
+    "default": {
+      "branch": "main",
+      "health": "inherit",
+      "workers": {"driver": "horizon", "enabled": true},
+      "scheduler": {"enabled": true}
+    },
+    "feature-x": {
+      "branch": "feature/x",
+      "health": "inherit",
+      "workers": null,
+      "scheduler": null
+    }
+  }
+}
+```
+
+Legacy top-level `branch`, `workers`, and `scheduler` fields remain accepted and are
+written back in nested form on the next registry mutation. Exact-plan environment removal
+deletes only that environment's route, processes, database, Valkey keys, releases, and
+storage; it never modifies the Git branch or repository.
 
 ## Deployment health gates
 
@@ -283,7 +339,7 @@ commands:
 {
   "repository": "git@github.com:example/application.git",
   "framework": "laravel",
-  "branch": "main",
+  "environments": {"default": {"branch": "main"}},
   "artisan": {
     "allowed_commands": [
       "about",
@@ -307,6 +363,7 @@ and `arguments: ["--force"]`.
 An application may select standard Laravel queue workers or one Horizon master. The
 two modes are mutually exclusive, while the scheduler may be enabled independently.
 Nothing starts unless the application manifest opts in.
+The following fragments belong inside an `environments.<slug>` definition.
 
 Standard workers are explicit, bounded systemd instances:
 
@@ -372,7 +429,7 @@ Example Vite/static application entry in `config/apps.json`:
 {
   "repository": "git@github.com:example/dashboard.git",
   "framework": "static",
-  "branch": "main",
+  "environments": {"default": {"branch": "main"}},
   "frontend": {
     "package_manager": "npm",
     "build_script": "build",

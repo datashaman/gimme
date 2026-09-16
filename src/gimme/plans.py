@@ -7,6 +7,35 @@ from typing import Any
 from gimme.config import AppConfig, ArtisanInvocation, ServerConfig, StackConfig
 
 
+def environment_deploy_path(
+    server: ServerConfig, name: str, environment: str = "default"
+) -> str:
+    base = f"{server.apps_root}/{name}"
+    return base if environment == "default" else f"{base}/environments/{environment}"
+
+
+def environment_site_url(
+    server: ServerConfig, name: str, environment: str = "default"
+) -> str:
+    prefix = name if environment == "default" else f"{environment}.{name}"
+    return f"https://{prefix}.{server.mdns_name}.local"
+
+
+def environment_instance(name: str, environment: str = "default") -> str:
+    return name if environment == "default" else f"{name}--{environment}"
+
+
+def environment_database_identifier(name: str, environment: str = "default") -> str:
+    parts = ["gimme", name.replace("-", "_")]
+    if environment != "default":
+        parts.append(environment.replace("-", "_"))
+    candidate = "_".join(parts)
+    if len(candidate) <= 63:
+        return candidate
+    digest = hashlib.sha256(f"{name}\0{environment}".encode()).hexdigest()[:10]
+    return f"{candidate[:52]}_{digest}"
+
+
 def plan_id(plan: dict[str, Any]) -> str:
     encoded = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
     return "plan_" + hashlib.sha256(encoded).hexdigest()[:20]
@@ -38,18 +67,20 @@ def stack_plan(
         "services": stack.services,
         "apps_root": server.apps_root,
         "sites": {
-            name: {
-                "url": f"https://{name}.{server.mdns_name}.local",
+            (name if environment == "default" else f"{name}/{environment}"): {
+                "url": environment_site_url(server, name, environment),
                 "document_root": (
-                    f"{server.apps_root}/{name}/current/{app.frontend.output_dir}"
+                    f"{environment_deploy_path(server, name, environment)}/current/"
+                    f"{app.frontend.output_dir}"
                     if app.framework == "static" and app.frontend is not None
-                    else f"{server.apps_root}/{name}/current/public"
+                    else f"{environment_deploy_path(server, name, environment)}/current/public"
                     if app.framework in {"laravel", "symfony"}
-                    else f"{server.apps_root}/{name}/current"
+                    else f"{environment_deploy_path(server, name, environment)}/current"
                 ),
                 "tls": "caddy-local-ca",
             }
             for name, app in sorted(apps.items())
+            for environment in sorted(app.environments)
         },
         "ready": unavailable == [] and package_manager_processes == [],
         "unavailable_packages": unavailable,
@@ -74,43 +105,73 @@ def stack_plan(
 
 
 def app_resource_plan(
-    server: ServerConfig, name: str, app: AppConfig
+    server: ServerConfig,
+    name: str,
+    app: AppConfig,
+    environment: str = "default",
 ) -> dict[str, Any]:
-    identifier = name.replace("-", "_")
+    definition = app.environment(environment)
+    identifier = environment_database_identifier(name, environment)
     is_static = app.framework == "static"
+    deploy_path = environment_deploy_path(server, name, environment)
     plan: dict[str, Any] = {
         "kind": "app_resources",
         "host": server.hostname,
         "application": name,
-        "database": None if is_static else f"gimme_{identifier}",
-        "database_role": None if is_static else f"gimme_{identifier}",
+        "environment": environment,
+        "database": None if is_static else identifier,
+        "database_role": None if is_static else identifier,
         "cache": None
         if is_static
         else {
             "engine": "valkey",
             "endpoint": "127.0.0.1:6379",
-            "prefix": f"gimme:{name}:",
+            "prefix": (
+                f"gimme:{name}:"
+                if environment == "default"
+                else f"gimme:{name}:{environment}:"
+            ),
             "isolation": "namespace only",
         },
         "environment_file": None
         if is_static
-        else f"{server.apps_root}/{name}/shared/.env",
+        else f"{deploy_path}/shared/.env",
         "repository": app.repository,
         "framework": app.framework,
-        "branch": app.branch,
+        "branch": definition.branch,
         "frontend": app.frontend.model_dump() if app.frontend is not None else None,
-        "site_url": f"https://{name}.{server.mdns_name}.local",
+        "site_url": environment_site_url(server, name, environment),
+        "effects": [
+            "reconcile the environment Caddy route and Avahi publisher",
+            *(
+                []
+                if is_static
+                else [
+                    "create the isolated PostgreSQL database and role",
+                    "write the protected shared environment file",
+                    "assign an isolated Valkey key prefix",
+                ]
+            ),
+        ],
     }
     return {"plan_id": plan_id(plan), **plan}
 
 
 def deployment_plan(
-    server: ServerConfig, name: str, app: AppConfig
+    server: ServerConfig,
+    name: str,
+    app: AppConfig,
+    environment: str = "default",
+    *,
+    revision: str | None = None,
 ) -> dict[str, Any]:
-    site_url = f"https://{name}.{server.mdns_name}.local"
+    definition = app.environment(environment)
+    site_url = environment_site_url(server, name, environment)
+    deploy_path = environment_deploy_path(server, name, environment)
+    effective_health = app.effective_health(environment)
     health: dict[str, Any] | None = None
-    if app.health is not None:
-        settings = app.health.model_dump()
+    if effective_health is not None:
+        settings = effective_health.model_dump()
         common = {
             "expected_status": settings["expected_status"],
             "attempts": settings["attempts"],
@@ -134,11 +195,16 @@ def deployment_plan(
         "kind": "application_deploy",
         "host": server.hostname,
         "application": name,
+        "environment": environment,
         "repository": app.repository,
-        "branch": app.branch,
+        "branch": definition.branch,
+        "revision": revision,
+        "deploy_path": deploy_path,
         "framework": app.framework,
         "frontend": app.frontend.model_dump() if app.frontend is not None else None,
-        "workers": app.workers.model_dump() if app.workers is not None else None,
+        "workers": (
+            definition.workers.model_dump() if definition.workers is not None else None
+        ),
         "site_url": site_url,
         "health": health,
         "effects": [
@@ -153,12 +219,51 @@ def deployment_plan(
     return {"plan_id": plan_id(plan), **plan}
 
 
+def environment_removal_plan(
+    server: ServerConfig, name: str, app: AppConfig, environment: str
+) -> dict[str, Any]:
+    if environment == "default":
+        raise ValueError("the default environment cannot be removed")
+    definition = app.environment(environment)
+    identifier = environment_database_identifier(name, environment)
+    plan: dict[str, Any] = {
+        "kind": "environment_removal",
+        "host": server.hostname,
+        "application": name,
+        "environment": environment,
+        "branch": definition.branch,
+        "site_url": environment_site_url(server, name, environment),
+        "deploy_path": environment_deploy_path(server, name, environment),
+        "database": None if app.framework == "static" else identifier,
+        "database_role": None if app.framework == "static" else identifier,
+        "cache_prefix": (
+            None if app.framework == "static" else f"gimme:{name}:{environment}:"
+        ),
+        "effects": [
+            "remove the environment Caddy route and Avahi publisher",
+            "stop and remove environment worker and scheduler units",
+            *(
+                []
+                if app.framework == "static"
+                else [
+                    "drop the isolated PostgreSQL database and role",
+                    "unlink keys only beneath the isolated Valkey prefix",
+                ]
+            ),
+            "remove the validated environment deploy directory",
+            "remove the local environment registration after remote cleanup succeeds",
+        ],
+    }
+    return {"plan_id": plan_id(plan), **plan}
+
+
 def artisan_command_plan(
     server: ServerConfig,
     name: str,
     app: AppConfig,
     command: str,
     arguments: list[str] | None = None,
+    environment: str = "default",
 ) -> dict[str, Any]:
     if app.framework != "laravel" or app.artisan is None:
         raise ValueError("Artisan commands require a registered Laravel application")
@@ -168,11 +273,13 @@ def artisan_command_plan(
             f"Artisan command '{invocation.command}' is not allowlisted for application "
             f"'{name}'"
         )
-    working_directory = f"{server.apps_root}/{name}/current"
+    app.environment(environment)
+    working_directory = f"{environment_deploy_path(server, name, environment)}/current"
     plan: dict[str, Any] = {
         "kind": "artisan_command",
         "host": server.hostname,
         "application": name,
+        "environment": environment,
         "working_directory": working_directory,
         "argv": [
             "php",
@@ -193,6 +300,7 @@ def app_process_plan(
     server: ServerConfig,
     name: str,
     app: AppConfig,
+    environment: str = "default",
     *,
     helper: str,
     current_release: str,
@@ -203,46 +311,48 @@ def app_process_plan(
     if app.framework != "laravel":
         raise ValueError("managed application processes require a Laravel application")
 
+    definition = app.environment(environment)
+    instance = environment_instance(name, environment)
     worker: dict[str, Any] | None = None
-    workers_enabled = app.workers is not None and app.workers.enabled
-    if workers_enabled and app.workers is not None:
-        if app.workers.driver == "queue":
+    workers_enabled = definition.workers is not None and definition.workers.enabled
+    if workers_enabled and definition.workers is not None:
+        if definition.workers.driver == "queue":
             worker = {
                 "driver": "queue",
                 "units": [
-                    f"gimme-worker-{name}@{index}.service"
-                    for index in range(1, app.workers.processes + 1)
+                    f"gimme-worker-{instance}@{index}.service"
+                    for index in range(1, definition.workers.processes + 1)
                 ],
                 "argv": [
                     "/usr/bin/php",
                     "artisan",
                     "queue:work",
-                    app.workers.connection,
-                    f"--queue={','.join(app.workers.queues)}",
-                    f"--sleep={app.workers.sleep_seconds}",
-                    f"--tries={app.workers.tries}",
-                    f"--timeout={app.workers.timeout_seconds}",
-                    f"--memory={app.workers.memory_mb}",
-                    f"--max-time={app.workers.max_time_seconds}",
-                    f"--max-jobs={app.workers.max_jobs}",
-                    f"--backoff={app.workers.backoff_seconds}",
+                    definition.workers.connection,
+                    f"--queue={','.join(definition.workers.queues)}",
+                    f"--sleep={definition.workers.sleep_seconds}",
+                    f"--tries={definition.workers.tries}",
+                    f"--timeout={definition.workers.timeout_seconds}",
+                    f"--memory={definition.workers.memory_mb}",
+                    f"--max-time={definition.workers.max_time_seconds}",
+                    f"--max-jobs={definition.workers.max_jobs}",
+                    f"--backoff={definition.workers.backoff_seconds}",
                     "--no-interaction",
                 ],
-                "stop_wait_seconds": app.workers.timeout_seconds + 30,
+                "stop_wait_seconds": definition.workers.timeout_seconds + 30,
             }
         else:
             worker = {
                 "driver": "horizon",
-                "unit": f"gimme-horizon-{name}.service",
+                "unit": f"gimme-horizon-{instance}.service",
                 "argv": ["/usr/bin/php", "artisan", "horizon"],
-                "stop_wait_seconds": app.workers.stop_wait_seconds,
+                "stop_wait_seconds": definition.workers.stop_wait_seconds,
             }
 
-    scheduler_enabled = app.scheduler is not None and app.scheduler.enabled
+    scheduler_enabled = definition.scheduler is not None and definition.scheduler.enabled
     scheduler = (
         {
-            "service": f"gimme-scheduler-{name}.service",
-            "timer": f"gimme-scheduler-{name}.timer",
+            "service": f"gimme-scheduler-{instance}.service",
+            "timer": f"gimme-scheduler-{instance}.timer",
             "argv": ["/usr/bin/php", "artisan", "--no-interaction", "schedule:run"],
             "calendar": "*-*-* *:*:00",
         }
@@ -266,7 +376,8 @@ def app_process_plan(
         "kind": "app_processes",
         "host": server.hostname,
         "application": name,
-        "working_directory": f"{server.apps_root}/{name}/current",
+        "environment": environment,
+        "working_directory": f"{environment_deploy_path(server, name, environment)}/current",
         "worker": worker,
         "scheduler": scheduler,
         "preflight": {

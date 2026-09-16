@@ -103,6 +103,55 @@ def test_mdns_service_has_a_restricted_systemd_sandbox() -> None:
     assert "CapabilityBoundingSet=" in unit
 
 
+def test_helper_accepts_isolated_environment_site() -> None:
+    helper = load_helper()
+    sites = helper["validate_sites"](
+        {
+            "example-app--feature-x": {
+                "application": "example-app",
+                "environment": "feature-x",
+                "framework": "laravel",
+                "site_host": "feature-x.example-app.devbox.local",
+                "document_root": (
+                    "/srv/gimme/apps/example-app/environments/feature-x/current/public"
+                ),
+            }
+        }
+    )
+    site = sites["example-app--feature-x"]
+
+    assert site["site_host"] == "feature-x.example-app.devbox.local"
+    assert site["document_root"] == Path(
+        "/srv/gimme/apps/example-app/environments/feature-x/current/public"
+    )
+
+
+def test_helper_rejects_environment_document_root_escape() -> None:
+    helper = load_helper()
+
+    with pytest.raises(RuntimeError, match="escapes applications root"):
+        helper["validate_sites"](
+            {
+                "example-app--feature-x": {
+                    "application": "example-app",
+                    "environment": "feature-x",
+                    "framework": "laravel",
+                    "site_host": "feature-x.example-app.devbox.local",
+                    "document_root": "/etc/current/public",
+                }
+            }
+        )
+
+
+def test_sites_only_mode_refuses_to_repair_stack_drift() -> None:
+    source = (ROOT / "scripts" / "gimme-provision-stack").read_text()
+
+    assert 'mode == "sites" and missing' in source
+    assert "sites-only reconciliation requires the provisioned package stack" in source
+    assert "sites-only reconciliation requires active configured services" in source
+    assert "sites-only reconciliation requires the configured hostname" in source
+
+
 def test_php_renders_python_safe_helper_state_path() -> None:
     recipe = (ROOT / "deploy.php").read_text()
     state_replacement = recipe.split('"__GIMME_STATE_PATH__"', 1)[1].split(

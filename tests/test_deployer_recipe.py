@@ -117,14 +117,14 @@ def test_host_inspection_reports_application_reachability() -> None:
     assert "getent hosts ' . escapeshellarg($siteHost)" in task
     assert "getent ahostsv4 ' . escapeshellarg($siteHost)" not in task
     assert "'.mdns_publisher='" in task
-    assert "site.{$name}.https_status=" in task
-    assert "site.{$name}.path_permissions=" in task
-    assert "site.{$name}.env_keys=" in task
-    assert "site.{$name}.laravel_log_files=" in task
-    assert "site.{$name}.laravel_errors=" not in task
-    assert "site.{$name}.laravel_log=" not in task
+    assert "site.{$instance}.https_status=" in task
+    assert "site.{$instance}.path_permissions=" in task
+    assert "site.{$instance}.env_keys=" in task
+    assert "site.{$instance}.laravel_log_files=" in task
+    assert "site.{$instance}.laravel_errors=" not in task
+    assert "site.{$instance}.laravel_log=" not in task
     assert "xargs -0 tail -n 30" not in task
-    assert "site.{$name}.runtime_path_permissions=" in task
+    assert "site.{$instance}.runtime_path_permissions=" in task
     assert "php_fpm_socket=" in task
     assert "php_fpm_recent_log=" not in task
     assert "ssh_agent=forwarded" in task
@@ -156,7 +156,7 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "APP_KEY=base64:" in task
     assert "APP_ENV=production" in task
     assert "APP_DEBUG=false" in task
-    assert "APP_URL=https://{$app}.{$mdnsName}.local" in task
+    assert "APP_URL=https://{$siteHost}" in task
     assert "grep -q '^APP_KEY='" in task
     assert "php artisan optimize:clear" in task
     assert "php artisan optimize" in task
@@ -196,6 +196,22 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
     assert '"{$sudo} bash -c %bootstrap%"' in task
     assert "secrets: ['bootstrap' => escapeshellarg($bootstrap)]" in task
     assert "sudo -n /usr/local/sbin/gimme-provision-stack" in task
+
+
+def test_environment_removal_is_bounded_to_non_default_environment_root() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:remove:environment'", 1)[1].split(
+        "if ($health === null)", 1
+    )[0]
+
+    assert "$environmentName === 'default'" in task
+    assert '"{$appsRoot}/{$app}/environments/{$environmentName}"' in task
+    assert "get('deploy_path') !== $expectedPath" in task
+    assert "Refusing to remove a symlinked environment root" in task
+    assert "Refusing to remove an environment through a symlinked parent" in task
+    assert 'rm -rf -- "\\$path"' in task
+    assert "dropdb --if-exists --force" in task
+    assert 'redis.call("SCAN"' in task
 
 
 def test_frontend_build_runs_after_composer_dependencies() -> None:

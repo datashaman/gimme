@@ -2,6 +2,7 @@ import pytest
 
 from gimme.config import (
     AppConfig,
+    EnvironmentConfig,
     FrontendBuildConfig,
     HealthCheckConfig,
     HorizonWorkerConfig,
@@ -87,6 +88,35 @@ def test_stack_plan_includes_https_sites_for_registered_apps() -> None:
     }
 
 
+def test_stack_plan_includes_each_registered_environment_site() -> None:
+    stack = StackConfig(package_manager="apt", packages=["caddy"], services=["caddy"])
+    apps = {
+        "example-app": AppConfig(
+            repository="git@example.test:acme/example-app.git",
+            framework="laravel",
+            environments={
+                "default": EnvironmentConfig(branch="main"),
+                "feature-x": EnvironmentConfig(branch="feature/x"),
+            },
+        )
+    }
+
+    plan = stack_plan(
+        server(),
+        stack,
+        {"caddy": {"installed": "2.6.2", "candidate": "2.6.2"}},
+        apps=apps,
+    )
+
+    assert plan["sites"]["example-app/feature-x"] == {
+        "url": "https://feature-x.example-app.devbox.local",
+        "document_root": (
+            "/srv/gimme/apps/example-app/environments/feature-x/current/public"
+        ),
+        "tls": "caddy-local-ca",
+    }
+
+
 def test_stack_plan_blocks_unavailable_package() -> None:
     stack = StackConfig(
         package_manager="apt",
@@ -132,6 +162,49 @@ def test_app_resources_use_safe_derived_names() -> None:
     assert plan["cache"]["prefix"] == "gimme:my-app:"
     assert plan["environment_file"] == "/srv/gimme/apps/my-app/shared/.env"
     assert plan["site_url"] == "https://my-app.devbox.local"
+
+
+def test_additional_environment_has_isolated_paths_url_database_and_cache() -> None:
+    app = AppConfig(
+        repository="git@example.test:me/my-app.git",
+        framework="laravel",
+        environments={
+            "default": EnvironmentConfig(branch="main"),
+            "feature-x": EnvironmentConfig(branch="feature/worktrees"),
+        },
+    )
+
+    plan = app_resource_plan(server(), "my-app", app, "feature-x")
+
+    assert plan["environment"] == "feature-x"
+    assert plan["branch"] == "feature/worktrees"
+    assert plan["database"] == "gimme_my_app_feature_x"
+    assert plan["database_role"] == "gimme_my_app_feature_x"
+    assert plan["cache"]["prefix"] == "gimme:my-app:feature-x:"
+    assert plan["environment_file"] == (
+        "/srv/gimme/apps/my-app/environments/feature-x/shared/.env"
+    )
+    assert plan["site_url"] == "https://feature-x.my-app.devbox.local"
+
+
+def test_long_environment_database_identifiers_are_bounded_and_collision_safe() -> None:
+    name = "application-" + "a" * 36
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        environments={
+            "default": EnvironmentConfig(),
+            "feature-" + "x" * 24: EnvironmentConfig(branch="feature/x"),
+            "feature-" + "y" * 24: EnvironmentConfig(branch="feature/y"),
+        },
+    )
+
+    first = app_resource_plan(server(), name, app, "feature-" + "x" * 24)
+    second = app_resource_plan(server(), name, app, "feature-" + "y" * 24)
+
+    assert len(first["database"]) <= 63
+    assert len(first["database_role"]) <= 63
+    assert first["database"] != second["database"]
 
 
 def test_app_plan_changes_when_deployment_definition_changes() -> None:
@@ -192,6 +265,37 @@ def test_deployment_plan_exposes_candidate_and_live_health_gates() -> None:
         app.model_copy(update={"health": HealthCheckConfig(path="/health")}),
     )
     assert changed["plan_id"] != plan["plan_id"]
+
+
+def test_environment_deployment_plan_uses_branch_url_and_health_override() -> None:
+    app = AppConfig(
+        repository="git@example.test:me/my-app.git",
+        framework="laravel",
+        health=HealthCheckConfig(path="/up"),
+        environments={
+            "default": EnvironmentConfig(branch="main"),
+            "feature-x": EnvironmentConfig(
+                branch="feature/x",
+                health=HealthCheckConfig(path="/health", expected_status=204),
+            ),
+        },
+    )
+
+    plan = deployment_plan(
+        server(), "my-app", app, "feature-x", revision="a" * 40
+    )
+
+    assert plan["environment"] == "feature-x"
+    assert plan["branch"] == "feature/x"
+    assert plan["revision"] == "a" * 40
+    assert plan["deploy_path"] == (
+        "/srv/gimme/apps/my-app/environments/feature-x"
+    )
+    assert plan["site_url"] == "https://feature-x.my-app.devbox.local"
+    assert plan["health"]["pre_activation"]["path"] == "/health"
+    assert plan["health"]["post_activation"]["target"] == (
+        "https://feature-x.my-app.devbox.local/health"
+    )
 
 
 def test_static_frontend_has_no_backend_resources() -> None:
@@ -318,3 +422,38 @@ def test_horizon_plan_uses_one_master_and_reports_preflight_blockers() -> None:
         "argv": ["/usr/bin/php", "artisan", "horizon"],
         "stop_wait_seconds": 3600,
     }
+
+
+def test_environment_processes_use_isolated_units_and_working_directory() -> None:
+    app = AppConfig(
+        repository="https://example.test/app.git",
+        framework="laravel",
+        environments={
+            "default": EnvironmentConfig(branch="main"),
+            "feature-x": EnvironmentConfig(
+                branch="feature/x",
+                workers=HorizonWorkerConfig(),
+                scheduler=SchedulerConfig(),
+            ),
+        },
+    )
+
+    plan = app_process_plan(
+        server(),
+        "my-app",
+        app,
+        "feature-x",
+        helper="ready",
+        current_release="ready",
+        pcntl="ready",
+        posix="ready",
+        horizon="ready",
+    )
+
+    assert plan["working_directory"] == (
+        "/srv/gimme/apps/my-app/environments/feature-x/current"
+    )
+    assert plan["worker"]["unit"] == "gimme-horizon-my-app--feature-x.service"
+    assert plan["scheduler"]["timer"] == (
+        "gimme-scheduler-my-app--feature-x.timer"
+    )

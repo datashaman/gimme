@@ -20,7 +20,7 @@ from typing import Any
 
 EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
 STATE_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "processes"
-APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,81}$")
 UNIX_USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 UNIX_GROUP = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$")
 QUEUE_CONNECTION = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
@@ -194,6 +194,7 @@ def load_state(application: str, sudo_user: str, sudo_uid: int) -> dict[str, Any
         "framework",
         "remote_user",
         "apps_root",
+        "deploy_path",
         "workers",
         "scheduler",
     }:
@@ -204,7 +205,15 @@ def load_state(application: str, sudo_user: str, sudo_uid: int) -> dict[str, Any
         fail("managed processes require a Laravel application")
     if state["remote_user"] != sudo_user or state["apps_root"] != str(EXPECTED_APPS_ROOT):
         fail("process desired-state authority mismatch")
+    deploy_path = Path(state["deploy_path"])
+    root = EXPECTED_APPS_ROOT.resolve()
+    resolved = deploy_path.resolve(strict=False)
+    if not deploy_path.is_absolute() or ".." in deploy_path.parts or (
+        resolved == root or not resolved.is_relative_to(root)
+    ):
+        fail("process deploy_path escapes applications root")
     return {
+        "deploy_path": deploy_path,
         "workers": validate_workers(state["workers"]),
         "scheduler": validate_scheduler(state["scheduler"]),
     }
@@ -389,13 +398,18 @@ def reconcile() -> None:
     sudo_user = require_string(os.environ.get("SUDO_USER"), "SUDO_USER", UNIX_USER)
     account = pwd.getpwnam(sudo_user)
     state = load_state(application, sudo_user, account.pw_uid)
-    application_root = EXPECTED_APPS_ROOT / application
+    application_root = state["deploy_path"]
     current = application_root / "current"
-    if not current.exists() or not (current / "artisan").is_file():
-        fail("current release does not contain Artisan")
 
     worker = state["workers"]
     scheduler = state["scheduler"]
+    processes_enabled = (
+        worker is not None and worker["enabled"]
+    ) or (scheduler is not None and scheduler["enabled"])
+    if processes_enabled and (
+        not current.exists() or not (current / "artisan").is_file()
+    ):
+        fail("current release does not contain Artisan")
     queue_template = SYSTEMD_ROOT / f"gimme-worker-{application}@.service"
     horizon_unit = SYSTEMD_ROOT / f"gimme-horizon-{application}.service"
     scheduler_service = SYSTEMD_ROOT / f"gimme-scheduler-{application}.service"

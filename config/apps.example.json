@@ -1,7 +1,6 @@
 {
   "apps": {
     "example": {
-      "branch": "main",
       "framework": "laravel",
       "artisan": {
         "allowed_commands": [
@@ -26,14 +25,6 @@
           "view:clear"
         ]
       },
-      "workers": {
-        "driver": "horizon",
-        "enabled": true,
-        "stop_wait_seconds": 3600
-      },
-      "scheduler": {
-        "enabled": true
-      },
       "health": {
         "path": "/up",
         "expected_status": 200,
@@ -46,7 +37,27 @@
         "output_dir": "public/build",
         "package_manager": "npm"
       },
-      "repository": "git@github.com:example/example.git"
+      "repository": "git@github.com:example/example.git",
+      "environments": {
+        "default": {
+          "branch": "main",
+          "health": "inherit",
+          "workers": {
+            "driver": "horizon",
+            "enabled": true,
+            "stop_wait_seconds": 3600
+          },
+          "scheduler": {
+            "enabled": true
+          }
+        },
+        "feature-example": {
+          "branch": "feature/example",
+          "health": "inherit",
+          "workers": null,
+          "scheduler": null
+        }
+      }
     }
   }
 }

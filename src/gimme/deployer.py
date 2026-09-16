@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Sequence
 
 from gimme.config import AppConfig, ServerConfig, StackConfig
+from gimme.plans import (
+    environment_database_identifier,
+    environment_deploy_path,
+    environment_instance,
+    environment_site_url,
+)
 
 
 MAX_OUTPUT = 24_000
@@ -96,6 +102,9 @@ class DeployerRunner:
         stack: StackConfig | None = None,
         app_name: str | None = None,
         app: AppConfig | None = None,
+        environment_name: str = "default",
+        revision: str | None = None,
+        exclude_instance: str | None = None,
         arguments: Sequence[str] = (),
         artisan_command: str | None = None,
         artisan_arguments: Sequence[str] | None = None,
@@ -150,24 +159,50 @@ class DeployerRunner:
                     "GIMME_SERVICES_JSON": json.dumps(stack.services),
                 }
             )
+        if exclude_instance is not None:
+            environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if app_name is not None and app is not None:
+            definition = app.environment(environment_name)
+            site_url = environment_site_url(server, app_name, environment_name)
             environment.update(
                 {
                     "GIMME_APP": app_name,
+                    "GIMME_ENVIRONMENT": environment_name,
+                    "GIMME_INSTANCE": environment_instance(app_name, environment_name),
+                    "GIMME_DEPLOY_PATH": environment_deploy_path(
+                        server, app_name, environment_name
+                    ),
+                    "GIMME_SITE_HOST": site_url.removeprefix("https://"),
+                    "GIMME_DATABASE_IDENTIFIER": environment_database_identifier(
+                        app_name, environment_name
+                    ),
+                    "GIMME_CACHE_PREFIX": (
+                        f"gimme:{app_name}:"
+                        if environment_name == "default"
+                        else f"gimme:{app_name}:{environment_name}:"
+                    ),
                     "GIMME_REPOSITORY": app.repository,
                     "GIMME_FRAMEWORK": app.framework,
-                    "GIMME_BRANCH": app.branch,
+                    "GIMME_BRANCH": definition.branch,
                     "GIMME_WORKERS_JSON": json.dumps(
-                        app.workers.model_dump() if app.workers is not None else None
+                        definition.workers.model_dump()
+                        if definition.workers is not None
+                        else None
                     ),
                     "GIMME_SCHEDULER_JSON": json.dumps(
-                        app.scheduler.model_dump() if app.scheduler is not None else None
+                        definition.scheduler.model_dump()
+                        if definition.scheduler is not None
+                        else None
                     ),
                     "GIMME_HEALTH_JSON": json.dumps(
-                        app.health.model_dump() if app.health is not None else None
+                        app.effective_health(environment_name).model_dump()
+                        if app.effective_health(environment_name) is not None
+                        else None
                     ),
                 }
             )
+            if revision is not None:
+                environment["GIMME_REVISION"] = revision
             if app.frontend is not None:
                 environment.update(
                     {

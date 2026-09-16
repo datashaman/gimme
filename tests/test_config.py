@@ -15,6 +15,7 @@ from gimme.config import (
     QueueWorkerConfig,
     SchedulerConfig,
     ServerConfig,
+    EnvironmentConfig,
 )
 
 
@@ -49,6 +50,57 @@ def test_register_app_is_idempotent(tmp_path: Path) -> None:
     assert store.register_app("acme", app) is True
     assert store.register_app("acme", app) is False
     assert store.app("acme") == app
+
+
+def test_legacy_app_definition_becomes_a_default_environment() -> None:
+    app = AppConfig.model_validate(
+        {
+            "repository": "git@example.test:acme/app.git",
+            "framework": "laravel",
+            "branch": "stable",
+            "workers": {"driver": "horizon", "enabled": True},
+            "scheduler": {"enabled": True},
+        }
+    )
+
+    assert app.environment("default").branch == "stable"
+    assert app.environment("default").workers.driver == "horizon"
+    assert app.environment("default").scheduler.enabled is True
+    assert "branch" not in app.model_dump()
+    assert app.model_dump()["environments"]["default"]["branch"] == "stable"
+
+
+def test_register_additional_environment_is_idempotent_and_preserves_default(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    store.register_app(
+        "acme",
+        AppConfig(
+            repository="git@example.test:acme/app.git",
+            framework="laravel",
+            branch="main",
+            workers=HorizonWorkerConfig(),
+        ),
+    )
+
+    environment = EnvironmentConfig(branch="feature/worktrees")
+    assert store.register_environment("acme", "feature-x", environment) is True
+    assert store.register_environment("acme", "feature-x", environment) is False
+    assert store.environment("acme", "default").branch == "main"
+    assert store.environment("acme", "feature-x").branch == "feature/worktrees"
+    assert store.environment("acme", "feature-x").workers is None
+
+
+@pytest.mark.parametrize("name", ["default", "../bad", "Bad", "bad_name", "x" * 33])
+def test_rejects_reserved_or_unsafe_additional_environment_names(
+    tmp_path: Path, name: str
+) -> None:
+    store = make_store(tmp_path)
+    store.register_app("acme", AppConfig(repository="https://example.test/app.git"))
+
+    with pytest.raises(ValueError):
+        store.register_environment("acme", name, EnvironmentConfig(branch="feature/x"))
 
 
 def test_configure_app_processes_preserves_the_deployment_definition(tmp_path: Path) -> None:

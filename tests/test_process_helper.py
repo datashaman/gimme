@@ -165,6 +165,7 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
     monkeypatch.setitem(helper, "EXPECTED_APPS_ROOT", apps_root)
     monkeypatch.setitem(helper, "SYSTEMD_ROOT", systemd_root)
     monkeypatch.setitem(helper, "load_state", lambda *_args: {
+        "deploy_path": apps_root / "example-app",
         "workers": queue_config(),
         "scheduler": {"enabled": True},
     })
@@ -186,3 +187,37 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
     assert ["systemctl", "enable", "gimme-worker-example-app@1.service"] in commands
     assert ["systemctl", "restart", "gimme-worker-example-app@2.service"] in commands
     assert ["systemctl", "enable", "gimme-scheduler-example-app.timer"] in commands
+
+
+def test_teardown_does_not_require_a_current_release(tmp_path, monkeypatch) -> None:
+    helper = helper_namespace()
+    apps_root = tmp_path / "apps"
+    deploy_path = apps_root / "example-app" / "environments" / "feature-x"
+    deploy_path.mkdir(parents=True)
+    systemd_root = tmp_path / "systemd"
+    systemd_root.mkdir()
+    account = SimpleNamespace(pw_name="deployer", pw_gid=1000, pw_uid=1000)
+
+    monkeypatch.setitem(helper, "EXPECTED_APPS_ROOT", apps_root)
+    monkeypatch.setitem(helper, "SYSTEMD_ROOT", systemd_root)
+    monkeypatch.setitem(
+        helper,
+        "load_state",
+        lambda *_args: {
+            "deploy_path": deploy_path,
+            "workers": None,
+            "scheduler": None,
+        },
+    )
+    monkeypatch.setitem(helper, "listed_worker_instances", lambda _app: set())
+    monkeypatch.setitem(helper, "succeeds", lambda _command: False)
+    monkeypatch.setitem(helper, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setattr(helper["pwd"], "getpwnam", lambda _user: account)
+    monkeypatch.setattr(helper["sys"], "argv", [
+        "gimme-provision-processes",
+        "example-app--feature-x",
+    ])
+    monkeypatch.setenv("SUDO_USER", "deployer")
+
+    helper["reconcile"]()

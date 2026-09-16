@@ -6,13 +6,14 @@ import re
 import tempfile
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 APP_NAME = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+ENVIRONMENT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SSH_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.-]{0,79}$")
 SERVICE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9@_.:-]{0,79}$")
@@ -335,17 +336,60 @@ class HealthCheckConfig(BaseModel):
         return value
 
 
+class EnvironmentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    branch: str = Field(default="main", min_length=1, max_length=120)
+    health: Literal["inherit"] | HealthCheckConfig | None = "inherit"
+    workers: WorkerConfig | None = None
+    scheduler: SchedulerConfig | None = None
+
+    @field_validator("branch")
+    @classmethod
+    def valid_branch(cls, value: str) -> str:
+        if not _valid_git_branch(value):
+            raise ValueError("branch is not a safe Git branch name")
+        return value
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: str = Field(min_length=1, max_length=500)
     framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common"
-    branch: str = Field(default="main", min_length=1, max_length=120)
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
-    workers: WorkerConfig | None = None
-    scheduler: SchedulerConfig | None = None
     health: HealthCheckConfig | None = None
+    environments: dict[str, EnvironmentConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_default_environment(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        legacy_present = any(
+            key in migrated for key in ("branch", "workers", "scheduler")
+        )
+        environments = migrated.get("environments")
+        if environments is None:
+            environments = {}
+        elif not isinstance(environments, dict):
+            return migrated
+        else:
+            environments = dict(environments)
+        if "default" not in environments:
+            environments["default"] = {
+                "branch": migrated.pop("branch", "main"),
+                "workers": migrated.pop("workers", None),
+                "scheduler": migrated.pop("scheduler", None),
+            }
+        elif legacy_present:
+            raise ValueError(
+                "legacy branch/process fields cannot be combined with environments.default"
+            )
+        migrated["environments"] = environments
+        return migrated
 
     @model_validator(mode="after")
     def validate_framework_configuration(self) -> "AppConfig":
@@ -355,8 +399,21 @@ class AppConfig(BaseModel):
             self.artisan = ArtisanConfig()
         elif self.framework != "laravel" and self.artisan is not None:
             raise ValueError("Artisan configuration is supported only for Laravel applications")
+        if "default" not in self.environments:
+            raise ValueError("applications require an environments.default definition")
+        invalid_names = [
+            name for name in self.environments if ENVIRONMENT_NAME.fullmatch(name) is None
+        ]
+        if invalid_names:
+            raise ValueError(f"invalid environment names: {', '.join(invalid_names)}")
+        has_environment_laravel_settings = any(
+            environment.workers is not None
+            or environment.scheduler is not None
+            or environment.health != "inherit"
+            for environment in self.environments.values()
+        )
         if self.framework != "laravel" and (
-            self.workers is not None or self.scheduler is not None or self.health is not None
+            has_environment_laravel_settings or self.health is not None
         ):
             raise ValueError(
                 "worker, scheduler, and health configuration require a Laravel application"
@@ -398,12 +455,29 @@ class AppConfig(BaseModel):
             raise ValueError("repository contains an unsafe path")
         return value
 
-    @field_validator("branch")
-    @classmethod
-    def valid_branch(cls, value: str) -> str:
-        if not _valid_git_branch(value):
-            raise ValueError("branch is not a safe Git branch name")
-        return value
+    def environment(self, name: str = "default") -> EnvironmentConfig:
+        if ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise ValueError("environment name is unsafe")
+        try:
+            return self.environments[name]
+        except KeyError as exc:
+            raise KeyError(f"environment '{name}' is not registered") from exc
+
+    def effective_health(self, name: str = "default") -> HealthCheckConfig | None:
+        override = self.environment(name).health
+        return self.health if override == "inherit" else override
+
+    @property
+    def branch(self) -> str:
+        return self.environment().branch
+
+    @property
+    def workers(self) -> WorkerConfig | None:
+        return self.environment().workers
+
+    @property
+    def scheduler(self) -> SchedulerConfig | None:
+        return self.environment().scheduler
 
 
 class AppRegistry(BaseModel):
@@ -474,6 +548,10 @@ class ConfigStore:
                 f"application '{name}' is not registered; use register_app first"
             ) from exc
 
+    def environment(self, name: str, environment: str = "default") -> EnvironmentConfig:
+        self.validate_environment_name(environment)
+        return self.app(name).environment(environment)
+
     def register_app(self, name: str, app: AppConfig) -> bool:
         self.validate_app_name(name)
         registry = self.registry()
@@ -483,18 +561,53 @@ class ConfigStore:
             self._atomic_json_write(self.apps_path, registry.model_dump(mode="json"))
         return changed
 
+    def register_environment(
+        self, name: str, environment: str, definition: EnvironmentConfig
+    ) -> bool:
+        self.validate_environment_name(environment, allow_default=False)
+        app = self.app(name)
+        environments = dict(app.environments)
+        changed = environments.get(environment) != definition
+        environments[environment] = definition
+        if changed:
+            updated = AppConfig.model_validate(
+                {**app.model_dump(mode="python"), "environments": environments}
+            )
+            self.register_app(name, updated)
+        return changed
+
     def configure_app_processes(
         self,
         name: str,
         workers: WorkerConfig | None,
         scheduler: SchedulerConfig | None,
     ) -> bool:
+        return self.configure_environment_processes(
+            name, "default", workers, scheduler
+        )
+
+    def configure_environment_processes(
+        self,
+        name: str,
+        environment: str,
+        workers: WorkerConfig | None,
+        scheduler: SchedulerConfig | None,
+    ) -> bool:
         app = self.app(name)
+        self.validate_environment_name(environment)
+        environments = dict(app.environments)
+        definition = EnvironmentConfig.model_validate(
+            {
+                **app.environment(environment).model_dump(mode="python"),
+                "workers": workers,
+                "scheduler": scheduler,
+            }
+        )
+        environments[environment] = definition
         updated = AppConfig.model_validate(
             {
                 **app.model_dump(mode="python"),
-                "workers": workers,
-                "scheduler": scheduler,
+                "environments": environments,
             }
         )
         return self.register_app(name, updated)
@@ -513,12 +626,52 @@ class ConfigStore:
         )
         return self.register_app(name, updated)
 
+    def configure_environment_health(
+        self,
+        name: str,
+        environment: str,
+        health: Literal["inherit"] | HealthCheckConfig | None,
+    ) -> bool:
+        app = self.app(name)
+        self.validate_environment_name(environment)
+        environments = dict(app.environments)
+        environments[environment] = EnvironmentConfig.model_validate(
+            {
+                **app.environment(environment).model_dump(mode="python"),
+                "health": health,
+            }
+        )
+        updated = AppConfig.model_validate(
+            {**app.model_dump(mode="python"), "environments": environments}
+        )
+        return self.register_app(name, updated)
+
+    def remove_environment(self, name: str, environment: str) -> bool:
+        self.validate_environment_name(environment, allow_default=False)
+        app = self.app(name)
+        if environment not in app.environments:
+            return False
+        environments = dict(app.environments)
+        del environments[environment]
+        updated = AppConfig.model_validate(
+            {**app.model_dump(mode="python"), "environments": environments}
+        )
+        return self.register_app(name, updated)
+
     @staticmethod
     def validate_app_name(name: str) -> None:
         if not APP_NAME.fullmatch(name):
             raise ValueError(
                 "application name must start with a letter and contain only "
                 "lowercase letters, digits, and hyphens (maximum 48 characters)"
+            )
+
+    @staticmethod
+    def validate_environment_name(name: str, *, allow_default: bool = True) -> None:
+        if ENVIRONMENT_NAME.fullmatch(name) is None or (not allow_default and name == "default"):
+            raise ValueError(
+                "environment name must start with a letter and contain only lowercase "
+                "letters, digits, and hyphens (maximum 32 characters); default is reserved"
             )
 
     @staticmethod
