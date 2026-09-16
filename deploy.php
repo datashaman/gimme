@@ -535,6 +535,40 @@ trap - EXIT
 BASH;
 }
 
+function process_state_write_command(
+    string $statePath,
+    string $instance,
+    string $appsRoot,
+    string $deployPath,
+    string $remoteUser,
+    ?array $workers,
+    ?array $scheduler,
+): string {
+    $state = json_encode([
+        'version' => 1,
+        'application' => $instance,
+        'framework' => 'laravel',
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'deploy_path' => $deployPath,
+        'workers' => $workers,
+        'scheduler' => $scheduler,
+    ], JSON_THROW_ON_ERROR);
+    $encoded = escapeshellarg(base64_encode($state));
+    $directory = escapeshellarg(dirname($statePath));
+    $path = escapeshellarg($statePath);
+    return <<<BASH
+set -eu
+install -d -m 0700 {$directory}
+temporary={$path}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$encoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$path}
+trap - EXIT
+BASH;
+}
+
 function privileged_helper_source_hashes(): array
 {
     $hashes = [];
@@ -1203,6 +1237,15 @@ task('gimme:provision:app', function () use (
                 'run the documented interactive stack bootstrap first'
             );
         }
+        run('bash -c ' . escapeshellarg(process_state_write_command(
+            $processStatePath,
+            $instance,
+            $appsRoot,
+            $deployPath,
+            $remoteUser,
+            configured_workers(),
+            configured_scheduler(),
+        )));
     }
 
     run('install -d -m 0700 ' . escapeshellarg($sharedPath));
@@ -1427,30 +1470,15 @@ BASH;
         );
     }
     $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
-    $state = json_encode([
-        'version' => 1,
-        'application' => $instance,
-        'framework' => 'laravel',
-        'remote_user' => $remoteUser,
-        'apps_root' => $appsRoot,
-        'deploy_path' => get('deploy_path'),
-        'workers' => $workers,
-        'scheduler' => configured_scheduler(),
-    ], JSON_THROW_ON_ERROR);
-    $encoded = escapeshellarg(base64_encode($state));
-    $directory = escapeshellarg(dirname($statePath));
-    $path = escapeshellarg($statePath);
-    $script = <<<BASH
-set -eu
-install -d -m 0700 {$directory}
-temporary={$path}.tmp.\$\$
-trap 'rm -f "\$temporary"' EXIT
-printf %s {$encoded} | base64 -d > "\$temporary"
-chmod 0600 "\$temporary"
-mv "\$temporary" {$path}
-trap - EXIT
-BASH;
-    run('bash -c ' . escapeshellarg($script));
+    run('bash -c ' . escapeshellarg(process_state_write_command(
+        $statePath,
+        $instance,
+        $appsRoot,
+        get('deploy_path'),
+        $remoteUser,
+        $workers,
+        configured_scheduler(),
+    )));
     run(
         'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
         forceOutput: true,

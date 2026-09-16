@@ -189,6 +189,17 @@ def test_laravel_runtime_reconciliation_is_atomic_and_process_aware() -> None:
     assert "invoke('gimme:restart:workers')" in task
 
 
+def test_runtime_reconciliation_upgrades_process_state_before_using_helper() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split(
+        "task('gimme:service:status'", 1
+    )[0]
+
+    state_write = task.index("process_state_write_command(")
+    helper_call = task.index("sudo -n /usr/local/sbin/gimme-provision-processes")
+    assert state_write < helper_call
+
+
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

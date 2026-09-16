@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import textwrap
 
 from gimme.plans import environment_database_identifier, environment_instance
 
@@ -109,6 +110,16 @@ def ssh(*arguments: str) -> str:
     return result.stdout.strip()
 
 
+def ssh_python(program: str) -> None:
+    subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", HOSTNAME, "python3", "-"],
+        input=program,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
 def verify() -> None:
     require_disposable_host()
     from gimme import server as gimme
@@ -123,6 +134,30 @@ def verify() -> None:
     if first_instance == second_instance:
         raise AssertionError("process and site identities collided")
 
+    legacy_process_state = {
+        "version": 1,
+        "application": "smoke-app",
+        "framework": "laravel",
+        "remote_user": ssh("id", "-un"),
+        "apps_root": APPS_ROOT,
+        "workers": None,
+        "scheduler": None,
+    }
+    ssh_python(
+        textwrap.dedent(
+            f"""
+            import os
+            from pathlib import Path
+
+            directory = Path({str(APPS_ROOT + "/.gimme/processes")!r})
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = directory / "smoke-app.json"
+            path.write_text({json.dumps(json.dumps(legacy_process_state))})
+            os.chmod(path, 0o600)
+            """
+        )
+    )
+
     for application, environment in (
         ("smoke-app", "default"),
         ("smoke", "app"),
@@ -134,6 +169,12 @@ def verify() -> None:
     for database in (default_database, branch_database):
         if database not in databases:
             raise AssertionError(f"missing PostgreSQL database {database}")
+
+    upgraded_state = json.loads(
+        ssh("cat", f"{APPS_ROOT}/.gimme/processes/smoke-app.json")
+    )
+    if upgraded_state.get("deploy_path") != f"{APPS_ROOT}/smoke-app":
+        raise AssertionError("legacy process desired state was not upgraded")
 
     default_prefix = ssh("grep", "^HORIZON_PREFIX=", f"{APPS_ROOT}/smoke-app/shared/.env")
     branch_prefix = ssh(
