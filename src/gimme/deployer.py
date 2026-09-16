@@ -4,6 +4,7 @@ import json
 import os
 # Deployer is invoked through a fixed argv vector and never through a shell.
 import subprocess  # nosec B404
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -26,6 +27,41 @@ PASSTHROUGH_ENVIRONMENT = (
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
 )
+
+
+def _agent_has_identities(socket_path: str) -> bool:
+    path = Path(socket_path)
+    if not path.is_absolute() or not path.is_socket():
+        return False
+    result = subprocess.run(  # nosec B603
+        ["/usr/bin/ssh-add", "-l"],
+        env={"PATH": os.defpath, "SSH_AUTH_SOCK": socket_path},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _preferred_ssh_auth_sock(current: str | None) -> str | None:
+    if sys.platform != "darwin" or (current is not None and _agent_has_identities(current)):
+        return current
+    result = subprocess.run(  # nosec B603
+        ["/bin/launchctl", "getenv", "SSH_AUTH_SOCK"],
+        env={"PATH": os.defpath},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    candidate = result.stdout.strip()
+    if result.returncode == 0 and _agent_has_identities(candidate):
+        return candidate
+    return current
 
 
 class DeployerError(RuntimeError):
@@ -89,6 +125,9 @@ class DeployerRunner:
             if name in os.environ
         }
         environment.setdefault("PATH", os.defpath)
+        preferred_agent = _preferred_ssh_auth_sock(environment.get("SSH_AUTH_SOCK"))
+        if preferred_agent is not None:
+            environment["SSH_AUTH_SOCK"] = preferred_agent
         environment.update(
             {
                 "GIMME_HOSTNAME": server.hostname,

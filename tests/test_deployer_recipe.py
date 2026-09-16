@@ -129,6 +129,10 @@ def test_host_inspection_reports_application_reachability() -> None:
     assert "php_fpm_recent_log=" not in task
     assert "ssh_agent=forwarded" in task
     assert "ssh_agent=missing" in task
+    assert "ssh_agent_identities=available" in task
+    assert "ssh_agent_identities=empty" in task
+    assert "ssh_agent_identities=unreachable" in task
+    assert "ssh-add -l >/dev/null 2>&1" in task
     assert "ssh_agent_key=" not in task
 
 

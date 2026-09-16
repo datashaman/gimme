@@ -10,6 +10,7 @@ from gimme.config import (
     ServerConfig,
 )
 from gimme.deployer import DeployerRunner
+import gimme.deployer as deployer_module
 
 
 def server() -> ServerConfig:
@@ -66,6 +67,38 @@ def test_runner_does_not_inherit_unrelated_secrets(tmp_path: Path, monkeypatch) 
     assert "UNRELATED_API_TOKEN" not in captured
     assert "GIMME_INTERACTIVE_SUDO" not in captured
     assert captured["SSH_AUTH_SOCK"] == "/tmp/test-agent.sock"
+
+
+def test_macos_runner_replaces_an_empty_agent_with_the_launchd_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    empty_path = Path("/tmp/gimme-empty-agent.sock")
+    launchd_path = Path("/tmp/gimme-launchd-agent.sock")
+    captured: dict[str, str] = {}
+
+    def fake_run(command, *args, **kwargs):
+        if command == ["/usr/bin/ssh-add", "-l"]:
+            return subprocess.CompletedProcess(
+                command,
+                1 if kwargs["env"]["SSH_AUTH_SOCK"] == str(empty_path) else 0,
+                "",
+            )
+        if command == ["/bin/launchctl", "getenv", "SSH_AUTH_SOCK"]:
+            return subprocess.CompletedProcess(command, 0, str(launchd_path) + "\n")
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(command, 0, "ok")
+
+    monkeypatch.setattr(deployer_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        Path,
+        "is_socket",
+        lambda path: path in {empty_path, launchd_path},
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(empty_path))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner(tmp_path).run("deploy", server())
+
+    assert captured["SSH_AUTH_SOCK"] == str(launchd_path)
 
 
 def test_stack_tasks_can_connect_to_bootstrap_hostname(

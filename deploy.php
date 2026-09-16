@@ -723,8 +723,16 @@ BASH;
     $agentScript = <<<'BASH'
 if [ -S "${SSH_AUTH_SOCK:-}" ]; then
     printf 'ssh_agent=forwarded\n'
+    if ssh-add -l >/dev/null 2>&1; then
+        printf 'ssh_agent_identities=available\n'
+    elif [ "$?" -eq 1 ]; then
+        printf 'ssh_agent_identities=empty\n'
+    else
+        printf 'ssh_agent_identities=unreachable\n'
+    fi
 else
     printf 'ssh_agent=missing\n'
+    printf 'ssh_agent_identities=unreachable\n'
 fi
 BASH;
     writeln(run('bash -c ' . escapeshellarg($agentScript)));
