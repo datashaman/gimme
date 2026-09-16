@@ -77,6 +77,7 @@ def test_stack_bootstrap_uses_bootstrap_hostname() -> None:
     assert "['gimme:preflight:stack', 'gimme:provision:stack']" in recipe
     assert "$arguments = $_SERVER['argv'] ?? [];" in recipe
     assert "($useBootstrapHostname ? $bootstrapHostname : $hostname)" in recipe
+    assert "($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance))" in recipe
 
 
 def test_stack_includes_laravel_php_extensions() -> None:

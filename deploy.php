@@ -547,7 +547,7 @@ if ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,47}$/', $app)) {
     throw new \RuntimeException('Unsafe application name');
 }
 if (!preg_match('/^[a-z][a-z0-9-]{0,31}$/', $environmentName) ||
-    !preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance)) {
+    ($app !== '' && !preg_match('/^[a-z][a-z0-9-]{0,93}$/', $instance))) {
     throw new \RuntimeException('Unsafe environment identity');
 }
 if ($app !== '') {
