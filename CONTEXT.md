@@ -34,9 +34,25 @@ in an isolated derived workspace. It may also host Deployments, but build and re
 separate operations; it receives no Deployment runtime secrets or Resource access.
 _Avoid_: Deployment Target, CI runner
 
+**Provider Account**:
+A named control-plane identity for one external service provider. It owns bounded provider
+configuration and encrypted credential references, while Resources retain service intent. An
+operator credential handles ordinary inspection and reconciliation; an optional destructive
+credential is resolved only for explicitly confirmed cleanup.
+_Avoid_: Cloud token, provider config
+
 **Resource**:
-A named, versioned service available on one Target and shareable by multiple Deployments.
+A named, versioned service supplied either by one Target or by a registered Provider Account and
+shareable by multiple Deployments. Its provider is a bounded implementation detail behind the
+Resource contract. A managed PostgreSQL Resource owns one provider cluster; each bound Deployment
+owns an isolated database and least-privilege role within it.
 _Avoid_: Deployment database, application service
+
+**Observed Resource State**:
+A secret-free, replaceable cache of provider identity, health, version, and drift. Desired state
+remains declarative; provider ownership tags permit observed identity to be rebuilt without making
+one control-plane workstation authoritative. Ambiguous identity fails closed.
+_Avoid_: Desired resource config, provider credentials
 
 **Deployment**:
 One Application placed at one stage on one Target, with isolated runtime identity, data
