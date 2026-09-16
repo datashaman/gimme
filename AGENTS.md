@@ -37,3 +37,19 @@ bash scripts/gimme-verify
 
 See `README.md` for operation, `docs/reference/mcp.md` for the MCP surface,
 `CONTRIBUTING.md` for change requirements, and `SECURITY.md` for reporting.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `datashaman/gimme`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical triage labels configured in GitHub. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Gimme uses a single-context domain layout. See `docs/agents/domain.md`.
