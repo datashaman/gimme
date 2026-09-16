@@ -277,13 +277,16 @@ class DeployerRunner:
 
         try:
             # The executable is fixed beneath the project root; shell=False is implicit.
+            # Interactive bootstrap must inherit the complete terminal. Capturing only
+            # stdout makes Symfony's hidden sudo question non-interactive even when stdin
+            # still points at the user's terminal.
             completed = subprocess.run(  # nosec B603
                 command,
                 cwd=self.root,
                 env=environment,
                 stdin=None if interactive_sudo else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stdout=None if interactive_sudo else subprocess.PIPE,
+                stderr=None if interactive_sudo else subprocess.STDOUT,
                 text=True,
                 timeout=timeout,
                 check=False,
@@ -291,7 +294,7 @@ class DeployerRunner:
         except subprocess.TimeoutExpired as exc:
             raise DeployerError(f"Deployer timed out after {timeout} seconds") from exc
 
-        output = completed.stdout
+        output = completed.stdout or ""
         if len(output) > MAX_OUTPUT:
             output = output[-MAX_OUTPUT:]
             output = "[earlier output truncated]\n" + output

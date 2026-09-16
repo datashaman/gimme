@@ -5,6 +5,8 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed the bootstrap CLI to inherit all terminal streams so Deployer's hidden sudo
+  prompt is displayed live instead of being buffered with captured task output.
 - Blocked deployments with managed processes before activation when the target-bound
   process helper is stale, and made target inspection use the same policy-hash check.
 - Added a private append-only, secret-safe operation journal with correlated plan/apply

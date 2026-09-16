@@ -107,6 +107,8 @@ This keeps one interactive terminal open for sudo and installs root-owned,
 policy-bound helpers. Later MCP reconciliations use only those exact sudo rules. Run
 the bootstrap command again after changing the target's stack policy or upgrading
 Gimme's helper implementation.
+The bootstrap command inherits the terminal directly, so the password prompt appears
+live and input remains hidden; do not run it through a non-interactive pipe.
 
 The second command grants the deployment user PostgreSQL `CREATEDB` and `CREATEROLE`;
 they allow database lifecycle management but do not grant operating-system root.

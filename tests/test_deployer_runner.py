@@ -115,6 +115,31 @@ def test_stack_tasks_can_connect_to_bootstrap_hostname(tmp_path: Path, monkeypat
     assert captured["GIMME_HOSTNAME"] == "devbox.local"
 
 
+def test_interactive_sudo_inherits_all_terminal_streams(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, None)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = runner(tmp_path).run(
+        "gimme:provision:stack",
+        server(),
+        bootstrap=True,
+        interactive_sudo=True,
+    )
+
+    assert captured["stdin"] is None
+    assert captured["stdout"] is None
+    assert captured["stderr"] is None
+    assert "--no-interaction" not in captured["command"]
+    assert captured["env"]["GIMME_INTERACTIVE_SUDO"] == "1"
+    assert result.output == ""
+
+
 def test_artisan_invocation_crosses_the_runner_boundary_as_json(
     tmp_path: Path, monkeypatch
 ) -> None:
