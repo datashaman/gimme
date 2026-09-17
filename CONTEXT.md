@@ -83,6 +83,15 @@ destination-built local or preview workflow, or `artifact` for immutable build/r
 staging and production require artifact mode.
 _Avoid_: Environment, release, app
 
+**Rollout**:
+A Deployment-owned, temporary traffic transition between its currently live stable Application
+Artifact and one different compatible candidate Application Artifact. New request cohorts receive
+explicit integer weights totaling 100 and retain release affinity. Completion makes the candidate
+the sole live artifact; reversal restores the stable artifact. A Rollout never changes Deployment
+placement, data identity, or public route identity. Its bounded lifecycle is resumable across
+control-plane or Target interruption and fails closed when recorded generations disagree.
+_Avoid_: Deployment, release, load balancer
+
 **Placement Policy**:
 A bounded Deployment declaration that deterministically selects its initial Target from an explicit
 set of registered Targets. Capacity is a declared count of Deployment slots on each Target, and
