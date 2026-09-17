@@ -13,6 +13,12 @@ Deployment. Zero slots drains new admission while preserving existing placements
 policy-driven placement obey the same capacity limit.
 _Avoid_: Host, server, box
 
+**Provider Attachment**:
+An optional, exact association between a Target and its compute identity in one Provider Account
+and region. Provider topology, addresses, state, and network membership are observed from that
+identity rather than copied into desired state.
+_Avoid_: Cloud host, instance metadata
+
 **Application**:
 A reusable source and build definition that can participate in many Deployments.
 _Avoid_: App instance, site
@@ -43,6 +49,13 @@ configuration and authentication policy, while Resources and stores retain servi
 Authentication may use ambient identity, exact assumed roles, or encrypted credential references;
 distinct capabilities remain separated where the provider permits it.
 _Avoid_: Cloud token, provider config
+
+**AWS Network**:
+A named, validated set of pre-existing AWS data-network and edge prerequisites within one Provider
+Account, region, and VPC. It bounds the subnets, security groups, TLS certificate, hosted zone, and
+DNS suffix from which Gimme may create managed Resources and one supported AWS routing topology;
+it does not grant generic infrastructure provisioning.
+_Avoid_: VPC, cloud network, load balancer
 
 **Secret Store**:
 A named, bounded external location from which the control plane may resolve Deployment secrets at
@@ -77,11 +90,25 @@ one control-plane workstation authoritative. Ambiguous identity fails closed.
 _Avoid_: Desired resource config, provider credentials
 
 **Deployment**:
-One Application placed at one stage on one Target, with isolated runtime identity, data
-identity, environment, processes, and routing. Its explicit release mode is `source` for a
-destination-built local or preview workflow, or `artifact` for immutable build/release separation;
-staging and production require artifact mode.
+A logical placement of one Application at one stage, with one data identity, environment, release
+identity, process policy, and public route. A single topology has one Deployment Replica; a supported
+high-availability topology has multiple Replicas sharing those identities. Its explicit release mode
+is `source` for a destination-built local or preview workflow, or `artifact` for immutable
+build/release separation; staging and production require artifact mode.
 _Avoid_: Environment, release, app
+
+**Deployment Replica**:
+One Target-specific runtime materialization of a Deployment. It has immutable Target placement and
+runtime/process identity, consumes one Target Deployment slot, and runs the Deployment's exact live
+Application Artifact. Replicas share only the Deployment's explicitly declared managed Resources,
+environment, data identity, and public route.
+_Avoid_: Deployment, release, database replica
+
+**Observed Topology State**:
+The secret-free, replaceable cache of a Deployment's Replica generations, provider identities,
+health, routing state, and resumable operation phase. Desired state, provider ownership markers,
+and Target manifests can reconstruct it; ambiguous identity fails closed.
+_Avoid_: Deployment configuration, operation journal, controller database
 
 **Rollout**:
 A Deployment-owned, temporary traffic transition between its currently live stable Application
@@ -93,10 +120,11 @@ control-plane or Target interruption and fails closed when recorded generations 
 _Avoid_: Deployment, release, load balancer
 
 **Placement Policy**:
-A bounded Deployment declaration that deterministically selects its initial Target from an explicit
-set of registered Targets. Capacity is a declared count of Deployment slots on each Target, and
-each registered Deployment consumes one slot until it is removed from desired state, regardless of
-deployment or health status; transient machine utilization is not placement input.
+A bounded single-topology Deployment declaration that deterministically selects its initial Target
+from an explicit set of registered Targets. Capacity is a declared count of Deployment slots on each
+Target, and each registered Deployment Replica consumes one slot until it is removed from desired
+state, regardless of deployment or health status; transient machine utilization is not placement
+input.
 Once selected, the Deployment retains that Target and its immutable placement identities until a
 separate migration is planned and confirmed; target loss never causes automatic relocation.
 _Avoid_: Scheduler, failover policy, target preference
