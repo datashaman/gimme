@@ -19,6 +19,12 @@ and region. Provider topology, addresses, state, and network membership are obse
 identity rather than copied into desired state.
 _Avoid_: Cloud host, instance metadata
 
+**Administration Target**:
+The explicit registered Target through which Gimme performs fixed private-network administration
+for one managed Resource. It is an execution boundary rather than a Deployment placement and
+therefore consumes no Deployment slot.
+_Avoid_: Deployment Target, bastion, database host
+
 **Application**:
 A reusable source and build definition that can participate in many Deployments.
 _Avoid_: App instance, site
@@ -82,6 +88,23 @@ shareable by multiple Deployments. Its provider is a bounded implementation deta
 Resource contract. A managed PostgreSQL Resource owns one provider cluster; each bound Deployment
 owns an isolated database and least-privilege role within it.
 _Avoid_: Deployment database, application service
+
+**Resource Credential**:
+A provider-backed secret owned by one Resource allocation rather than supplied by an operator.
+Gimme may create and rotate it through a bounded provider contract, but plaintext exists only at
+protected execution boundaries and never enters desired or observed state.
+_Avoid_: Secret Reference, master password, environment value
+
+**Detached Allocation**:
+A retained Deployment-owned database and disabled login identity that remains inside a managed
+Resource after its Deployment binding is removed. Rebinding restores the same data identity;
+destructive purge requires verified Recovery Point evidence.
+_Avoid_: Orphan database, Resource backup
+
+**Retained Resource**:
+Provider infrastructure deliberately left intact after its Resource registration is removed.
+Gimme keeps only a secret-free inventory tombstone and neither reconciles nor silently re-adopts it.
+_Avoid_: Managed Resource, Observed Resource State
 
 **Observed Resource State**:
 A secret-free, replaceable cache of provider identity, health, version, and drift. Desired state
