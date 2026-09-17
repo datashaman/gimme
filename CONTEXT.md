@@ -39,10 +39,29 @@ _Avoid_: Deployment Target, CI runner
 
 **Provider Account**:
 A named control-plane identity for one external service provider. It owns bounded provider
-configuration and encrypted credential references, while Resources retain service intent. An
-operator credential handles ordinary inspection and reconciliation; an optional destructive
-credential is resolved only for explicitly confirmed cleanup.
+configuration and authentication policy, while Resources and stores retain service intent.
+Authentication may use ambient identity, exact assumed roles, or encrypted credential references;
+distinct capabilities remain separated where the provider permits it.
 _Avoid_: Cloud token, provider config
+
+**Secret Store**:
+A named, bounded external location from which the control plane may resolve Deployment secrets at
+the protected execution boundary. It belongs to one Provider Account and constrains account,
+region, namespace, ownership, and version-selection policy. Targets never receive Secret Store
+credentials.
+_Avoid_: Secret file, environment, vault token
+
+**Secret Reference**:
+A Deployment-owned selection of one top-level string field from one secret in a registered Secret
+Store. It names no provider ARN or version directly; planning pins the store's current version
+metadata, while only apply may retrieve plaintext.
+_Avoid_: Secret value, provider URI
+
+**Applied Secret Manifest**:
+The replaceable, secret-free record of which exact external secret versions were last applied to a
+Deployment. It contains only environment keys and identity/version fingerprints, enabling rotation
+and drift planning without reading plaintext or persisting value hashes.
+_Avoid_: Secret cache, environment backup
 
 **Resource**:
 A named, versioned service supplied either by one Target or by a registered Provider Account and
