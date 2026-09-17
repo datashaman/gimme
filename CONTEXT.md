@@ -7,7 +7,10 @@ on explicitly registered machines.
 
 **Target**:
 A registered machine with one machine identity, network policy, package stack, and runtime
-policy.
+policy. It declares a bounded Deployment-slot capacity used only for placement admission. Reducing
+capacity below existing reservations marks the Target overcommitted but never evicts or relocates a
+Deployment. Zero slots drains new admission while preserving existing placements; explicit and
+policy-driven placement obey the same capacity limit.
 _Avoid_: Host, server, box
 
 **Application**:
@@ -60,6 +63,22 @@ identity, environment, processes, and routing. Its explicit release mode is `sou
 destination-built local or preview workflow, or `artifact` for immutable build/release separation;
 staging and production require artifact mode.
 _Avoid_: Environment, release, app
+
+**Placement Policy**:
+A bounded Deployment declaration that deterministically selects its initial Target from an explicit
+set of registered Targets. Capacity is a declared count of Deployment slots on each Target, and
+each registered Deployment consumes one slot until it is removed from desired state, regardless of
+deployment or health status; transient machine utilization is not placement input.
+Once selected, the Deployment retains that Target and its immutable placement identities until a
+separate migration is planned and confirmed; target loss never causes automatic relocation.
+_Avoid_: Scheduler, failover policy, target preference
+
+**Placement Decision**:
+The immutable, secret-free explanation of how a Deployment received its Target. It records whether
+selection was explicit or policy-driven, the normalized candidate set, the versioned selection
+rule, bounded capacity and eligibility results, the selected Target, and fingerprints of the policy
+and readiness observations. It contains no raw command output, exception text, or credentials.
+_Avoid_: Scheduler state, capacity history
 
 **Recovery Point**:
 A Deployment-scoped representation of restorable data at a moment in time. It contains one
