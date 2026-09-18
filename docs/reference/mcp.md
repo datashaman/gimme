@@ -1,7 +1,7 @@
 # MCP reference
 
 Gimme is a local stdio MCP server built with FastMCP. Its desired state is stored in
-schema-v3 JSON; decrypted secrets are never returned by resources or tools.
+schema-v4 JSON; decrypted secrets are never returned by resources or tools.
 
 Runtime schemas returned by MCP discovery are authoritative. This page documents the
 stable intent, mutation boundary, and pairing of each primitive.
@@ -13,8 +13,9 @@ stable intent, mutation boundary, and pairing of each primitive.
   recomputes the plan and rejects stale or altered IDs.
 - Every plan includes an `execution_fingerprint`; executable control-plane or dependency
   changes invalidate its `plan_id` before apply.
-- Registration tools create local desired-state entries directly because no prior
-  object exists to diff.
+- Target, Application, Resource, and Deployment registration tools create local entries
+  directly. Provider Account and Secret Store registration is plan/apply because it verifies
+  external identity and policy.
 - `rollback_deployment` and `remove_deployment` require exact confirmation text.
 - Remote operations are restricted to registered targets and validated fields. There
   is no arbitrary shell, SQL, service, package, or filesystem-path tool.
@@ -27,21 +28,25 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://operations` | The 50 most recent secret-safe operation events, newest first |
 | `gimme://targets/{name}` | One target and its network, stack, and runtime policy |
 | `gimme://applications/{name}` | One reusable application definition |
+| `gimme://provider-accounts/{name}` | One credential-free provider identity policy |
+| `gimme://secret-stores/{name}` | One bounded Secret Store policy and derived ownership tag |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The five parameterized URIs are resource templates. `gimme://state` and
+The seven parameterized URIs are resource templates. `gimme://state` and
 `gimme://operations` are concrete resources.
 
 ## State and inventory tools
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_state_migration` | Read | Inspect installed versions and plan migration to schema v3 |
+| `plan_state_migration` | Read | Inspect installed versions and plan migration to schema v4 |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
 | `list_applications` | Read | List application source/build definitions |
+| `list_provider_accounts` | Read | List credential-free external-provider identity policy |
+| `list_secret_stores` | Read | List bounded Secret Store policy without secret identities or values |
 | `list_resources` | Read | List named resources, optionally filtered by target |
 | `list_deployments` | Read | List deployments, optionally filtered by target |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
@@ -68,6 +73,18 @@ bounded to 200 records per call.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
+| `plan_register_provider_account` | Provider read | Verify both exact AWS roles and plan registration |
+| `register_provider_account` | Local write | Reverify and register an AWS Provider Account |
+| `plan_update_provider_account` | Provider read | Reverify and plan an account policy update |
+| `update_provider_account` | Local write | Apply an exact account update plan |
+| `plan_remove_provider_account` | Read | Plan local removal when no store references the account |
+| `remove_provider_account` | Local write | Remove only the local account registration |
+| `plan_register_secret_store` | Provider read | Verify region and inspection identity and plan store registration |
+| `register_secret_store` | Local write | Register a bounded AWS Secrets Manager store |
+| `plan_update_secret_store` | Provider read | Plan a bounded store policy update |
+| `update_secret_store` | Local write | Apply an exact store update plan |
+| `plan_remove_secret_store` | Read | Plan local removal when no Deployment references the store |
+| `remove_secret_store` | Local write | Remove only the local store registration |
 | `register_target` | Local write | Register a target |
 | `plan_update_target` | Read | Diff a proposed target update |
 | `update_target` | Local write | Apply an exact target update plan |
@@ -117,6 +134,23 @@ For deployments with Horizon, queue workers, or a scheduler, planning also verif
 content-bound privileged process helper and required PHP process extensions. Apply is
 blocked before deployment when that preflight reports `bootstrap_required` or a missing
 extension.
+
+### Secret planning and resolution
+
+Deployment secrets are structured `{store, secret, field}` references. The fixed
+`local-sops` store accepts no path and always uses `secrets.enc.json` in the state
+directory. AWS stores derive a complete name from a registered prefix and require the
+derived `gimme:secret-store=<store-name>` ownership tag.
+
+Planning reads SOPS encrypted structure or calls AWS `DescribeSecret` through the
+inspection role. Returned plans contain environment keys and reference/version
+fingerprints, not ciphertext, AWS version IDs, ARNs, provider errors, or values. Apply
+revalidates metadata, obtains the exact reviewed version through the distinct resolver
+role, resolves every field before target mutation, and sends values only through protected
+temporary material. Each field is limited to 8 KiB, the combined payload to 64 KiB, and a
+Deployment to 128 secret environment keys. See
+[`use-aws-secret-stores.md`](../how-to/use-aws-secret-stores.md) for IAM, KMS, rotation,
+migration, and failure behavior.
 
 ## Application operation tools
 

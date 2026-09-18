@@ -84,8 +84,9 @@ import tempfile
 
 path = Path(sys.argv[1])
 updates = json.loads(base64.b64decode(sys.argv[2]).decode())
-if len(sys.argv) == 4:
-    secret_path = Path(sys.argv[3])
+secret_argument = sys.argv[3] if len(sys.argv) > 3 else "-"
+if secret_argument != "-":
+    secret_path = Path(secret_argument)
     secret_details = secret_path.lstat()
     if secret_path.is_symlink() or not stat.S_ISREG(secret_details.st_mode):
         raise RuntimeError("refusing to read a non-regular secret document")
@@ -96,6 +97,13 @@ if len(sys.argv) == 4:
         if not isinstance(key, str) or not isinstance(value, str):
             raise RuntimeError("secret document contains an invalid value")
     updates.update(secrets)
+manifest = (
+    json.loads(base64.b64decode(sys.argv[4]).decode())
+    if len(sys.argv) > 4 else []
+)
+if not isinstance(manifest, list) or len(manifest) > 128:
+    raise RuntimeError("secret manifest must be a bounded list")
+manifest_path = path.parent / ".gimme-secret-manifest.json"
 details = path.lstat()
 if path.is_symlink() or not stat.S_ISREG(details.st_mode):
     raise RuntimeError("refusing to reconcile a non-regular environment file")
@@ -128,7 +136,9 @@ for key, value in updates.items():
         runtime_changed = True
 
 desired_content = "\n".join(rendered) + "\n"
-if desired_content == original:
+manifest_content = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+manifest_original = manifest_path.read_text() if manifest_path.is_file() else None
+if desired_content == original and manifest_content == manifest_original:
     print("GIMME_RUNTIME_CHANGED|no")
     raise SystemExit(0)
 
@@ -146,6 +156,66 @@ except BaseException:
     temporary_path.unlink(missing_ok=True)
     raise
 
+manifest_descriptor, manifest_temporary = tempfile.mkstemp(
+    prefix=".gimme-secret-manifest.", dir=path.parent
+)
+manifest_temporary_path = Path(manifest_temporary)
+try:
+    with os.fdopen(manifest_descriptor, "w") as handle:
+        handle.write(manifest_content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(manifest_temporary_path, 0o600)
+    os.chown(manifest_temporary_path, details.st_uid, details.st_gid)
+    os.replace(manifest_temporary_path, manifest_path)
+except BaseException:
+    manifest_temporary_path.unlink(missing_ok=True)
+    rollback_descriptor, rollback_temporary = tempfile.mkstemp(prefix=".env.rollback.", dir=path.parent)
+    rollback_path = Path(rollback_temporary)
+    try:
+        with os.fdopen(rollback_descriptor, "w") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(rollback_path, 0o600)
+        os.chown(rollback_path, details.st_uid, details.st_gid)
+        os.replace(rollback_path, path)
+    except BaseException:
+        rollback_path.unlink(missing_ok=True)
+    raise
+
 print("GIMME_RUNTIME_CHANGED|" + ("yes" if runtime_changed else "no"))
 PYTHON;
+}
+
+function assert_laravel_configuration_health(
+    array $health,
+    string $siteHost,
+    string $appsRoot,
+): void {
+    foreach ($health as $probe) {
+        if (!in_array('live', $probe['phases'], true)) {
+            continue;
+        }
+        $expected = $probe['expected_status'];
+        $command =
+            'GIMME_HEALTH_URL=' . escapeshellarg("https://{$siteHost}{$probe['path']}") . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($siteHost) . ' ' .
+            'GIMME_HEALTH_CA=' . escapeshellarg("{$appsRoot}/.caddy-local-root.crt") . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+            'GIMME_HEALTH_TIMEOUT=' . escapeshellarg((string) $probe['timeout_seconds']) . ' ' .
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        for ($attempt = 1; $attempt <= $probe['attempts']; $attempt++) {
+            $output = run($command, secrets: [
+                'health_script' => escapeshellarg(laravel_live_health_script()),
+            ]);
+            if (trim($output) === "GIMME_HEALTH_STATUS|{$expected}") {
+                continue 2;
+            }
+            if ($attempt < $probe['attempts'] && $probe['delay_seconds'] > 0) {
+                run('/usr/bin/sleep ' . escapeshellarg((string) $probe['delay_seconds']));
+            }
+        }
+        throw new \RuntimeException('Configuration health verification failed');
+    }
 }

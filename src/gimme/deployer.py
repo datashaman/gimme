@@ -124,6 +124,7 @@ class DeployerRunner:
         php_extensions: Sequence[str] = (),
         variables: dict[str, str] | None = None,
         secret_file: Path | None = None,
+        secret_manifest: Sequence[dict[str, str]] | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -199,6 +200,8 @@ class DeployerRunner:
             if not resolved_secret_file.is_file():
                 raise ValueError("secret_file must be a regular local file")
             environment["GIMME_SECRET_FILE"] = str(resolved_secret_file)
+        if secret_manifest is not None:
+            environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if app_name is not None and app is not None:

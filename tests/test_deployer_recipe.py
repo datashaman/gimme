@@ -248,6 +248,11 @@ def test_laravel_runtime_reconciliation_is_atomic_and_process_aware() -> None:
     assert "os.fsync" in reconciler
     assert "os.replace" in reconciler
     assert "path.is_symlink()" in reconciler
+    assert ".gimme-secret-manifest.json" in reconciler
+    assert ".gimme-env-backup-" in task
+    assert ".gimme-manifest-backup-" in task
+    assert "assert_laravel_configuration_health" in task
+    assert "the prior protected state was restored" in task
     assert "process.units_changed=yes" in task
     assert "invoke('gimme:restart:workers')" in task
 

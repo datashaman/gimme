@@ -16,4 +16,6 @@ config/.gimme-journal.lock
 config/state.json
 config/secrets*.json
 config/operations.jsonl
+config/applied-secrets/
+config/deployment-locks/
 !config/secrets.enc.example.json

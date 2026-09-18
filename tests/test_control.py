@@ -82,7 +82,7 @@ def test_control_state_references_registered_target_and_application() -> None:
         deployments={"example-local": deployment(devbox)},
     )
 
-    assert state.schema_version == 3
+    assert state.schema_version == 4
     assert state.deployments["example-local"].placement.site_host == (
         "example-local.devbox.local"
     )
@@ -189,7 +189,7 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     store.save(state)
 
     assert store.load() == state
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 3
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 4
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -198,7 +198,7 @@ def test_canonical_state_example_validates_against_current_schema() -> None:
 
     state = ControlState.model_validate_json(example.read_text())
 
-    assert state.schema_version == 3
+    assert state.schema_version == 4
     assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
 
 
@@ -257,6 +257,9 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
     old_placement = document["deployments"]["example-local"]["placement"]
     document["deployments"]["example-local"].pop("runtimes")
     document["deployments"]["example-local"].pop("resources")
+    document["deployments"]["example-local"]["secrets"] = {
+        "MAIL_PASSWORD": "example-local/MAIL_PASSWORD"
+    }
     store = StateStore(tmp_path)
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "state.json").write_text(json.dumps(document))
@@ -268,10 +271,31 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
         }
     })
 
-    assert migrated.schema_version == 3
+    assert migrated.schema_version == 4
     assert migrated.deployments["example-local"].placement.model_dump(mode="json") == old_placement
     assert migrated.deployments["example-local"].runtimes["node"].provider == "system"
     assert migrated.deployments["example-local"].resources.database == "devbox-postgres"
+
+
+def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) -> None:
+    document = json.loads((Path(__file__).parents[1] / "config/state.example.json").read_text())
+    document["schema_version"] = 3
+    document.pop("provider_accounts")
+    document.pop("secret_stores")
+    document["deployments"]["example-local"]["secrets"] = {
+        "MAIL_PASSWORD": "example-local/mail/MAIL_PASSWORD"
+    }
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "state.json").write_text(json.dumps(document))
+
+    migrated = StateStore(tmp_path).state_migration({})
+
+    assert migrated.schema_version == 4
+    assert migrated.secret_stores["local-sops"].provider == "sops"
+    reference = migrated.deployments["example-local"].secrets["MAIL_PASSWORD"]
+    assert reference.model_dump() == {
+        "store": "local-sops", "secret": "example-local/mail", "field": "MAIL_PASSWORD"
+    }
 
 
 def test_mise_pin_requires_an_exact_target_mise_version() -> None:

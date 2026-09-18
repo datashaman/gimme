@@ -26,10 +26,12 @@ Repository URLs must be credential-free. Authentication belongs in SSH agents,
 repository-scoped deploy keys, or credential helpers. The Deployer child receives an
 explicit environment allowlist, so unrelated shell credentials are not inherited.
 
-Secrets are references such as `my-deployment/STRIPE_KEY`, never MCP arguments or
-tool output. They are resolved from `secrets.enc.json` with SOPS, placed in an
-owner-only temporary file, transferred to an owner-only remote temporary file, and
-removed after environment reconciliation.
+Secrets are bounded `{store, secret, field}` references, never plaintext MCP arguments or
+tool output. The built-in `local-sops` store resolves from `secrets.enc.json`; registered
+AWS Secrets Manager stores use separate inspection and resolver roles. Values are placed in
+an owner-only temporary file, transferred to an owner-only remote temporary file, and
+removed after environment reconciliation. See
+[`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md).
 
 Create or edit the encrypted document with `sops config/secrets.enc.json`; its nested
 JSON keys must match the references declared by deployments. Configure age through
@@ -58,11 +60,13 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v3 targets, applications, resources, deployments, pins
+state.json          # schema-v4 desired state, provider accounts, stores, and pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence
 .gimme-journal.lock # local journal append lock
+applied-secrets/    # secret-free Applied Secret Manifest fingerprints
+deployment-locks/   # owner-only Deployment resource locks
 ```
 
 Operational state and encrypted secrets are ignored in this public source repository
@@ -91,6 +95,7 @@ For guided workflows, see:
 
 - [`docs/tutorials/first-local-deployment.md`](docs/tutorials/first-local-deployment.md)
 - [`docs/how-to/migrate-a-runtime-to-mise.md`](docs/how-to/migrate-a-runtime-to-mise.md)
+- [`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
 ## Target bootstrap
@@ -225,6 +230,8 @@ Read-only resources:
 - `gimme://operations`
 - `gimme://targets/{name}`
 - `gimme://applications/{name}`
+- `gimme://provider-accounts/{name}`
+- `gimme://secret-stores/{name}`
 - `gimme://resources/{name}`
 - `gimme://deployments/{name}`
 - `gimme://operations/{correlation_id}`
@@ -240,10 +247,10 @@ catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
 
 ## Current scope
 
-Gimme 0.6 provides the multi-target foundation and strong production invariants. It
-still provisions target-local PostgreSQL and Valkey. Managed cloud databases, backups,
-HA, external secret stores, immutable build artifacts, traffic splitting, and fleet
-scheduling are intentionally future work rather than implied production guarantees.
+Gimme provides the multi-target foundation, local SOPS, and bounded AWS Secrets Manager
+stores. It still provisions target-local PostgreSQL and Valkey. Managed cloud databases,
+backups, HA, immutable build artifacts, traffic splitting, and fleet scheduling remain
+future work rather than implied production guarantees.
 
 ## Development
 

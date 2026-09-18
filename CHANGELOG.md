@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added schema-v4 AWS Provider Accounts, bounded AWS Secrets Manager stores, structured
+  Secret References, metadata-only planning, exact-version apply-time resolution, and
+  secret-safe Applied Secret Manifests while retaining the fixed local SOPS store.
 - Bound every schema-v3 mutation plan to a fingerprint of executable Gimme, Deployer,
   privileged-helper, and dependency-lock inputs so code changes invalidate stale plans.
 - Fixed empty deployment environment objects being misclassified as JSON lists by PHP.

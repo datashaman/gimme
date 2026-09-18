@@ -7,6 +7,8 @@ from gimme.config import (
     ArtisanConfig, HealthCheckConfig, HorizonWorkerConfig, SchedulerConfig, StackConfig,
 )
 from gimme.control import (
+    AWSProviderAccount,
+    AWSSecretsManagerStore,
     ApplicationConfig,
     ControlState,
     DeploymentConfig,
@@ -80,6 +82,17 @@ def use_store(tmp_path: Path, monkeypatch) -> StateStore:
     return selected
 
 
+class FakeAWSIdentity:
+    def __init__(self) -> None:
+        self.roles: list[str] = []
+
+    def known_regions(self) -> set[str]:
+        return {"us-east-1"}
+
+    def verify_role(self, account, role_arn) -> None:
+        self.roles.append(role_arn)
+
+
 def test_deployment_diagnostics_return_only_allowlisted_structured_evidence(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -108,7 +121,40 @@ password=must-not-escape
     assert "secret-value" not in str(result)
 
 
-async def test_hard_v3_tool_surface() -> None:
+def test_provider_account_and_secret_store_registration_are_planned_and_secret_safe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    aws = FakeAWSIdentity()
+    monkeypatch.setattr(server_module, "aws_secrets", aws)
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+
+    account_plan = server_module.plan_register_provider_account("production", account)
+    server_module.register_provider_account(
+        "production", account, str(account_plan["plan_id"])
+    )
+    definition = AWSSecretsManagerStore(
+        provider_account="production", region="us-east-1", prefix="gimme/apps"
+    )
+    store_plan = server_module.plan_register_secret_store("applications", definition)
+    server_module.register_secret_store(
+        "applications", definition, str(store_plan["plan_id"])
+    )
+
+    state = selected.load()
+    assert state.provider_accounts["production"] == account
+    assert state.secret_stores["applications"] == definition
+    assert len(aws.roles) == 6  # both roles on each account plan/apply; inspection for store
+    journal = (selected.root / "operations.jsonl").read_text()
+    assert "123456789012" not in journal
+    assert "arn:aws" not in journal
+
+
+async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
         resources = await client.list_resources()
@@ -138,6 +184,10 @@ async def test_hard_v3_tool_surface() -> None:
         "run_artisan",
         "diagnose_deployment",
         "list_operations",
+        "plan_register_provider_account",
+        "register_provider_account",
+        "plan_register_secret_store",
+        "register_secret_store",
     }
     assert {str(resource.uri) for resource in resources} == {
         "gimme://state", "gimme://operations"
@@ -148,6 +198,8 @@ async def test_hard_v3_tool_surface() -> None:
         "gimme://resources/{name}",
         "gimme://deployments/{name}",
         "gimme://operations/{correlation_id}",
+        "gimme://provider-accounts/{name}",
+        "gimme://secret-stores/{name}",
     }
     assert all(tool.annotations is not None for tool in tools)
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
@@ -337,5 +389,5 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 3
+    assert value["schema_version"] == 4
     assert "deployments" in value
