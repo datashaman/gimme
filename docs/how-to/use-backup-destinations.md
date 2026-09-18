@@ -1,0 +1,100 @@
+# Use S3-compatible Backup Destinations for on-demand Recovery Points
+
+Gimme's first Recovery Point tracer registers one named S3-compatible Backup
+Destination, binds it to a Deployment through a Recovery Policy, and creates and
+inventories on-demand PostgreSQL Recovery Points. Only the control-plane process
+resolves any Backup Destination credential; Targets never receive it.
+
+## Bucket prerequisites
+
+Provision the bucket outside Gimme before registering it:
+
+- versioning must be enabled (not merely available and unset, and not suspended);
+- either server-side AES256 or a registered customer-managed KMS key (same account,
+  same region as the destination);
+- TLS only — Gimme always connects over HTTPS and never accepts a caller-supplied
+  scheme;
+- either the control plane's ambient AWS credential chain has S3 read/write/delete
+  access to the bucket, or an encrypted credential reference resolves an access key
+  pair with that access.
+
+## Register a destination
+
+Use `plan_register_backup_destination` to review the proposed destination, then pass its
+`plan_id` to `register_backup_destination`. A destination fixes:
+
+- one bounded, non-IP-literal bucket name and SDK-known region;
+- an optional custom HTTPS endpoint (for non-AWS S3-compatible stores) and addressing
+  style (`virtual_hosted` or `path`);
+- one encryption policy (`{"method": "aes256"}` or `{"method": "kms", "kms_key_arn":
+  "..."}`, same-region only);
+- one authentication mode: `{"mode": "ambient"}` uses the control plane's own AWS
+  identity; `{"mode": "credential_reference", "access_key_id": {...}, "secret_access_key":
+  {...}}` points at two `{store, secret, field}` Secret References, exactly like a
+  Deployment secret.
+
+`plan_register_backup_destination`/`plan_update_backup_destination` never call the
+destination — a plan tool must not touch remote state, and the endpoint is
+caller-supplied. The live preflight instead runs during
+`register_backup_destination`/`update_backup_destination` apply, once the reviewed plan
+is confirmed, for both authentication modes (this also keeps `credential_reference` auth
+from resolving plaintext before plan time, the same no-plaintext-at-plan-time boundary
+AWS Secret Stores use). Preflight rejects a bucket with unavailable or disabled
+versioning, then round-trips one probe object (write, read, delete) to prove
+write/read/delete capability, leaving nothing behind either on success or on a failed
+probe; a failed preflight leaves nothing registered.
+
+## Bind a Recovery Policy
+
+A Deployment opts into recovery by setting `recovery.destination` on an ordinary
+`plan_update_deployment` / `update_deployment` call — there is no separate binding tool.
+A bound database resource is required; a static deployment (which cannot bind a
+database) cannot bind recovery either.
+
+```json
+{
+  "recovery": {"destination": "primary"}
+}
+```
+
+## Create and list on-demand Recovery Points
+
+`plan_create_recovery_point(deployment, request_id)` plans one capture; pass its
+`plan_id` and the same `request_id` to `create_recovery_point`. The Recovery Point's
+identity is derived from `(deployment, destination, request_id)`, never from wall-clock
+time, so retrying the exact same `plan_id`/`request_id` — for example after a dropped
+connection — is a deterministic no-op that returns the already-published manifest
+without re-running `pg_dump` or re-uploading. A different `request_id` always produces a
+new, distinct Recovery Point.
+
+Capture runs `pg_dump --no-owner --no-privileges --no-acl` against the Deployment's
+isolated database on its Target, so roles, ownership, ACLs, and credential material are
+never part of the dump. Because on-demand capture runs while the MCP server is live
+(unlike future scheduled, systemd-timer-driven capture), the dump is pulled back to the
+control plane over the same transport already used for Deployment secret files, then
+uploaded from there with server-side encryption and a SHA-256 checksum. The component
+upload is verified against that checksum before the immutable Recovery Manifest is
+published; a failed or partial upload is cleaned up rather than left dangling, and the
+Recovery Point never becomes visible until verification succeeds.
+
+`list_recovery_points(deployment)` reads Recovery Manifests directly from the bound
+destination — authoritative inventory even if the Target is gone — and returns only
+bounded, secret-safe metadata (recovery point ID, creation time, and each component's
+key, byte count, and checksum). A manifest whose referenced component object no longer
+matches its declared checksum is rejected and excluded from `recovery_points`, but does
+not fail the rest of the listing; its ID is reported under `rejected`.
+
+`create_recovery_point` serializes concurrent applies against the same Deployment through
+a local, per-control-plane lock. That lock does not extend across two independent
+control-plane processes (different state directories) targeting the same real
+destination bucket — Gimme assumes a single operator per Deployment, the same
+trusted-operator model the plan/apply split already relies on elsewhere. Running more
+than one control plane against the same Deployment's recovery destination at once is
+unsupported and can race.
+
+## What this issue does not cover
+
+Restore, Safety Recovery Points, Valkey component backups, scheduled/systemd-timer
+cadences, and `retain_last` pruning are separate, future work described in
+[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md) and are not implemented by
+this tracer.

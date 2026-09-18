@@ -6,6 +6,7 @@ from gimme.control import (
     ApplicationConfig,
     ControlState,
     DeploymentConfig,
+    S3BackupDestination,
     StateStore,
     TargetConfig,
 )
@@ -219,6 +220,35 @@ def deployment_release_plan(
                 "switch the current symlink only after the candidate succeeds",
                 "roll back automatically if the live health check fails",
                 "gracefully refresh managed queue workers after activation",
+            ],
+        }
+    )
+
+
+def recovery_point_creation_plan(
+    deployment_name: str,
+    deployment: DeploymentConfig,
+    destination_name: str,
+    destination: S3BackupDestination,
+    request_id: str,
+    point_id: str,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "recovery_point_creation",
+            "deployment": deployment_name,
+            "target": deployment.target,
+            "destination": destination_name,
+            "destination_policy": destination.model_dump(mode="json"),
+            "request_id": request_id,
+            "recovery_point_id": point_id,
+            "components": ["postgres"],
+            "effects": [
+                "run a transactionally consistent pg_dump of the deployment's isolated database",
+                "exclude roles, ownership, ACLs, and credential material from the dump",
+                "upload the checksummed component with server-side encryption",
+                "publish the immutable Recovery Manifest only after verification succeeds",
+                "make no other remote or destination changes",
             ],
         }
     )

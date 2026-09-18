@@ -30,11 +30,12 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://applications/{name}` | One reusable application definition |
 | `gimme://provider-accounts/{name}` | One credential-free provider identity policy |
 | `gimme://secret-stores/{name}` | One bounded Secret Store policy and derived ownership tag |
+| `gimme://backup-destinations/{name}` | One bounded S3-compatible Backup Destination policy without credentials |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The seven parameterized URIs are resource templates. `gimme://state` and
+The eight parameterized URIs are resource templates. `gimme://state` and
 `gimme://operations` are concrete resources.
 
 ## State and inventory tools
@@ -49,6 +50,8 @@ The seven parameterized URIs are resource templates. `gimme://state` and
 | `list_secret_stores` | Read | List bounded Secret Store policy without secret identities or values |
 | `list_resources` | Read | List named resources, optionally filtered by target |
 | `list_deployments` | Read | List deployments, optionally filtered by target |
+| `list_backup_destinations` | Read | List registered S3-compatible Backup Destinations without credentials |
+| `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
 
 ## Operation journal
@@ -85,6 +88,12 @@ bounded to 200 records per call.
 | `update_secret_store` | Local write | Apply an exact store update plan |
 | `plan_remove_secret_store` | Read | Plan local removal when no Deployment references the store |
 | `remove_secret_store` | Local write | Remove only the local store registration |
+| `plan_register_backup_destination` | Read | Diff a proposed Backup Destination registration; makes no destination calls |
+| `register_backup_destination` | Destination write | Preflight-verify and register one Backup Destination without storing credentials |
+| `plan_update_backup_destination` | Read | Diff a proposed Backup Destination policy update; makes no destination calls |
+| `update_backup_destination` | Destination write | Preflight-verify and apply one reviewed Backup Destination policy update |
+| `plan_remove_backup_destination` | Read | Plan local removal when no Deployment references the destination |
+| `remove_backup_destination` | Local write | Remove only the local destination registration |
 | `register_target` | Local write | Register a target |
 | `plan_update_target` | Read | Diff a proposed target update |
 | `update_target` | Local write | Apply an exact target update plan |
@@ -151,6 +160,35 @@ temporary material. Each field is limited to 8 KiB, the combined payload to 64 K
 Deployment to 128 secret environment keys. See
 [`use-aws-secret-stores.md`](../how-to/use-aws-secret-stores.md) for IAM, KMS, rotation,
 migration, and failure behavior.
+
+### Backup destinations and Recovery Points
+
+A Deployment opts into recovery by setting `recovery.destination` to one registered
+Backup Destination name through the existing `plan_update_deployment` /
+`update_deployment` pair; a bound database resource is required. On-demand PostgreSQL
+Recovery Points are then created and listed with:
+
+| Tool | Access | Purpose |
+| --- | --- | --- |
+| `plan_create_recovery_point` | Read | Plan one on-demand PostgreSQL Recovery Point for a recovery-bound deployment |
+| `create_recovery_point` | Remote + destination write | Dump, upload, verify, and publish one Recovery Point |
+
+`create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
+identity is derived from `(deployment, destination, request_id)`, never from wall-clock
+time. Re-applying the same `plan_id`/`request_id` after a prior success is a deterministic
+no-op that returns the already-published manifest without re-running `pg_dump` or
+re-uploading. `pg_dump` runs on the Deployment's Target with `--no-owner --no-privileges
+--no-acl` (roles, ownership, and ACLs are never captured); the dump is pulled back to the
+control plane over the same transport already used for deployment secret files, then
+uploaded from there with server-side encryption, because on-demand capture runs while the
+MCP server is live. (Scheduled, systemd-timer-driven capture is separate, future work and
+may instead use the Target's own ambient or credential-referenced identity, per
+[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).) The component upload is
+verified against its declared SHA-256 before the immutable Recovery Manifest is published;
+a failed or partial upload is cleaned up rather than left dangling. `list_recovery_points`
+reads manifests directly from the bound destination — authoritative even if the owning
+Target is gone — and rejects (without failing the whole call) any manifest whose
+referenced component object no longer matches its declared checksum.
 
 ## Application operation tools
 

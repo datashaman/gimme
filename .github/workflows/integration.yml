@@ -60,3 +60,23 @@ jobs:
         run: uv run python tests/integration/disposable_vm_smoke.py pin-resources
       - name: Exercise isolated resources and host services
         run: uv run python tests/integration/disposable_vm_smoke.py verify
+      - name: Start a TLS-verified MinIO Backup Destination
+        run: |
+          install -d -m 0700 "$RUNNER_TEMP/minio-certs" "$RUNNER_TEMP/minio-data"
+          openssl req -x509 -newkey rsa:2048 -keyout "$RUNNER_TEMP/minio-certs/private.key" \
+            -out "$RUNNER_TEMP/minio-certs/public.crt" -days 1 -nodes \
+            -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+          docker run -d --name gimme-ci-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=gimme-ci -e MINIO_ROOT_PASSWORD=gimme-ci-secret \
+            -v "$RUNNER_TEMP/minio-certs:/root/.minio/certs" \
+            -v "$RUNNER_TEMP/minio-data:/data" \
+            minio/minio server /data --certs-dir /root/.minio/certs
+          for _ in $(seq 1 30); do
+            curl -sk --max-time 2 https://127.0.0.1:9000/minio/health/live && break
+            sleep 1
+          done
+          echo "AWS_CA_BUNDLE=$RUNNER_TEMP/minio-certs/public.crt" >> "$GITHUB_ENV"
+          echo "AWS_ACCESS_KEY_ID=gimme-ci" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=gimme-ci-secret" >> "$GITHUB_ENV"
+      - name: Register a Backup Destination and create an on-demand Recovery Point
+        run: uv run python tests/integration/disposable_vm_smoke.py verify-backup-destination
