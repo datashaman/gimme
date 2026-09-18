@@ -438,6 +438,24 @@ def test_artisan_is_deployment_scoped_and_plan_gated(tmp_path, monkeypatch) -> N
     assert calls[-1]["artisan_arguments"] == ["--force"]
 
 
+def test_target_service_status_passes_the_service_as_a_config_override(
+    tmp_path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, tuple(kwargs.get("arguments", ()))))
+        return CommandResult(["dep"], 0, "active (running)")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    server_module.target_service_status("devbox", "postgresql")
+
+    # A raw "service=postgresql" positional token is parsed by Deployer as a host
+    # selector filter, not a config override, and get('gimme_service') never sees it.
+    assert calls[-1] == ("gimme:service:status", ("-o", "gimme_service=postgresql"))
+
+
 def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
     tmp_path, monkeypatch
 ) -> None:

@@ -1363,8 +1363,11 @@ def target_service_status(name: Name,
                           ) -> dict[str, object]:
     """Read status for one allowlisted service on a registered target."""
     target = store.target(name)
+    # A raw "service=..." positional token is parsed by Deployer as a host selector
+    # filter, not a config override; -o is required for get('gimme_service') to see it.
     return _result(runner.run("gimme:service:status", legacy_server(target),
-                              stack=target.stack, arguments=(f"service={service}",), timeout=60))
+                              stack=target.stack,
+                              arguments=("-o", f"gimme_service={service}"), timeout=60))
 
 
 def main() -> None:
