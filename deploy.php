@@ -999,6 +999,7 @@ task('gimme:provision:app', function () use (
     $instance,
     $appsRoot,
     $hostname,
+    $health,
     $mdnsName,
     $remoteUser,
 ): void {
@@ -1120,7 +1121,12 @@ BASH;
         ], JSON_THROW_ON_ERROR);
         $runtimeProgram = escapeshellarg(base64_encode(laravel_environment_reconcile_script()));
         $runtimeEncoded = escapeshellarg(base64_encode($runtimeValues));
-        $secretArgument = $localSecretFile === '' ? '' : ' ' . escapeshellarg($remoteSecretFile);
+        $secretArgument = escapeshellarg(
+            $localSecretFile === '' ? '-' : $remoteSecretFile
+        );
+        $manifestEncoded = escapeshellarg(base64_encode(json_encode(
+            configured_secret_manifest(), JSON_THROW_ON_ERROR
+        )));
         $script .= <<<BASH
 
 if ! grep -q '^APP_NAME=' "\$env_path"; then
@@ -1133,46 +1139,115 @@ if ! grep -q '^APP_KEY=' "\$env_path"; then
     app_key=\$(openssl rand -base64 32 | tr -d '\n')
     printf 'APP_KEY=base64:%s\n' "\$app_key" >> "\$env_path"
 fi
-runtime_output=\$(printf %s {$runtimeProgram} | base64 -d | python3 - "\$env_path" {$runtimeEncoded}{$secretArgument})
+runtime_output=\$(printf %s {$runtimeProgram} | base64 -d | python3 - "\$env_path" {$runtimeEncoded} {$secretArgument} {$manifestEncoded})
 printf '%s\n' "\$runtime_output"
 BASH;
     }
 
+    $backupToken = bin2hex(random_bytes(8));
+    $environmentBackup = "{$sharedPath}/.gimme-env-backup-{$backupToken}";
+    $manifestPath = "{$sharedPath}/.gimme-secret-manifest.json";
+    $manifestBackup = "{$sharedPath}/.gimme-manifest-backup-{$backupToken}";
+    $backup = <<<BASH
+umask 077
+if [ -L "{$manifestPath}" ]; then
+    printf 'Refusing to manage symlinked secret manifest\n' >&2
+    exit 1
+fi
+if [ -f "{$envPath}" ]; then cp -p "{$envPath}" "{$environmentBackup}"; fi
+if [ -f "{$manifestPath}" ]; then cp -p "{$manifestPath}" "{$manifestBackup}"; fi
+BASH;
+    $script = $backup . "\n" . $script;
+
     try {
-        $resourceOutput = run(
-            'flock -w 300 ' . escapeshellarg("{$sharedPath}/.gimme-resource.lock") .
-            ' bash -c ' . escapeshellarg($script)
+        try {
+            $resourceOutput = run(
+                'flock -w 300 ' . escapeshellarg("{$sharedPath}/.gimme-resource.lock") .
+                ' bash -c ' . escapeshellarg($script)
+            );
+        } finally {
+            if ($localSecretFile !== '') {
+                run('rm -f ' . escapeshellarg($remoteSecretFile));
+            }
+        }
+        $environmentChanged = str_contains($resourceOutput, 'GIMME_ENVIRONMENT_CHANGED|yes');
+        if ($framework === 'laravel') {
+            $currentPath = get('deploy_path') . '/current';
+            $hasCurrentRelease = test(
+                '[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]'
+            );
+            if ($hasCurrentRelease) {
+                run(
+                    'cd ' . escapeshellarg($currentPath) .
+                    ' && {{bin/php}} artisan optimize:clear && {{bin/php}} artisan optimize'
+                );
+            }
+            $unitsChanged = false;
+            if ($hasProcessState) {
+                $processOutput = run(
+                    'sudo -n /usr/local/sbin/gimme-provision-processes ' .
+                    escapeshellarg($instance),
+                    forceOutput: true,
+                    timeout: 1800,
+                );
+                $unitsChanged = str_contains($processOutput, 'process.units_changed=yes');
+            }
+            if ($hasCurrentRelease && $environmentChanged && !$unitsChanged) {
+                invoke('gimme:restart:workers');
+            }
+            if ($hasCurrentRelease) {
+                assert_laravel_configuration_health($health, $siteHost, $appsRoot);
+            }
+        }
+    } catch (\Throwable) {
+        $restore =
+            'set -eu; ' .
+            'if [ -f ' . escapeshellarg($environmentBackup) . ' ]; then ' .
+            'mv -f ' . escapeshellarg($environmentBackup) . ' ' . escapeshellarg($envPath) .
+            '; else rm -f ' . escapeshellarg($envPath) . '; fi; ' .
+            'if [ -f ' . escapeshellarg($manifestBackup) . ' ]; then ' .
+            'mv -f ' . escapeshellarg($manifestBackup) . ' ' . escapeshellarg($manifestPath) .
+            '; else rm -f ' . escapeshellarg($manifestPath) . '; fi';
+        try {
+            run(
+                'flock -w 300 ' . escapeshellarg("{$sharedPath}/.gimme-resource.lock") .
+                ' bash -c ' . escapeshellarg($restore)
+            );
+            if ($framework === 'laravel') {
+                $currentPath = get('deploy_path') . '/current';
+                $hasCurrentRelease = test(
+                    '[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]'
+                );
+                if ($hasCurrentRelease) {
+                    run(
+                        'cd ' . escapeshellarg($currentPath) .
+                        ' && {{bin/php}} artisan optimize:clear && {{bin/php}} artisan optimize'
+                    );
+                }
+                if ($hasProcessState) {
+                    run(
+                        'sudo -n /usr/local/sbin/gimme-provision-processes ' .
+                        escapeshellarg($instance),
+                        forceOutput: true,
+                        timeout: 1800,
+                    );
+                } elseif ($hasCurrentRelease) {
+                    invoke('gimme:restart:workers');
+                }
+                if ($hasCurrentRelease) {
+                    assert_laravel_configuration_health($health, $siteHost, $appsRoot);
+                }
+            }
+        } catch (\Throwable) {
+            throw new \RuntimeException(
+                'Deployment environment activation failed and rollback is degraded'
+            );
+        }
+        throw new \RuntimeException(
+            'Deployment environment activation failed; the prior protected state was restored'
         );
     } finally {
-        if ($localSecretFile !== '') {
-            run('rm -f ' . escapeshellarg($remoteSecretFile));
-        }
-    }
-    $runtimeChanged = str_contains($resourceOutput, 'GIMME_RUNTIME_CHANGED|yes');
-    if ($framework === 'laravel') {
-        $currentPath = get('deploy_path') . '/current';
-        $hasCurrentRelease = test(
-            '[ -f ' . escapeshellarg("{$currentPath}/artisan") . ' ]'
-        );
-        if ($hasCurrentRelease) {
-            run(
-                'cd ' . escapeshellarg($currentPath) .
-                ' && {{bin/php}} artisan optimize:clear && {{bin/php}} artisan optimize'
-            );
-        }
-        $unitsChanged = false;
-        if ($hasProcessState) {
-            $processOutput = run(
-                'sudo -n /usr/local/sbin/gimme-provision-processes ' .
-                escapeshellarg($instance),
-                forceOutput: true,
-                timeout: 1800,
-            );
-            $unitsChanged = str_contains($processOutput, 'process.units_changed=yes');
-        }
-        if ($hasCurrentRelease && $runtimeChanged && !$unitsChanged) {
-            invoke('gimme:restart:workers');
-        }
+        run('rm -f ' . escapeshellarg($environmentBackup) . ' ' . escapeshellarg($manifestBackup));
     }
 });
 

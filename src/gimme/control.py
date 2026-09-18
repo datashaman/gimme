@@ -8,7 +8,7 @@ import re
 import tempfile
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -36,6 +36,12 @@ DOMAIN_NAME = re.compile(
 )
 ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 SECRET_REF = re.compile(r"^[a-z][a-z0-9-]{0,63}(?:/[A-Z][A-Z0-9_]{0,63})+$")
+AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
+AWS_ROLE_ARN = re.compile(r"^arn:aws:iam::([0-9]{12}):role/([A-Za-z0-9+=,.@_/-]{1,512})$")
+AWS_REGION = re.compile(r"^(?:[a-z]{2}(?:-gov)?|us-gov)-[a-z]+-[1-9][0-9]?$")
+SECRET_STORE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+SECRET_IDENTITY = re.compile(r"^[A-Za-z0-9_+=.@-]+(?:/[A-Za-z0-9_+=.@-]+)*$")
+SECRET_FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 RELATIVE_PATH = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
@@ -141,6 +147,97 @@ class ResourceBindings(BaseModel):
 
     database: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
     cache: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
+
+
+class AWSProviderAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["aws"] = "aws"
+    account_id: str = Field(pattern=AWS_ACCOUNT_ID.pattern)
+    inspection_role_arn: str = Field(min_length=20, max_length=600)
+    resolver_role_arn: str = Field(min_length=20, max_length=600)
+
+    @model_validator(mode="after")
+    def exact_roles(self) -> "AWSProviderAccount":
+        accounts: list[str] = []
+        for role in (self.inspection_role_arn, self.resolver_role_arn):
+            match = AWS_ROLE_ARN.fullmatch(role)
+            if match is None:
+                raise ValueError("AWS roles must be exact commercial-partition IAM role ARNs")
+            accounts.append(match.group(1))
+        if any(account != self.account_id for account in accounts):
+            raise ValueError("AWS roles must belong to the expected account")
+        if self.inspection_role_arn == self.resolver_role_arn:
+            raise ValueError("AWS inspection and resolver roles must be distinct")
+        return self
+
+
+ProviderAccount = Annotated[AWSProviderAccount, Field(discriminator="provider")]
+
+
+class SopsSecretStore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["sops"] = "sops"
+
+
+class AWSSecretsManagerStore(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["aws_secrets_manager"] = "aws_secrets_manager"
+    provider_account: str = Field(pattern=SECRET_STORE_NAME.pattern)
+    region: str = Field(pattern=AWS_REGION.pattern)
+    prefix: str = Field(min_length=1, max_length=400)
+    kms_key_arn: str | None = Field(default=None, min_length=20, max_length=600)
+
+    @field_validator("prefix")
+    @classmethod
+    def bounded_prefix(cls, value: str) -> str:
+        if (
+            value.startswith(("/", "-"))
+            or value.endswith("/")
+            or SECRET_IDENTITY.fullmatch(value) is None
+            or len(value.encode()) > 400
+        ):
+            raise ValueError("AWS secret prefix must be a bounded relative name")
+        return value
+
+    @model_validator(mode="after")
+    def bounded_kms_policy(self) -> "AWSSecretsManagerStore":
+        if self.kms_key_arn is not None:
+            match = re.fullmatch(
+                r"arn:aws:kms:([a-z0-9-]+):([0-9]{12}):key/([0-9a-f-]{36})",
+                self.kms_key_arn,
+            )
+            if match is None or match.group(1) != self.region:
+                raise ValueError("customer KMS key must be one exact same-region key ARN")
+        return self
+
+
+SecretStore = Annotated[
+    SopsSecretStore | AWSSecretsManagerStore,
+    Field(discriminator="provider"),
+]
+
+
+class SecretReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    store: str = Field(pattern=SECRET_STORE_NAME.pattern)
+    secret: str = Field(min_length=1, max_length=400)
+    field: str = Field(pattern=SECRET_FIELD.pattern)
+
+    @field_validator("secret")
+    @classmethod
+    def bounded_secret(cls, value: str) -> str:
+        if (
+            value.startswith(("/", "-"))
+            or value.endswith("/")
+            or SECRET_IDENTITY.fullmatch(value) is None
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError("secret must be a bounded relative identity")
+        return value
 
 
 class TargetConfig(BaseModel):
@@ -285,7 +382,7 @@ class DeploymentConfig(BaseModel):
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
-    secrets: dict[str, str] = Field(default_factory=dict, max_length=128)
+    secrets: dict[str, SecretReference] = Field(default_factory=dict, max_length=128)
     runtimes: dict[RuntimeName, RuntimePin]
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
     placement: Placement
@@ -325,12 +422,10 @@ class DeploymentConfig(BaseModel):
 
     @field_validator("secrets")
     @classmethod
-    def safe_secrets(cls, value: dict[str, str]) -> dict[str, str]:
-        for key, reference in value.items():
+    def safe_secrets(cls, value: dict[str, SecretReference]) -> dict[str, SecretReference]:
+        for key in value:
             if ENV_KEY.fullmatch(key) is None or key in RESERVED_ENV_KEYS:
                 raise ValueError(f"secret environment key is reserved or unsafe: {key}")
-            if SECRET_REF.fullmatch(reference) is None:
-                raise ValueError(f"secret reference is unsafe: {reference}")
         return value
 
 
@@ -351,7 +446,7 @@ class DeploymentRegistration(BaseModel):
     workers: WorkerConfig | None = None
     scheduler: SchedulerConfig | None = None
     variables: dict[str, str] = Field(default_factory=dict, max_length=128)
-    secrets: dict[str, str] = Field(default_factory=dict, max_length=128)
+    secrets: dict[str, SecretReference] = Field(default_factory=dict, max_length=128)
     runtimes: dict[RuntimeName, RuntimePin]
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
 
@@ -381,19 +476,21 @@ class DeploymentRegistration(BaseModel):
 
     @field_validator("secrets")
     @classmethod
-    def safe_secrets(cls, value: dict[str, str]) -> dict[str, str]:
-        for key, reference in value.items():
+    def safe_secrets(cls, value: dict[str, SecretReference]) -> dict[str, SecretReference]:
+        for key in value:
             if ENV_KEY.fullmatch(key) is None or key in RESERVED_ENV_KEYS:
                 raise ValueError(f"secret environment key is reserved or unsafe: {key}")
-            if SECRET_REF.fullmatch(reference) is None:
-                raise ValueError(f"secret reference is unsafe: {reference}")
         return value
 
 
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[3] = 3
+    schema_version: Literal[4] = 4
+    provider_accounts: dict[str, ProviderAccount] = Field(default_factory=dict)
+    secret_stores: dict[str, SecretStore] = Field(
+        default_factory=lambda: {"local-sops": SopsSecretStore()}
+    )
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     applications: dict[str, ApplicationConfig] = Field(default_factory=dict)
     resources: dict[str, ResourceConfig] = Field(default_factory=dict)
@@ -401,6 +498,22 @@ class ControlState(BaseModel):
 
     @model_validator(mode="after")
     def references_exist(self) -> "ControlState":
+        for name in self.provider_accounts:
+            if SECRET_STORE_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid provider account name: {name}")
+        if self.secret_stores.get("local-sops") != SopsSecretStore():
+            raise ValueError("local-sops must be the fixed built-in SOPS store")
+        for name, secret_store in self.secret_stores.items():
+            if SECRET_STORE_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid secret store name: {name}")
+            if isinstance(secret_store, AWSSecretsManagerStore):
+                account = self.provider_accounts.get(secret_store.provider_account)
+                if account is None:
+                    raise ValueError(f"secret store {name} references an unknown provider account")
+                if secret_store.kms_key_arn is not None:
+                    key_account = secret_store.kms_key_arn.split(":", 5)[4]
+                    if key_account != account.account_id:
+                        raise ValueError(f"secret store {name} KMS key is in another account")
         for name in self.targets:
             if TARGET_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid target name: {name}")
@@ -427,6 +540,11 @@ class ControlState(BaseModel):
                 raise ValueError(f"deployment {name} references an unknown application")
             if deployment.target not in self.targets:
                 raise ValueError(f"deployment {name} references an unknown target")
+            for reference in deployment.secrets.values():
+                if reference.store not in self.secret_stores:
+                    raise ValueError(
+                        f"deployment {name} references unknown secret store {reference.store}"
+                    )
             validate_stage_policy(
                 deployment,
                 self.targets[deployment.target],
@@ -453,6 +571,8 @@ class ControlState(BaseModel):
             has_cache = deployment.resources.cache is not None
             if is_static and (has_database or has_cache):
                 raise ValueError(f"static deployment {name} cannot bind database or cache")
+            if is_static and deployment.secrets:
+                raise ValueError(f"static deployment {name} cannot receive runtime secrets")
             if not is_static and (
                 not has_database or not has_cache
             ):
@@ -563,7 +683,7 @@ class StateStore:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
         document = self.raw_state()
-        if document.get("schema_version") != 3:
+        if document.get("schema_version") != 4:
             raise RuntimeError("state migration required; call plan_state_migration")
         return ControlState.model_validate(document)
 
@@ -707,17 +827,47 @@ class StateStore:
         if not self.exists():
             return self.legacy_migration(observations)
         document = self.raw_state()
+        if document.get("schema_version") == 4:
+            raise ValueError("schema-v4 state already exists")
         if document.get("schema_version") == 3:
-            raise ValueError("schema-v3 state already exists")
+            migrated = json.loads(json.dumps(document))
+            migrated["schema_version"] = 4
+            migrated["provider_accounts"] = {}
+            migrated["secret_stores"] = {"local-sops": {"provider": "sops"}}
+            deployments = migrated.get("deployments")
+            if not isinstance(deployments, dict):
+                raise ValueError("schema-v3 deployments are invalid")
+            for deployment_name, deployment in deployments.items():
+                if not isinstance(deployment, dict):
+                    raise ValueError(f"deployment {deployment_name} is invalid")
+                references = deployment.get("secrets", {})
+                if not isinstance(references, dict):
+                    raise ValueError(f"deployment {deployment_name} secrets are invalid")
+                converted: dict[str, object] = {}
+                for key, reference in references.items():
+                    if not isinstance(key, str) or not isinstance(reference, str):
+                        raise ValueError(f"deployment {deployment_name} secret is invalid")
+                    parts = reference.split("/")
+                    if len(parts) < 2:
+                        raise ValueError(f"deployment {deployment_name} secret is invalid")
+                    converted[key] = {
+                        "store": "local-sops",
+                        "secret": "/".join(parts[:-1]),
+                        "field": parts[-1],
+                    }
+                deployment["secrets"] = converted
+            return ControlState.model_validate(migrated)
         if document.get("schema_version") != 2:
-            raise ValueError("only schema-v2 state can be migrated")
+            raise ValueError("only schema-v2 or schema-v3 state can be migrated")
         targets = document.get("targets")
         applications = document.get("applications")
         deployments = document.get("deployments")
         if not all(isinstance(value, dict) for value in (targets, applications, deployments)):
             raise ValueError("schema-v2 state collections are invalid")
         migrated = json.loads(json.dumps(document))
-        migrated["schema_version"] = 3
+        migrated["schema_version"] = 4
+        migrated["provider_accounts"] = {}
+        migrated["secret_stores"] = {"local-sops": {"provider": "sops"}}
         migrated["resources"] = {}
         for target_name, target in migrated["targets"].items():
             if not isinstance(target, dict):
@@ -749,6 +899,22 @@ class StateStore:
                     backend=application.get("framework") != "static"
                 ).items()
             }
+            references = deployment.get("secrets", {})
+            if not isinstance(references, dict):
+                raise ValueError(f"deployment {deployment_name} secrets are invalid")
+            converted: dict[str, object] = {}
+            for key, reference in references.items():
+                if not isinstance(key, str) or not isinstance(reference, str):
+                    raise ValueError(f"deployment {deployment_name} secret is invalid")
+                parts = reference.split("/")
+                if len(parts) < 2:
+                    raise ValueError(f"deployment {deployment_name} secret is invalid")
+                converted[key] = {
+                    "store": "local-sops",
+                    "secret": "/".join(parts[:-1]),
+                    "field": parts[-1],
+                }
+            deployment["secrets"] = converted
             if isinstance(application, dict) and application.get("framework") != "static":
                 database_resource = f"{target_name}-postgres"
                 cache_resource = f"{target_name}-valkey"

@@ -278,6 +278,28 @@ function configured_resources(): array
     return $decoded;
 }
 
+function configured_secret_manifest(): array
+{
+    $raw = getenv('GIMME_SECRET_MANIFEST_JSON') ?: '[]';
+    $decoded = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($decoded) || !array_is_list($decoded) || count($decoded) > 128) {
+        throw new \RuntimeException('Secret manifest must be a bounded list');
+    }
+    foreach ($decoded as $item) {
+        if (!is_array($item) || array_is_list($item) ||
+            array_diff(array_keys($item), [
+                'environment_key', 'reference_fingerprint', 'version_fingerprint', 'status',
+            ]) !== [] ||
+            !preg_match('/^[A-Z][A-Z0-9_]{0,63}$/', $item['environment_key'] ?? '') ||
+            !preg_match('/^ref_[0-9a-f]{64}$/', $item['reference_fingerprint'] ?? '') ||
+            !preg_match('/^ver_[0-9a-f]{64}$/', $item['version_fingerprint'] ?? '') ||
+            !in_array($item['status'] ?? null, ['current', 'rotated', 'unknown'], true)) {
+            throw new \RuntimeException('Secret manifest contains an invalid entry');
+        }
+    }
+    return $decoded;
+}
+
 function runtime_command(array $runtimes, array $names, string $appsRoot, array $command): string
 {
     $mise = [];

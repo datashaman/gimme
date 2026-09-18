@@ -5,6 +5,7 @@ description = "An MCP deployment control plane for provisioning and deploying PH
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3>=1.40,<2.0",
     "fastmcp>=3.0,<4.0",
     "pydantic>=2.10,<3.0",
 ]

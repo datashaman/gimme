@@ -28,8 +28,10 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "state_migration",
-            "schema_version": 3,
+            "schema_version": 4,
             "state_directory": state_directory,
+            "provider_accounts": sorted(state.provider_accounts),
+            "secret_stores": state.model_dump(mode="json")["secret_stores"],
             "targets": state.model_dump(mode="json")["targets"],
             "applications": sorted(state.applications),
             "resources": state.model_dump(mode="json")["resources"],
@@ -50,7 +52,8 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
                 for name, deployment in sorted(state.deployments.items())
             },
             "effects": [
-                "write one atomic schema-v3 desired-state document",
+                "write one atomic schema-v4 desired-state document",
+                "migrate local secret references to the fixed local-sops store",
                 "pin observed runtime and target-local resource versions explicitly",
                 "preserve existing remote paths, identities, databases, cache prefixes, and URLs",
                 "leave legacy manifests and every remote target unchanged",
@@ -135,6 +138,7 @@ def deployment_resource_plan(
     application: ApplicationConfig,
     *,
     missing_secrets: list[str] | None = None,
+    secret_versions: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     deploy_path = f"{target.apps_root}/{deployment.placement.relative_path}"
     missing = sorted(missing_secrets or [])
@@ -159,8 +163,8 @@ def deployment_resource_plan(
                 },
             },
             "resource_bindings": deployment.resources.model_dump(mode="json"),
-            "secret_references": sorted(deployment.secrets.values()),
-            "missing_secret_references": missing,
+            "secret_versions": secret_versions or [],
+            "secret_issues": missing,
             "ready": not missing,
             "effects": [
                 "reconcile only this target's registered routes",

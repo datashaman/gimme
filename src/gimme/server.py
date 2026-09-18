@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import re
 import socket
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
@@ -13,9 +16,9 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from gimme.control import (
-    ApplicationConfig, ControlState, DeploymentConfig, DeploymentRegistration,
-    DeploymentSource, ResourceConfig, StateStore, TargetConfig, legacy_app, legacy_server,
-    new_placement, target_sites,
+    AWSProviderAccount, AWSSecretsManagerStore, ApplicationConfig, ControlState,
+    DeploymentConfig, DeploymentRegistration, DeploymentSource, ResourceConfig, SecretStore,
+    StateStore, TargetConfig, legacy_app, legacy_server, new_placement, target_sites,
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
@@ -23,17 +26,22 @@ from gimme.control_plans import (
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
-from gimme.secrets import SecretError, protected_secret_file, resolve_secret_references
+from gimme.secrets import (
+    BotoAWSSecretAdapter, SecretError, load_applied_secret_manifest,
+    plan_secret_references, protected_secret_file, resolve_planned_secret_references,
+    save_applied_secret_manifest, validate_aws_account, validate_aws_store,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 store = StateStore.from_environment(ROOT)
 runner = DeployerRunner(ROOT)
+aws_secrets = BotoAWSSecretAdapter()
 mcp = FastMCP(
     "Gimme",
     instructions=(
         "Git-backed deployment control plane for explicitly registered Ubuntu targets, "
         "applications, and deployments. Inspect a plan before every remote mutation and "
-        "pass its exact plan_id to apply. Secrets are SOPS references, never tool arguments."
+        "pass its exact plan_id to apply. Secrets are bounded references, never tool arguments."
     ),
 )
 READ = ToolAnnotations(title="Read Gimme control-plane state", readOnlyHint=True,
@@ -53,6 +61,18 @@ _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", d
 
 def _journal() -> OperationJournal:
     return OperationJournal(store.root)
+
+
+@contextmanager
+def _deployment_resource_lock(name: str):
+    directory = store.root / "deployment-locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    path = directory / f"{name}.lock"
+    with path.open("a+") as lock:
+        os.chmod(path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
 
 
 def _subjects(function: Callable[..., object], fields: tuple[str, ...],
@@ -211,6 +231,7 @@ def _context(name: str) -> tuple[ControlState, DeploymentConfig, TargetConfig, A
 def _run_deployment(
     task: str, name: str, *, revision: str | None = None,
     arguments: tuple[str, ...] = (), secret_file: Path | None = None,
+    secret_manifest: list[dict[str, str]] | None = None,
     artisan_command: str | None = None, artisan_arguments: list[str] | None = None,
     timeout: int = 900,
 ) -> CommandResult:
@@ -238,6 +259,7 @@ def _run_deployment(
         resources=bound_resources, mise_version=target.runtimes.mise_version,
         php_extensions=application.php_extensions,
         variables=deployment.variables, secret_file=secret_file,
+        secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
             application.artisan.allowed_commands
@@ -276,12 +298,17 @@ def _dns_issues(deployment: DeploymentConfig, target: TargetConfig) -> list[str]
     ]
 
 
-def _secret_issues(deployment: DeploymentConfig) -> list[str]:
+def _secret_plan(name: str, state: ControlState, deployment: DeploymentConfig
+                 ) -> tuple[list[dict[str, str]], list[str]]:
     try:
-        resolve_secret_references(store.secrets_path, deployment.secrets)
+        planned = plan_secret_references(
+            state, store.secrets_path, deployment.secrets, aws_secrets,
+            load_applied_secret_manifest(store.root, name),
+        )
+        issues = ["secret_reference_missing" for item in planned if item["status"] == "missing"]
+        return planned, issues
     except SecretError as exc:
-        return [str(exc)]
-    return []
+        return [], [str(exc)]
 
 
 def _resolved_stack_plan(name: str) -> dict[str, Any]:
@@ -311,10 +338,11 @@ def _resolved_stack_plan(name: str) -> dict[str, Any]:
 
 
 def _resource_plan(name: str) -> dict[str, Any]:
-    _, deployment, target, application = _context(name)
-    issues = _secret_issues(deployment) + _dns_issues(deployment, target)
+    state, deployment, target, application = _context(name)
+    secret_versions, secret_issues = _secret_plan(name, state, deployment)
+    issues = secret_issues + _dns_issues(deployment, target)
     plan = deployment_resource_plan(name, deployment, target, application,
-                                    missing_secrets=issues)
+                                    missing_secrets=issues, secret_versions=secret_versions)
     if issues:
         plan["readiness_issues"] = issues
         plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})
@@ -322,8 +350,9 @@ def _resource_plan(name: str) -> dict[str, Any]:
 
 
 def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
-    _, deployment, target, application = _context(name)
-    issues = _secret_issues(deployment) + _dns_issues(deployment, target)
+    state, deployment, target, application = _context(name)
+    _, secret_issues = _secret_plan(name, state, deployment)
+    issues = secret_issues + _dns_issues(deployment, target)
     if issues:
         raise ValueError("deployment is not ready: " + "; ".join(issues))
     selected = revision or _revision(name)
@@ -416,6 +445,12 @@ def _migration_observations() -> dict[str, dict[str, str]]:
     return observations
 
 
+def _migration_state() -> ControlState:
+    if store.exists() and store.raw_state().get("schema_version") == 3:
+        return store.state_migration({})
+    return store.state_migration(_migration_observations())
+
+
 @mcp.resource("gimme://state")
 def desired_state() -> dict[str, object]:
     """Complete desired state without decrypted secret values."""
@@ -430,6 +465,20 @@ def target_resource(name: str) -> dict[str, object]:
 @mcp.resource("gimme://applications/{name}")
 def application_resource(name: str) -> dict[str, object]:
     return store.application(name).model_dump(mode="json")
+
+
+@mcp.resource("gimme://provider-accounts/{name}")
+def provider_account_resource(name: str) -> dict[str, object]:
+    return store.load().provider_accounts[name].model_dump(mode="json")
+
+
+@mcp.resource("gimme://secret-stores/{name}")
+def secret_store_resource(name: str) -> dict[str, object]:
+    state = store.load()
+    value = state.secret_stores[name].model_dump(mode="json")
+    if value["provider"] == "aws_secrets_manager":
+        value["ownership_tag"] = f"gimme:secret-store={name}"
+    return value
 
 
 @mcp.resource("gimme://resources/{name}")
@@ -459,23 +508,21 @@ def operation_trace_resource(correlation_id: str) -> dict[str, object]:
 @mcp.tool(annotations=READ)
 @_journal_plan("state_migration")
 def plan_state_migration() -> dict[str, object]:
-    """Inspect exact installed versions and plan migration to schema-v3 state."""
-    if store.exists() and store.raw_state().get("schema_version") == 3:
-        raise ValueError("schema-v3 state already exists")
-    observations = _migration_observations()
-    return migration_plan(store.state_migration(observations), str(store.root))
+    """Inspect exact installed versions and plan migration to schema-v4 state."""
+    if store.exists() and store.raw_state().get("schema_version") == 4:
+        raise ValueError("schema-v4 state already exists")
+    return migration_plan(_migration_state(), str(store.root))
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("state_migration")
 def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
-    """Atomically write schema-v3 state after re-observing exact installed versions."""
-    observations = _migration_observations()
-    state = store.state_migration(observations)
+    """Atomically write schema-v4 state after re-observing exact installed versions."""
+    state = _migration_state()
     expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
     store.save(state)
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 3}
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 4}
 
 
 @mcp.tool(annotations=READ)
@@ -488,6 +535,23 @@ def list_targets() -> dict[str, object]:
 def list_applications() -> dict[str, object]:
     """List reusable registered application source and build definitions."""
     return {"applications": store.load().model_dump(mode="json")["applications"]}
+
+
+@mcp.tool(annotations=READ)
+def list_provider_accounts() -> dict[str, object]:
+    """List bounded external-provider identities without credentials."""
+    return {"provider_accounts": store.load().model_dump(mode="json")["provider_accounts"]}
+
+
+@mcp.tool(annotations=READ)
+def list_secret_stores() -> dict[str, object]:
+    """List bounded Secret Store policy without secret names or values."""
+    state = store.load()
+    values = state.model_dump(mode="json")["secret_stores"]
+    for name, value in values.items():
+        if value["provider"] == "aws_secrets_manager":
+            value["ownership_tag"] = f"gimme:secret-store={name}"
+    return {"secret_stores": values}
 
 
 @mcp.tool(annotations=READ)
@@ -516,6 +580,176 @@ def list_operations(limit: int = 50, operation: OperationName | None = None,
     events = _journal().list(limit=limit, operation=operation, subject=subject,
                              correlation_id=correlation_id)
     return {"events": [event.model_dump(mode="json") for event in events]}
+
+
+def _account_registration_plan(name: str, definition: AWSProviderAccount,
+                               *, update: bool) -> dict[str, object]:
+    state = store.load()
+    exists = name in state.provider_accounts
+    if update != exists:
+        message = "provider account already exists" if exists else "provider account missing"
+        raise ValueError(message)
+    validate_aws_account(definition, aws_secrets)
+    proposed = _replace(state, "provider_accounts", name, definition)
+    return exact_plan({
+        "kind": "provider_account_update" if update else "provider_account_registration",
+        "name": name,
+        "current": (state.provider_accounts[name].model_dump(mode="json") if exists else None),
+        "proposed": proposed.provider_accounts[name].model_dump(mode="json"),
+        "identity_verified": True,
+        "effects": ["replace local desired state only", "make no AWS changes"],
+    })
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("register_provider_account", "name")
+def plan_register_provider_account(name: Name, definition: AWSProviderAccount) -> dict[str, object]:
+    """Verify both exact AWS roles and plan a Provider Account registration."""
+    return _account_registration_plan(name, definition, update=False)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("register_provider_account", "name")
+def register_provider_account(name: Name, definition: AWSProviderAccount,
+                              plan_id: PlanId) -> dict[str, object]:
+    """Register one verified AWS Provider Account without storing credentials."""
+    expected = _account_registration_plan(name, definition, update=False)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "provider_accounts", name, definition))
+    return {"changed": True, "provider_account": name}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("update_provider_account", "name")
+def plan_update_provider_account(name: Name, definition: AWSProviderAccount) -> dict[str, object]:
+    """Reverify and plan an exact Provider Account policy update."""
+    return _account_registration_plan(name, definition, update=True)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("update_provider_account", "name")
+def update_provider_account(name: Name, definition: AWSProviderAccount,
+                            plan_id: PlanId) -> dict[str, object]:
+    """Apply one reviewed Provider Account policy update."""
+    expected = _account_registration_plan(name, definition, update=True)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "provider_accounts", name, definition))
+    return {"changed": True, "provider_account": name}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("remove_provider_account", "name")
+def plan_remove_provider_account(name: Name) -> dict[str, object]:
+    """Plan local removal when no Secret Store or Resource references the account."""
+    state = store.load()
+    if name not in state.provider_accounts:
+        raise KeyError("provider account is not registered")
+    stores = sorted(store_name for store_name, value in state.secret_stores.items()
+                    if isinstance(value, AWSSecretsManagerStore)
+                    and value.provider_account == name)
+    if stores:
+        raise ValueError("provider account is still referenced by a secret store")
+    return exact_plan({"kind": "provider_account_removal", "name": name,
+                       "effects": ["remove local desired state only", "make no AWS changes"]})
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("remove_provider_account", "name")
+def remove_provider_account(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Apply a reviewed local-only Provider Account removal."""
+    expected = plan_remove_provider_account(name)
+    _assert_plan(expected, plan_id)
+    store.save(_delete(store.load(), "provider_accounts", name))
+    return {"changed": True, "provider_account": name}
+
+
+def _secret_store_registration_plan(name: str, definition: SecretStore,
+                                    *, update: bool) -> dict[str, object]:
+    if name == "local-sops":
+        raise ValueError("the built-in local-sops store cannot be registered or updated")
+    state = store.load()
+    exists = name in state.secret_stores
+    if update != exists:
+        raise ValueError("secret store already exists" if exists else "secret store missing")
+    if not isinstance(definition, AWSSecretsManagerStore):
+        raise ValueError("only AWS Secrets Manager stores can be registered")
+    account = state.provider_accounts.get(definition.provider_account)
+    if account is None:
+        raise ValueError("secret store references an unknown provider account")
+    validate_aws_store(definition, aws_secrets)
+    aws_secrets.verify_role(account, account.inspection_role_arn)
+    proposed = _replace(state, "secret_stores", name, definition)
+    return exact_plan({
+        "kind": "secret_store_update" if update else "secret_store_registration",
+        "name": name,
+        "current": (state.secret_stores[name].model_dump(mode="json") if exists else None),
+        "proposed": proposed.secret_stores[name].model_dump(mode="json"),
+        "ownership_tag": f"gimme:secret-store={name}",
+        "identity_verified": True,
+        "effects": ["replace local desired state only", "make no AWS changes"],
+    })
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("register_secret_store", "name")
+def plan_register_secret_store(name: Name, definition: SecretStore) -> dict[str, object]:
+    """Verify bounded store policy and plan an AWS Secret Store registration."""
+    return _secret_store_registration_plan(name, definition, update=False)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("register_secret_store", "name")
+def register_secret_store(name: Name, definition: SecretStore,
+                          plan_id: PlanId) -> dict[str, object]:
+    """Register one reviewed Secret Store without listing or mutating AWS secrets."""
+    expected = _secret_store_registration_plan(name, definition, update=False)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "secret_stores", name, definition))
+    return {"changed": True, "secret_store": name}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("update_secret_store", "name")
+def plan_update_secret_store(name: Name, definition: SecretStore) -> dict[str, object]:
+    """Plan an exact bounded Secret Store policy update."""
+    return _secret_store_registration_plan(name, definition, update=True)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("update_secret_store", "name")
+def update_secret_store(name: Name, definition: SecretStore,
+                        plan_id: PlanId) -> dict[str, object]:
+    """Apply one reviewed Secret Store policy update."""
+    expected = _secret_store_registration_plan(name, definition, update=True)
+    _assert_plan(expected, plan_id)
+    store.save(_replace(store.load(), "secret_stores", name, definition))
+    return {"changed": True, "secret_store": name}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("remove_secret_store", "name")
+def plan_remove_secret_store(name: Name) -> dict[str, object]:
+    """Plan local Secret Store removal when no Deployment references it."""
+    if name == "local-sops":
+        raise ValueError("the built-in local-sops store cannot be removed")
+    state = store.load()
+    if name not in state.secret_stores:
+        raise KeyError("secret store is not registered")
+    if any(reference.store == name for deployment in state.deployments.values()
+           for reference in deployment.secrets.values()):
+        raise ValueError("secret store is still referenced by a deployment")
+    return exact_plan({"kind": "secret_store_removal", "name": name,
+                       "effects": ["remove local desired state only", "make no AWS changes"]})
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("remove_secret_store", "name")
+def remove_secret_store(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Apply a reviewed local-only Secret Store removal."""
+    expected = plan_remove_secret_store(name)
+    _assert_plan(expected, plan_id)
+    store.save(_delete(store.load(), "secret_stores", name))
+    return {"changed": True, "secret_store": name}
 
 
 @mcp.tool(annotations=WRITE)
@@ -735,13 +969,24 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
     if not expected["ready"]:
         raise ValueError("deployment resources are not ready; inspect readiness_issues")
     state, deployment, target, _ = _context(name)
-    runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
-               sites=target_sites(state, deployment.target), network_mode=target.network.mode,
-               mise_version=target.runtimes.mise_version, timeout=1800)
-    resolved = resolve_secret_references(store.secrets_path, deployment.secrets)
-    with protected_secret_file(resolved) as secret_file:
-        result = _run_deployment("gimme:provision:app", name, secret_file=secret_file,
-                                 timeout=1800)
+    resolved = resolve_planned_secret_references(
+        state, store.secrets_path, deployment.secrets,
+        cast(list[dict[str, str]], expected["secret_versions"]), aws_secrets,
+    )
+    with _deployment_resource_lock(name):
+        runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
+                   sites=target_sites(state, deployment.target),
+                   network_mode=target.network.mode,
+                   mise_version=target.runtimes.mise_version, timeout=1800)
+        with protected_secret_file(resolved) as secret_file:
+            result = _run_deployment("gimme:provision:app", name, secret_file=secret_file,
+                                     secret_manifest=cast(
+                                         list[dict[str, str]], expected["secret_versions"]
+                                     ),
+                                     timeout=1800)
+        save_applied_secret_manifest(
+            store.root, name, cast(list[dict[str, str]], expected["secret_versions"])
+        )
     return _result(result)
 
 
@@ -848,6 +1093,7 @@ def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[st
     result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
     state = _delete(store.load(), "deployments", name)
     store.save(state)
+    (store.root / "applied-secrets" / f"{name}.json").unlink(missing_ok=True)
     target = state.targets[expected["target"]]
     runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
                sites=target_sites(state, str(expected["target"])),
