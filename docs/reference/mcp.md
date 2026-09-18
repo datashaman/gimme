@@ -109,6 +109,9 @@ bounded to 200 records per call.
 
 ## Managed AWS RDS PostgreSQL resources
 
+See [`use-aws-rds-postgresql.md`](../how-to/use-aws-rds-postgresql.md) for prerequisites,
+the IAM roles, and the provisioning and binding workflow.
+
 `register_resource`, `plan_update_resource`, and `update_resource` also accept an AWS
 RDS PostgreSQL resource (provider `aws_rds_postgres`): an exact engine version, instance
 class, allocated storage, an AWS Network (VPC, exactly two private subnets), an
