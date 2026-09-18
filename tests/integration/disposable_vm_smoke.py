@@ -307,7 +307,10 @@ def verify() -> None:
 
     for service in ("postgresql", "valkey-server", "caddy"):
         status = str(gimme.target_service_status(TARGET, service)["output"])
-        if "active (running)" not in status:
+        # postgresql.service is a Type=oneshot meta-unit that wraps the real
+        # postgresql@<ver>-main instance, so it reports "active (exited)", never
+        # "(running)"; match the unit-type-agnostic "Active: active" line instead.
+        if "Active: active" not in status:
             raise AssertionError(f"{service} is not active")
 
 
