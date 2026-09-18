@@ -1170,7 +1170,7 @@ BASH;
                 run('rm -f ' . escapeshellarg($remoteSecretFile));
             }
         }
-        $runtimeChanged = str_contains($resourceOutput, 'GIMME_RUNTIME_CHANGED|yes');
+        $environmentChanged = str_contains($resourceOutput, 'GIMME_ENVIRONMENT_CHANGED|yes');
         if ($framework === 'laravel') {
             $currentPath = get('deploy_path') . '/current';
             $hasCurrentRelease = test(
@@ -1192,7 +1192,7 @@ BASH;
                 );
                 $unitsChanged = str_contains($processOutput, 'process.units_changed=yes');
             }
-            if ($hasCurrentRelease && $runtimeChanged && !$unitsChanged) {
+            if ($hasCurrentRelease && $environmentChanged && !$unitsChanged) {
                 invoke('gimme:restart:workers');
             }
             if ($hasCurrentRelease) {

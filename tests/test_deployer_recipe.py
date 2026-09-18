@@ -227,7 +227,7 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "APP_URL=https://{$siteHost}" in task
     assert "HORIZON_PREFIX={$cachePrefix}horizon:" in task
     assert "laravel_environment_reconcile_script" in task
-    assert "GIMME_RUNTIME_CHANGED|yes" in task
+    assert "GIMME_ENVIRONMENT_CHANGED|yes" in task
     assert "grep -q '^APP_KEY='" in task
     assert "{{bin/php}} artisan optimize:clear" in task
     assert "{{bin/php}} artisan optimize" in task
@@ -312,8 +312,12 @@ def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     )
 
     content = env_path.read_text()
-    assert changed.stdout.strip() == "GIMME_RUNTIME_CHANGED|yes"
-    assert unchanged.stdout.strip() == "GIMME_RUNTIME_CHANGED|no"
+    assert changed.stdout.splitlines() == [
+        "GIMME_RUNTIME_CHANGED|yes", "GIMME_ENVIRONMENT_CHANGED|yes",
+    ]
+    assert unchanged.stdout.splitlines() == [
+        "GIMME_RUNTIME_CHANGED|no", "GIMME_ENVIRONMENT_CHANGED|no",
+    ]
     assert env_path.stat().st_ino == first_inode
     assert env_path.stat().st_mode & 0o777 == 0o600
     assert "APP_KEY=secret-value" in content
@@ -321,6 +325,40 @@ def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     assert "APP_ENV=local" in content
     assert "APP_DEBUG=true" in content
     assert "secret-value" not in changed.stdout
+
+
+def test_laravel_secret_reconciliation_marks_the_environment_changed(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("APP_ENV=production\nAPI_TOKEN=old-value\n")
+    secret_path = tmp_path / "secrets.json"
+    secret_path.write_text(json.dumps({"API_TOKEN": "rotated-value"}))
+    updates = base64.b64encode(b'{}').decode()
+    manifest = base64.b64encode(b'[]').decode()
+
+    result = subprocess.run(
+        [
+            "python3", "-c", laravel_environment_reconciler(), str(env_path), updates,
+            str(secret_path), manifest,
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "GIMME_ENVIRONMENT_CHANGED|yes" in result.stdout
+    assert "GIMME_RUNTIME_CHANGED|no" in result.stdout
+    assert "API_TOKEN=rotated-value" in env_path.read_text()
+
+
+def test_secret_environment_changes_restart_managed_workers() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:provision:app'", 1)[1].split(
+        "task('gimme:service:status'", 1
+    )[0]
+
+    assert "GIMME_ENVIRONMENT_CHANGED|yes" in task
+    assert "$environmentChanged && !$unitsChanged" in task
+    assert "invoke('gimme:restart:workers')" in task
 
 
 def test_laravel_runtime_reconciler_rejects_symlinks(tmp_path: Path) -> None:

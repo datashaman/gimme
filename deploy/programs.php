@@ -138,8 +138,10 @@ for key, value in updates.items():
 desired_content = "\n".join(rendered) + "\n"
 manifest_content = json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
 manifest_original = manifest_path.read_text() if manifest_path.is_file() else None
-if desired_content == original and manifest_content == manifest_original:
+environment_changed = desired_content != original
+if not environment_changed and manifest_content == manifest_original:
     print("GIMME_RUNTIME_CHANGED|no")
+    print("GIMME_ENVIRONMENT_CHANGED|no")
     raise SystemExit(0)
 
 descriptor, temporary = tempfile.mkstemp(prefix=".env.", dir=path.parent)
@@ -185,6 +187,7 @@ except BaseException:
     raise
 
 print("GIMME_RUNTIME_CHANGED|" + ("yes" if runtime_changed else "no"))
+print("GIMME_ENVIRONMENT_CHANGED|" + ("yes" if environment_changed else "no"))
 PYTHON;
 }
 
