@@ -993,6 +993,46 @@ BASH;
     run("{$sudo} -u postgres bash -c " . escapeshellarg($script));
 });
 
+task('gimme:resource:bind-postgres', function (): void {
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    if ($localSecretFile === '') {
+        throw new \RuntimeException(
+            'A secret file is required to bind a managed PostgreSQL resource'
+        );
+    }
+    if (!is_file($localSecretFile) || is_link($localSecretFile)) {
+        throw new \RuntimeException('Unsafe local secret transfer file');
+    }
+    $host = required_env('GIMME_RESOURCE_ENDPOINT');
+    $port = required_env('GIMME_RESOURCE_PORT');
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    if (
+        !valid_endpoint($host) ||
+        !preg_match('/^[1-9][0-9]{0,4}$/', $port) || (int) $port > 65535 ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)
+    ) {
+        throw new \RuntimeException('Unsafe managed PostgreSQL binding identity');
+    }
+
+    $remoteDirectory = '/tmp/.gimme-resource-bind';
+    $remoteSecretFile = "{$remoteDirectory}/." . bin2hex(random_bytes(8)) . '.json';
+    run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
+    upload($localSecretFile, $remoteSecretFile);
+    run('chmod 0600 ' . escapeshellarg($remoteSecretFile));
+
+    $bindProgram = escapeshellarg(base64_encode(managed_postgres_bind_script()));
+    try {
+        run(
+            'printf %s ' . $bindProgram . ' | base64 -d | python3 - ' .
+            escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+            escapeshellarg($database) . ' ' . escapeshellarg($remoteSecretFile),
+            timeout: 120,
+        );
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteSecretFile));
+    }
+});
+
 task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
     $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');

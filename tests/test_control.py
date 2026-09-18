@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
@@ -7,11 +8,16 @@ from pydantic import ValidationError
 from gimme.config import FrontendBuildConfig, HealthCheckConfig, StackConfig
 from gimme.control import (
     ApplicationConfig,
+    AWSNetwork,
+    AWSProviderAccount,
+    AWSRDSPostgresResource,
+    AWSSecretsManagerStore,
     ControlState,
     CredentialReferenceBackupAuth,
     DeploymentConfig,
     DeploymentSource,
     RecoveryPolicy,
+    Resource,
     ResourceBindings,
     ResourceConfig,
     RuntimePin,
@@ -72,7 +78,7 @@ def deployment(target_config: TargetConfig, **updates: object) -> DeploymentConf
     return DeploymentConfig.model_validate(values)
 
 
-def resources() -> dict[str, ResourceConfig]:
+def resources() -> dict[str, Resource]:
     return {
         "devbox-postgres": ResourceConfig(target="devbox", kind="postgres", version="17.2"),
         "devbox-valkey": ResourceConfig(target="devbox", kind="valkey", version="8.0.1"),
@@ -252,6 +258,8 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
     document = json.loads((Path(__file__).parents[1] / "config/state.example.json").read_text())
     document["schema_version"] = 2
     document.pop("resources")
+    document.pop("aws_networks", None)
+    document["targets"].pop("adminbox", None)
     document["targets"]["devbox"]["toolchains"] = {
         "node": "22.12.0", "npm": "10.9.0", "pnpm": None, "yarn": None, "bun": None,
     }
@@ -288,6 +296,9 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
     document["schema_version"] = 3
     document.pop("provider_accounts")
     document.pop("secret_stores")
+    document.pop("aws_networks", None)
+    document["targets"].pop("adminbox", None)
+    document["resources"].pop("example-rds-postgres", None)
     document["deployments"]["example-local"]["secrets"] = {
         "MAIL_PASSWORD": "example-local/mail/MAIL_PASSWORD"
     }
@@ -465,6 +476,175 @@ def test_deployment_recovery_binds_to_a_registered_destination() -> None:
     )
 
     assert state.deployments["example-local"].recovery.destination == "primary"
+
+
+def _target_with_role(
+    alias: str, role: Literal["deployment", "administration"] = "deployment"
+) -> TargetConfig:
+    return TargetConfig(
+        host_alias=alias,
+        bootstrap_hostname="192.0.2.10",
+        hostname=f"{alias}.local",
+        system_hostname=alias,
+        remote_user="deployer",
+        apps_root="/srv/gimme/apps",
+        network=TargetNetwork(mode="local_mdns", mdns_name=alias),
+        stack=StackConfig(package_manager="apt", packages=["git"], services=[]),
+        role=role,
+    )
+
+
+def _aws_network() -> AWSNetwork:
+    return AWSNetwork(
+        provider_account="main",
+        region="us-east-1",
+        vpc_id="vpc-0123456789abcdef0",
+        private_subnet_ids=["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"],
+    )
+
+
+def _rds_resource(**updates: object) -> AWSRDSPostgresResource:
+    values: dict[str, object] = {
+        "aws_network": "primary",
+        "administration_target": "adminbox",
+        "engine_version": "17.2",
+        "instance_class": "db.t3.medium",
+        "allocated_storage_gb": 20,
+        "administration_security_group_id": "sg-0123456789abcdef0",
+        "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
+        "workload_secret_store": "workload-secrets",
+    }
+    values.update(updates)
+    return AWSRDSPostgresResource.model_validate(values)
+
+
+def _rds_state(**deployment_updates: object) -> ControlState:
+    devbox = target()
+    adminbox = _target_with_role("adminbox", role="administration")
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+    workload_store = AWSSecretsManagerStore(
+        provider_account="main", region="us-east-1", prefix="gimme/workload",
+    )
+    resource = _rds_resource()
+    candidate = deployment(devbox, **deployment_updates)
+    return ControlState(
+        provider_accounts={"main": account},
+        secret_stores={
+            "local-sops": {"provider": "sops"},
+            "workload-secrets": workload_store,
+        },
+        aws_networks={"primary": _aws_network()},
+        targets={"devbox": devbox, "adminbox": adminbox},
+        applications={"example": application()},
+        resources={"devbox-postgres": resource, "devbox-valkey": resources()["devbox-valkey"]},
+        deployments={"example-local": candidate},
+    )
+
+
+def test_aws_network_requires_two_distinct_subnets() -> None:
+    with pytest.raises(ValidationError, match="two distinct data subnet"):
+        AWSNetwork(
+            provider_account="main", region="us-east-1", vpc_id="vpc-0123456789abcdef0",
+            private_subnet_ids=["subnet-0123456789abcdef0", "subnet-0123456789abcdef0"],
+        )
+
+
+def test_aws_rds_resource_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        _rds_resource(unexpected="nope")
+
+
+def test_aws_rds_resource_requires_exact_engine_version() -> None:
+    with pytest.raises(ValidationError, match="engine_version"):
+        _rds_resource(engine_version=">=17")
+
+
+def test_aws_rds_resource_deployment_security_groups_must_be_exact() -> None:
+    with pytest.raises(ValidationError, match="deployment_security_group_ids"):
+        _rds_resource(deployment_security_group_ids={"devbox": "not-a-security-group"})
+
+
+def test_control_state_binds_a_deployment_to_a_managed_postgres_resource() -> None:
+    state = _rds_state(
+        resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey")
+    )
+
+    assert state.resources["devbox-postgres"].provider == "aws_rds_postgres"
+    assert state.deployments["example-local"].resources.database == "devbox-postgres"
+
+
+def test_managed_postgres_resource_requires_a_registered_aws_network() -> None:
+    devbox = target()
+    resource = _rds_resource(aws_network="missing")
+    with pytest.raises(ValidationError, match="unknown AWS Network"):
+        ControlState(
+            targets={"devbox": devbox}, applications={"example": application()},
+            resources={"devbox-postgres": resource,
+                      "devbox-valkey": resources()["devbox-valkey"]},
+            deployments={"example-local": deployment(devbox, resources=ResourceBindings())},
+        )
+
+
+def test_managed_postgres_resource_requires_an_administration_target() -> None:
+    devbox = target()
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+    resource = _rds_resource(administration_target="devbox")
+    with pytest.raises(ValidationError, match="administration Target"):
+        ControlState(
+            provider_accounts={"main": account},
+            aws_networks={"primary": _aws_network()},
+            targets={"devbox": devbox}, applications={"example": application()},
+            resources={"devbox-postgres": resource,
+                      "devbox-valkey": resources()["devbox-valkey"]},
+            deployments={"example-local": deployment(devbox, resources=ResourceBindings())},
+        )
+
+
+def test_administration_target_cannot_host_a_deployment() -> None:
+    devbox = target().model_copy(update={"role": "administration"})
+    with pytest.raises(ValidationError, match="Deployment Target"):
+        ControlState(
+            targets={"devbox": devbox}, applications={"example": application()},
+            resources=resources(), deployments={"example-local": deployment(devbox)},
+        )
+
+
+def test_deployment_cannot_bind_managed_postgres_from_an_ineligible_target() -> None:
+    devbox = target()
+    other = _target_with_role("other")
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+    adminbox = _target_with_role("adminbox", role="administration")
+    workload_store = AWSSecretsManagerStore(
+        provider_account="main", region="us-east-1", prefix="gimme/workload",
+    )
+    resource = _rds_resource(deployment_security_group_ids={"other": "sg-0123456789abcdef1"})
+    with pytest.raises(ValidationError, match="eligible Deployment Target"):
+        ControlState(
+            provider_accounts={"main": account},
+            secret_stores={"local-sops": {"provider": "sops"},
+                          "workload-secrets": workload_store},
+            aws_networks={"primary": _aws_network()},
+            targets={"devbox": devbox, "other": other, "adminbox": adminbox},
+            applications={"example": application()},
+            resources={"devbox-postgres": resource,
+                      "devbox-valkey": resources()["devbox-valkey"]},
+            deployments={"example-local": deployment(
+                devbox,
+                resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey"),
+            )},
+        )
 
 
 def test_backup_destination_rejects_credential_reference_to_unknown_store() -> None:

@@ -126,6 +126,8 @@ class DeployerRunner:
         secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
         backup_local_path: Path | None = None,
+        resource_endpoint: tuple[str, int] | None = None,
+        resource_database: str | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -205,6 +207,12 @@ class DeployerRunner:
             environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
+        if resource_endpoint is not None:
+            host, port = resource_endpoint
+            environment["GIMME_RESOURCE_ENDPOINT"] = host
+            environment["GIMME_RESOURCE_PORT"] = str(port)
+        if resource_database is not None:
+            environment["GIMME_DATABASE_IDENTIFIER"] = resource_database
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if app_name is not None and app is not None:

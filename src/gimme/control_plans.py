@@ -4,6 +4,7 @@ from typing import Any
 
 from gimme.control import (
     ApplicationConfig,
+    AWSRDSPostgresResource,
     ControlState,
     DeploymentConfig,
     S3BackupDestination,
@@ -250,6 +251,77 @@ def recovery_point_creation_plan(
                 "publish the immutable Recovery Manifest only after verification succeeds",
                 "make no other remote or destination changes",
             ],
+        }
+    )
+
+
+def resource_provision_plan(
+    resource_name: str,
+    resource: AWSRDSPostgresResource,
+    observed: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_provision",
+            "resource": resource_name,
+            "aws_network": resource.aws_network,
+            "administration_target": resource.administration_target,
+            "engine_version": resource.engine_version,
+            "instance_class": resource.instance_class,
+            "allocated_storage_gb": resource.allocated_storage_gb,
+            "current_phase": observed["phase"] if observed is not None else "absent",
+            "effects": [
+                "create the RDS instance when absent, or reconcile it when present",
+                "poll for at most 30 seconds and return a bounded pending phase if not yet ready",
+                "never returns, stores, or logs a decrypted credential",
+            ],
+        }
+    )
+
+
+def resource_binding_plan(
+    deployment_name: str,
+    deployment: DeploymentConfig,
+    resource_name: str,
+    observed: dict[str, Any] | None,
+) -> dict[str, Any]:
+    allocations = observed["allocations"] if observed is not None else {}
+    return exact_plan(
+        {
+            "kind": "resource_binding",
+            "deployment": deployment_name,
+            "resource": resource_name,
+            "database": deployment.placement.database_identifier,
+            "resource_ready": observed is not None and observed["phase"] == "ready",
+            "already_bound": deployment_name in allocations,
+            "effects": [
+                "create or reconcile the deployment's isolated database and role through "
+                "the Administration Target",
+                "create or rotate a tagged Secrets Manager workload secret",
+                "never returns, stores, or logs the workload credential",
+            ],
+        }
+    )
+
+
+def resource_cleanup_plan(resource_name: str, *, managed: bool) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_cleanup",
+            "resource": resource_name,
+            "confirmation": f"RETAIN {resource_name}",
+            "effects": (
+                [
+                    "remove local desired-state registration only",
+                    "leave the RDS instance and its data intact as a Retained Resource",
+                    "write a secret-free Retained Resource tombstone",
+                ]
+                if managed
+                else [
+                    "remove local desired-state registration only",
+                    "make no remote changes",
+                ]
+            ),
         }
     )
 
