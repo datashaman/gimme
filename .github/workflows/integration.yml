@@ -70,7 +70,7 @@ jobs:
             -e MINIO_ROOT_USER=gimme-ci -e MINIO_ROOT_PASSWORD=gimme-ci-secret \
             -v "$RUNNER_TEMP/minio-certs:/root/.minio/certs" \
             -v "$RUNNER_TEMP/minio-data:/data" \
-            minio/minio server /data --certs-dir /root/.minio/certs
+            quay.io/minio/minio server /data --certs-dir /root/.minio/certs
           for _ in $(seq 1 30); do
             curl -sk --max-time 2 https://127.0.0.1:9000/minio/health/live && break
             sleep 1
