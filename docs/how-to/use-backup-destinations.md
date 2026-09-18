@@ -18,6 +18,12 @@ Provision the bucket outside Gimme before registering it:
   access to the bucket, or an encrypted credential reference resolves an access key
   pair with that access.
 
+On a self-hosted S3-compatible server such as MinIO, `{"method": "aes256"}` still
+requires a KMS backend on the server — unlike AWS S3, MinIO has no key-management-free
+SSE-S3 path, so a `PutObject` with `ServerSideEncryption: AES256` fails with
+`NotImplemented` unless the server was started with a KMS configured (for example
+`MINIO_KMS_SECRET_KEY`).
+
 ## Register a destination
 
 Use `plan_register_backup_destination` to review the proposed destination, then pass its

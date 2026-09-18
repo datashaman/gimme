@@ -68,6 +68,7 @@ jobs:
             -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
           docker run -d --name gimme-ci-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=gimme-ci -e MINIO_ROOT_PASSWORD=gimme-ci-secret \
+            -e MINIO_KMS_SECRET_KEY="gimme-ci-key:$(openssl rand -base64 32)" \
             -v "$RUNNER_TEMP/minio-certs:/root/.minio/certs" \
             -v "$RUNNER_TEMP/minio-data:/data" \
             quay.io/minio/minio server /data --certs-dir /root/.minio/certs
