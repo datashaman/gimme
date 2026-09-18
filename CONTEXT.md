@@ -86,8 +86,16 @@ _Avoid_: Secret cache, environment backup
 A named, versioned service supplied either by one Target or by a registered Provider Account and
 shareable by multiple Deployments. Its provider is a bounded implementation detail behind the
 Resource contract. A managed PostgreSQL Resource owns one provider cluster; each bound Deployment
-owns an isolated database and least-privilege role within it.
+owns an isolated database and least-privilege role within it. A managed Valkey Resource owns one
+provider cluster; each bound Deployment owns an isolated key namespace and access identity.
 _Avoid_: Deployment database, application service
+
+**Durable Resource**:
+A Resource whose provider contract preserves acknowledged writes through its explicitly supported
+infrastructure-failure scenarios. Durability does not recover logical deletion, application error,
+credential misuse, expiry, or a failure outside that contract; those require Recovery Points and a
+separate recovery objective.
+_Avoid_: Backup, indestructible Resource, globally durable Resource
 
 **Resource Credential**:
 A provider-backed secret owned by one Resource allocation rather than supplied by an operator.
@@ -95,10 +103,17 @@ Gimme may create and rotate it through a bounded provider contract, but plaintex
 protected execution boundaries and never enters desired or observed state.
 _Avoid_: Secret Reference, master password, environment value
 
+**Resource Binding**:
+A Deployment-owned association with one registered Resource for an explicit set of supported uses.
+The binding owns the Deployment's isolated allocation and access identity; it does not grant every
+capability of the shared Resource. A Valkey binding distinguishes cache, session, and queue use.
+_Avoid_: Resource, connection string, implicit cache
+
 **Detached Allocation**:
-A retained Deployment-owned database and disabled login identity that remains inside a managed
-Resource after its Deployment binding is removed. Rebinding restores the same data identity;
-destructive purge requires verified Recovery Point evidence.
+A retained Deployment-owned data allocation and disabled access identity that remains inside a
+managed Resource after its Deployment binding is removed. It may be a database or a bounded key
+namespace. Rebinding restores the same data identity; destructive purge requires verified Recovery
+Point evidence.
 _Avoid_: Orphan database, Resource backup
 
 **Retained Resource**:
@@ -170,9 +185,10 @@ _Avoid_: Resource backup, service snapshot
 
 **Component Backup**:
 The part of a Recovery Point representing one Deployment-owned data component, such as its
-PostgreSQL database or an explicitly selected Valkey key prefix. Valkey data is never assumed
-to be durable merely because the Deployment binds a Valkey Resource; expiring keys retain
-their absolute expiry and are not resurrected after that time.
+PostgreSQL database or an explicitly selected Valkey key prefix. Resource durability protects
+acknowledged writes from supported infrastructure failures; it does not protect against logical
+deletion, application error, or expiry. Expiring Valkey keys retain their absolute expiry and are
+not resurrected after that time.
 _Avoid_: Whole-service backup
 
 **Recovery Policy**:
