@@ -4,6 +4,7 @@ import fcntl
 import os
 import re
 import socket
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -15,17 +16,21 @@ from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from gimme import recovery as recovery_module
 from gimme.control import (
     AWSProviderAccount, AWSSecretsManagerStore, ApplicationConfig, ControlState,
-    DeploymentConfig, DeploymentRegistration, DeploymentSource, ResourceConfig, SecretStore,
-    StateStore, TargetConfig, legacy_app, legacy_server, new_placement, target_sites,
+    DeploymentConfig, DeploymentRegistration, DeploymentSource, ResourceConfig,
+    S3BackupDestination, SecretStore, StateStore, TargetConfig, legacy_app, legacy_server,
+    new_placement, target_sites,
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
-    exact_plan, migration_plan, registration_update_plan, target_stack_plan,
+    exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
+    target_stack_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
+from gimme.recovery import ComponentDump, RecoveryError, preflight_backup_destination
 from gimme.secrets import (
     BotoAWSSecretAdapter, SecretError, load_applied_secret_manifest,
     plan_secret_references, protected_secret_file, resolve_planned_secret_references,
@@ -36,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[2]
 store = StateStore.from_environment(ROOT)
 runner = DeployerRunner(ROOT)
 aws_secrets = BotoAWSSecretAdapter()
+backup_s3 = recovery_module.BotoS3Adapter()
 mcp = FastMCP(
     "Gimme",
     instructions=(
@@ -54,6 +60,7 @@ Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$", min_length=1, max
 PlanId = Annotated[str, Field(pattern=r"^plan_[a-f0-9]{20}$")]
 CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
+RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
 P = ParamSpec("P")
 R = TypeVar("R", bound=dict[str, object])
 _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", default=False)
@@ -233,6 +240,7 @@ def _run_deployment(
     arguments: tuple[str, ...] = (), secret_file: Path | None = None,
     secret_manifest: list[dict[str, str]] | None = None,
     artisan_command: str | None = None, artisan_arguments: list[str] | None = None,
+    backup_local_path: Path | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -266,6 +274,7 @@ def _run_deployment(
             if artisan_command is not None and application.artisan is not None
             else None
         ),
+        backup_local_path=backup_local_path,
         timeout=timeout,
     )
 
@@ -479,6 +488,11 @@ def secret_store_resource(name: str) -> dict[str, object]:
     if value["provider"] == "aws_secrets_manager":
         value["ownership_tag"] = f"gimme:secret-store={name}"
     return value
+
+
+@mcp.resource("gimme://backup-destinations/{name}")
+def backup_destination_resource(name: str) -> dict[str, object]:
+    return store.load().backup_destinations[name].model_dump(mode="json")
 
 
 @mcp.resource("gimme://resources/{name}")
@@ -750,6 +764,207 @@ def remove_secret_store(name: Name, plan_id: PlanId) -> dict[str, object]:
     _assert_plan(expected, plan_id)
     store.save(_delete(store.load(), "secret_stores", name))
     return {"changed": True, "secret_store": name}
+
+
+def _backup_destination_credentials(
+    state: ControlState, definition: S3BackupDestination
+) -> tuple[list[dict[str, str]] | None, tuple[str, str] | None]:
+    planned = recovery_module.plan_destination_credentials(state, store.secrets_path, definition)
+    credentials = recovery_module.resolve_destination_credentials(
+        state, store.secrets_path, definition, planned
+    )
+    return planned, credentials
+
+
+def _backup_destination_registration_plan(
+    name: str, definition: S3BackupDestination, *, update: bool
+) -> dict[str, object]:
+    """Diff the proposed destination locally. Never calls the destination: a plan tool
+    must not touch remote state, and definition.endpoint is caller-supplied."""
+    state = store.load()
+    exists = name in state.backup_destinations
+    if update != exists:
+        message = (
+            "backup destination already exists" if exists else "backup destination missing"
+        )
+        raise ValueError(message)
+    proposed = _replace(state, "backup_destinations", name, definition)
+    return exact_plan(
+        {
+            "kind": "backup_destination_update" if update else "backup_destination_registration",
+            "name": name,
+            "current": (
+                state.backup_destinations[name].model_dump(mode="json") if exists else None
+            ),
+            "proposed": proposed.backup_destinations[name].model_dump(mode="json"),
+            "preflight_verified": False,
+            "preflight": "deferred to apply; plan performs no live destination calls",
+            "effects": ["replace local desired state only", "make no destination changes"],
+        }
+    )
+
+
+def _backup_destination_apply(
+    name: str, definition: S3BackupDestination, plan_id: str, *, update: bool
+) -> dict[str, object]:
+    expected = _backup_destination_registration_plan(name, definition, update=update)
+    _assert_plan(expected, plan_id)
+    state = store.load()
+    _, credentials = _backup_destination_credentials(state, definition)
+    preflight_backup_destination(definition, credentials, backup_s3)
+    store.save(_replace(store.load(), "backup_destinations", name, definition))
+    return {"changed": True, "backup_destination": name}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("register_backup_destination", "name")
+def plan_register_backup_destination(
+    name: Name, definition: S3BackupDestination
+) -> dict[str, object]:
+    """Diff a proposed Backup Destination registration; preflight runs at apply."""
+    return _backup_destination_registration_plan(name, definition, update=False)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("register_backup_destination", "name")
+def register_backup_destination(
+    name: Name, definition: S3BackupDestination, plan_id: PlanId
+) -> dict[str, object]:
+    """Preflight-verify and register one Backup Destination without storing credentials."""
+    return _backup_destination_apply(name, definition, plan_id, update=False)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("update_backup_destination", "name")
+def plan_update_backup_destination(
+    name: Name, definition: S3BackupDestination
+) -> dict[str, object]:
+    """Diff a proposed Backup Destination policy update; preflight runs at apply."""
+    return _backup_destination_registration_plan(name, definition, update=True)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("update_backup_destination", "name")
+def update_backup_destination(
+    name: Name, definition: S3BackupDestination, plan_id: PlanId
+) -> dict[str, object]:
+    """Preflight-verify and apply one reviewed Backup Destination policy update."""
+    return _backup_destination_apply(name, definition, plan_id, update=True)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("remove_backup_destination", "name")
+def plan_remove_backup_destination(name: Name) -> dict[str, object]:
+    """Plan local Backup Destination removal when no Deployment references it."""
+    state = store.load()
+    if name not in state.backup_destinations:
+        raise KeyError("backup destination is not registered")
+    if any(
+        deployment.recovery is not None and deployment.recovery.destination == name
+        for deployment in state.deployments.values()
+    ):
+        raise ValueError("backup destination is still referenced by a deployment")
+    return exact_plan(
+        {
+            "kind": "backup_destination_removal",
+            "name": name,
+            "effects": ["remove local desired state only", "make no destination changes"],
+        }
+    )
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("remove_backup_destination", "name")
+def remove_backup_destination(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Apply a reviewed local-only Backup Destination removal."""
+    expected = plan_remove_backup_destination(name)
+    _assert_plan(expected, plan_id)
+    store.save(_delete(store.load(), "backup_destinations", name))
+    return {"changed": True, "backup_destination": name}
+
+
+@mcp.tool(annotations=READ)
+def list_backup_destinations() -> dict[str, object]:
+    """List registered S3-compatible Backup Destinations without credentials."""
+    return {"backup_destinations": store.load().model_dump(mode="json")["backup_destinations"]}
+
+
+def _recovery_context(
+    name: str,
+) -> tuple[ControlState, DeploymentConfig, str, S3BackupDestination]:
+    state, deployment, _target, _application = _context(name)
+    if deployment.recovery is None:
+        raise ValueError(f"deployment {name} has no Recovery Policy bound")
+    destination_name = deployment.recovery.destination
+    destination = state.backup_destinations[destination_name]
+    return state, deployment, destination_name, destination
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("create_recovery_point", "name")
+def plan_create_recovery_point(name: Name, request_id: RequestId) -> dict[str, object]:
+    """Plan one on-demand PostgreSQL Recovery Point for a recovery-bound deployment."""
+    _state, deployment, destination_name, destination = _recovery_context(name)
+    point_id = recovery_module.recovery_point_id(name, destination_name, request_id)
+    return recovery_point_creation_plan(
+        name, deployment, destination_name, destination, request_id, point_id
+    )
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("create_recovery_point", "name")
+def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) -> dict[str, object]:
+    """Apply a reviewed on-demand Recovery Point: dump, upload, verify, and publish."""
+    state, deployment, destination_name, destination = _recovery_context(name)
+    point_id = recovery_module.recovery_point_id(name, destination_name, request_id)
+    expected = recovery_point_creation_plan(
+        name, deployment, destination_name, destination, request_id, point_id
+    )
+    _assert_plan(expected, plan_id)
+    _, credentials = _backup_destination_credentials(state, destination)
+    with _deployment_resource_lock(name):
+        existing = recovery_module.find_recovery_point(
+            destination_name, destination, credentials, backup_s3, name, point_id
+        )
+        if existing is not None:
+            return {"changed": False, "recovery_point": existing}
+        with tempfile.TemporaryDirectory(prefix="gimme-recovery-") as directory:
+            local_path = Path(directory) / "postgres.dump"
+            result = _run_deployment(
+                "gimme:backup:dump-postgres", name, backup_local_path=local_path, timeout=1800,
+            )
+            sha256 = ""
+            size = -1
+            for raw in result.output.splitlines():
+                line = raw.split("] ", 1)[-1].strip()
+                if line.startswith("GIMME_BACKUP|"):
+                    parts = line.split("|", 2)
+                    if len(parts) == 3 and parts[2].isdigit():
+                        sha256, size = parts[1], int(parts[2])
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                or size < 0
+                or not local_path.is_file()
+                or local_path.stat().st_size != size
+            ):
+                raise RecoveryError("recovery_dump_metadata_invalid")
+            dump = ComponentDump(
+                kind="postgres", local_path=local_path, sha256=sha256, bytes=size
+            )
+            manifest = recovery_module.create_recovery_point(
+                destination_name, destination, credentials, backup_s3, name, point_id, dump,
+            )
+    return {"changed": True, "recovery_point": manifest}
+
+
+@mcp.tool(annotations=READ)
+def list_recovery_points(name: Name) -> dict[str, object]:
+    """List one deployment's Recovery Points from destination-authoritative inventory."""
+    state, _deployment, destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    return recovery_module.list_recovery_points(
+        destination_name, destination, credentials, backup_s3, name
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -1148,8 +1363,11 @@ def target_service_status(name: Name,
                           ) -> dict[str, object]:
     """Read status for one allowlisted service on a registered target."""
     target = store.target(name)
+    # A raw "service=..." positional token is parsed by Deployer as a host selector
+    # filter, not a config override; -o is required for get('gimme_service') to see it.
     return _result(runner.run("gimme:service:status", legacy_server(target),
-                              stack=target.stack, arguments=(f"service={service}",), timeout=60))
+                              stack=target.stack,
+                              arguments=("-o", f"gimme_service={service}"), timeout=60))
 
 
 def main() -> None:

@@ -993,6 +993,36 @@ BASH;
     run("{$sudo} -u postgres bash -c " . escapeshellarg($script));
 });
 
+task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');
+    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)) {
+        throw new \RuntimeException('Unsafe database identity');
+    }
+    $backupDirectory = "{$appsRoot}/.gimme/backups";
+    $remotePath = "{$backupDirectory}/." . bin2hex(random_bytes(8)) . '.dump';
+    run('install -d -m 0700 ' . escapeshellarg($backupDirectory));
+    $sha256 = '';
+    $bytes = '';
+    try {
+        run(
+            'pg_dump --format=custom --no-owner --no-privileges --no-acl --role=' .
+            escapeshellarg($database) . ' -d ' .
+            escapeshellarg($database) . ' -f ' . escapeshellarg($remotePath)
+        );
+        run('chmod 0600 ' . escapeshellarg($remotePath));
+        $sha256 = trim(run('sha256sum ' . escapeshellarg($remotePath) . " | cut -d' ' -f1"));
+        $bytes = trim(run('stat -c %s ' . escapeshellarg($remotePath)));
+        if (!preg_match('/^[0-9a-f]{64}$/', $sha256) || !preg_match('/^[0-9]{1,15}$/', $bytes)) {
+            throw new \RuntimeException('Unsafe backup dump metadata');
+        }
+        download($remotePath, $localPath);
+    } finally {
+        run('rm -f ' . escapeshellarg($remotePath));
+    }
+    writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
+});
+
 task('gimme:provision:app', function () use (
     $app,
     $siteHost,

@@ -4,6 +4,17 @@
   "secret_stores": {
     "local-sops": {"provider": "sops"}
   },
+  "backup_destinations": {
+    "primary": {
+      "provider": "s3_compatible",
+      "bucket": "gimme-example-backups",
+      "region": "us-east-1",
+      "endpoint": null,
+      "addressing": "virtual_hosted",
+      "encryption": {"method": "aes256"},
+      "auth": {"mode": "ambient"}
+    }
+  },
   "targets": {
     "devbox": {
       "host_alias": "devbox",
@@ -133,6 +144,9 @@
       "resources": {
         "database": "devbox-postgres",
         "cache": "devbox-valkey"
+      },
+      "recovery": {
+        "destination": "primary"
       },
       "placement": {
         "instance": "example-local",

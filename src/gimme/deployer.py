@@ -125,6 +125,7 @@ class DeployerRunner:
         variables: dict[str, str] | None = None,
         secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
+        backup_local_path: Path | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -202,6 +203,8 @@ class DeployerRunner:
             environment["GIMME_SECRET_FILE"] = str(resolved_secret_file)
         if secret_manifest is not None:
             environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
+        if backup_local_path is not None:
+            environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if app_name is not None and app is not None:

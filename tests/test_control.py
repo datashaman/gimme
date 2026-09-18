@@ -8,11 +8,17 @@ from gimme.config import FrontendBuildConfig, HealthCheckConfig, StackConfig
 from gimme.control import (
     ApplicationConfig,
     ControlState,
+    CredentialReferenceBackupAuth,
     DeploymentConfig,
     DeploymentSource,
+    RecoveryPolicy,
     ResourceBindings,
     ResourceConfig,
     RuntimePin,
+    S3BackupDestination,
+    SecretReference,
+    SSEAES256,
+    SSEKMS,
     StateStore,
     TargetConfig,
     TargetNetwork,
@@ -321,3 +327,163 @@ def test_mise_target_requires_fixed_repository_bootstrap_packages() -> None:
             **target().model_dump(mode="json"),
             "runtimes": {"mise_version": "2026.9.9"},
         })
+
+
+def test_backup_destination_rejects_ip_literal_bucket() -> None:
+    with pytest.raises(ValidationError, match="bucket"):
+        S3BackupDestination(bucket="192.168.1.1", region="us-east-1", encryption=SSEAES256())
+
+
+def test_backup_destination_requires_matching_region_kms_key() -> None:
+    with pytest.raises(ValidationError, match="region"):
+        S3BackupDestination(
+            bucket="gimme-backups",
+            region="us-east-1",
+            encryption=SSEKMS(
+                kms_key_arn="arn:aws:kms:us-west-2:123456789012:key/"
+                "11111111-1111-1111-1111-111111111111"
+            ),
+        )
+
+
+def test_backup_destination_endpoint_must_be_a_safe_host() -> None:
+    with pytest.raises(ValidationError):
+        S3BackupDestination(
+            bucket="gimme-backups", region="us-east-1", endpoint="https://evil.test/path",
+            encryption=SSEAES256(),
+        )
+
+
+def test_backup_destination_endpoint_accepts_a_safe_non_standard_port() -> None:
+    destination = S3BackupDestination(
+        bucket="gimme-backups", region="us-east-1", endpoint="127.0.0.1:9000",
+        addressing="path", encryption=SSEAES256(),
+    )
+
+    assert destination.endpoint == "127.0.0.1:9000"
+
+
+def test_backup_destination_endpoint_rejects_an_unsafe_port() -> None:
+    with pytest.raises(ValidationError, match="port"):
+        S3BackupDestination(
+            bucket="gimme-backups", region="us-east-1", endpoint="127.0.0.1:99999",
+            encryption=SSEAES256(),
+        )
+
+
+def test_backup_destination_endpoint_accepts_a_bracketed_ipv6_literal_with_port() -> None:
+    destination = S3BackupDestination(
+        bucket="gimme-backups", region="us-east-1", endpoint="[::1]:9000",
+        addressing="path", encryption=SSEAES256(),
+    )
+
+    assert destination.endpoint == "[::1]:9000"
+
+
+def test_backup_destination_endpoint_accepts_a_bracketed_ipv6_literal_without_port() -> None:
+    destination = S3BackupDestination(
+        bucket="gimme-backups", region="us-east-1", endpoint="[2001:db8::1]",
+        addressing="path", encryption=SSEAES256(),
+    )
+
+    assert destination.endpoint == "[2001:db8::1]"
+
+
+def test_backup_destination_endpoint_rejects_an_unbracketed_ipv6_literal() -> None:
+    with pytest.raises(ValidationError, match="bracketed"):
+        S3BackupDestination(
+            bucket="gimme-backups", region="us-east-1", endpoint="2001:db8::1",
+            encryption=SSEAES256(),
+        )
+
+
+def test_backup_destination_endpoint_rejects_an_unsafe_bracketed_ipv6_port() -> None:
+    with pytest.raises(ValidationError, match="port"):
+        S3BackupDestination(
+            bucket="gimme-backups", region="us-east-1", endpoint="[::1]:99999",
+            encryption=SSEAES256(),
+        )
+
+
+def test_backup_destination_endpoint_rejects_an_unterminated_ipv6_bracket() -> None:
+    with pytest.raises(ValidationError):
+        S3BackupDestination(
+            bucket="gimme-backups", region="us-east-1", endpoint="[::1:9000",
+            encryption=SSEAES256(),
+        )
+
+
+def test_deployment_recovery_requires_known_destination() -> None:
+    devbox = target()
+    candidate = deployment(devbox, recovery=RecoveryPolicy(destination="primary"))
+
+    with pytest.raises(ValidationError, match="unknown backup destination"):
+        ControlState(
+            targets={"devbox": devbox}, applications={"example": application()},
+            resources=resources(), deployments={"example-local": candidate},
+        )
+
+
+def test_deployment_recovery_requires_a_bound_database() -> None:
+    devbox = target()
+    static_app = ApplicationConfig(
+        repository="git@github.com:example/site.git", framework="static",
+        frontend=FrontendBuildConfig(package_manager="npm"),
+    )
+    candidate = deployment(
+        devbox, application="site", resources=ResourceBindings(), secrets={},
+        runtimes={
+            "node": RuntimePin(provider="system", version="22.12.0"),
+            "npm": RuntimePin(provider="bundled", version="10.9.0"),
+        },
+        recovery=RecoveryPolicy(destination="primary"),
+    )
+
+    with pytest.raises(ValidationError, match="requires a bound database"):
+        ControlState(
+            targets={"devbox": devbox}, applications={"site": static_app},
+            backup_destinations={
+                "primary": S3BackupDestination(
+                    bucket="gimme-backups", region="us-east-1", encryption=SSEAES256()
+                )
+            },
+            resources={}, deployments={"example-local": candidate},
+        )
+
+
+def test_deployment_recovery_binds_to_a_registered_destination() -> None:
+    devbox = target()
+    candidate = deployment(devbox, recovery=RecoveryPolicy(destination="primary"))
+    state = ControlState(
+        targets={"devbox": devbox}, applications={"example": application()},
+        backup_destinations={
+            "primary": S3BackupDestination(
+                bucket="gimme-backups", region="us-east-1", encryption=SSEAES256()
+            )
+        },
+        resources=resources(), deployments={"example-local": candidate},
+    )
+
+    assert state.deployments["example-local"].recovery.destination == "primary"
+
+
+def test_backup_destination_rejects_credential_reference_to_unknown_store() -> None:
+    devbox = target()
+    with pytest.raises(ValidationError, match="unknown secret store"):
+        ControlState(
+            targets={"devbox": devbox}, applications={"example": application()},
+            resources=resources(),
+            backup_destinations={
+                "primary": S3BackupDestination(
+                    bucket="gimme-backups", region="us-east-1", encryption=SSEAES256(),
+                    auth=CredentialReferenceBackupAuth(
+                        access_key_id=SecretReference(
+                            store="missing", secret="minio", field="access_key_id"
+                        ),
+                        secret_access_key=SecretReference(
+                            store="missing", secret="minio", field="secret_access_key"
+                        ),
+                    ),
+                )
+            },
+        )

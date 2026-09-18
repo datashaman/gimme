@@ -42,6 +42,9 @@ AWS_REGION = re.compile(r"^(?:[a-z]{2}(?:-gov)?|us-gov)-[a-z]+-[1-9][0-9]?$")
 SECRET_STORE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 SECRET_IDENTITY = re.compile(r"^[A-Za-z0-9_+=.@-]+(?:/[A-Za-z0-9_+=.@-]+)*$")
 SECRET_FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+BACKUP_DESTINATION_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+S3_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+S3_KMS_KEY_ARN = re.compile(r"^arn:aws:kms:([a-z0-9-]+):([0-9]{12}):key/([0-9a-f-]{36})$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 RELATIVE_PATH = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
@@ -240,6 +243,122 @@ class SecretReference(BaseModel):
         return value
 
 
+class SSEAES256(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["aes256"] = "aes256"
+
+
+class SSEKMS(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal["kms"] = "kms"
+    kms_key_arn: str = Field(min_length=20, max_length=600)
+
+    @field_validator("kms_key_arn")
+    @classmethod
+    def exact_kms_key(cls, value: str) -> str:
+        if S3_KMS_KEY_ARN.fullmatch(value) is None:
+            raise ValueError("kms_key_arn must be one exact customer-managed KMS key ARN")
+        return value
+
+
+BackupEncryption = Annotated[SSEAES256 | SSEKMS, Field(discriminator="method")]
+
+
+class AmbientBackupAuth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["ambient"] = "ambient"
+
+
+class CredentialReferenceBackupAuth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["credential_reference"] = "credential_reference"
+    access_key_id: SecretReference
+    secret_access_key: SecretReference
+
+
+BackupDestinationAuth = Annotated[
+    AmbientBackupAuth | CredentialReferenceBackupAuth,
+    Field(discriminator="mode"),
+]
+
+
+class S3BackupDestination(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["s3_compatible"] = "s3_compatible"
+    bucket: str = Field(pattern=S3_BUCKET.pattern)
+    region: str = Field(pattern=AWS_REGION.pattern)
+    endpoint: str | None = Field(default=None, min_length=1, max_length=261)
+    addressing: Literal["virtual_hosted", "path"] = "virtual_hosted"
+    encryption: BackupEncryption
+    auth: BackupDestinationAuth = AmbientBackupAuth()
+
+    @field_validator("bucket")
+    @classmethod
+    def safe_bucket(cls, value: str) -> str:
+        if ".." in value or _looks_like_ip(value):
+            raise ValueError("bucket must be a safe, non-IP-literal bounded S3 bucket name")
+        return value
+
+    @field_validator("endpoint")
+    @classmethod
+    def safe_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value.startswith("["):
+            # A bracketed IPv6 literal, optionally with a port: [::1] or [::1]:9000.
+            close = value.find("]")
+            if close == -1:
+                raise ValueError("endpoint host is not a safe IP address or DNS name")
+            host, remainder = value[1:close], value[close + 1:]
+            _valid_endpoint(host)
+            if remainder == "":
+                return value
+            port = remainder.removeprefix(":")
+            if remainder == port or not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("endpoint port must be a safe port number")
+            return value
+        host, sep, port = value.rpartition(":")
+        if sep != "" and ":" in host:
+            # A bare (unbracketed) IPv6 literal: rpartition would otherwise mistake its
+            # last hextet for a port, and https://<host> is not a valid URL without
+            # brackets around an IPv6 host either way — require [::1] / [::1]:port.
+            raise ValueError("an IPv6 endpoint must be bracketed, e.g. [::1] or [::1]:9000")
+        if sep == "":
+            _valid_endpoint(value)
+            return value
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise ValueError("endpoint port must be a safe port number")
+        _valid_endpoint(host)
+        return value
+
+    @model_validator(mode="after")
+    def bounded_kms_region(self) -> "S3BackupDestination":
+        if isinstance(self.encryption, SSEKMS):
+            match = S3_KMS_KEY_ARN.fullmatch(self.encryption.kms_key_arn)
+            if match is not None and match.group(1) != self.region:
+                raise ValueError("customer KMS key must be in the destination's own region")
+        return self
+
+
+class RecoveryPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    destination: str = Field(pattern=BACKUP_DESTINATION_NAME.pattern)
+
+
+def _looks_like_ip(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 class TargetConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -385,6 +504,7 @@ class DeploymentConfig(BaseModel):
     secrets: dict[str, SecretReference] = Field(default_factory=dict, max_length=128)
     runtimes: dict[RuntimeName, RuntimePin]
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
+    recovery: RecoveryPolicy | None = None
     placement: Placement
 
     @model_validator(mode="after")
@@ -449,6 +569,7 @@ class DeploymentRegistration(BaseModel):
     secrets: dict[str, SecretReference] = Field(default_factory=dict, max_length=128)
     runtimes: dict[RuntimeName, RuntimePin]
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
+    recovery: RecoveryPolicy | None = None
 
     def materialize(self, placement: Placement) -> DeploymentConfig:
         return DeploymentConfig(**self.model_dump(), placement=placement)
@@ -491,6 +612,7 @@ class ControlState(BaseModel):
     secret_stores: dict[str, SecretStore] = Field(
         default_factory=lambda: {"local-sops": SopsSecretStore()}
     )
+    backup_destinations: dict[str, S3BackupDestination] = Field(default_factory=dict)
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     applications: dict[str, ApplicationConfig] = Field(default_factory=dict)
     resources: dict[str, ResourceConfig] = Field(default_factory=dict)
@@ -514,6 +636,18 @@ class ControlState(BaseModel):
                     key_account = secret_store.kms_key_arn.split(":", 5)[4]
                     if key_account != account.account_id:
                         raise ValueError(f"secret store {name} KMS key is in another account")
+        for name, destination in self.backup_destinations.items():
+            if BACKUP_DESTINATION_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid backup destination name: {name}")
+            if isinstance(destination.auth, CredentialReferenceBackupAuth):
+                for reference in (
+                    destination.auth.access_key_id,
+                    destination.auth.secret_access_key,
+                ):
+                    if reference.store not in self.secret_stores:
+                        raise ValueError(
+                            f"backup destination {name} references an unknown secret store"
+                        )
         for name in self.targets:
             if TARGET_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid target name: {name}")
@@ -573,6 +707,15 @@ class ControlState(BaseModel):
                 raise ValueError(f"static deployment {name} cannot bind database or cache")
             if is_static and deployment.secrets:
                 raise ValueError(f"static deployment {name} cannot receive runtime secrets")
+            if deployment.recovery is not None:
+                if deployment.recovery.destination not in self.backup_destinations:
+                    raise ValueError(
+                        f"deployment {name} references an unknown backup destination"
+                    )
+                if not has_database:
+                    raise ValueError(
+                        f"deployment {name} requires a bound database to enable recovery"
+                    )
             if not is_static and (
                 not has_database or not has_cache
             ):

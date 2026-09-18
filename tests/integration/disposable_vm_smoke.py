@@ -16,6 +16,10 @@ APPS_ROOT = "/srv/gimme-integration/apps"
 HOSTNAME = "gimme-ci.local"
 TARGET = "integration"
 DEPLOYMENTS = ("smoke-default", "smoke-preview")
+BACKUP_DESTINATION = "primary"
+BACKUP_BUCKET = "gimme-ci-recovery"
+MINIO_ENDPOINT = "https://127.0.0.1:9000"
+RECOVERY_DEPLOYMENT = "smoke-default"
 
 
 def require_disposable_host() -> None:
@@ -303,8 +307,105 @@ def verify() -> None:
 
     for service in ("postgresql", "valkey-server", "caddy"):
         status = str(gimme.target_service_status(TARGET, service)["output"])
-        if "active (running)" not in status:
+        # postgresql.service is a Type=oneshot meta-unit that wraps the real
+        # postgresql@<ver>-main instance, so it reports "active (exited)", never
+        # "(running)"; match the unit-type-agnostic "Active: active" line instead.
+        if "Active: active" not in status:
             raise AssertionError(f"{service} is not active")
+
+
+def minio_client():
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=MINIO_ENDPOINT,
+        region_name="us-east-1",
+        config=Config(s3={"addressing_style": "path"}),
+    )
+
+
+def create_minio_bucket() -> None:
+    """Provision the bucket outside Gimme, exactly as a real operator would."""
+    client = minio_client()
+    existing = {bucket["Name"] for bucket in client.list_buckets().get("Buckets", [])}
+    if BACKUP_BUCKET not in existing:
+        client.create_bucket(Bucket=BACKUP_BUCKET)
+    client.put_bucket_versioning(
+        Bucket=BACKUP_BUCKET, VersioningConfiguration={"Status": "Enabled"}
+    )
+
+
+def verify_backup_destination() -> None:
+    """Register a real S3-compatible destination, bind recovery, and prove the tracer."""
+    require_disposable_host()
+    from gimme import server as gimme
+    from gimme.control import S3BackupDestination, SSEAES256
+
+    create_minio_bucket()
+
+    definition = S3BackupDestination(
+        bucket=BACKUP_BUCKET,
+        region="us-east-1",
+        endpoint="127.0.0.1:9000",
+        addressing="path",
+        encryption=SSEAES256(),
+    )
+    destination_plan = gimme.plan_register_backup_destination(BACKUP_DESTINATION, definition)
+    gimme.register_backup_destination(
+        BACKUP_DESTINATION, definition, str(destination_plan["plan_id"])
+    )
+
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    from gimme.control import DeploymentRegistration, RecoveryPolicy
+
+    proposed = DeploymentRegistration.from_deployment(current).model_copy(
+        update={"recovery": RecoveryPolicy(destination=BACKUP_DESTINATION)}
+    )
+    update_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
+    gimme.update_deployment(RECOVERY_DEPLOYMENT, proposed, str(update_plan["plan_id"]))
+
+    plan = gimme.plan_create_recovery_point(RECOVERY_DEPLOYMENT, "ci-smoke-1")
+    result = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-smoke-1", str(plan["plan_id"])
+    )
+    if not result["changed"]:
+        raise AssertionError(
+            f"first on-demand Recovery Point apply should not be a no-op: {result}"
+        )
+
+    duplicate = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-smoke-1", str(plan["plan_id"])
+    )
+    if duplicate["changed"]:
+        raise AssertionError("duplicate apply with the same request_id must be a no-op")
+    if duplicate["recovery_point"] != result["recovery_point"]:
+        raise AssertionError("duplicate apply must return the exact published manifest")
+
+    inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
+    point_ids = {item["recovery_point_id"] for item in inventory["recovery_points"]}
+    if result["recovery_point"]["recovery_point_id"] not in point_ids:
+        raise AssertionError(f"created Recovery Point is missing from inventory: {inventory}")
+    if inventory["rejected"]:
+        raise AssertionError(f"inventory unexpectedly rejected a manifest: {inventory}")
+
+    tamper_component(result["recovery_point"]["components"][0]["key"])
+    tampered_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
+    tampered_ids = {item["recovery_point_id"] for item in tampered_inventory["recovery_points"]}
+    point_id = result["recovery_point"]["recovery_point_id"]
+    if point_id in tampered_ids:
+        raise AssertionError(f"tampered component was not rejected: {tampered_inventory}")
+    if point_id not in tampered_inventory["rejected"]:
+        raise AssertionError(f"tampered manifest missing from rejected list: {tampered_inventory}")
+
+    for path in (STATE_PATH, STATE_DIRECTORY / "operations.jsonl"):
+        if path.exists() and "gimme-ci-secret" in path.read_text():
+            raise AssertionError(f"MinIO credential leaked into {path}")
+
+
+def tamper_component(key: str) -> None:
+    minio_client().put_object(Bucket=BACKUP_BUCKET, Key=key, Body=b"corrupted-after-publish")
 
 
 if __name__ == "__main__":
@@ -314,5 +415,10 @@ if __name__ == "__main__":
         pin_resources()
     elif sys.argv[1:] == ["verify"]:
         verify()
+    elif sys.argv[1:] == ["verify-backup-destination"]:
+        verify_backup_destination()
     else:
-        raise SystemExit("usage: disposable_vm_smoke.py setup|pin-resources|verify")
+        raise SystemExit(
+            "usage: disposable_vm_smoke.py "
+            "setup|pin-resources|verify|verify-backup-destination"
+        )

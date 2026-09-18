@@ -5,6 +5,14 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added schema-v4 S3-compatible Backup Destinations, Deployment Recovery Policies, and
+  on-demand, content-addressed PostgreSQL Recovery Point creation and inventory.
+  Destinations are preflight-verified (bucket versioning, encryption, and a
+  leave-nothing-behind write/read/delete round trip); `pg_dump` excludes roles,
+  ownership, and ACLs; the checksummed component and its immutable Recovery Manifest
+  are verified before a Recovery Point becomes visible; and duplicate apply with the
+  same request identity is a deterministic no-op. See
+  [`docs/how-to/use-backup-destinations.md`](docs/how-to/use-backup-destinations.md).
 - Added schema-v4 AWS Provider Accounts, bounded AWS Secrets Manager stores, structured
   Secret References, metadata-only planning, exact-version apply-time resolution, and
   secret-safe Applied Secret Manifests while retaining the fixed local SOPS store.

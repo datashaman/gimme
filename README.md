@@ -96,6 +96,7 @@ For guided workflows, see:
 - [`docs/tutorials/first-local-deployment.md`](docs/tutorials/first-local-deployment.md)
 - [`docs/how-to/migrate-a-runtime-to-mise.md`](docs/how-to/migrate-a-runtime-to-mise.md)
 - [`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md)
+- [`docs/how-to/use-backup-destinations.md`](docs/how-to/use-backup-destinations.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
 ## Target bootstrap
