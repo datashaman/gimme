@@ -76,9 +76,17 @@ def _provider_error(exc: Exception, operation: str) -> ResourceError:
         mapping = {
             "AccessDenied": "access_denied",
             "AccessDeniedException": "access_denied",
+            # RDS wire codes are inconsistent: some carry a "Fault" suffix and some do not
+            # (DBInstanceNotFound vs DBSubnetGroupNotFoundFault), so both are mapped.
+            "DBInstanceNotFound": "missing",
             "DBInstanceNotFoundFault": "missing",
             "ResourceNotFoundException": "missing",
+            "DBInstanceAlreadyExists": "already_exists",
             "DBInstanceAlreadyExistsFault": "already_exists",
+            "DBSubnetGroupAlreadyExists": "already_exists",
+            "DBSubnetGroupAlreadyExistsFault": "already_exists",
+            "ResourceExistsException": "already_exists",
+            "InvalidDBInstanceState": "invalid_state",
             "InvalidDBInstanceStateFault": "invalid_state",
             "DecryptionFailure": "revoked",
             "Throttling": "throttled",
