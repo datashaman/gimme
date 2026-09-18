@@ -144,8 +144,13 @@ class FakeClock:
     ("code", "expected"),
     [
         ("AccessDenied", "access_denied"),
+        ("DBInstanceNotFound", "missing"),
         ("DBInstanceNotFoundFault", "missing"),
+        ("DBInstanceAlreadyExists", "already_exists"),
         ("DBInstanceAlreadyExistsFault", "already_exists"),
+        ("DBSubnetGroupAlreadyExists", "already_exists"),
+        ("ResourceExistsException", "already_exists"),
+        ("InvalidDBInstanceState", "invalid_state"),
         ("Throttling", "throttled"),
         ("SomeUnmappedProviderCode", "unavailable"),
     ],
@@ -435,7 +440,7 @@ def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) ->
 
 def test_describe_instance_treats_a_missing_instance_as_absent(monkeypatch) -> None:
     rds, stub = _stubbed("rds")
-    stub.add_client_error("describe_db_instances", service_error_code="DBInstanceNotFoundFault")
+    stub.add_client_error("describe_db_instances", service_error_code="DBInstanceNotFound")
     adapter = BotoRDSAdapter()
     monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
 
@@ -519,3 +524,52 @@ def test_workload_secret_failure_surfaces_only_a_bounded_code(monkeypatch) -> No
 
     assert str(raised.value) == "aws_rds_workload_secret_create_access_denied"
     assert "workload-pw" not in str(raised.value)
+
+
+def test_create_instance_is_idempotent_on_the_real_already_exists_wire_codes(monkeypatch) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    rds, stub = _stubbed("rds")
+    stub.add_client_error("create_db_subnet_group", service_error_code="DBSubnetGroupAlreadyExists")
+    stub.add_client_error("create_db_instance", service_error_code="DBInstanceAlreadyExists")
+    stub.add_response(
+        "describe_db_instances",
+        {"DBInstances": [_instance_response(identifier, tag="devbox-postgres")]},
+        {"DBInstanceIdentifier": identifier},
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+
+    with stub:
+        observed = adapter.create_instance(
+            account(),
+            network(),
+            resource(),
+            "devbox-postgres",
+            identifier,
+            ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+        )
+
+    assert observed.status == "available"
+
+
+def test_workload_secret_rotation_writes_a_new_version_when_the_secret_exists(monkeypatch) -> None:
+    secrets_client, stub = _stubbed("secretsmanager")
+    stub.add_client_error("create_secret", service_error_code="ResourceExistsException")
+    stub.add_response(
+        "put_secret_value",
+        {
+            "ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:x",
+            "VersionId": "6f1f3f0e-7c3a-4b8e-9c55-0a1b2c3d4e5f",
+        },
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: _StubbedSession({"secretsmanager": secrets_client})
+    )
+
+    with stub:
+        arn, version = adapter.create_workload_secret(
+            account(), workload_store(), "devbox-postgres/example-local", {}, {"password": "pw"}
+        )
+
+    assert version.startswith("6f1f3f0e")
