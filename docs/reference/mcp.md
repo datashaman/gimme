@@ -107,6 +107,50 @@ bounded to 200 records per call.
 | `plan_update_deployment` | Read | Diff a deployment update while preserving placement |
 | `update_deployment` | Local write | Apply an exact deployment update plan |
 
+## Managed AWS RDS PostgreSQL resources
+
+`register_resource`, `plan_update_resource`, and `update_resource` also accept an AWS
+RDS PostgreSQL resource (provider `aws_rds_postgres`): an exact engine version, instance
+class, allocated storage, an AWS Network (VPC, exactly two private subnets), an
+Administration Target, fixed security groups, and the AWS Secrets Manager store that
+holds workload credentials. Registration makes no AWS calls; it is a local desired-state
+write like every other Resource.
+
+| Tool | Access | Purpose |
+| --- | --- | --- |
+| `plan_apply_resource` | Read | Plan provisioning or reconciling one managed instance |
+| `apply_resource` | Remote write | Create or reconcile the RDS instance without returning a credential |
+| `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations; falls back to the last observed state with a bounded `refresh_error` |
+| `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret |
+| `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
+| `plan_cleanup_resource` | Read | Plan local resource removal |
+| `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
+
+`apply_resource` creates the instance with `ManageMasterUserPassword=True` so the master
+credential is generated and stored by AWS, never by Gimme, and polls for at most 30
+seconds before returning a bounded `pending` phase; a later call resumes by describing
+the existing instance rather than recreating it. `bind_resource` requires the resource to
+already report `phase: ready`; it resolves the master credential through the account's
+distinct resolver role only at apply time, creates or reconciles the deployment's isolated
+database and role through the Administration Target over TLS `psql`, and stores a
+generation-1 workload credential as a tagged Secrets Manager secret — the response
+contains only the `{store, secret}` reference. Workload credential rotation, Detached
+Allocation rebind, and the Retained Resource "forget" workflow are not implemented yet.
+
+Runtime wiring of a managed database into a Deployment is not implemented yet, so a
+Deployment whose database binding is a managed Resource is fenced off rather than half
+working: `plan_deployment_resources` reports a readiness issue (blocking
+`apply_deployment_resources`), `plan_deployment` refuses, and Recovery Points reject it,
+because those tasks assume a target-local PostgreSQL. Only target-local Resources are sent
+to the Deployer recipe.
+
+`apply_cleanup_resource` is non-destructive by default: a managed AWS RDS resource is
+left running with its data intact, and Gimme instead writes a secret-free Retained
+Resource tombstone recording the resource's AWS Network so it can be re-adopted later;
+only the local registration is removed. Destructive instance deletion is a deliberately
+separate, not-yet-implemented capability. Cleanup is refused while any Deployment still
+references the resource.
+
 ## Target and runtime tools
 
 | Tool | Access | Purpose |

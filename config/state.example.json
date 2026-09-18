@@ -1,8 +1,29 @@
 {
   "schema_version": 4,
-  "provider_accounts": {},
+  "provider_accounts": {
+    "main": {
+      "provider": "aws",
+      "account_id": "123456789012",
+      "inspection_role_arn": "arn:aws:iam::123456789012:role/gimme-inspect",
+      "resolver_role_arn": "arn:aws:iam::123456789012:role/gimme-resolve"
+    }
+  },
   "secret_stores": {
-    "local-sops": {"provider": "sops"}
+    "local-sops": {"provider": "sops"},
+    "workload-secrets": {
+      "provider": "aws_secrets_manager",
+      "provider_account": "main",
+      "region": "us-east-1",
+      "prefix": "gimme/workload"
+    }
+  },
+  "aws_networks": {
+    "primary": {
+      "provider_account": "main",
+      "region": "us-east-1",
+      "vpc_id": "vpc-0123456789abcdef0",
+      "private_subnet_ids": ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
+    }
   },
   "backup_destinations": {
     "primary": {
@@ -64,6 +85,29 @@
       "runtimes": {
         "mise_version": "2026.9.9"
       }
+    },
+    "adminbox": {
+      "host_alias": "adminbox",
+      "bootstrap_hostname": "192.0.2.20",
+      "hostname": "adminbox.local",
+      "system_hostname": "adminbox",
+      "remote_user": "deployer",
+      "apps_root": "/srv/gimme/apps",
+      "keep_releases": 5,
+      "role": "administration",
+      "network": {
+        "mode": "local_mdns",
+        "mdns_name": "adminbox",
+        "expected_addresses": []
+      },
+      "stack": {
+        "package_manager": "apt",
+        "packages": ["acl", "git"],
+        "services": []
+      },
+      "runtimes": {
+        "mise_version": null
+      }
     }
   },
   "applications": {
@@ -113,6 +157,19 @@
       "kind": "valkey",
       "provider": "target_local",
       "version": "8.0.1"
+    },
+    "example-rds-postgres": {
+      "kind": "postgres",
+      "provider": "aws_rds_postgres",
+      "aws_network": "primary",
+      "administration_target": "adminbox",
+      "engine_version": "17.2",
+      "instance_class": "db.t3.medium",
+      "allocated_storage_gb": 20,
+      "administration_security_group_id": "sg-0123456789abcdef0",
+      "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
+      "workload_secret_store": "workload-secrets",
+      "retain_on_removal": true
     }
   },
   "deployments": {

@@ -17,20 +17,22 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from gimme import recovery as recovery_module
+from gimme import resources_postgres as resources_postgres_module
 from gimme.control import (
-    AWSProviderAccount, AWSSecretsManagerStore, ApplicationConfig, ControlState,
-    DeploymentConfig, DeploymentRegistration, DeploymentSource, ResourceConfig,
-    S3BackupDestination, SecretStore, StateStore, TargetConfig, legacy_app, legacy_server,
-    new_placement, target_sites,
+    AWSProviderAccount, AWSRDSPostgresResource, AWSSecretsManagerStore, ApplicationConfig,
+    ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
+    ResourceConfig, S3BackupDestination, SecretStore, StateStore, TargetConfig, legacy_app,
+    legacy_server, new_placement, target_sites,
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
-    target_stack_plan,
+    resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
 from gimme.recovery import ComponentDump, RecoveryError, preflight_backup_destination
+from gimme.resources_postgres import ResourceError
 from gimme.secrets import (
     BotoAWSSecretAdapter, SecretError, load_applied_secret_manifest,
     plan_secret_references, protected_secret_file, resolve_planned_secret_references,
@@ -42,6 +44,7 @@ store = StateStore.from_environment(ROOT)
 runner = DeployerRunner(ROOT)
 aws_secrets = BotoAWSSecretAdapter()
 backup_s3 = recovery_module.BotoS3Adapter()
+rds_postgres = resources_postgres_module.BotoRDSAdapter()
 mcp = FastMCP(
     "Gimme",
     instructions=(
@@ -245,12 +248,13 @@ def _run_deployment(
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
     bound_resources = {
-        kind: state.resources[resource_name].model_dump(mode="json")
+        kind: resource.model_dump(mode="json")
         for kind, resource_name in (
             ("database", deployment.resources.database),
             ("cache", deployment.resources.cache),
         )
         if resource_name is not None
+        and isinstance(resource := state.resources[resource_name], ResourceConfig)
     }
     return runner.run(
         task, legacy_server(target), stack=target.stack,
@@ -346,10 +350,22 @@ def _resolved_stack_plan(name: str) -> dict[str, Any]:
                              privileged_helper=helper, sites=target_sites(state, name))
 
 
+def _managed_database_issues(state: ControlState, deployment: DeploymentConfig) -> list[str]:
+    binding = deployment.resources.database
+    if binding is not None and isinstance(state.resources[binding], AWSRDSPostgresResource):
+        return [
+            f"database is bound to managed resource {binding}; runtime wiring of managed "
+            "database credentials is not implemented yet"
+        ]
+    return []
+
+
 def _resource_plan(name: str) -> dict[str, Any]:
     state, deployment, target, application = _context(name)
     secret_versions, secret_issues = _secret_plan(name, state, deployment)
-    issues = secret_issues + _dns_issues(deployment, target)
+    issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
+        state, deployment
+    )
     plan = deployment_resource_plan(name, deployment, target, application,
                                     missing_secrets=issues, secret_versions=secret_versions)
     if issues:
@@ -361,7 +377,9 @@ def _resource_plan(name: str) -> dict[str, Any]:
 def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
     state, deployment, target, application = _context(name)
     _, secret_issues = _secret_plan(name, state, deployment)
-    issues = secret_issues + _dns_issues(deployment, target)
+    issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
+        state, deployment
+    )
     if issues:
         raise ValueError("deployment is not ready: " + "; ".join(issues))
     selected = revision or _revision(name)
@@ -573,7 +591,7 @@ def list_resources(target: Name | None = None) -> dict[str, object]:
     """List named, version-pinned infrastructure resources."""
     values = store.load().model_dump(mode="json")["resources"]
     if target is not None:
-        values = {name: item for name, item in values.items() if item["target"] == target}
+        values = {name: item for name, item in values.items() if item.get("target") == target}
     return {"resources": values}
 
 
@@ -582,7 +600,7 @@ def list_deployments(target: Name | None = None) -> dict[str, object]:
     """List deployments, optionally restricted to one registered target."""
     values = store.load().model_dump(mode="json")["deployments"]
     if target is not None:
-        values = {name: item for name, item in values.items() if item["target"] == target}
+        values = {name: item for name, item in values.items() if item.get("target") == target}
     return {"deployments": values}
 
 
@@ -895,6 +913,11 @@ def _recovery_context(
     state, deployment, _target, _application = _context(name)
     if deployment.recovery is None:
         raise ValueError(f"deployment {name} has no Recovery Policy bound")
+    if _managed_database_issues(state, deployment):
+        raise ValueError(
+            f"deployment {name} database is a managed resource; "
+            "Recovery Points support target-local PostgreSQL only"
+        )
     destination_name = deployment.recovery.destination
     destination = state.backup_destinations[destination_name]
     return state, deployment, destination_name, destination
@@ -1032,7 +1055,7 @@ def update_application(name: Name, definition: ApplicationConfig,
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("register_resource", "name")
-def register_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
+def register_resource(name: Name, definition: Resource) -> dict[str, object]:
     """Register a named, exact-version infrastructure resource locally."""
     state = store.load()
     if name in state.resources:
@@ -1043,7 +1066,7 @@ def register_resource(name: Name, definition: ResourceConfig) -> dict[str, objec
 
 @mcp.tool(annotations=READ)
 @_journal_plan("update_resource", "name")
-def plan_update_resource(name: Name, definition: ResourceConfig) -> dict[str, object]:
+def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
     """Show the exact before/after state for a resource update."""
     state = store.load()
     _replace(state, "resources", name, definition)
@@ -1052,12 +1075,205 @@ def plan_update_resource(name: Name, definition: ResourceConfig) -> dict[str, ob
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("update_resource", "name")
-def update_resource(name: Name, definition: ResourceConfig, plan_id: PlanId) -> dict[str, object]:
+def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed resource update to local desired state."""
     expected = plan_update_resource(name, definition)
     _assert_plan(expected, plan_id)
     store.save(_replace(store.load(), "resources", name, definition))
     return {"changed": True, "resource": name}
+
+
+def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
+    state = store.load()
+    resource = state.resources.get(name)
+    if resource is None:
+        raise KeyError(f"resource '{name}' is not registered")
+    if not isinstance(resource, AWSRDSPostgresResource):
+        raise ValueError(f"resource '{name}' is not a managed AWS RDS PostgreSQL resource")
+    return state, resource
+
+
+def _resource_provision_plan(name: str) -> dict[str, object]:
+    _state, resource = _managed_resource(name)
+    observed = resources_postgres_module.load_observed(store.root, name)
+    return resource_provision_plan(name, resource, observed)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("apply_resource", "name")
+def plan_apply_resource(name: Name) -> dict[str, object]:
+    """Plan provisioning or reconciling one managed AWS RDS PostgreSQL instance."""
+    return _resource_provision_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("apply_resource", "name")
+def apply_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Create or reconcile the RDS instance, polling at most 30 seconds before
+    returning a bounded pending phase. Never returns a decrypted credential."""
+    expected = _resource_provision_plan(name)
+    _assert_plan(expected, plan_id)
+    state, resource = _managed_resource(name)
+    network = state.aws_networks[resource.aws_network]
+    account = state.provider_accounts[network.provider_account]
+    result = resources_postgres_module.apply_provision(
+        rds_postgres, store.root, account, network, resource, name
+    )
+    return {"changed": True, **result}
+
+
+@mcp.tool(annotations=READ)
+def inspect_resource(name: Name) -> dict[str, object]:
+    """Read-only, secret-free provider identity, health, and version for one resource."""
+    state = store.load()
+    resource = state.resources.get(name)
+    if resource is None:
+        raise KeyError(f"resource '{name}' is not registered")
+    if not isinstance(resource, AWSRDSPostgresResource):
+        return {
+            "resource": name, "provider": resource.provider, "target": resource.target,
+            "kind": resource.kind, "version": resource.version,
+        }
+    observed = resources_postgres_module.load_observed(store.root, name)
+    network = state.aws_networks[resource.aws_network]
+    account = state.provider_accounts[network.provider_account]
+    live: resources_postgres_module.InstanceObservation | None = None
+    refresh_error: str | None = None
+    try:
+        live = rds_postgres.describe_instance(
+            account, network, resources_postgres_module.derive_instance_identifier(name)
+        )
+    except ResourceError as exc:
+        refresh_error = str(exc)
+    result: dict[str, object] = {
+        "resource": name, "provider": "aws_rds_postgres",
+        "phase": "absent" if observed is None else observed["phase"],
+        "source": "cache" if live is None else "live",
+    }
+    if refresh_error is not None:
+        result["refresh_error"] = refresh_error
+    if live is not None:
+        result.update(
+            phase="ready" if live.status == "available" else "pending",
+            status=live.status, engine_version=live.engine_version, identity=live.identity,
+            endpoint=live.endpoint, port=live.port,
+        )
+    elif observed is not None:
+        result.update(
+            status=observed["status"], engine_version=observed["engine_version"],
+            identity=observed["identity"], endpoint=observed["endpoint"], port=observed["port"],
+        )
+    if observed is not None:
+        result["allocations"] = {
+            deployment_name: {
+                "database": allocation["database_identifier"], "status": allocation["status"],
+            }
+            for deployment_name, allocation in cast(
+                dict[str, dict[str, object]], observed["allocations"]
+            ).items()
+        }
+    return result
+
+
+def _resource_binding_plan(name: str) -> dict[str, object]:
+    _state, deployment, _target, _application = _context(name)
+    resource_name = deployment.resources.database
+    if resource_name is None:
+        raise ValueError(f"deployment {name} has no bound database resource")
+    _managed_resource(resource_name)
+    observed = resources_postgres_module.load_observed(store.root, resource_name)
+    return resource_binding_plan(name, deployment, resource_name, observed)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("bind_resource", "name")
+def plan_bind_resource(name: Name) -> dict[str, object]:
+    """Plan creating this deployment's isolated database, role, and workload secret."""
+    return _resource_binding_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("bind_resource", "name")
+def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Create or reconcile the deployment's isolated database and Resource Credential.
+    Never returns the workload username or password."""
+    expected = _resource_binding_plan(name)
+    _assert_plan(expected, plan_id)
+    if not expected["resource_ready"]:
+        raise ValueError("managed resource is not ready; run apply_resource first")
+    state, deployment, _target, _application = _context(name)
+    resource_name = str(expected["resource"])
+    _state, resource = _managed_resource(resource_name)
+    network = state.aws_networks[resource.aws_network]
+    account = state.provider_accounts[network.provider_account]
+    admin_target = state.targets[resource.administration_target]
+    store_name = resource.workload_secret_store
+    workload_store = state.secret_stores[store_name]
+    if not isinstance(workload_store, AWSSecretsManagerStore):
+        raise ValueError("workload_secret_store must be an AWS Secrets Manager store")
+    observed = resources_postgres_module.load_observed(store.root, resource_name)
+    if observed is None or observed["master_secret_arn"] is None:
+        raise ResourceError("aws_rds_master_secret_missing")
+    master_username, master_password = rds_postgres.resolve_master_credential(
+        account, network.region, str(observed["master_secret_arn"])
+    )
+    database_identifier = deployment.placement.database_identifier
+    workload_password = resources_postgres_module.generate_workload_password()
+    payload = {
+        "master_username": master_username,
+        "master_password": master_password,
+        "workload_password": workload_password,
+    }
+    with _deployment_resource_lock(name), protected_secret_file(payload) as secret_file:
+        runner.run(
+            "gimme:resource:bind-postgres", legacy_server(admin_target), stack=admin_target.stack,
+            resource_endpoint=(str(observed["endpoint"]), int(cast(int, observed["port"]))),
+            resource_database=database_identifier, secret_file=secret_file, timeout=120,
+        )
+        summary = resources_postgres_module.persist_binding(
+            rds_postgres, store.root, account, workload_store, store_name, resource_name, name,
+            database_identifier, database_identifier, workload_password,
+            str(observed["endpoint"]), int(cast(int, observed["port"])),
+        )
+    return {"changed": True, **summary}
+
+
+def _resource_cleanup_plan(name: str) -> dict[str, object]:
+    state = store.load()
+    resource = state.resources.get(name)
+    if resource is None:
+        raise KeyError(f"resource '{name}' is not registered")
+    if any(
+        deployment.resources.database == name or deployment.resources.cache == name
+        for deployment in state.deployments.values()
+    ):
+        raise ValueError(f"resource {name} is still referenced by a deployment")
+    return resource_cleanup_plan(name, managed=isinstance(resource, AWSRDSPostgresResource))
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("cleanup_resource", "name")
+def plan_cleanup_resource(name: Name) -> dict[str, object]:
+    """Plan non-destructive Resource removal; a managed Resource is retained by default."""
+    return _resource_cleanup_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("cleanup_resource", "name")
+def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
+    """Remove local Resource registration after exact plan and confirmation checks.
+    A managed AWS resource and its data are left intact as a Retained Resource."""
+    expected = _resource_cleanup_plan(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    state = store.load()
+    resource = state.resources[name]
+    retained = isinstance(resource, AWSRDSPostgresResource)
+    if retained:
+        resources_postgres_module.retain_resource(store.root, name, resource.aws_network)
+    store.save(_delete(state, "resources", name))
+    return {"changed": True, "resource": name, "retained": retained}
 
 
 @mcp.tool(annotations=WRITE)

@@ -45,6 +45,11 @@ SECRET_FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 BACKUP_DESTINATION_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 S3_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 S3_KMS_KEY_ARN = re.compile(r"^arn:aws:kms:([a-z0-9-]+):([0-9]{12}):key/([0-9a-f-]{36})$")
+AWS_NETWORK_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+AWS_VPC_ID = re.compile(r"^vpc-[0-9a-f]{8,17}$")
+AWS_SUBNET_ID = re.compile(r"^subnet-[0-9a-f]{8,17}$")
+AWS_SECURITY_GROUP_ID = re.compile(r"^sg-[0-9a-f]{8,17}$")
+AWS_DB_INSTANCE_CLASS = re.compile(r"^db\.[a-z0-9]+\.[a-z0-9]+$")
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 RELATIVE_PATH = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
@@ -143,6 +148,77 @@ class ResourceConfig(BaseModel):
         if VERSION.fullmatch(value) is None:
             raise ValueError("resource versions must be exact bounded version strings")
         return value
+
+
+class AWSNetwork(BaseModel):
+    """A validated, narrow subset of one pre-existing AWS VPC's prerequisites: only the
+    two private data subnets a managed RDS Resource's DB subnet group may use. Gimme
+    creates no VPC, subnet, route, or security group here; it only records identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_account: str = Field(pattern=AWS_NETWORK_NAME.pattern)
+    region: str = Field(pattern=AWS_REGION.pattern)
+    vpc_id: str = Field(pattern=AWS_VPC_ID.pattern)
+    private_subnet_ids: list[str] = Field(min_length=2, max_length=2)
+
+    @field_validator("private_subnet_ids")
+    @classmethod
+    def exact_distinct_subnets(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != 2 or any(AWS_SUBNET_ID.fullmatch(item) is None for item in value):
+            raise ValueError("an AWS Network requires exactly two distinct data subnet ids")
+        return value
+
+
+class AWSRDSPostgresResource(BaseModel):
+    """One managed AWS RDS for PostgreSQL instance (ADR 0008). Bindable by many
+    Deployments placed on any Target listed in deployment_security_group_ids; each owns
+    an isolated database, role, and Resource Credential created at bind time."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["postgres"] = "postgres"
+    provider: Literal["aws_rds_postgres"] = "aws_rds_postgres"
+    aws_network: str = Field(pattern=AWS_NETWORK_NAME.pattern)
+    administration_target: str = Field(pattern=TARGET_NAME.pattern)
+    engine_version: str
+    instance_class: str = Field(pattern=AWS_DB_INSTANCE_CLASS.pattern)
+    allocated_storage_gb: int = Field(ge=20, le=65536)
+    administration_security_group_id: str = Field(pattern=AWS_SECURITY_GROUP_ID.pattern)
+    deployment_security_group_ids: dict[str, str] = Field(default_factory=dict, max_length=32)
+    workload_secret_store: str = Field(pattern=SECRET_STORE_NAME.pattern)
+    retain_on_removal: bool = Field(
+        default=True,
+        description="Lifecycle policy: ordinary Resource removal only deletes desired "
+        "registration and leaves the RDS instance and its data intact (Retained Resource).",
+    )
+
+    @field_validator("engine_version")
+    @classmethod
+    def exact_engine_version(cls, value: str) -> str:
+        if VERSION.fullmatch(value) is None:
+            raise ValueError("engine_version must be an exact bounded PostgreSQL version")
+        return value
+
+    @field_validator("deployment_security_group_ids")
+    @classmethod
+    def valid_deployment_security_groups(cls, value: dict[str, str]) -> dict[str, str]:
+        for target_name, security_group_id in value.items():
+            if (
+                TARGET_NAME.fullmatch(target_name) is None
+                or AWS_SECURITY_GROUP_ID.fullmatch(security_group_id) is None
+            ):
+                raise ValueError(
+                    "deployment_security_group_ids must map exact target names to "
+                    "exact security group ids"
+                )
+        return value
+
+
+Resource = Annotated[
+    ResourceConfig | AWSRDSPostgresResource,
+    Field(discriminator="provider"),
+]
 
 
 class ResourceBindings(BaseModel):
@@ -372,6 +448,11 @@ class TargetConfig(BaseModel):
     network: TargetNetwork
     stack: StackConfig
     runtimes: TargetRuntimePolicy = Field(default_factory=TargetRuntimePolicy)
+    role: Literal["deployment", "administration"] = Field(
+        default="deployment",
+        description="An administration Target is a private-network execution boundary "
+        "for one managed Resource's provider administration; it never hosts a Deployment.",
+    )
 
     @field_validator("bootstrap_hostname", "hostname")
     @classmethod
@@ -615,7 +696,8 @@ class ControlState(BaseModel):
     backup_destinations: dict[str, S3BackupDestination] = Field(default_factory=dict)
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     applications: dict[str, ApplicationConfig] = Field(default_factory=dict)
-    resources: dict[str, ResourceConfig] = Field(default_factory=dict)
+    aws_networks: dict[str, AWSNetwork] = Field(default_factory=dict)
+    resources: dict[str, Resource] = Field(default_factory=dict)
     deployments: dict[str, DeploymentConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -654,19 +736,50 @@ class ControlState(BaseModel):
         for name in self.applications:
             if APP_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid application name: {name}")
+        for name, network in self.aws_networks.items():
+            if AWS_NETWORK_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid AWS Network name: {name}")
+            if network.provider_account not in self.provider_accounts:
+                raise ValueError(f"AWS Network {name} references an unknown provider account")
         target_resource_versions: dict[tuple[str, str], str] = {}
         for name, resource in self.resources.items():
             if DEPLOYMENT_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid resource name: {name}")
-            if resource.target not in self.targets:
-                raise ValueError(f"resource {name} references an unknown target")
-            key = (resource.target, resource.kind)
-            previous = target_resource_versions.setdefault(key, resource.version)
-            if previous != resource.version:
-                raise ValueError(
-                    f"target-local {resource.kind} resources on {resource.target} "
-                    "must use one version"
-                )
+            if isinstance(resource, ResourceConfig):
+                if resource.target not in self.targets:
+                    raise ValueError(f"resource {name} references an unknown target")
+                if self.targets[resource.target].role != "deployment":
+                    raise ValueError(f"resource {name} target must be a Deployment Target")
+                key = (resource.target, resource.kind)
+                previous = target_resource_versions.setdefault(key, resource.version)
+                if previous != resource.version:
+                    raise ValueError(
+                        f"target-local {resource.kind} resources on {resource.target} "
+                        "must use one version"
+                    )
+            else:
+                network = self.aws_networks.get(resource.aws_network)
+                if network is None:
+                    raise ValueError(f"resource {name} references an unknown AWS Network")
+                administration_target = self.targets.get(resource.administration_target)
+                if administration_target is None or administration_target.role != "administration":
+                    raise ValueError(
+                        f"resource {name} administration_target must be a registered "
+                        "administration Target"
+                    )
+                secret_store = self.secret_stores.get(resource.workload_secret_store)
+                if not isinstance(secret_store, AWSSecretsManagerStore):
+                    raise ValueError(
+                        f"resource {name} workload_secret_store must be a registered "
+                        "AWS Secrets Manager store"
+                    )
+                for target_name in resource.deployment_security_group_ids:
+                    deployment_target = self.targets.get(target_name)
+                    if deployment_target is None or deployment_target.role != "deployment":
+                        raise ValueError(
+                            f"resource {name} deployment_security_group_ids references "
+                            "an invalid target"
+                        )
         for name, deployment in self.deployments.items():
             if DEPLOYMENT_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid deployment name: {name}")
@@ -674,6 +787,8 @@ class ControlState(BaseModel):
                 raise ValueError(f"deployment {name} references an unknown application")
             if deployment.target not in self.targets:
                 raise ValueError(f"deployment {name} references an unknown target")
+            if self.targets[deployment.target].role != "deployment":
+                raise ValueError(f"deployment {name} target must be a Deployment Target")
             for reference in deployment.secrets.values():
                 if reference.store not in self.secret_stores:
                     raise ValueError(
@@ -698,8 +813,16 @@ class ControlState(BaseModel):
                 resource = self.resources.get(binding)
                 if resource is None:
                     raise ValueError(f"deployment {name} references unknown resource {binding}")
-                if resource.target != deployment.target or resource.kind != kind:
+                if resource.kind != kind:
                     raise ValueError(f"deployment {name} has an incompatible {kind} binding")
+                if isinstance(resource, ResourceConfig):
+                    if resource.target != deployment.target:
+                        raise ValueError(f"deployment {name} has an incompatible {kind} binding")
+                elif deployment.target not in resource.deployment_security_group_ids:
+                    raise ValueError(
+                        f"deployment {name} target is not an eligible Deployment Target "
+                        f"for resource {binding}"
+                    )
             is_static = self.applications[deployment.application].framework == "static"
             has_database = deployment.resources.database is not None
             has_cache = deployment.resources.cache is not None
@@ -882,7 +1005,7 @@ class StateStore:
             stack=stack,
         )
         applications: dict[str, ApplicationConfig] = {}
-        resources: dict[str, ResourceConfig] = {}
+        resources: dict[str, Resource] = {}
         deployments: dict[str, DeploymentConfig] = {}
         from gimme.plans import (
             environment_database_identifier,

@@ -36,6 +36,13 @@ def laravel_environment_reconciler() -> str:
     return recipe.split("return <<<'PYTHON'", 1)[1].split("\nPYTHON;", 1)[0]
 
 
+def managed_postgres_bind_script() -> str:
+    recipe = deployer_source()
+    return recipe.split("function managed_postgres_bind_script", 1)[1].split(
+        "return <<<'PYTHON'", 1
+    )[1].split("\nPYTHON;", 1)[0]
+
+
 def rendered_deploy_plan(health: dict[str, object]) -> str:
     environment = {
         **os.environ,
@@ -584,3 +591,150 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert recipe.index('visudo -cf "\\$sudoers_tmp"') < recipe.index(
         'mv "\\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack'
     )
+
+
+def test_managed_postgres_bind_uses_no_sudo_and_shreds_its_secret_file() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:resource:bind-postgres'", 1)[1].split(
+        "task('gimme:backup:dump-postgres'", 1
+    )[0]
+
+    assert "sudo" not in task
+    assert "valid_endpoint($host)" in task
+    assert "is_link($localSecretFile)" in task
+    assert "rm -f ' . escapeshellarg($remoteSecretFile)" in task
+    assert "managed_postgres_bind_script" in task
+
+
+def _fake_psql(tmp_path: Path, *, fail: bool = False) -> Path:
+    """A stand-in psql that records argv and stdin. It cannot judge SQL semantics, so the
+    statements it receives are additionally exercised against a real server by hand; these
+    tests pin the contract: statements arrive on stdin and secrets never reach argv."""
+    log_path = tmp_path / "psql-calls.jsonl"
+    script = tmp_path / "psql"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "stdin = sys.stdin.read()\n"
+        f"with open({str(log_path)!r}, 'a') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin}) + chr(10))\n"
+        f"if {fail!r}:\n"
+        "    sys.stdout.write('ERROR: ' + stdin)\n"
+        "    sys.exit(3)\n"
+        "sys.exit(0)\n"
+    )
+    script.chmod(0o700)
+    return log_path
+
+
+def _run_bind_script(tmp_path: Path, secret: dict[str, str], *,
+                     fail: bool = False) -> subprocess.CompletedProcess[str]:
+    secret_path = tmp_path / "secret.json"
+    secret_path.write_text(json.dumps(secret))
+    secret_path.chmod(0o600)
+    log_path = _fake_psql(tmp_path, fail=fail)
+    result = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_bind_script(),
+            "db.example.test", "5432", "gimme_example", str(secret_path),
+        ],
+        text=True, capture_output=True, check=False,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+    result.calls = [  # type: ignore[attr-defined]
+        json.loads(line) for line in log_path.read_text().splitlines()
+    ] if log_path.exists() else []
+    return result
+
+
+BIND_SECRET = {
+    "master_username": "gimme_admin",
+    "master_password": "s3cr3t-master",
+    "workload_password": "s3cr3t-workload",
+}
+
+
+def test_managed_postgres_bind_script_sends_statements_over_stdin_never_argv(
+    tmp_path: Path,
+) -> None:
+    result = _run_bind_script(tmp_path, BIND_SECRET)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "GIMME_RESOURCE_BOUND|gimme_example"
+    calls = result.calls  # type: ignore[attr-defined]
+    assert len(calls) == 2
+    for call in calls:
+        argv = " ".join(call["argv"])
+        assert "-c" not in call["argv"]
+        assert "s3cr3t-workload" not in argv
+        assert "s3cr3t-master" not in argv
+    role_sql, database_sql = calls[0]["stdin"], calls[1]["stdin"]
+    assert "\\set role 'gimme_example'" in role_sql
+    assert "CREATE ROLE %I LOGIN" in role_sql and "\\gexec" in role_sql
+    assert "ALTER ROLE %I PASSWORD %L" in role_sql
+    assert "CREATE DATABASE %I OWNER %I" in database_sql and "\\gexec" in database_sql
+    assert "DO $" not in role_sql + database_sql
+
+
+def test_managed_postgres_bind_script_redacts_secrets_from_failure_output(
+    tmp_path: Path,
+) -> None:
+    result = _run_bind_script(tmp_path, BIND_SECRET, fail=True)
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "role reconciliation failed" in output
+    assert "s3cr3t-workload" not in output
+    assert "s3cr3t-master" not in output
+    assert "[redacted]" in output
+
+
+def test_managed_postgres_bind_script_rejects_unsafe_workload_password_and_database(
+    tmp_path: Path,
+) -> None:
+    weak = _run_bind_script(tmp_path, {**BIND_SECRET, "workload_password": "bad'; drop"})
+    assert weak.returncode != 0
+    assert "unexpected format" in weak.stdout + weak.stderr
+    assert weak.calls == []  # type: ignore[attr-defined]
+
+    secret_path = tmp_path / "secret.json"
+    unsafe = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_bind_script(),
+            "db.example.test", "5432", "x'; drop database postgres; --", str(secret_path),
+        ],
+        text=True, capture_output=True, check=False,
+    )
+    assert unsafe.returncode != 0
+    assert "unsafe database identifier" in unsafe.stdout + unsafe.stderr
+
+
+def test_managed_postgres_bind_script_rejects_an_unexpected_secret_shape(
+    tmp_path: Path,
+) -> None:
+    result = _run_bind_script(tmp_path, {"master_username": "gimme_admin"})
+
+    assert result.returncode != 0
+    assert "unexpected shape" in (result.stdout + result.stderr)
+
+
+def test_managed_postgres_bind_script_rejects_a_symlinked_secret_file(tmp_path: Path) -> None:
+    real_secret = tmp_path / "real-secret.json"
+    real_secret.write_text(json.dumps({
+        "master_username": "gimme_admin", "master_password": "x", "workload_password": "y",
+    }))
+    link = tmp_path / "linked-secret.json"
+    link.symlink_to(real_secret)
+    _fake_psql(tmp_path)
+
+    result = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_bind_script(),
+            "db.example.test", "5432", "gimme_example", str(link),
+        ],
+        text=True, capture_output=True, check=False,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode != 0
+    assert "non-regular secret document" in (result.stdout + result.stderr)
