@@ -311,21 +311,34 @@ class BotoElastiCacheAdapter(AWSAdapter):
         status = response.get("Status")
         if not isinstance(arn, str) or not isinstance(status, str):
             raise ResourceError("aws_elasticache_group_identity_invalid")
-        try:
-            tags = client.list_tags_for_resource(ResourceName=arn)
-        except Exception as exc:
-            raise _provider_error(exc, "tags", self.error_prefix) from None
-        owner = _tags(tags).get("gimme:resource")
-        if (
-            not isinstance(owner, str)
-            or RESOURCE_NAME.fullmatch(owner) is None
-            or derive_group_id(owner) != group_id
-        ):
-            raise ResourceError("aws_elasticache_group_ownership_mismatch")
+        # ElastiCache rejects ListTagsForResource until a new replication group is available.
+        # A pending group is only observed and never modified or destroyed, so defer ownership
+        # verification until AWS makes that read possible.
+        if status == "available":
+            try:
+                tags = client.list_tags_for_resource(ResourceName=arn)
+            except Exception as exc:
+                raise _provider_error(exc, "tags", self.error_prefix) from None
+            owner = _tags(tags).get("gimme:resource")
+            if (
+                not isinstance(owner, str)
+                or RESOURCE_NAME.fullmatch(owner) is None
+                or derive_group_id(owner) != group_id
+            ):
+                raise ResourceError("aws_elasticache_group_ownership_mismatch")
         member_ids = response.get("MemberClusters")
         node_groups = response.get("NodeGroups")
-        if not isinstance(member_ids, list) or not isinstance(node_groups, list):
-            raise ResourceError("aws_elasticache_group_identity_invalid")
+        if not isinstance(member_ids, list):
+            if status == "available":
+                raise ResourceError("aws_elasticache_group_identity_invalid")
+            member_ids = []
+        # AWS omits member and node-group topology while a new group is creating and while
+        # one is deleting. Topology is verified once the group reaches available; a pending
+        # group is never modified or bound.
+        if not isinstance(node_groups, list):
+            if status == "available":
+                raise ResourceError("aws_elasticache_group_identity_invalid")
+            node_groups = []
         zones = tuple(sorted(
             member["PreferredAvailabilityZone"]
             for node_group in node_groups if isinstance(node_group, dict)
@@ -424,10 +437,10 @@ class BotoElastiCacheAdapter(AWSAdapter):
 
     def _service_update_overdue(self, client, group_id: str) -> bool:
         """True when AWS says a service update missed its recommended apply-by date and is
-        not finished. ponytail: one page of 100 actions for one group; page if that overflows."""
+        not finished. ponytail: one bounded page of 50 actions for one group."""
         try:
             response = client.describe_update_actions(
-                ReplicationGroupIds=[group_id], ServiceUpdateStatus=["available"], MaxRecords=100,
+                ReplicationGroupIds=[group_id], ServiceUpdateStatus=["available"], MaxRecords=50,
             )
         except Exception as exc:
             raise _provider_error(exc, "update_actions", self.error_prefix) from None
@@ -582,6 +595,16 @@ class BotoElastiCacheAdapter(AWSAdapter):
             raise error from None
         return True
 
+    @staticmethod
+    def _disabled_default_password() -> str:
+        """Return an unpersisted password required by ElastiCache for its disabled default user.
+
+        The ``default`` user has the ``off`` ACL, so this value cannot authenticate any
+        client. It is deliberately generated for the create request only: it is never
+        written to a Secret Store, observation, plan, log, or error.
+        """
+        return secrets_module.token_urlsafe(36)
+
     def _ensure_authentication(
         self, account: AWSProviderAccount, client, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str,
@@ -590,7 +613,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
         default_id, admin_id = _derived(group_id, "default"), _derived(group_id, "admin")
         self._tolerate_existing("user_create", lambda: client.create_user(
             UserId=default_id, UserName="default", Engine="valkey",
-            AccessString=DEFAULT_ACCESS_STRING, NoPasswordRequired=True, Tags=tag,
+            AccessString=DEFAULT_ACCESS_STRING,
+            Passwords=[self._disabled_default_password()], Tags=tag,
         ))
         # The password only ever exists here: it is written to the Secret Store and sent to
         # ElastiCache, never returned. An existing user keeps the credential already stored.
@@ -876,7 +900,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
         default_id, admin_id = _derived(group_id, "default"), _derived(group_id, "admin")
         self._tolerate_existing("user_create", lambda: client.create_user(
             UserId=default_id, UserName="default", Engine="valkey",
-            AccessString=DEFAULT_ACCESS_STRING, NoPasswordRequired=True, Tags=tag,
+            AccessString=DEFAULT_ACCESS_STRING,
+            Passwords=[self._disabled_default_password()], Tags=tag,
         ))
         if not self._user_exists(client, admin_id):
             password = self._read_secret(account, store, f"{resource_name}/_admin")["password"]
