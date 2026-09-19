@@ -30,6 +30,10 @@ ALLOCATION_STATUS = ("active", "detached")
 POLL_BUDGET_SECONDS = 30
 POLL_INTERVAL_SECONDS = 3
 MAX_OBSERVED_BYTES = 32 * 1024
+MODIFIABLE_FIELDS = frozenset({
+    "EngineVersion", "DBInstanceClass", "AllocatedStorage", "VpcSecurityGroupIds",
+    "DBParameterGroupName",
+})
 # The pinned AWS commercial-region RDS trust bundle; see deploy/aws-rds-global-bundle.md.
 RDS_TRUST_BUNDLE_SHA256 = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
 
@@ -51,6 +55,21 @@ class InstanceObservation:
     allocated_storage_gb: int | None = None
     security_group_ids: tuple[str, ...] | None = None
     modification_pending: bool = False
+    # Pending values for the fields Gimme converges, and the attached parameter group.
+    pending_engine_version: str | None = None
+    pending_instance_class: str | None = None
+    pending_allocated_storage_gb: int | None = None
+    parameter_group_name: str | None = None
+    parameter_group_status: str | None = None
+
+    @property
+    def converging(self) -> bool:
+        """True while AWS still has an unapplied change to a field Gimme manages. Other
+        pending values (for example a maintenance-window change) do not hold readiness."""
+        return any(value is not None for value in (
+            self.pending_engine_version, self.pending_instance_class,
+            self.pending_allocated_storage_gb,
+        ))
 
 
 class RDSAdapter(Protocol):
@@ -62,6 +81,16 @@ class RDSAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSRDSPostgresResource, resource_name: str, aws_instance_identifier: str,
         security_group_ids: list[str],
+    ) -> InstanceObservation: ...
+
+    def modify_instance(
+        self, account: AWSProviderAccount, network: AWSNetwork,
+        resource: AWSRDSPostgresResource, resource_name: str, aws_instance_identifier: str,
+        changes: dict[str, object],
+    ) -> InstanceObservation: ...
+
+    def reboot_instance(
+        self, account: AWSProviderAccount, network: AWSNetwork, aws_instance_identifier: str,
     ) -> InstanceObservation: ...
 
     def resolve_master_credential(
@@ -170,6 +199,18 @@ class BotoRDSAdapter:
         storage = response.get("AllocatedStorage")
         groups = response.get("VpcSecurityGroups")
         pending = response.get("PendingModifiedValues")
+        pending_values = pending if isinstance(pending, dict) else {}
+        pending_version = pending_values.get("EngineVersion")
+        pending_class = pending_values.get("DBInstanceClass")
+        pending_storage = pending_values.get("AllocatedStorage")
+        parameter_groups = response.get("DBParameterGroups")
+        group = (
+            parameter_groups[0]
+            if isinstance(parameter_groups, list) and len(parameter_groups) == 1
+            and isinstance(parameter_groups[0], dict) else {}
+        )
+        group_name = group.get("DBParameterGroupName")
+        group_status = group.get("ParameterApplyStatus")
         return InstanceObservation(
             identity=arn, status=status, engine_version=engine_version,
             endpoint=address if isinstance(address, str) else None,
@@ -182,6 +223,13 @@ class BotoRDSAdapter:
                 if isinstance(item, dict) and isinstance(item.get("VpcSecurityGroupId"), str)
             )) if isinstance(groups, list) else None,
             modification_pending=bool(pending),
+            pending_engine_version=pending_version if isinstance(pending_version, str) else None,
+            pending_instance_class=pending_class if isinstance(pending_class, str) else None,
+            pending_allocated_storage_gb=(
+                pending_storage if isinstance(pending_storage, int) else None
+            ),
+            parameter_group_name=group_name if isinstance(group_name, str) else None,
+            parameter_group_status=group_status if isinstance(group_status, str) else None,
         )
 
     def describe_instance(
@@ -229,6 +277,38 @@ class BotoRDSAdapter:
         ):
             raise ResourceError("aws_rds_parameter_group_ownership_mismatch")
 
+    def _ensure_parameter_group(
+        self, client, parameter_group_name: str, family: str, resource_name: str
+    ) -> None:
+        """Create this Resource's parameter group (or verify it owns an existing one) and
+        converge it onto rds.force_ssl=1."""
+        try:
+            client.create_db_parameter_group(
+                DBParameterGroupName=parameter_group_name,
+                DBParameterGroupFamily=family,
+                Description=f"Gimme-managed parameter group for {resource_name}",
+                Tags=[{"Key": "gimme:resource", "Value": resource_name}],
+            )
+        except Exception as exc:
+            error = _provider_error(exc, "parameter_group")
+            if "already_exists" not in str(error):
+                raise error from None
+            self._verify_parameter_group_ownership(
+                client, parameter_group_name, family, resource_name
+            )
+        try:
+            # Applied even when the group already existed so a stale group converges.
+            client.modify_db_parameter_group(
+                DBParameterGroupName=parameter_group_name,
+                Parameters=[{
+                    "ParameterName": "rds.force_ssl",
+                    "ParameterValue": "1",
+                    "ApplyMethod": "pending-reboot",
+                }],
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "parameter_group_modify") from None
+
     def create_instance(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSRDSPostgresResource, resource_name: str, aws_instance_identifier: str,
@@ -250,32 +330,9 @@ class BotoRDSAdapter:
             error = _provider_error(exc, "subnet_group")
             if "already_exists" not in str(error):
                 raise error from None
-        try:
-            client.create_db_parameter_group(
-                DBParameterGroupName=parameter_group_name,
-                DBParameterGroupFamily=parameter_group_family,
-                Description=f"Gimme-managed parameter group for {resource_name}",
-                Tags=[{"Key": "gimme:resource", "Value": resource_name}],
-            )
-        except Exception as exc:
-            error = _provider_error(exc, "parameter_group")
-            if "already_exists" not in str(error):
-                raise error from None
-            self._verify_parameter_group_ownership(
-                client, parameter_group_name, parameter_group_family, resource_name
-            )
-        try:
-            # Applied even when the group already existed so a stale group converges.
-            client.modify_db_parameter_group(
-                DBParameterGroupName=parameter_group_name,
-                Parameters=[{
-                    "ParameterName": "rds.force_ssl",
-                    "ParameterValue": "1",
-                    "ApplyMethod": "pending-reboot",
-                }],
-            )
-        except Exception as exc:
-            raise _provider_error(exc, "parameter_group_modify") from None
+        self._ensure_parameter_group(
+            client, parameter_group_name, parameter_group_family, resource_name
+        )
         try:
             client.create_db_instance(
                 DBInstanceIdentifier=aws_instance_identifier,
@@ -304,6 +361,48 @@ class BotoRDSAdapter:
         observed = self.describe_instance(account, network, aws_instance_identifier)
         if observed is None:
             raise ResourceError("aws_rds_instance_missing_after_create")
+        return observed
+
+    def modify_instance(
+        self, account: AWSProviderAccount, network: AWSNetwork,
+        resource: AWSRDSPostgresResource, resource_name: str, aws_instance_identifier: str,
+        changes: dict[str, object],
+    ) -> InstanceObservation:
+        """One immediate modification of exactly the given fields, never a major upgrade."""
+        if not changes or not set(changes) <= MODIFIABLE_FIELDS:
+            raise ResourceError("aws_rds_modify_field_forbidden")
+        family = _parameter_group_family(resource.engine_version)
+        session = self._session(account, account.inspection_role_arn, "rds-modify")
+        client = session.client("rds", region_name=network.region)
+        if "DBParameterGroupName" in changes:
+            self._ensure_parameter_group(
+                client, derive_parameter_group_name(aws_instance_identifier), family,
+                resource_name,
+            )
+        try:
+            client.modify_db_instance(
+                DBInstanceIdentifier=aws_instance_identifier, ApplyImmediately=True, **changes
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "modify") from None
+        observed = self.describe_instance(account, network, aws_instance_identifier)
+        if observed is None:
+            raise ResourceError("aws_rds_instance_disappeared")
+        return observed
+
+    def reboot_instance(
+        self, account: AWSProviderAccount, network: AWSNetwork, aws_instance_identifier: str,
+    ) -> InstanceObservation:
+        session = self._session(account, account.inspection_role_arn, "rds-reboot")
+        try:
+            session.client("rds", region_name=network.region).reboot_db_instance(
+                DBInstanceIdentifier=aws_instance_identifier, ForceFailover=False
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "reboot") from None
+        observed = self.describe_instance(account, network, aws_instance_identifier)
+        if observed is None:
+            raise ResourceError("aws_rds_instance_disappeared")
         return observed
 
     def resolve_master_credential(
@@ -468,7 +567,8 @@ def _instance_document(
     resource_name: str, aws_instance_identifier: str, observation: InstanceObservation,
     previous_allocations: dict[str, object],
 ) -> dict[str, object]:
-    phase = "ready" if observation.status == "available" else "pending"
+    ready = observation.status == "available" and not observation.converging
+    phase = "ready" if ready else "pending"
     return {
         "schema_version": 1,
         "resource": resource_name,
@@ -517,6 +617,44 @@ def validate_update(
         forbid("deployment_security_group_ids")
 
 
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"[0-9]+", version))
+
+
+def modification_for(
+    resource: AWSRDSPostgresResource, live: InstanceObservation, aws_instance_identifier: str
+) -> dict[str, object]:
+    """The exact modify_db_instance fields that bring an available instance onto desired
+    state, or {} when nothing differs. Values AWS already has pending count as applied, so a
+    resumed apply never re-sends them. Refuses, before any call, what ADR 0008 forbids."""
+    version = live.pending_engine_version or live.engine_version
+    storage = (
+        live.pending_allocated_storage_gb
+        if live.pending_allocated_storage_gb is not None else live.allocated_storage_gb
+    )
+    instance_class = live.pending_instance_class or live.instance_class
+    if version.split(".")[0] != resource.engine_version.split(".")[0]:
+        raise ResourceError("aws_rds_modify_forbidden_engine_major")
+    if _version_tuple(resource.engine_version) < _version_tuple(version):
+        raise ResourceError("aws_rds_modify_forbidden_engine_downgrade")
+    if storage is not None and resource.allocated_storage_gb < storage:
+        raise ResourceError("aws_rds_modify_forbidden_allocated_storage_gb")
+    changes: dict[str, object] = {}
+    if resource.engine_version != version:
+        changes["EngineVersion"] = resource.engine_version
+    if instance_class is not None and resource.instance_class != instance_class:
+        changes["DBInstanceClass"] = resource.instance_class
+    if storage is not None and resource.allocated_storage_gb > storage:
+        changes["AllocatedStorage"] = resource.allocated_storage_gb
+    desired_groups = desired_security_group_ids(resource)
+    if live.security_group_ids is not None and live.security_group_ids != desired_groups:
+        changes["VpcSecurityGroupIds"] = list(desired_groups)
+    parameter_group = derive_parameter_group_name(aws_instance_identifier)
+    if live.parameter_group_name is not None and live.parameter_group_name != parameter_group:
+        changes["DBParameterGroupName"] = parameter_group
+    return changes
+
+
 def instance_drift(
     resource: AWSRDSPostgresResource, live: InstanceObservation
 ) -> dict[str, object]:
@@ -555,19 +693,47 @@ def apply_provision(
         dict(cast(dict[str, object], previous["allocations"])) if previous is not None else {}
     )
     security_group_ids = list(desired_security_group_ids(resource))
+    modified_fields: list[str] = []
+    rebooted = False
+    deadline = now() + POLL_BUDGET_SECONDS
+
+    def settle(observed: InstanceObservation) -> InstanceObservation:
+        while (
+            observed.status not in ("available", "failed") or observed.converging
+        ) and now() < deadline:
+            sleep(POLL_INTERVAL_SECONDS)
+            refreshed = adapter.describe_instance(account, network, aws_instance_identifier)
+            if refreshed is None:
+                raise ResourceError("aws_rds_instance_disappeared")
+            observed = refreshed
+        return observed
+
     observed = adapter.describe_instance(account, network, aws_instance_identifier)
     if observed is None:
         observed = adapter.create_instance(
             account, network, resource, resource_name, aws_instance_identifier,
             security_group_ids,
         )
-    deadline = now() + POLL_BUDGET_SECONDS
-    while observed.status not in ("available", "failed") and now() < deadline:
-        sleep(POLL_INTERVAL_SECONDS)
-        refreshed = adapter.describe_instance(account, network, aws_instance_identifier)
-        if refreshed is None:
-            raise ResourceError("aws_rds_instance_disappeared")
-        observed = refreshed
+    else:
+        if observed.status not in ("available", "failed"):
+            # Diff against the settled instance so drift is not reported as ready.
+            observed = settle(observed)
+        if observed.status == "available":
+            changes = modification_for(resource, observed, aws_instance_identifier)
+            if changes:
+                observed = adapter.modify_instance(
+                    account, network, resource, resource_name, aws_instance_identifier, changes
+                )
+                modified_fields = sorted(changes)
+    observed = settle(observed)
+    # ponytail: at most one reboot per apply, decided from the live status. A second apply
+    # racing RDS's status flip could reboot again; add a journal entry if that ever matters.
+    if (
+        observed.status == "available" and not observed.converging
+        and observed.parameter_group_status == "pending-reboot"
+    ):
+        observed = settle(adapter.reboot_instance(account, network, aws_instance_identifier))
+        rebooted = True
     document = _instance_document(
         resource_name, aws_instance_identifier, observed, previous_allocations
     )
@@ -581,6 +747,8 @@ def apply_provision(
         "engine_version": observed.engine_version,
         "endpoint": observed.endpoint,
         "port": observed.port,
+        "modified_fields": modified_fields,
+        "rebooted": rebooted,
     }
 
 

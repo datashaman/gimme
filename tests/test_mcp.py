@@ -625,6 +625,8 @@ class FakeRDS:
     def __init__(self, *, fail_master: bool = False, fail_describe: bool = False) -> None:
         self.instances: dict[str, InstanceObservation] = {}
         self.create_calls = 0
+        self.modify_calls: list[dict[str, object]] = []
+        self.reboot_calls = 0
         self.fail_master = fail_master
         self.fail_describe = fail_describe
         self.secret_payloads: dict[str, dict[str, str]] = {}
@@ -645,6 +647,22 @@ class FakeRDS:
             allocated_storage_gb=resource.allocated_storage_gb,
             security_group_ids=tuple(sorted(group_ids)),
         )
+        return self.instances[identifier]
+
+    def modify_instance(self, account, network, resource, name, identifier, changes):
+        self.modify_calls.append(dict(changes))
+        live = self.instances[identifier]
+        renames = {
+            "EngineVersion": "engine_version", "DBInstanceClass": "instance_class",
+            "AllocatedStorage": "allocated_storage_gb",
+        }
+        self.instances[identifier] = dataclasses.replace(
+            live, **{renames[key]: value for key, value in changes.items() if key in renames}
+        )
+        return self.instances[identifier]
+
+    def reboot_instance(self, account, network, identifier):
+        self.reboot_calls += 1
         return self.instances[identifier]
 
     def resolve_master_credential(self, account, region, secret_arn):
@@ -983,14 +1001,79 @@ def test_inspect_resource_reports_drift_only_from_a_successful_live_read(
     assert "drift" not in cached
 
 
-def test_resource_provision_plan_says_an_existing_instance_is_not_modified(
+def test_resource_provision_plan_describes_convergence_and_binds_the_security_groups(
     tmp_path, monkeypatch
 ) -> None:
-    use_rds_store(tmp_path, monkeypatch, bound=False)
-    effects = " ".join(server_module.plan_apply_resource("primary-rds")["effects"])
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=False)
+    monkeypatch.setattr(
+        adapter, "describe_instance", lambda *a, **k: pytest.fail("planning must stay local")
+    )
+    plan = server_module.plan_apply_resource("primary-rds")
+    effects = " ".join(plan["effects"])
 
-    assert "only polled, never modified" in effects
-    assert "reconcile it when present" not in effects
+    assert "one immediate modification" in effects
+    assert "restarts the instance" in effects and "fails over" in effects
+    assert "without forced failover" in effects
+    assert "only polled" not in effects
+    assert plan["security_group_ids"] == ["sg-0123456789abcdef0", "sg-0123456789abcdef1"]
+
+    changed = rds_definition(deployment_security_group_ids={"devbox": "sg-0123456789abcdef9"})
+    server_module.update_resource(
+        "primary-rds", changed,
+        str(server_module.plan_update_resource("primary-rds", changed)["plan_id"]),
+    )
+    assert server_module.plan_apply_resource("primary-rds")["plan_id"] != plan["plan_id"]
+
+
+def test_apply_resource_converges_an_existing_instance_and_reports_only_field_names(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=False)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    larger = rds_definition(instance_class="db.m6g.large", allocated_storage_gb=40)
+    server_module.update_resource(
+        "primary-rds", larger,
+        str(server_module.plan_update_resource("primary-rds", larger)["plan_id"]),
+    )
+
+    result = server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+
+    assert adapter.modify_calls == [{"DBInstanceClass": "db.m6g.large", "AllocatedStorage": 40}]
+    assert adapter.create_calls == 1 and adapter.reboot_calls == 0
+    assert result["modified_fields"] == ["AllocatedStorage", "DBInstanceClass"]
+    assert result["phase"] == "ready"
+    assert MASTER_PASSWORD not in str(result)
+    again = server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    assert again["modified_fields"] == [] and len(adapter.modify_calls) == 1
+
+
+def test_inspect_resource_is_pending_while_a_managed_change_is_unapplied(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=False)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    identifier = next(iter(adapter.instances))
+    assert server_module.inspect_resource("primary-rds")["phase"] == "ready"
+
+    adapter.instances[identifier] = dataclasses.replace(
+        adapter.instances[identifier], pending_instance_class="db.m6g.large",
+        modification_pending=True,
+    )
+    assert server_module.inspect_resource("primary-rds")["phase"] == "pending"
+    adapter.instances[identifier] = dataclasses.replace(
+        adapter.instances[identifier], pending_instance_class=None,
+    )
+    assert server_module.inspect_resource("primary-rds")["phase"] == "ready", (
+        "an unmanaged pending value must not hold readiness"
+    )
 
 
 def test_bind_resource_rejects_stale_plans_and_unready_resources(tmp_path, monkeypatch) -> None:

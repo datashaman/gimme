@@ -12,6 +12,7 @@ from gimme.control import (
     TargetConfig,
 )
 from gimme.execution import execution_fingerprint
+from gimme.resources_postgres import desired_security_group_ids
 
 
 def exact_plan(value: dict[str, Any]) -> dict[str, Any]:
@@ -269,11 +270,20 @@ def resource_provision_plan(
             "engine_version": resource.engine_version,
             "instance_class": resource.instance_class,
             "allocated_storage_gb": resource.allocated_storage_gb,
+            "security_group_ids": list(desired_security_group_ids(resource)),
             "current_phase": observed["phase"] if observed is not None else "absent",
             "effects": [
                 "create the RDS instance, its DB subnet group, and its DB parameter group "
-                "(rds.force_ssl=1) when absent; an existing instance is only polled, "
-                "never modified",
+                "(rds.force_ssl=1) when absent",
+                "converge an existing instance with one immediate modification of only the "
+                "fields that differ: same-major engine version, instance class, an increased "
+                "storage size, security groups, and the Resource-owned parameter group; a "
+                "storage decrease, version downgrade, or major mismatch is refused before "
+                "any change",
+                "disruption: an instance-class change fails over a Multi-AZ instance, and an "
+                "engine version change or parameter group attach restarts the instance",
+                "reboot the instance once, without forced failover, when its parameter group "
+                "reports pending-reboot and no modification is pending",
                 "poll for at most 30 seconds and return a bounded pending phase if not yet ready",
                 "never returns, stores, or logs a decrypted credential",
             ],
