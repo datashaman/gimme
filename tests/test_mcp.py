@@ -41,6 +41,7 @@ from gimme.recovery import append_restore_event, recovery_point_id, restore_even
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
+import gimme.recovery as recovery_module
 from gimme.server import mcp
 
 
@@ -303,6 +304,7 @@ async def test_hard_v4_tool_surface() -> None:
         "create_recovery_point",
         "list_recovery_points",
         "list_restores",
+        "plan_restore_deployment",
     }
     assert {str(resource.uri) for resource in resources} == {
         "gimme://state", "gimme://operations"
@@ -651,6 +653,7 @@ def test_restore_record_tool_and_resource_are_destination_authoritative(
     append_restore_event(
         server_module.store.load().backup_destinations["primary"], None, adapter,
         "example-app", "restore-1", "started", source_recovery_point_id=point,
+        destination_resource="devbox-postgres",
         destination_provider="target_local", destination_kind="postgres",
         destination_version="17.2",
     )
@@ -661,6 +664,90 @@ def test_restore_record_tool_and_resource_are_destination_authoritative(
     assert listed["restores"] == [resource]
     assert resource["state"] == "started"
     assert "gimme/restores" not in str(listed)
+
+
+def test_restore_plan_is_read_only_content_addressed_and_exactly_confirmed(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    content = b"postgres-dump"
+    path = tmp_path / "postgres.dump"
+    path.write_bytes(content)
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=path,
+            sha256=hashlib.sha256(content).hexdigest(), bytes=len(content),
+            resource_version="17.2",
+        ),
+    )
+    calls = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append(task)
+        return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+
+    plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
+
+    assert calls == ["gimme:recovery:inspect-postgres"]
+    assert plan["ready"] is True
+    assert plan["source"] == {
+        "recovery_point_id": point, "provider": "target_local",
+        "kind": "postgres", "version": "17.2",
+    }
+    assert plan["destination"] == {
+        "resource": "devbox-postgres", "provider": "target_local",
+        "kind": "postgres", "version": "17.2", "empty": False,
+    }
+    assert plan["confirmation"] == f"RESTORE DEPLOYMENT example-app FROM {point}"
+    assert "database_identifier" not in str(plan)
+    assert "gimme/recovery-points" not in str(plan)
+
+
+def test_restore_plan_reports_multi_component_and_version_incompatibility(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    postgres = tmp_path / "postgres.dump"
+    valkey = tmp_path / "valkey.dump"
+    postgres.write_bytes(b"pg")
+    valkey.write_bytes(b'{}\n')
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, [
+            recovery_module.ComponentDump(
+                kind="postgres", local_path=postgres,
+                sha256=hashlib.sha256(b"pg").hexdigest(), bytes=2,
+                resource_version="16.6",
+            ),
+            recovery_module.ComponentDump(
+                kind="valkey", local_path=valkey,
+                sha256=hashlib.sha256(b'{}\n').hexdigest(), bytes=3,
+                resource_version="8.0.1", format="gimme-valkey-v1", records=0,
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *args, **kwargs: CommandResult(
+            ["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty"
+        ),
+    )
+
+    plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
+
+    assert plan["ready"] is False
+    assert plan["readiness_issues"] == [
+        "multi_component_restore_unsupported", "source_version_incompatible",
+    ]
 
 
 def test_delete_recovery_point_requires_both_confirmations_for_the_last_point(

@@ -34,6 +34,7 @@ from gimme.control import (
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
+    deployment_restore_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, recovery_point_deletion_plan,
     registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
@@ -1254,6 +1255,61 @@ def restore_record_resource(name: str, request_id: str) -> dict[str, object]:
     _, credentials = _backup_destination_credentials(state, destination)
     return recovery_module.load_restore_record(
         destination, credentials, backup_s3, name, request_id
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("restore_deployment", "name")
+def plan_restore_deployment(
+    name: Name, recovery_point_id: RecoveryPointId, request_id: RequestId,
+) -> dict[str, object]:
+    """Plan a confirmed PostgreSQL-only Restore without mutating target or destination."""
+    state, deployment, destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    manifest = recovery_module.find_recovery_point(
+        destination_name, destination, credentials, backup_s3, name, recovery_point_id
+    )
+    if manifest is None:
+        raise RecoveryError("restore_source_missing")
+    resource_name = deployment.resources.database
+    resource = state.resources[resource_name] if resource_name is not None else None
+    if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
+        raise RecoveryError("restore_destination_incompatible")
+    observation = _run_deployment(
+        "gimme:recovery:inspect-postgres", name, timeout=60
+    )
+    states = {
+        line.split("|", 1)[1]
+        for raw in observation.output.splitlines()
+        if (line := raw.split("] ", 1)[-1].strip()).startswith(
+            "GIMME_POSTGRES_RESTORE_PREFLIGHT|"
+        )
+    }
+    if len(states) != 1 or not states <= {"empty", "nonempty"}:
+        raise RecoveryError("restore_destination_inspection_failed")
+    try:
+        existing_restore = recovery_module.load_restore_record(
+            destination, credentials, backup_s3, name, request_id
+        )
+    except RecoveryError as exc:
+        if str(exc) != "restore_record_missing":
+            raise
+        existing_restore = None
+    expected_destination = {
+        "resource": resource_name, "provider": "target_local",
+        "kind": "postgres", "version": resource.version,
+    }
+    request_conflict = existing_restore is not None and (
+        existing_restore["source_recovery_point_id"] != recovery_point_id
+        or existing_restore["destination"] != expected_destination
+    )
+    return deployment_restore_plan(
+        name, recovery_point_id, request_id,
+        cast(list[dict[str, object]], manifest["components"]),
+        resource_name, resource.version, states == {"empty"},
+        deployment.recovery.valkey,
+        None if existing_restore is None else str(existing_restore["state"]),
+        request_conflict,
     )
 
 

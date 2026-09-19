@@ -266,6 +266,7 @@ On-demand Recovery Points are created and listed with:
 | `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
+| `plan_restore_deployment` | Destination + remote read | Verify a PostgreSQL-only source, exact destination compatibility, and database emptiness; return exact effects and confirmation without mutation |
 
 `create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
 identity is derived from `(deployment, destination, request_id)`, never from wall-clock
@@ -305,6 +306,16 @@ Restore transitions are append-only, immutable objects in the bound Backup Desti
 Deployment and request identities, source Recovery Point identity, destination provider/kind/
 version, current bounded state, timestamps, event count, and Safety Recovery Point identity.
 Storage identities, database identities, paths, SQL, endpoints, and credentials remain private.
+
+`plan_restore_deployment` is read-only. It validates the exact source manifest under the
+owning Deployment, requires a PostgreSQL-only source and policy, compares the source and
+current target-local PostgreSQL versions exactly, and runs one fixed catalog inspection to
+classify the current database as `empty` or `nonempty`. Tables, partitioned tables, views,
+materialized views, sequences, foreign tables, routines, user-defined composite/domain/enum/
+range types, and non-baseline extensions all make the database non-empty; an ambiguous or
+failed inspection fails closed. The plan contains no database name and returns the exact
+`RESTORE DEPLOYMENT <deployment> FROM <recovery-point>` confirmation. Apply and verification
+tools are added by the following restore-execution slice.
 
 ## Application operation tools
 
