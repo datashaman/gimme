@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from functools import wraps
 from inspect import signature
 from pathlib import Path
-from typing import Annotated, Any, Callable, Literal, ParamSpec, TypeVar, cast
+from typing import Annotated, Any, Callable, Iterator, Literal, ParamSpec, TypeVar, cast
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -263,10 +263,14 @@ def _run_deployment(
     secret_manifest: list[dict[str, str]] | None = None,
     artisan_command: str | None = None, artisan_arguments: list[str] | None = None,
     backup_local_path: Path | None = None,
+    recovery_action: str | None = None,
+    recovery_request_id: str | None = None,
+    recovery_quiesce_wait: int | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
     valkey = deployment.resources.valkey
+    valkey_resource = None if valkey is None else state.resources[valkey.resource]
     contract_values, _credentials, probe, _issues = _valkey_runtime(name, state, deployment)
     bound_resources = {
         kind: resource.model_dump(mode="json")
@@ -285,7 +289,12 @@ def _run_deployment(
         deploy_path=f"{target.apps_root}/{deployment.placement.relative_path}",
         site_host=deployment.placement.site_host,
         database_identifier=deployment.placement.database_identifier,
-        cache_prefix=deployment.placement.cache_prefix,
+        cache_prefix=(
+            f"{{gimme:{name}}}:"
+            if task == "gimme:backup:capture-valkey"
+            and isinstance(valkey_resource, AWSElastiCacheValkeyResource)
+            else deployment.placement.cache_prefix
+        ),
         source_kind=deployment.source.kind, sites=target_sites(state, deployment.target),
         network_mode=target.network.mode,
         runtimes={key: value.model_dump(mode="json") for key, value in deployment.runtimes.items()},
@@ -301,8 +310,48 @@ def _run_deployment(
             else None
         ),
         backup_local_path=backup_local_path,
+        recovery_action=recovery_action,
+        recovery_request_id=recovery_request_id,
+        recovery_quiesce_wait=recovery_quiesce_wait,
         timeout=timeout,
     )
+
+
+@contextmanager
+def _recovery_maintenance_window(
+    name: str, request_id: str, wait_seconds: int, *, enabled: bool,
+) -> Iterator[Callable[[], None]]:
+    """Keep request-owned maintenance active until verified uploads are ready to publish."""
+    pending = enabled
+
+    def restore() -> None:
+        nonlocal pending
+        if not pending:
+            return
+        try:
+            _run_deployment(
+                "gimme:recovery:maintenance", name,
+                recovery_action="exit", recovery_request_id=request_id,
+                recovery_quiesce_wait=wait_seconds, timeout=900,
+            )
+        except Exception:
+            raise RecoveryError("recovery_runtime_restore_failed") from None
+        pending = False
+
+    if enabled:
+        try:
+            _run_deployment(
+                "gimme:recovery:maintenance", name,
+                recovery_action="enter", recovery_request_id=request_id,
+                recovery_quiesce_wait=wait_seconds, timeout=900,
+            )
+        except Exception:
+            restore()
+            raise RecoveryError("recovery_maintenance_failed") from None
+    try:
+        yield restore
+    finally:
+        restore()
 
 
 def _revision(name: str) -> str:
@@ -1042,8 +1091,6 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
         name, deployment, destination_name, destination, request_id, point_id
     )
     _assert_plan(expected, plan_id)
-    if not expected["ready"]:
-        raise RecoveryError("valkey_recovery_capture_unavailable")
     _, credentials = _backup_destination_credentials(state, destination)
     with _deployment_resource_lock(name):
         existing = recovery_module.find_recovery_point(
@@ -1056,35 +1103,113 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
             }
         with tempfile.TemporaryDirectory(prefix="gimme-recovery-") as directory:
             local_path = Path(directory) / "postgres.dump"
-            result = _run_deployment(
-                "gimme:backup:dump-postgres", name, backup_local_path=local_path, timeout=1800,
+            valkey_path = Path(directory) / "valkey.archive"
+            results: dict[str, CommandResult] = {}
+            binding = deployment.resources.valkey
+            valkey_resource_name = binding.resource if binding is not None else None
+            valkey_resource = (
+                state.resources[valkey_resource_name]
+                if valkey_resource_name is not None else None
             )
-            sha256 = ""
-            size = -1
-            for raw in result.output.splitlines():
-                line = raw.split("] ", 1)[-1].strip()
-                if line.startswith("GIMME_BACKUP|"):
-                    parts = line.split("|", 2)
-                    if len(parts) == 3 and parts[2].isdigit():
-                        sha256, size = parts[1], int(parts[2])
-            if (
-                re.fullmatch(r"[0-9a-f]{64}", sha256) is None
-                or size < 0
-                or not local_path.is_file()
-                or local_path.stat().st_size != size
-            ):
-                raise RecoveryError("recovery_dump_metadata_invalid")
-            database_name = deployment.resources.database
-            database = state.resources[database_name] if database_name is not None else None
-            if not isinstance(database, ResourceConfig):
-                raise RecoveryError("recovery_database_provenance_invalid")
-            dump = ComponentDump(
-                kind="postgres", local_path=local_path, sha256=sha256, bytes=size,
-                resource_version=database.version, captured_at=datetime.now(UTC).isoformat(),
-            )
-            manifest = recovery_module.create_recovery_point(
-                destination_name, destination, credentials, backup_s3, name, point_id, dump,
-            )
+            admin_credential: dict[str, str] = {}
+            if deployment.recovery.valkey and isinstance(
+                valkey_resource, AWSElastiCacheValkeyResource
+            ) and valkey_resource_name is not None:
+                network = state.aws_networks[valkey_resource.aws_network]
+                account = state.provider_accounts[network.provider_account]
+                workload_store = cast(
+                    AWSSecretsManagerStore,
+                    state.secret_stores[valkey_resource.workload_secret_store],
+                )
+                elasticache_valkey.ensure_admin_capture_access(
+                    account, network, valkey_resource_name
+                )
+                admin_credential = elasticache_valkey.resolve_admin_credential(
+                    account, workload_store, valkey_resource_name
+                )
+            with _recovery_maintenance_window(
+                name, request_id, deployment.recovery.quiesce_wait_seconds,
+                enabled=deployment.recovery.valkey,
+            ) as restore_runtime:
+                with protected_secret_file(admin_credential) as valkey_secret:
+                    try:
+                        results["postgres"] = _run_deployment(
+                            "gimme:backup:dump-postgres", name,
+                            backup_local_path=local_path, timeout=1800,
+                        )
+                        if deployment.recovery.valkey:
+                            results["valkey"] = _run_deployment(
+                                "gimme:backup:capture-valkey", name,
+                                backup_local_path=valkey_path, secret_file=valkey_secret,
+                                timeout=1800,
+                            )
+                    except Exception:
+                        raise RecoveryError("recovery_capture_failed") from None
+                result = results["postgres"]
+                sha256 = ""
+                size = -1
+                for raw in result.output.splitlines():
+                    line = raw.split("] ", 1)[-1].strip()
+                    if line.startswith("GIMME_BACKUP|"):
+                        parts = line.split("|", 2)
+                        if len(parts) == 3 and parts[2].isdigit():
+                            sha256, size = parts[1], int(parts[2])
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                    or size < 0
+                    or not local_path.is_file()
+                    or local_path.stat().st_size != size
+                ):
+                    raise RecoveryError("recovery_dump_metadata_invalid")
+                database_name = deployment.resources.database
+                database = state.resources[database_name] if database_name is not None else None
+                if not isinstance(database, ResourceConfig):
+                    raise RecoveryError("recovery_database_provenance_invalid")
+                dumps = [ComponentDump(
+                    kind="postgres", local_path=local_path, sha256=sha256, bytes=size,
+                    resource_version=database.version, captured_at=datetime.now(UTC).isoformat(),
+                )]
+                if deployment.recovery.valkey:
+                    version = (
+                        valkey_resource.version if isinstance(valkey_resource, ResourceConfig)
+                        else valkey_resource.engine_version
+                        if isinstance(valkey_resource, AWSElastiCacheValkeyResource) else ""
+                    )
+                    valkey_sha256 = ""
+                    valkey_size = -1
+                    valkey_records = -1
+                    captured_at = ""
+                    for raw in results["valkey"].output.splitlines():
+                        line = raw.split("] ", 1)[-1].strip()
+                        if line.startswith("GIMME_VALKEY_BACKUP|"):
+                            parts = line.split("|", 4)
+                            if len(parts) == 5 and parts[2].isdigit() and parts[3].isdigit():
+                                valkey_sha256 = parts[1]
+                                valkey_size = int(parts[2])
+                                valkey_records = int(parts[3])
+                                captured_at = parts[4]
+                    try:
+                        capture_time = datetime.fromisoformat(captured_at)
+                    except ValueError:
+                        capture_time = None
+                    if (
+                        re.fullmatch(r"[0-9a-f]{64}", valkey_sha256) is None
+                        or valkey_size < 0 or not 0 <= valkey_records <= 100_000
+                        or not valkey_path.is_file()
+                        or valkey_path.stat().st_size != valkey_size
+                        or capture_time is None or capture_time.tzinfo is None or not version
+                    ):
+                        raise RecoveryError("recovery_valkey_metadata_invalid")
+                    dumps.append(ComponentDump(
+                        kind="valkey", local_path=valkey_path, sha256=valkey_sha256,
+                        bytes=valkey_size, resource_version=version,
+                        format="gimme-valkey-v1", records=valkey_records,
+                        captured_at=captured_at,
+                    ))
+                manifest = recovery_module.create_recovery_point(
+                    destination_name, destination, credentials, backup_s3, name, point_id, dumps,
+                    before_publish=restore_runtime if deployment.recovery.valkey else None,
+                )
     return {
         "changed": True,
         "recovery_point": recovery_module.public_recovery_point(manifest),

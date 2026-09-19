@@ -187,7 +187,10 @@ BASH;
 function privileged_helper_source_hashes(): array
 {
     $hashes = [];
-    foreach (['gimme-provision-stack', 'gimme-provision-processes'] as $name) {
+    foreach ([
+        'gimme-provision-stack', 'gimme-provision-processes',
+        'gimme-recovery-maintenance',
+    ] as $name) {
         $source = file_get_contents(dirname(__DIR__) . "/scripts/{$name}");
         if ($source === false) {
             throw new \RuntimeException("Missing privileged helper source: {$name}");

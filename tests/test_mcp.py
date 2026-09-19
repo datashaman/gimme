@@ -809,10 +809,12 @@ def test_create_recovery_point_requires_a_bound_recovery_policy(tmp_path, monkey
         server_module.plan_create_recovery_point("example-app", "req-1")
 
 
-def test_valkey_recovery_opt_in_and_drain_interval_are_content_addressed(
+def test_valkey_recovery_quiesces_captures_both_components_and_restores_runtime(
     tmp_path, monkeypatch
 ) -> None:
     selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
     postgres_only = server_module.plan_create_recovery_point("example-app", "req-1")
     deployment = selected.deployment("example-app")
     selected.save(
@@ -832,13 +834,81 @@ def test_valkey_recovery_opt_in_and_drain_interval_are_content_addressed(
     assert postgres_only["components"] == ["postgres"]
     assert inclusive["components"] == ["postgres", "valkey"]
     assert inclusive["quiesce_wait_seconds"] == 45
-    assert inclusive["ready"] is False
+    assert inclusive["ready"] is True
     assert inclusive["plan_id"] != postgres_only["plan_id"]
+    calls = []
 
-    with pytest.raises(RecoveryError, match="^valkey_recovery_capture_unavailable$"):
-        server_module.create_recovery_point(
-            "example-app", "req-1", str(inclusive["plan_id"])
-        )
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs.get("recovery_action")))
+        if task == "gimme:backup:dump-postgres":
+            content = b"postgres-dump"
+            kwargs["backup_local_path"].write_bytes(content)
+            return CommandResult(
+                ["dep"], 0,
+                f"GIMME_BACKUP|{hashlib.sha256(content).hexdigest()}|{len(content)}",
+            )
+        if task == "gimme:backup:capture-valkey":
+            content = b'{"format":"gimme-valkey-v1"}\n'
+            kwargs["backup_local_path"].write_bytes(content)
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_VALKEY_BACKUP|"
+                f"{hashlib.sha256(content).hexdigest()}|{len(content)}|0|"
+                "2026-09-19T10:00:00+00:00",
+            )
+        return CommandResult(["dep"], 0, "maintenance")
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    result = server_module.create_recovery_point(
+        "example-app", "req-1", str(inclusive["plan_id"])
+    )
+
+    assert calls == [
+        ("gimme:recovery:maintenance", "enter"),
+        ("gimme:backup:dump-postgres", None),
+        ("gimme:backup:capture-valkey", None),
+        ("gimme:recovery:maintenance", "exit"),
+    ]
+    assert [item["kind"] for item in result["recovery_point"]["components"]] == [
+        "postgres", "valkey",
+    ]
+
+
+def test_valkey_capture_failure_restores_runtime_and_publishes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    deployment = selected.deployment("example-app")
+    selected.save(selected.load().model_copy(update={"deployments": {
+        "example-app": deployment.model_copy(update={
+            "recovery": RecoveryPolicy(destination="primary", valkey=True)
+        })
+    }}))
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    calls = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs.get("recovery_action")))
+        if task == "gimme:backup:dump-postgres":
+            content = b"postgres-dump"
+            kwargs["backup_local_path"].write_bytes(content)
+            return CommandResult(
+                ["dep"], 0,
+                f"GIMME_BACKUP|{hashlib.sha256(content).hexdigest()}|{len(content)}",
+            )
+        if task == "gimme:backup:capture-valkey":
+            raise RuntimeError("private key material must never escape")
+        return CommandResult(["dep"], 0, "maintenance")
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    plan = server_module.plan_create_recovery_point("example-app", "req-1")
+
+    with pytest.raises(RecoveryError, match="^recovery_capture_failed$"):
+        server_module.create_recovery_point("example-app", "req-1", str(plan["plan_id"]))
+
+    assert calls[-1] == ("gimme:recovery:maintenance", "exit")
+    assert adapter.objects == {}
 
 
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:

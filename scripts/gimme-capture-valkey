@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+"""Capture one internally supplied Deployment Valkey prefix as a binary-safe archive."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import stat
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+MAX_BULK = 64 * 1024 * 1024
+MAX_KEYS = 100_000
+MAX_ARCHIVE = 512 * 1024 * 1024
+MINIMUM_FREE = 64 * 1024 * 1024
+PREFIX = re.compile(
+    r"^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$"
+)
+HOST = re.compile(r"^[a-zA-Z0-9.-]{1,255}$")
+
+
+class CaptureFailure(RuntimeError):
+    pass
+
+
+class ServerError(CaptureFailure):
+    def __init__(self, message: bytes):
+        super().__init__("valkey server rejected capture")
+        self.message = message
+
+
+class Connection:
+    def __init__(self, host: str, port: int, tls: bool):
+        raw = socket.create_connection((host, port), timeout=10)
+        self.socket = (
+            ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+            if tls else raw
+        )
+        self.socket.settimeout(10)
+        self.reader = self.socket.makefile("rb")
+
+    def call(self, *arguments: str | bytes | int):
+        parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+        self.socket.sendall(
+            b"*%d\r\n" % len(parts)
+            + b"".join(b"$%d\r\n%s\r\n" % (len(item), item) for item in parts)
+        )
+        return self.read()
+
+    def read(self):
+        line = self.reader.readline(128)
+        if not line.endswith(b"\r\n"):
+            raise CaptureFailure("valkey capture protocol invalid")
+        kind, value = line[:1], line[1:-2]
+        if kind == b"+":
+            return value
+        if kind == b"-":
+            raise ServerError(value)
+        if kind == b":":
+            return int(value)
+        if kind == b"$":
+            size = int(value)
+            if size < 0:
+                return None
+            if size > MAX_BULK:
+                raise CaptureFailure("valkey capture value too large")
+            payload = self.reader.read(size + 2)
+            if len(payload) != size + 2 or not payload.endswith(b"\r\n"):
+                raise CaptureFailure("valkey capture protocol invalid")
+            return payload[:-2]
+        if kind == b"*":
+            count = int(value)
+            if count < 0:
+                return None
+            if count > MAX_KEYS:
+                raise CaptureFailure("valkey capture response too large")
+            return [self.read() for _ in range(count)]
+        raise CaptureFailure("valkey capture protocol invalid")
+
+    def close(self) -> None:
+        self.reader.close()
+        self.socket.close()
+
+
+class Session:
+    def __init__(
+        self, host: str, port: int, tls: bool, username: str | None, password: str | None
+    ):
+        self.base_host = host
+        self.tls = tls
+        self.username = username
+        self.password = password
+        self.connection = Connection(host, port, tls)
+        self.authenticate()
+
+    def authenticate(self) -> None:
+        if self.username is not None and self.password is not None:
+            self.connection.call("AUTH", self.username, self.password)
+
+    def call(self, *arguments: str | bytes | int):
+        for _attempt in range(3):
+            try:
+                return self.connection.call(*arguments)
+            except ServerError as error:
+                parts = error.message.split()
+                if len(parts) < 3 or parts[0] != b"MOVED":
+                    raise
+                rendered = parts[2].decode("ascii", "strict")
+                host, separator, port = rendered.rpartition(":")
+                domain = self.base_host.partition(".")[2]
+                if (
+                    separator != ":" or not port.isdigit() or not 1 <= int(port) <= 65535
+                    or not (
+                        host == self.base_host
+                        or ("." in domain and host.endswith("." + domain))
+                    )
+                ):
+                    raise CaptureFailure("valkey capture redirect invalid") from None
+                self.connection.close()
+                self.connection = Connection(host, int(port), self.tls)
+                self.authenticate()
+        raise CaptureFailure("valkey capture redirect limit")
+
+
+def credential(path: str) -> tuple[str | None, str | None]:
+    if path == "-":
+        return None, None
+    secret = Path(path)
+    details = secret.lstat()
+    if (
+        secret.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size > 4096
+    ):
+        raise CaptureFailure("valkey capture credential invalid")
+    value = json.loads(secret.read_text())
+    if (
+        not isinstance(value, dict) or set(value) != {"username", "password"}
+        or not all(isinstance(item, str) and item for item in value.values())
+    ):
+        raise CaptureFailure("valkey capture credential invalid")
+    return value["username"], value["password"]
+
+
+def capture(
+    output: Path, prefix: bytes, host: str, port: int, tls: bool,
+    username: str | None, password: str | None,
+) -> tuple[str, int, int, str]:
+    session = Session(host, port, tls, username, password)
+    cursor = 0
+    seen: set[bytes] = set()
+    records: list[tuple[bytes, bytes]] = []
+    scanned_bytes = 0
+    encoded_bytes = len(b'{"format":"gimme-valkey-v1"}\n')
+    script = (
+        "local d=redis.call('DUMP',KEYS[1]);"
+        "if not d then return {false,false} end;"
+        "return {d,redis.call('PEXPIRETIME',KEYS[1])}"
+    )
+    try:
+        while True:
+            response = session.call("SCAN", cursor, "MATCH", prefix + b"*", "COUNT", 1000)
+            if not isinstance(response, list) or len(response) != 2:
+                raise CaptureFailure("valkey capture scan invalid")
+            cursor = int(response[0])
+            keys = response[1]
+            if not isinstance(keys, list):
+                raise CaptureFailure("valkey capture scan invalid")
+            for key in keys:
+                if not isinstance(key, bytes) or not key.startswith(prefix):
+                    raise CaptureFailure("valkey capture isolation failed")
+                if key in seen:
+                    continue
+                seen.add(key)
+                scanned_bytes += len(key)
+                if len(seen) > MAX_KEYS:
+                    raise CaptureFailure("valkey capture key limit")
+                if scanned_bytes > MAX_ARCHIVE:
+                    raise CaptureFailure("valkey capture capacity insufficient")
+                result = session.call("EVAL", script, 1, key)
+                if not isinstance(result, list) or len(result) != 2:
+                    raise CaptureFailure("valkey capture response invalid")
+                if result[0] is None:
+                    continue
+                if not isinstance(result[0], bytes) or not isinstance(result[1], int):
+                    raise CaptureFailure("valkey capture response invalid")
+                expiry = result[1]
+                if expiry == -2:
+                    continue
+                if expiry < -1:
+                    raise CaptureFailure("valkey capture expiry invalid")
+                now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                if expiry >= 0 and expiry <= now_ms:
+                    continue
+                record = json.dumps({
+                    "dump": base64.b64encode(result[0]).decode("ascii"),
+                    "expires_at_ms": None if expiry < 0 else expiry,
+                    "key": base64.b64encode(key).decode("ascii"),
+                }, sort_keys=True, separators=(",", ":")).encode()
+                encoded_bytes += len(record) + 1
+                enough_space = (
+                    shutil.disk_usage(output.parent).free
+                    >= encoded_bytes * 2 + MINIMUM_FREE
+                )
+                if encoded_bytes > MAX_ARCHIVE or not enough_space:
+                    raise CaptureFailure("valkey capture capacity insufficient")
+                records.append((key, record))
+            if cursor == 0:
+                break
+    finally:
+        session.connection.close()
+    header = b'{"format":"gimme-valkey-v1"}'
+    body = b"\n".join([header, *(record for _key, record in sorted(records))]) + b"\n"
+    enough_space = shutil.disk_usage(output.parent).free >= len(body) * 2 + MINIMUM_FREE
+    if len(body) > MAX_ARCHIVE or not enough_space:
+        raise CaptureFailure("valkey capture capacity insufficient")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, output)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    captured_at = datetime.now(UTC).isoformat()
+    return hashlib.sha256(body).hexdigest(), len(body), len(records), captured_at
+
+
+def main() -> None:
+    if len(sys.argv) != 7:
+        raise CaptureFailure("valkey capture requires fixed internal inputs")
+    output = Path(sys.argv[1])
+    prefix_value, host, port_value, tls_value, secret_path = sys.argv[2:]
+    if (
+        not output.is_absolute() or PREFIX.fullmatch(prefix_value) is None
+        or HOST.fullmatch(host) is None or not port_value.isdigit()
+        or not 1 <= int(port_value) <= 65535 or tls_value not in {"yes", "no"}
+    ):
+        raise CaptureFailure("valkey capture policy invalid")
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    username, password = credential(secret_path)
+    sha256, size, keys, captured_at = capture(
+        output, prefix_value.encode(), host, int(port_value), tls_value == "yes",
+        username, password,
+    )
+    print(f"GIMME_VALKEY_BACKUP|{sha256}|{size}|{keys}|{captured_at}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (CaptureFailure, OSError, ValueError, json.JSONDecodeError):
+        print("GIMME_VALKEY_BACKUP_FAILED|capture_failed", file=sys.stderr)
+        raise SystemExit(1) from None

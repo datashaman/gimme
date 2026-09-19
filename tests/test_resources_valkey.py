@@ -729,6 +729,24 @@ def context():
     )
 
 
+def test_capture_converges_the_existing_admin_user_to_the_fixed_acl(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "modify_user", {},
+        {
+            "UserId": resources_valkey_module._derived(GROUP_ID, "admin"),
+            "AccessString": ADMIN_ACCESS_STRING,
+        },
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _store = context()
+
+    with stub:
+        adapter.ensure_admin_capture_access(account, network, NAME)
+
+    stub.assert_no_pending_responses()
+
+
 def group_response(**updates) -> dict[str, object]:
     values: dict[str, object] = {
         "ReplicationGroupId": GROUP_ID, "Status": "available", "ARN": ARN,

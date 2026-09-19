@@ -629,10 +629,14 @@ BASH;
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        '[ -x /usr/local/sbin/gimme-recovery-maintenance ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-recovery-maintenance && " .
         'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
-        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
+        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-recovery-maintenance enter probe probe ' .
+        '>/dev/null 2>&1'
     );
     writeln('privileged_helper=' . ($helperReady ? 'ready' : 'bootstrap_required'));
     foreach (configured_services() as $service) {
@@ -880,7 +884,11 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $processHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-provision-processes'
     );
-    if ($helperTemplate === false || $processHelperTemplate === false) {
+    $recoveryHelperTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-recovery-maintenance'
+    );
+    if ($helperTemplate === false || $processHelperTemplate === false ||
+        $recoveryHelperTemplate === false) {
         throw new \RuntimeException('Missing privileged helper source');
     }
     $policy = privileged_helper_policy(
@@ -922,14 +930,22 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         $processHelperTemplate,
     );
     $processHelper = str_replace('__GIMME_POLICY_ID__', $policy, $processHelper);
+    $recoveryHelper = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $recoveryHelperTemplate,
+    );
+    $recoveryHelper = str_replace('__GIMME_POLICY_ID__', $policy, $recoveryHelper);
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
+    $recoveryHelperEncoded = escapeshellarg(base64_encode($recoveryHelper));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
     $miseVersion = escapeshellarg(configured_mise_version() ?? '');
     $user = escapeshellarg($remoteUser);
     $sudoers = escapeshellarg(
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
-        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n"
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n" .
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *\n"
     );
     $rootWriteState = str_replace(
         'install -d -m 0700',
@@ -976,14 +992,18 @@ printf 'GIMME_BOOTSTRAP|state|writing validated desired state\n'
 printf 'GIMME_BOOTSTRAP|helpers|installing privileged helpers\n'
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
 process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
+recovery_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-recovery-maintenance.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$recovery_helper_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
 printf %s {$processHelperEncoded} | base64 -d > "\$process_helper_tmp"
 chown root:root "\$process_helper_tmp"
 chmod 0755 "\$process_helper_tmp"
+printf %s {$recoveryHelperEncoded} | base64 -d > "\$recovery_helper_tmp"
+chown root:root "\$recovery_helper_tmp"
+chmod 0755 "\$recovery_helper_tmp"
 printf %s {$sudoers} > "\$sudoers_tmp"
 chown root:root "\$sudoers_tmp"
 chmod 0440 "\$sudoers_tmp"
@@ -991,6 +1011,7 @@ printf 'GIMME_BOOTSTRAP|policy|validating sudo policy\n'
 visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
 mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
+mv "\$recovery_helper_tmp" /usr/local/sbin/gimme-recovery-maintenance
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack
 trap - EXIT
 printf 'GIMME_BOOTSTRAP|reconcile|applying target desired state\n'
@@ -1116,6 +1137,93 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
         run('rm -f ' . escapeshellarg($remotePath));
     }
     writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
+});
+
+task('gimme:recovery:maintenance', function () use ($appsRoot, $instance): void {
+    $action = required_env('GIMME_RECOVERY_ACTION');
+    $request = required_env('GIMME_RECOVERY_REQUEST_ID');
+    $wait = required_env('GIMME_RECOVERY_QUIESCE_WAIT');
+    if (!in_array($action, ['enter', 'exit'], true) ||
+        !preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $request) ||
+        !preg_match('/^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|300)$/', $wait)) {
+        throw new \RuntimeException('Unsafe recovery maintenance request');
+    }
+    $directory = "{$appsRoot}/.gimme/recovery-requests";
+    $path = "{$directory}/{$instance}.json";
+    if ($action === 'enter') {
+        $document = json_encode([
+            'schema_version' => 1,
+            'deployment' => $instance,
+            'request_id' => $request,
+            'quiesce_wait_seconds' => (int) $wait,
+        ], JSON_THROW_ON_ERROR);
+        $encoded = escapeshellarg(base64_encode($document));
+        run('install -d -m 0700 ' . escapeshellarg($directory));
+        run(
+            'printf %s ' . $encoded . ' | base64 -d > ' . escapeshellarg($path) .
+            ' && chmod 0600 ' . escapeshellarg($path)
+        );
+    }
+    run(
+        'sudo -n /usr/local/sbin/gimme-recovery-maintenance ' .
+        escapeshellarg($action) . ' ' . escapeshellarg($instance) . ' ' .
+        escapeshellarg($request),
+        forceOutput: true,
+        timeout: 900,
+    );
+    if ($action === 'exit') {
+        run('rm -f ' . escapeshellarg($path));
+    }
+});
+
+task('gimme:backup:capture-valkey', function () use ($appsRoot): void {
+    $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');
+    $cachePrefix = required_env('GIMME_CACHE_PREFIX');
+    if (!preg_match(
+        '/^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$/',
+        $cachePrefix,
+    )) {
+        throw new \RuntimeException('Unsafe Valkey recovery prefix');
+    }
+    $probe = json_decode(getenv('GIMME_VALKEY_PROBE_JSON') ?: 'null', true);
+    $host = is_array($probe) ? ($probe['host'] ?? null) : '127.0.0.1';
+    $port = is_array($probe) ? ($probe['port'] ?? null) : 6379;
+    $tls = is_array($probe) ? 'yes' : 'no';
+    if (!is_string($host) || !valid_endpoint($host) || !is_int($port) ||
+        $port < 1 || $port > 65535) {
+        throw new \RuntimeException('Unsafe Valkey recovery endpoint');
+    }
+    $directory = "{$appsRoot}/.gimme/backups";
+    $suffix = bin2hex(random_bytes(8));
+    $remotePath = "{$directory}/.{$suffix}.valkey";
+    $remoteSecret = "{$directory}/.{$suffix}.json";
+    $localSecret = getenv('GIMME_SECRET_FILE') ?: '';
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    try {
+        if ($localSecret !== '') {
+            if (is_link($localSecret) || !is_file($localSecret)) {
+                throw new \RuntimeException('Unsafe Valkey recovery credential');
+            }
+            upload($localSecret, $remoteSecret);
+            run('chmod 0600 ' . escapeshellarg($remoteSecret));
+        }
+        $program = file_get_contents(__DIR__ . '/scripts/gimme-capture-valkey');
+        if ($program === false) {
+            throw new \RuntimeException('Missing Valkey recovery program');
+        }
+        $output = run(
+            'printf %s ' . escapeshellarg(base64_encode($program)) .
+            ' | base64 -d | python3 - ' . escapeshellarg($remotePath) . ' ' .
+            escapeshellarg($cachePrefix) . ' ' . escapeshellarg($host) . ' ' .
+            escapeshellarg((string) $port) . ' ' . escapeshellarg($tls) . ' ' .
+            escapeshellarg($localSecret === '' ? '-' : $remoteSecret),
+            timeout: 1800,
+        );
+        download($remotePath, $localPath);
+        writeln($output);
+    } finally {
+        run('rm -f ' . escapeshellarg($remotePath) . ' ' . escapeshellarg($remoteSecret));
+    }
 });
 
 task('gimme:provision:app', function () use (

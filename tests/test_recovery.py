@@ -183,6 +183,47 @@ def test_postgres_and_valkey_publish_together_in_one_manifest(tmp_path: Path) ->
     assert adapter.puts == 3  # both components, then the sole manifest
 
 
+def test_components_are_verified_before_runtime_restore_and_manifest_publish(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class OrderedS3(FakeS3):
+        def put_object(self, destination, credentials, key, body, sha256) -> ObjectMetadata:
+            events.append("manifest" if key.endswith("manifest.json") else "component")
+            return super().put_object(destination, credentials, key, body, sha256)
+
+        def get_object(self, destination, credentials, key, version_id=None) -> bytes:
+            events.append("verify")
+            return super().get_object(destination, credentials, key, version_id)
+
+    create_recovery_point(
+        "primary", destination(), None, OrderedS3(), "checkout",
+        recovery_point_id("checkout", "primary", "req-1"), valkey_dump(tmp_path),
+        before_publish=lambda: events.append("restore"),
+    )
+
+    assert events == ["component", "verify", "restore", "manifest"]
+
+
+def test_failed_runtime_restore_cleans_verified_components_without_publishing(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+
+    def fail_restore() -> None:
+        raise RecoveryError("recovery_runtime_restore_failed")
+
+    with pytest.raises(RecoveryError, match="^recovery_runtime_restore_failed$"):
+        create_recovery_point(
+            "primary", destination(), None, adapter, "checkout",
+            recovery_point_id("checkout", "primary", "req-1"), valkey_dump(tmp_path),
+            before_publish=fail_restore,
+        )
+
+    assert adapter.objects == {}
+
+
 def test_second_component_failure_removes_every_uploaded_exact_version(
     tmp_path: Path,
 ) -> None:

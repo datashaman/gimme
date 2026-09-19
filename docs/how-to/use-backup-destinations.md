@@ -2,7 +2,7 @@
 
 Gimme's first Recovery Point tracer registers one named S3-compatible Backup
 Destination, binds it to a Deployment through a Recovery Policy, and creates and
-inventories on-demand PostgreSQL Recovery Points. Only the control-plane process
+inventories on-demand PostgreSQL and opt-in Valkey Recovery Points. Only the control-plane process
 resolves any Backup Destination credential; Targets never receive it.
 
 ## Bucket prerequisites
@@ -67,6 +67,25 @@ database) cannot bind recovery either.
 }
 ```
 
+PostgreSQL is always included. Valkey is excluded unless `valkey` is explicitly
+`true`, and enabling it requires a Valkey binding. `quiesce_wait_seconds` accepts 1
+through 300 seconds and defaults to 30.
+
+Enable Valkey durability only when the Deployment owns durable state in its registered
+key prefix and that state must move back in time with PostgreSQL. Do not enable it for
+ordinary caches that can be rebuilt. Restoring old Valkey state can resurrect queued
+jobs, sessions, locks, rate limits, and cached records; for those workloads, restoring
+PostgreSQL alone is often safer.
+
+The consistency boundary covers only Gimme-managed writers. During capture, Gimme puts
+the selected Deployment route into a fixed 503 maintenance response, waits the drain
+interval, and stops only that Deployment's registered workers or Horizon process and
+scheduler. It does not stop the shared Valkey service, block other prefixes, or discover
+unmanaged cron jobs, external workers, direct database clients, or other Valkey writers.
+Choose a drain interval long enough for the longest in-flight HTTP request to finish,
+without making the maintenance window unnecessarily long. Operators must stop or avoid
+all unmanaged writers themselves.
+
 ## Create and list on-demand Recovery Points
 
 `plan_create_recovery_point(deployment, request_id)` plans one capture; pass its
@@ -79,13 +98,22 @@ new, distinct Recovery Point.
 
 Capture runs `pg_dump --no-owner --no-privileges --no-acl` against the Deployment's
 isolated database on its Target, so roles, ownership, ACLs, and credential material are
-never part of the dump. Because on-demand capture runs while the MCP server is live
+never part of the dump. With Valkey enabled, a binary-safe incremental scan selects only
+the registered Deployment prefix, deduplicates results, and records each value with its
+absolute expiry time; persistent keys remain persistent and keys that expire during
+capture are omitted. Keys, values, prefixes, and serialized payloads never appear in MCP
+results or manifests.
+
+Because on-demand capture runs while the MCP server is live
 (unlike future scheduled, systemd-timer-driven capture), the dump is pulled back to the
 control plane over the same transport already used for Deployment secret files, then
-uploaded from there with server-side encryption and a SHA-256 checksum. The component
-upload is verified against that checksum before the immutable Recovery Manifest is
-published; a failed or partial upload is cleaned up rather than left dangling, and the
-Recovery Point never becomes visible until verification succeeds.
+uploaded from there with server-side encryption and a SHA-256 checksum. Every selected
+component is uploaded and read back for checksum verification while maintenance remains
+active. Gimme then restores the previously active managed processes and normal route and
+publishes the single immutable Recovery Manifest last. A capture, upload, verification,
+or runtime-restoration failure publishes no Recovery Point and preserves earlier points;
+failed process restoration deliberately leaves the route in maintenance for a same-request
+cleanup retry.
 
 `list_recovery_points(deployment)` reads Recovery Manifests directly from the bound
 destination — authoritative inventory even if the Target is gone — and returns only
@@ -123,7 +151,7 @@ versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destin
 
 ## What this issue does not cover
 
-Restore, Safety Recovery Points, Valkey component backups, scheduled/systemd-timer
-cadences, and `retain_last` pruning are separate, future work described in
+Restore, Safety Recovery Points, scheduled/systemd-timer cadences, and `retain_last`
+pruning are separate work described in
 [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md) and are not implemented by
 this tracer.
