@@ -5,6 +5,16 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed managed AWS RDS PostgreSQL instances not forcing TLS below PostgreSQL 15: creation
+  now also creates a Resource-owned `gimme-<name>-params` DB parameter group
+  (`postgres<major>`, `rds.force_ssl=1`, applied `pending-reboot`) before the instance and
+  attaches it, re-applying the setting when the group already exists and refusing (with
+  `aws_rds_parameter_group_ownership_mismatch`) an existing group that lacks this Resource's
+  `gimme:resource` tag or the expected family. Privilege impact: the inspection role gains
+  `rds:CreateDBParameterGroup`, `rds:ModifyDBParameterGroup`, `rds:DescribeDBParameterGroups`,
+  `rds:ListTagsForResource`, and `rds:AddTagsToResource` on `pg:gimme-*`, and
+  `rds:CreateDBInstance` on `pg:gimme-*`. Parameter groups are retained, never deleted, on
+  Resource removal, and an already-created instance is not modified.
 - Added schema-v4 S3-compatible Backup Destinations, Deployment Recovery Policies, and
   on-demand, content-addressed PostgreSQL Recovery Point creation and inventory.
   Destinations are preflight-verified (bucket versioning, encryption, and a

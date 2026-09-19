@@ -85,6 +85,8 @@ def _provider_error(exc: Exception, operation: str) -> ResourceError:
             "DBInstanceAlreadyExistsFault": "already_exists",
             "DBSubnetGroupAlreadyExists": "already_exists",
             "DBSubnetGroupAlreadyExistsFault": "already_exists",
+            "DBParameterGroupAlreadyExists": "already_exists",
+            "DBParameterGroupAlreadyExistsFault": "already_exists",
             "ResourceExistsException": "already_exists",
             "InvalidDBInstanceState": "invalid_state",
             "InvalidDBInstanceStateFault": "invalid_state",
@@ -182,14 +184,43 @@ class BotoRDSAdapter:
             raise ResourceError("aws_rds_instance_identity_invalid")
         return self._observation(instances[0], aws_instance_identifier)
 
+    @staticmethod
+    def _verify_parameter_group_ownership(
+        client, parameter_group_name: str, family: str, resource_name: str
+    ) -> None:
+        """An already-existing group is reused only when it is this Resource's own: a
+        same-named pre-created, foreign, or wrong-family group is never modified."""
+        try:
+            groups = client.describe_db_parameter_groups(
+                DBParameterGroupName=parameter_group_name
+            ).get("DBParameterGroups") or []
+            arn = groups[0].get("DBParameterGroupArn") if len(groups) == 1 else None
+            tags = (
+                client.list_tags_for_resource(ResourceName=arn).get("TagList") or []
+                if isinstance(arn, str) else []
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "parameter_group_verify") from None
+        owner = {
+            item.get("Key"): item.get("Value") for item in tags if isinstance(item, dict)
+        }.get("gimme:resource")
+        if (
+            len(groups) != 1
+            or groups[0].get("DBParameterGroupFamily") != family
+            or owner != resource_name
+        ):
+            raise ResourceError("aws_rds_parameter_group_ownership_mismatch")
+
     def create_instance(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSRDSPostgresResource, resource_name: str, aws_instance_identifier: str,
         security_group_ids: list[str],
     ) -> InstanceObservation:
+        parameter_group_family = _parameter_group_family(resource.engine_version)
         session = self._session(account, account.inspection_role_arn, "rds-create")
         client = session.client("rds", region_name=network.region)
         subnet_group_name = f"{aws_instance_identifier}-subnets"
+        parameter_group_name = derive_parameter_group_name(aws_instance_identifier)
         try:
             client.create_db_subnet_group(
                 DBSubnetGroupName=subnet_group_name,
@@ -202,6 +233,32 @@ class BotoRDSAdapter:
             if "already_exists" not in str(error):
                 raise error from None
         try:
+            client.create_db_parameter_group(
+                DBParameterGroupName=parameter_group_name,
+                DBParameterGroupFamily=parameter_group_family,
+                Description=f"Gimme-managed parameter group for {resource_name}",
+                Tags=[{"Key": "gimme:resource", "Value": resource_name}],
+            )
+        except Exception as exc:
+            error = _provider_error(exc, "parameter_group")
+            if "already_exists" not in str(error):
+                raise error from None
+            self._verify_parameter_group_ownership(
+                client, parameter_group_name, parameter_group_family, resource_name
+            )
+        try:
+            # Applied even when the group already existed so a stale group converges.
+            client.modify_db_parameter_group(
+                DBParameterGroupName=parameter_group_name,
+                Parameters=[{
+                    "ParameterName": "rds.force_ssl",
+                    "ParameterValue": "1",
+                    "ApplyMethod": "pending-reboot",
+                }],
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "parameter_group_modify") from None
+        try:
             client.create_db_instance(
                 DBInstanceIdentifier=aws_instance_identifier,
                 Engine="postgres",
@@ -213,6 +270,7 @@ class BotoRDSAdapter:
                 MultiAZ=True,
                 PubliclyAccessible=False,
                 DBSubnetGroupName=subnet_group_name,
+                DBParameterGroupName=parameter_group_name,
                 VpcSecurityGroupIds=security_group_ids,
                 ManageMasterUserPassword=True,
                 MasterUsername="gimme_admin",
@@ -280,6 +338,17 @@ class BotoRDSAdapter:
         if not isinstance(arn, str) or not isinstance(version_id, str):
             raise ResourceError("aws_rds_workload_secret_invalid")
         return arn, version_id
+
+
+def _parameter_group_family(engine_version: str) -> str:
+    major = re.match(r"[0-9]+", engine_version)
+    if major is None:
+        raise ResourceError("aws_rds_engine_version_invalid")
+    return f"postgres{major.group()}"
+
+
+def derive_parameter_group_name(aws_instance_identifier: str) -> str:
+    return f"{aws_instance_identifier}-params"
 
 
 def derive_instance_identifier(resource_name: str) -> str:

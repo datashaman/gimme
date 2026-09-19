@@ -149,6 +149,8 @@ class FakeClock:
         ("DBInstanceAlreadyExists", "already_exists"),
         ("DBInstanceAlreadyExistsFault", "already_exists"),
         ("DBSubnetGroupAlreadyExists", "already_exists"),
+        ("DBParameterGroupAlreadyExists", "already_exists"),
+        ("DBParameterGroupAlreadyExistsFault", "already_exists"),
         ("ResourceExistsException", "already_exists"),
         ("InvalidDBInstanceState", "invalid_state"),
         ("Throttling", "throttled"),
@@ -380,6 +382,44 @@ def _stubbed(service: str):
     return client, Stubber(client)
 
 
+def _parameter_group_request(identifier: str, major: int) -> dict[str, object]:
+    return {
+        "DBParameterGroupName": f"{identifier}-params",
+        "DBParameterGroupFamily": f"postgres{major}",
+        "Description": "Gimme-managed parameter group for devbox-postgres",
+        "Tags": [{"Key": "gimme:resource", "Value": "devbox-postgres"}],
+    }
+
+
+def _owned_group_stubs(
+    stub, identifier: str, *, family: str = "postgres17", owner: str | None = "devbox-postgres"
+) -> None:
+    arn = f"arn:aws:rds:us-east-1:123456789012:pg:{identifier}-params"
+    stub.add_response(
+        "describe_db_parameter_groups",
+        {"DBParameterGroups": [{"DBParameterGroupFamily": family, "DBParameterGroupArn": arn}]},
+        {"DBParameterGroupName": f"{identifier}-params"},
+    )
+    stub.add_response(
+        "list_tags_for_resource",
+        {"TagList": [] if owner is None else [{"Key": "gimme:resource", "Value": owner}]},
+        {"ResourceName": arn},
+    )
+
+
+def _force_ssl_request(identifier: str) -> dict[str, object]:
+    return {
+        "DBParameterGroupName": f"{identifier}-params",
+        "Parameters": [
+            {
+                "ParameterName": "rds.force_ssl",
+                "ParameterValue": "1",
+                "ApplyMethod": "pending-reboot",
+            }
+        ],
+    }
+
+
 def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) -> None:
     identifier = derive_instance_identifier("devbox-postgres")
     rds, stub = _stubbed("rds")
@@ -393,6 +433,8 @@ def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) ->
             "Tags": [{"Key": "gimme:resource", "Value": "devbox-postgres"}],
         },
     )
+    stub.add_response("create_db_parameter_group", {}, _parameter_group_request(identifier, 17))
+    stub.add_response("modify_db_parameter_group", {}, _force_ssl_request(identifier))
     stub.add_response(
         "create_db_instance",
         {},
@@ -407,6 +449,7 @@ def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) ->
             "MultiAZ": True,
             "PubliclyAccessible": False,
             "DBSubnetGroupName": f"{identifier}-subnets",
+            "DBParameterGroupName": f"{identifier}-params",
             "VpcSecurityGroupIds": ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
             "ManageMasterUserPassword": True,
             "MasterUsername": "gimme_admin",
@@ -526,10 +569,19 @@ def test_workload_secret_failure_surfaces_only_a_bounded_code(monkeypatch) -> No
     assert "workload-pw" not in str(raised.value)
 
 
-def test_create_instance_is_idempotent_on_the_real_already_exists_wire_codes(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "parameter_group_code", ["DBParameterGroupAlreadyExists", "DBParameterGroupAlreadyExistsFault"]
+)
+def test_create_instance_is_idempotent_on_the_real_already_exists_wire_codes(
+    monkeypatch, parameter_group_code: str
+) -> None:
     identifier = derive_instance_identifier("devbox-postgres")
     rds, stub = _stubbed("rds")
     stub.add_client_error("create_db_subnet_group", service_error_code="DBSubnetGroupAlreadyExists")
+    stub.add_client_error("create_db_parameter_group", service_error_code=parameter_group_code)
+    # A resumed create verifies ownership, then converges the group onto rds.force_ssl.
+    _owned_group_stubs(stub, identifier)
+    stub.add_response("modify_db_parameter_group", {}, _force_ssl_request(identifier))
     stub.add_client_error("create_db_instance", service_error_code="DBInstanceAlreadyExists")
     stub.add_response(
         "describe_db_instances",
@@ -550,6 +602,148 @@ def test_create_instance_is_idempotent_on_the_real_already_exists_wire_codes(mon
         )
 
     assert observed.status == "available"
+
+
+@pytest.mark.parametrize(("engine_version", "major"), [("14.13", 14), ("17.2", 17)])
+def test_create_instance_derives_the_parameter_group_family_from_the_engine_version(
+    monkeypatch, engine_version: str, major: int
+) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    rds, stub = _stubbed("rds")
+    stub.add_response("create_db_subnet_group", {})
+    stub.add_response("create_db_parameter_group", {}, _parameter_group_request(identifier, major))
+    stub.add_response("modify_db_parameter_group", {}, _force_ssl_request(identifier))
+    stub.add_response("create_db_instance", {})
+    stub.add_response(
+        "describe_db_instances",
+        {"DBInstances": [_instance_response(identifier, tag="devbox-postgres")]},
+        {"DBInstanceIdentifier": identifier},
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+
+    with stub:
+        adapter.create_instance(
+            account(),
+            network(),
+            resource().model_copy(update={"engine_version": engine_version}),
+            "devbox-postgres",
+            identifier,
+            ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+        )
+        stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "code"),
+    [
+        ("create_db_parameter_group", "aws_rds_parameter_group_access_denied"),
+        ("modify_db_parameter_group", "aws_rds_parameter_group_modify_access_denied"),
+    ],
+)
+def test_create_instance_bounds_parameter_group_failures_and_never_creates_the_instance(
+    monkeypatch, failing_call: str, code: str
+) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    rds, stub = _stubbed("rds")
+    stub.add_response("create_db_subnet_group", {})
+    if failing_call == "modify_db_parameter_group":
+        stub.add_response("create_db_parameter_group", {})
+    stub.add_client_error(
+        failing_call,
+        service_error_code="AccessDenied",
+        service_message="user arn:aws:iam::123456789012:user/x cannot touch the group",
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.create_instance(
+            account(),
+            network(),
+            resource(),
+            "devbox-postgres",
+            identifier,
+            ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+        )
+
+    assert str(raised.value) == code
+    assert "arn:aws" not in str(raised.value)
+    assert "cannot touch" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("family", "owner"),
+    [
+        ("postgres14", "devbox-postgres"),  # retained group from a different engine major
+        ("postgres17", "other-postgres"),  # someone else's Resource
+        ("postgres17", None),  # pre-created, untagged
+    ],
+)
+def test_create_instance_refuses_an_existing_parameter_group_it_does_not_own(
+    monkeypatch, family: str, owner: str | None
+) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    rds, stub = _stubbed("rds")
+    stub.add_response("create_db_subnet_group", {})
+    stub.add_client_error(
+        "create_db_parameter_group", service_error_code="DBParameterGroupAlreadyExists"
+    )
+    _owned_group_stubs(stub, identifier, family=family, owner=owner)
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.create_instance(
+            account(), network(), resource(), "devbox-postgres", identifier,
+            ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+        )
+
+    # No modify_db_parameter_group or create_db_instance was queued, so reaching either
+    # would surface as a different (unclassified) error code.
+    assert str(raised.value) == "aws_rds_parameter_group_ownership_mismatch"
+
+
+def test_create_instance_bounds_parameter_group_verification_failures(monkeypatch) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    rds, stub = _stubbed("rds")
+    stub.add_response("create_db_subnet_group", {})
+    stub.add_client_error(
+        "create_db_parameter_group", service_error_code="DBParameterGroupAlreadyExists"
+    )
+    stub.add_client_error(
+        "describe_db_parameter_groups",
+        service_error_code="AccessDenied",
+        service_message="user arn:aws:iam::123456789012:user/x cannot describe the group",
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.create_instance(
+            account(), network(), resource(), "devbox-postgres", identifier,
+            ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+        )
+
+    assert str(raised.value) == "aws_rds_parameter_group_verify_access_denied"
+    assert "arn:aws" not in str(raised.value)
+
+
+def test_create_instance_rejects_an_unusable_engine_version_before_any_aws_call(
+    monkeypatch,
+) -> None:
+    adapter = BotoRDSAdapter()
+
+    def _no_aws(*args, **kwargs):
+        raise AssertionError("AWS must not be reached")
+
+    monkeypatch.setattr(adapter, "_session", _no_aws)
+    unusable = resource().model_copy(update={"engine_version": "latest"})
+
+    with pytest.raises(ResourceError, match="aws_rds_engine_version_invalid"):
+        adapter.create_instance(
+            account(), network(), unusable, "devbox-postgres", "gimme-devbox-postgres", []
+        )
 
 
 def test_workload_secret_rotation_writes_a_new_version_when_the_secret_exists(monkeypatch) -> None:
