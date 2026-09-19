@@ -43,6 +43,7 @@ def test_the_documented_example_registers_with_its_defaults() -> None:
     [
         {"engine_version": "8.1"}, {"engine_version": "7.2"}, {"engine_version": "9"},
         {"engine_version": "9.x"}, {"engine_version": "9.0-rc1"}, {"engine_version": "9.0.0.1"},
+        {"engine_version": "09.0"}, {"engine_version": "9.00"}, {"engine_version": "9.0.00"},
         {"node_type": "db.t3.medium"}, {"node_type": "cache.m7g"},
         {"node_type": "cache.m7g.large; x"},
         {"security_group_id": "sg-xyz"},
@@ -91,13 +92,15 @@ def test_adjacent_windows_are_accepted(snapshot, maintenance) -> None:
 def test_state_requires_the_network_administration_target_and_workload_store() -> None:
     document = json.loads(EXAMPLE.read_text())
     resource = document["resources"][NAME]
-    for field, value in (
-        ("aws_network", "missing"), ("administration_target", "devbox"),
-        ("administration_target", "missing"), ("workload_secret_store", "local-sops"),
+    for field, value, message in (
+        ("aws_network", "missing", "unknown AWS Network"),
+        ("administration_target", "devbox", "administration Target"),
+        ("administration_target", "missing", "administration Target"),
+        ("workload_secret_store", "local-sops", "AWS Secrets Manager store"),
     ):
         broken = json.loads(json.dumps(document))
         broken["resources"][NAME] = resource | {field: value}
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError, match=message):
             ControlState.model_validate(broken)
 
 
