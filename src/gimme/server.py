@@ -1072,8 +1072,9 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
     """Show the exact before/after state for a resource update."""
     state = store.load()
     current = state.resources.get(name)
-    if isinstance(current, AWSRDSPostgresResource) or isinstance(
-        definition, AWSRDSPostgresResource
+    if current is not None and (
+        isinstance(current, AWSRDSPostgresResource)
+        or isinstance(definition, AWSRDSPostgresResource)
     ):
         if not (
             isinstance(current, AWSRDSPostgresResource)

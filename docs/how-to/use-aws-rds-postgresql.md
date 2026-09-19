@@ -11,7 +11,7 @@ the target design and this page is the current behavior.
 
 ## Current scope
 
-Implemented: registration, provisioning and reconciliation, live inspection, creating a
+Implemented: registration, provisioning, live inspection with drift reporting, creating a
 Deployment's database and workload secret, and non-destructive removal.
 
 Not implemented yet:
@@ -231,7 +231,7 @@ an increased `allocated_storage_gb`, `administration_target`,
 ## Provision
 
 `plan_apply_resource` then `apply_resource` creates the DB subnet group, the DB parameter
-group (with `rds.force_ssl` set to `1`), and the instance, or reconciles an existing one.
+group (with `rds.force_ssl` set to `1`), and the instance. An existing instance is only polled, never modified.
 The instance is tagged `gimme:resource=<name>` and its AWS identifier is derived from the
 Resource name (`gimme-<name>`). Gimme refuses an instance whose tag does not derive that
 identifier, and never adopts an unrelated instance.

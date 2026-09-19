@@ -9,7 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, cast
+from typing import Callable, NoReturn, Protocol, cast
 
 from gimme.control import (
     AWSNetwork,
@@ -496,7 +496,7 @@ def validate_update(
     observed: dict[str, object] | None, bound_targets: set[str],
 ) -> None:
     """Refuse the updates ADR 0008 says need a new Resource. Local: never calls AWS."""
-    def forbid(field: str) -> None:
+    def forbid(field: str) -> NoReturn:
         raise ResourceError(f"aws_rds_update_forbidden_{field}")
 
     if proposed.aws_network != current.aws_network:

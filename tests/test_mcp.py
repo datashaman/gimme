@@ -903,9 +903,13 @@ def test_rds_updates_that_adr_0008_forbids_are_rejected_and_change_nothing(
     _assert_update_forbidden("allocated_storage_gb", allocated_storage_gb=50)
     _assert_update_forbidden("workload_secret_store", workload_secret_store="other-secrets")
     _assert_update_forbidden("deployment_security_group_ids", deployment_security_group_ids={})
+    local = sample_state().resources["devbox-postgres"]
     with pytest.raises(ResourceError, match="^aws_rds_update_forbidden_provider$"):
-        local = sample_state().resources["devbox-postgres"]
         server_module.plan_update_resource("primary-rds", local)
+    with pytest.raises(ResourceError, match="^aws_rds_update_forbidden_provider$"):
+        server_module.plan_update_resource("devbox-postgres", rds_definition())
+    with pytest.raises(KeyError, match="no-such-resource"):
+        server_module.plan_update_resource("no-such-resource", rds_definition())
 
 
 def test_rds_updates_within_the_allowlist_register_as_before(tmp_path, monkeypatch) -> None:
