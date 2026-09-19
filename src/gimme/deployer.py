@@ -128,6 +128,7 @@ class DeployerRunner:
         backup_local_path: Path | None = None,
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
+        resource_trust_bundle_sha256: str | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -211,6 +212,8 @@ class DeployerRunner:
             host, port = resource_endpoint
             environment["GIMME_RESOURCE_ENDPOINT"] = host
             environment["GIMME_RESOURCE_PORT"] = str(port)
+        if resource_trust_bundle_sha256 is not None:
+            environment["GIMME_RESOURCE_TRUST_BUNDLE_SHA256"] = resource_trust_bundle_sha256
         if resource_database is not None:
             environment["GIMME_DATABASE_IDENTIFIER"] = resource_database
         if exclude_instance is not None:

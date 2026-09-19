@@ -1205,6 +1205,8 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     resource_name = str(expected["resource"])
     _state, resource = _managed_resource(resource_name)
     network = state.aws_networks[resource.aws_network]
+    if network.region.startswith("us-gov-"):
+        raise ResourceError("aws_rds_tls_region_unsupported")
     account = state.provider_accounts[network.provider_account]
     admin_target = state.targets[resource.administration_target]
     store_name = resource.workload_secret_store
@@ -1228,7 +1230,9 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
         runner.run(
             "gimme:resource:bind-postgres", legacy_server(admin_target), stack=admin_target.stack,
             resource_endpoint=(str(observed["endpoint"]), int(cast(int, observed["port"]))),
-            resource_database=database_identifier, secret_file=secret_file, timeout=120,
+            resource_database=database_identifier, secret_file=secret_file,
+            resource_trust_bundle_sha256=resources_postgres_module.RDS_TRUST_BUNDLE_SHA256,
+            timeout=120,
         )
         summary = resources_postgres_module.persist_binding(
             rds_postgres, store.root, account, workload_store, store_name, resource_name, name,

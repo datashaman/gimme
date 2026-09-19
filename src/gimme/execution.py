@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FINGERPRINT_VERSION = b"gimme-execution-v1\0"
 REQUIRED_FILES = (
     "deploy.php",
+    "deploy/aws-rds-global-bundle.pem",
     "scripts/gimme-provision-stack",
     "scripts/gimme-provision-processes",
     "vendor/deployer/deployer/bin/dep",

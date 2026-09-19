@@ -1,8 +1,13 @@
 import base64
+import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -602,11 +607,18 @@ def test_managed_postgres_bind_uses_no_sudo_and_shreds_its_secret_file() -> None
     assert "sudo" not in task
     assert "valid_endpoint($host)" in task
     assert "is_link($localSecretFile)" in task
-    assert "rm -f ' . escapeshellarg($remoteSecretFile)" in task
+    assert (
+        "rm -f ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile)"
+        in task
+    )
+    assert task.index("try {") < task.index("upload($localSecretFile") < task.index(
+        "} finally {"
+    ), "uploads must sit inside the try so a failed upload still cleans up"
+    assert "upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile)" in task
     assert "managed_postgres_bind_script" in task
 
 
-def _fake_psql(tmp_path: Path, *, fail: bool = False) -> Path:
+def _fake_psql(tmp_path: Path, *, fail: bool = False, message: str | None = None) -> Path:
     """A stand-in psql that records argv and stdin. It cannot judge SQL semantics, so the
     statements it receives are additionally exercised against a real server by hand; these
     tests pin the contract: statements arrive on stdin and secrets never reach argv."""
@@ -614,12 +626,13 @@ def _fake_psql(tmp_path: Path, *, fail: bool = False) -> Path:
     script = tmp_path / "psql"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, sys\n"
+        "import json, os, sys\n"
         "stdin = sys.stdin.read()\n"
         f"with open({str(log_path)!r}, 'a') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin}) + chr(10))\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin,\n"
+        "        'env': {k: v for k, v in os.environ.items() if k[:5] == 'PGSSL'}}) + chr(10))\n"
         f"if {fail!r}:\n"
-        "    sys.stdout.write('ERROR: ' + stdin)\n"
+        f"    sys.stdout.write({message!r} if {message!r} else 'ERROR: ' + stdin)\n"
         "    sys.exit(3)\n"
         "sys.exit(0)\n"
     )
@@ -627,16 +640,26 @@ def _fake_psql(tmp_path: Path, *, fail: bool = False) -> Path:
     return log_path
 
 
+def _bundle(tmp_path: Path) -> tuple[Path, str]:
+    bundle = tmp_path / "bundle.pem"
+    bundle.write_text("test bundle\n")
+    bundle.chmod(0o600)
+    return bundle, hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+
 def _run_bind_script(tmp_path: Path, secret: dict[str, str], *,
-                     fail: bool = False) -> subprocess.CompletedProcess[str]:
+                     fail: bool = False, message: str | None = None,
+                     digest: str | None = None) -> subprocess.CompletedProcess[str]:
     secret_path = tmp_path / "secret.json"
     secret_path.write_text(json.dumps(secret))
     secret_path.chmod(0o600)
-    log_path = _fake_psql(tmp_path, fail=fail)
+    log_path = _fake_psql(tmp_path, fail=fail, message=message)
+    bundle, bundle_digest = _bundle(tmp_path)
     result = subprocess.run(
         [
             "python3", "-c", managed_postgres_bind_script(),
             "db.example.test", "5432", "gimme_example", str(secret_path),
+            str(bundle), digest or bundle_digest,
         ],
         text=True, capture_output=True, check=False,
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
@@ -702,6 +725,7 @@ def test_managed_postgres_bind_script_rejects_unsafe_workload_password_and_datab
         [
             "python3", "-c", managed_postgres_bind_script(),
             "db.example.test", "5432", "x'; drop database postgres; --", str(secret_path),
+            str(_bundle(tmp_path)[0]), "0" * 64,
         ],
         text=True, capture_output=True, check=False,
     )
@@ -731,6 +755,7 @@ def test_managed_postgres_bind_script_rejects_a_symlinked_secret_file(tmp_path: 
         [
             "python3", "-c", managed_postgres_bind_script(),
             "db.example.test", "5432", "gimme_example", str(link),
+            str(_bundle(tmp_path)[0]), "0" * 64,
         ],
         text=True, capture_output=True, check=False,
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
@@ -738,3 +763,87 @@ def test_managed_postgres_bind_script_rejects_a_symlinked_secret_file(tmp_path: 
 
     assert result.returncode != 0
     assert "non-regular secret document" in (result.stdout + result.stderr)
+
+
+def test_managed_postgres_bind_script_verifies_the_server_certificate_against_the_bundle(
+    tmp_path: Path,
+) -> None:
+    result = _run_bind_script(tmp_path, BIND_SECRET)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    for call in result.calls:  # type: ignore[attr-defined]
+        assert call["env"] == {
+            "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(tmp_path / "bundle.pem"),
+        }
+
+
+def test_managed_postgres_bind_script_refuses_a_bundle_digest_mismatch_before_connecting(
+    tmp_path: Path,
+) -> None:
+    result = _run_bind_script(tmp_path, BIND_SECRET, digest="0" * 64)
+
+    assert result.returncode != 0
+    assert "trust bundle digest mismatch" in result.stdout + result.stderr
+    assert result.calls == []  # type: ignore[attr-defined]
+
+
+def test_managed_postgres_bind_script_rejects_a_symlinked_trust_bundle(tmp_path: Path) -> None:
+    secret_path = tmp_path / "secret.json"
+    secret_path.write_text(json.dumps(BIND_SECRET))
+    bundle, digest = _bundle(tmp_path)
+    link = tmp_path / "linked-bundle.pem"
+    link.symlink_to(bundle)
+
+    result = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_bind_script(),
+            "db.example.test", "5432", "gimme_example", str(secret_path), str(link), digest,
+        ],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode != 0
+    assert "non-regular trust bundle" in result.stdout + result.stderr
+
+
+def test_managed_postgres_bind_script_classifies_certificate_failures_without_psql_output(
+    tmp_path: Path,
+) -> None:
+    for message in (
+        'psql: error: connection to server at "db.example.test" (10.0.0.5), port 5432 '
+        'failed: SSL error: certificate verify failed\n' + BIND_SECRET["master_password"],
+        'psql: error: connection to server at "db.example.test" (10.0.0.5), port 5432 '
+        'failed: server certificate for "other.example.test" does not match host name '
+        '"db.example.test"',
+    ):
+        result = _run_bind_script(tmp_path, BIND_SECRET, fail=True, message=message)
+
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "TLS certificate verification failed" in output
+        assert "role reconciliation failed" not in output
+        assert "psql" not in output and "10.0.0.5" not in output
+        assert "s3cr3t-master" not in output and "s3cr3t-workload" not in output
+
+
+def test_pinned_rds_trust_bundle_matches_its_digest_and_holds_only_root_cas() -> None:
+    from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256
+
+    bundle = ROOT / "deploy" / "aws-rds-global-bundle.pem"
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == RDS_TRUST_BUNDLE_SHA256
+    assert RDS_TRUST_BUNDLE_SHA256 in (ROOT / "deploy" / "aws-rds-global-bundle.md").read_text()
+
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is needed to inspect the bundle's certificates")
+    certificates = re.findall(
+        r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", bundle.read_text(), re.S
+    )
+    assert certificates
+    for pem in certificates:
+        described = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-issuer", "-ext", "basicConstraints"],
+            input=pem, text=True, capture_output=True, check=True,
+        ).stdout
+        subject = re.search(r"subject=(.*)", described).group(1)  # type: ignore[union-attr]
+        issuer = re.search(r"issuer=(.*)", described).group(1)  # type: ignore[union-attr]
+        assert subject == issuer and "CA:TRUE" in described, "the bundle must hold roots only"

@@ -21,12 +21,12 @@ Not implemented yet:
   readiness issue, `plan_deployment` refuses, and Recovery Points reject it;
 - workload credential rotation, Detached Allocation rebind, and Retained Resource forget;
 - destructive deletion. Removal never deletes the instance;
-- TLS certificate verification. Connections use `sslmode=require`;
 - in-place version, instance class, or storage updates.
 
 Differences from the ADR: two roles are used instead of four, the Administration Target
-runs plain `psql` instead of a root-owned helper, and secret-free observations are cached in
-`observed-resources/<name>.json` beside desired state.
+runs plain `psql` instead of a root-owned helper (verifying the certificate against a bundle
+delivered per bind rather than one that helper installs), and secret-free observations are
+cached in `observed-resources/<name>.json` beside desired state.
 
 ## Prerequisites
 
@@ -239,6 +239,24 @@ Administration Target through the same protected temporary file used for Deploym
 The Target's `psql` creates a role and database named after the Deployment's database
 identifier and sets the role's password. The step is idempotent, and re-binding replaces the
 password.
+
+The `psql` connection uses `sslmode=verify-full` against the pinned AWS commercial-region
+global RDS trust bundle (`deploy/aws-rds-global-bundle.pem`, provenance and refresh steps in
+`deploy/aws-rds-global-bundle.md`), so both the certificate chain and the endpoint hostname
+are verified. The bundle is uploaded on every bind beside the secret file, into the same
+`0700` directory with `0600` permissions, checked against a sha256 digest supplied by Gimme
+before any connection, and removed afterwards even on failure. Failures are fixed and
+secret-free: `bind_resource` reports `aws_rds_tls_region_unsupported` for `us-gov-*`
+regions before doing any remote work, the program stops with
+`trust bundle digest mismatch` if the uploaded bundle is not the pinned one, and
+`managed PostgreSQL TLS certificate verification failed` for an untrusted certificate or a
+hostname mismatch. Raw `psql` output is not returned for that failure.
+
+To check the real chain against a live instance, bind a Deployment to a ready Resource and
+expect success; then from the Administration Target run
+`PGSSLMODE=verify-full PGSSLROOTCERT=<bundle> psql -h <endpoint> -U <master> -d postgres -c 'select 1'`
+(it must succeed), and repeat it with the bundle path replaced by an unrelated CA file (it
+must fail with `certificate verify failed`).
 
 The workload credential is then written to Secrets Manager at
 `<store-prefix>/<resource>/<deployment>` with a JSON object of `username`, `password`,

@@ -30,6 +30,8 @@ ALLOCATION_STATUS = ("active", "detached")
 POLL_BUDGET_SECONDS = 30
 POLL_INTERVAL_SECONDS = 3
 MAX_OBSERVED_BYTES = 32 * 1024
+# The pinned AWS commercial-region RDS trust bundle; see deploy/aws-rds-global-bundle.md.
+RDS_TRUST_BUNDLE_SHA256 = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
 
 
 class ResourceError(RuntimeError):
