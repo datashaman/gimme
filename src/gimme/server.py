@@ -1372,8 +1372,8 @@ def plan_bind_resource(name: Name) -> dict[str, object]:
 @mcp.tool(annotations=WRITE)
 @_journal_apply("bind_resource", "name")
 def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
-    """Create or reconcile the deployment's isolated database and Resource Credential.
-    Never returns the workload username or password."""
+    """Create or reconcile the deployment's isolated database and Valkey ACL user, each with
+    its Resource Credential. Never returns a workload username or password."""
     expected = _resource_binding_plan(name)
     _assert_plan(expected, plan_id)
     valkey = _managed_valkey_binding(name)

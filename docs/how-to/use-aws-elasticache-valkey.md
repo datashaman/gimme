@@ -225,6 +225,11 @@ keyspace-scanning commands, so a Deployment cannot list or touch another Deploym
 `cache:clear` (which flushes the database) is therefore not permitted. Callers cannot supply an
 access string.
 
+Binding returns once ElastiCache accepts the change; the user group may stay `modifying` for a
+short while, during which another binding fails with `aws_elasticache_user_group_bind_invalid_state`
+and can simply be retried. The credential is not proven to work until the activation probes of a
+later slice.
+
 Binding needs a `ready` Resource by a fresh live read, so a `degraded` one, including unsafe
 security group drift, takes no new binding and existing Deployments keep running. Binding again
 keeps the recorded credential and only re-applies the profile. A Deployment name that has no

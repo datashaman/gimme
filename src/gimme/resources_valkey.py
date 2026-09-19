@@ -134,11 +134,21 @@ def derive_user_group_id(group_id: str) -> str:
 def derive_binding_user_id(group_id: str, deployment_name: str) -> str:
     """One opaque ElastiCache user id per (group, Deployment): letters, digits, and hyphens,
     at most 40 characters, and never equal to the default or administrative user."""
-    digest = hashlib.sha256(f"{group_id}/{deployment_name}".encode()).hexdigest()[:24]
+    digest = hashlib.sha256(
+        f"{group_id}/{_checked_name(deployment_name)}".encode()
+    ).hexdigest()[:24]
     return f"gimme-u-{digest}"
 
 
+def _checked_name(deployment_name: str) -> str:
+    # The name reaches an ACL string and a key pattern, so it is validated at every entry.
+    if DEPLOYMENT_NAME.fullmatch(deployment_name) is None:
+        raise ResourceError("deployment_name_invalid")
+    return deployment_name
+
+
 def laravel_access_string(deployment_name: str) -> str:
+    _checked_name(deployment_name)
     namespace = f"{{gimme:{deployment_name}}}:*"
     return f"on ~{namespace} &{namespace} -@all {' '.join(LARAVEL_COMMANDS)}"
 
@@ -146,7 +156,7 @@ def laravel_access_string(deployment_name: str) -> str:
 def namespace_prefixes(deployment_name: str, uses: list[str]) -> dict[str, str]:
     """Immutable, derived key namespaces sharing one hash tag, so multi-key Laravel and
     Horizon operations stay in a single cluster slot. Horizon accompanies queue."""
-    tag = f"{{gimme:{deployment_name}}}"
+    tag = f"{{gimme:{_checked_name(deployment_name)}}}"
     prefixes = {use: f"{tag}:{use}:" for use in uses}
     if "queue" in uses:
         prefixes["horizon"] = f"{tag}:horizon:"
@@ -779,6 +789,9 @@ def group_drift(
 
 
 def _validate_observed(document: object) -> dict[str, object]:
+    if isinstance(document, dict) and "allocations" not in document:
+        # A cache written before bindings existed: it is replaceable, so upgrade it in place.
+        document = {**document, "allocations": {}}
     if not isinstance(document, dict) or set(document) != {
         "schema_version", "resource", "replication_group_id", "identity", "status", "phase",
         "engine_version", "effective_durability", "issues", "endpoint", "port", "allocations",
@@ -900,8 +913,7 @@ def apply_binding(
     is not ready by a fresh live read, degraded included, takes no new binding. An existing
     allocation keeps its credential; a user with no recorded allocation gets a new one.
     Never returns the username or password."""
-    if DEPLOYMENT_NAME.fullmatch(deployment_name) is None:
-        raise ResourceError("deployment_name_invalid")
+    _checked_name(deployment_name)
     document = load_observed(root, resource_name)
     group_id = derive_group_id(resource_name)
     live = adapter.describe_group(account, network, group_id)

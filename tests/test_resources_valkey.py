@@ -1827,3 +1827,95 @@ def test_a_user_read_failure_stops_before_any_secret_is_written(monkeypatch) -> 
         ensure(adapter, keep=False)
 
     secrets_stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    "name", ["x} ~* +@all", "a b", "A", "a\n~*", "", "-a", "a:b", "a}", "{a", "a" * 65, "a*"]
+)
+def test_the_acl_helpers_refuse_a_name_that_could_alter_the_access_string(name) -> None:
+    for helper in (
+        laravel_access_string, lambda n: namespace_prefixes(n, ["cache"]),
+        lambda n: derive_binding_user_id(GROUP_ID, n),
+    ):
+        with pytest.raises(ResourceError, match="^deployment_name_invalid$"):
+            helper(name)
+
+
+def test_an_observation_cache_from_before_bindings_is_upgraded_in_place(tmp_path) -> None:
+    provision(FakeValkey(observation()), tmp_path)
+    path = tmp_path / "observed-resources" / f"{NAME}.json"
+    old = json.loads(path.read_text())
+    del old["allocations"]
+    path.write_text(json.dumps(old))
+
+    loaded = load_observed(tmp_path, NAME)
+
+    assert loaded is not None and loaded["allocations"] == {}
+
+
+@pytest.mark.parametrize(
+    "allocations",
+    [{"a": {}}, {"a": {"user_id": "u"}}, {"A": {"user_id": "u", "secret_arn": "x",
+     "secret_version_id": "v", "status": "active"}}, {"a": {"user_id": "u", "secret_arn": "x",
+     "secret_version_id": "v", "status": "gone"}}, [], "x"],
+)
+def test_a_malformed_allocation_makes_the_cache_invalid(tmp_path, allocations) -> None:
+    provision(FakeValkey(observation()), tmp_path)
+    path = tmp_path / "observed-resources" / f"{NAME}.json"
+    document = json.loads(path.read_text())
+    document["allocations"] = allocations
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ResourceError, match="^observed_resource_invalid$"):
+        load_observed(tmp_path, NAME)
+
+
+def test_a_deployment_with_a_managed_database_and_valkey_binds_the_database_first(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+    state = server_module.store.load()
+    dual = state.deployments[DEPLOYMENT].model_copy(update={"resources": ResourceBindings(
+        database="example-rds-postgres",
+        valkey=ValkeyBinding(resource=NAME, uses=["cache"]),
+    )})
+    server_module.store.save(state.model_copy(update={
+        "deployments": {**state.deployments, DEPLOYMENT: dual}
+    }))
+    order: list[str] = []
+    monkeypatch.setattr(
+        server_module, "_database_binding_plan",
+        lambda name: {"resource": "example-rds-postgres", "resource_ready": True},
+    )
+    monkeypatch.setattr(
+        server_module, "_bind_database", lambda name, expected: order.append("database") or {
+            "database": "gimme_example_local"},
+    )
+    original = adapter.ensure_binding
+    adapter.ensure_binding = lambda *a, **k: order.append("valkey") or original(*a, **k)  # type: ignore[method-assign]
+
+    result = bind()
+
+    assert order == ["database", "valkey"]
+    assert result["database"] == "gimme_example_local" and "valkey" in result
+    assert "password" not in json.dumps(result)
+
+
+def test_an_unready_managed_database_stops_a_dual_binding_before_any_change(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+    state = server_module.store.load()
+    dual = state.deployments[DEPLOYMENT].model_copy(update={"resources": ResourceBindings(
+        database="example-rds-postgres",
+        valkey=ValkeyBinding(resource=NAME, uses=["cache"]),
+    )})
+    server_module.store.save(state.model_copy(update={
+        "deployments": {**state.deployments, DEPLOYMENT: dual}
+    }))
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+
+    with pytest.raises(ValueError, match="not ready"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+    assert adapter.binding_calls == []
