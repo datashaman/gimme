@@ -251,11 +251,12 @@ def _run_deployment(
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
+    valkey = deployment.resources.valkey
     bound_resources = {
         kind: resource.model_dump(mode="json")
         for kind, resource_name in (
             ("database", deployment.resources.database),
-            ("cache", deployment.resources.cache),
+            ("cache", None if valkey is None else valkey.resource),
         )
         if resource_name is not None
         and isinstance(resource := state.resources[resource_name], ResourceConfig)
@@ -559,21 +560,21 @@ def operation_trace_resource(correlation_id: str) -> dict[str, object]:
 @mcp.tool(annotations=READ)
 @_journal_plan("state_migration")
 def plan_state_migration() -> dict[str, object]:
-    """Inspect exact installed versions and plan migration to schema-v4 state."""
-    if store.exists() and store.raw_state().get("schema_version") == 4:
-        raise ValueError("schema-v4 state already exists")
+    """Inspect exact installed versions and plan migration to schema-v5 state."""
+    if store.exists() and store.raw_state().get("schema_version") == 5:
+        raise ValueError("schema-v5 state already exists")
     return migration_plan(_migration_state(), str(store.root))
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("state_migration")
 def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
-    """Atomically write schema-v4 state after re-observing exact installed versions."""
+    """Atomically write schema-v5 state after re-observing exact installed versions."""
     state = _migration_state()
     expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
     store.save(state)
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 4}
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 5}
 
 
 @mcp.tool(annotations=READ)
@@ -1379,7 +1380,8 @@ def _resource_cleanup_plan(name: str) -> dict[str, object]:
     if resource is None:
         raise KeyError(f"resource '{name}' is not registered")
     if any(
-        deployment.resources.database == name or deployment.resources.cache == name
+        deployment.resources.database == name
+        or getattr(deployment.resources.valkey, "resource", None) == name
         for deployment in state.deployments.values()
     ):
         raise ValueError(f"resource {name} is still referenced by a deployment")

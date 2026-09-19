@@ -180,6 +180,19 @@ class AWSNetwork(BaseModel):
         return value
 
 
+def _valid_deployment_security_groups(value: dict[str, str]) -> dict[str, str]:
+    for target_name, security_group_id in value.items():
+        if (
+            TARGET_NAME.fullmatch(target_name) is None
+            or AWS_SECURITY_GROUP_ID.fullmatch(security_group_id) is None
+        ):
+            raise ValueError(
+                "deployment_security_group_ids must map exact target names to "
+                "exact security group ids"
+            )
+    return value
+
+
 class AWSRDSPostgresResource(BaseModel):
     """One managed AWS RDS for PostgreSQL instance (ADR 0008). Bindable by many
     Deployments placed on any Target listed in deployment_security_group_ids; each owns
@@ -213,16 +226,7 @@ class AWSRDSPostgresResource(BaseModel):
     @field_validator("deployment_security_group_ids")
     @classmethod
     def valid_deployment_security_groups(cls, value: dict[str, str]) -> dict[str, str]:
-        for target_name, security_group_id in value.items():
-            if (
-                TARGET_NAME.fullmatch(target_name) is None
-                or AWS_SECURITY_GROUP_ID.fullmatch(security_group_id) is None
-            ):
-                raise ValueError(
-                    "deployment_security_group_ids must map exact target names to "
-                    "exact security group ids"
-                )
-        return value
+        return _valid_deployment_security_groups(value)
 
 
 def _clock_minutes(clock: str) -> int:
@@ -261,7 +265,9 @@ def _maintenance_window_minutes(window: str) -> list[int]:
 class AWSElastiCacheValkeyResource(BaseModel):
     """One managed AWS ElastiCache for Valkey replication group (ADR 0009): one shard, one
     cross-AZ replica, cluster mode, TLS, and synchronous durability are fixed by Gimme and
-    are not fields. Registration makes no AWS call and a Deployment cannot bind it yet."""
+    are not fields. Bindable by many Deployments placed on any Target listed in
+    deployment_security_group_ids; each owns an ACL user, namespace, and Resource Credential.
+    Only the administration Target's security group and those may reach it (ADR 0009)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -272,6 +278,8 @@ class AWSElastiCacheValkeyResource(BaseModel):
     engine_version: str
     node_type: str = Field(pattern=AWS_CACHE_NODE_TYPE.pattern)
     security_group_id: str = Field(pattern=AWS_SECURITY_GROUP_ID.pattern)
+    administration_security_group_id: str = Field(pattern=AWS_SECURITY_GROUP_ID.pattern)
+    deployment_security_group_ids: dict[str, str] = Field(default_factory=dict, max_length=32)
     snapshot_window: str
     snapshot_retention_days: int = Field(default=7, ge=1, le=35)
     maintenance_window: str
@@ -281,6 +289,11 @@ class AWSElastiCacheValkeyResource(BaseModel):
         description="Lifecycle policy: ordinary Resource removal only deletes desired "
         "registration and leaves the replication group and its data intact.",
     )
+
+    @field_validator("deployment_security_group_ids")
+    @classmethod
+    def valid_deployment_security_groups(cls, value: dict[str, str]) -> dict[str, str]:
+        return _valid_deployment_security_groups(value)
 
     @field_validator("engine_version")
     @classmethod
@@ -316,11 +329,38 @@ Resource = Annotated[
 ]
 
 
+ValkeyUse = Literal["cache", "session", "queue"]
+
+
+class ValkeyBinding(BaseModel):
+    """Which Laravel uses of a Valkey Resource a Deployment relies on. The namespace and
+    credential of each use are derived by Gimme and can never be supplied."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    resource: str = Field(pattern=DEPLOYMENT_NAME.pattern)
+    uses: list[ValkeyUse] = Field(min_length=1, max_length=3)
+
+    @field_validator("uses")
+    @classmethod
+    def unique_uses(cls, value: list[ValkeyUse]) -> list[ValkeyUse]:
+        if len(set(value)) != len(value):
+            raise ValueError("each Valkey use may appear at most once")
+        return value
+
+
 class ResourceBindings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     database: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
-    cache: str | None = Field(default=None, pattern=DEPLOYMENT_NAME.pattern)
+    valkey: ValkeyBinding | None = None
+
+
+def runs_horizon(workers: object) -> bool:
+    """True for a Horizon worker that is enabled, as a model or a raw state document."""
+    if isinstance(workers, dict):
+        return workers.get("driver") == "horizon" and workers.get("enabled", True) is True
+    return getattr(workers, "driver", None) == "horizon" and getattr(workers, "enabled", False)
 
 
 class AWSProviderAccount(BaseModel):
@@ -783,7 +823,7 @@ class DeploymentRegistration(BaseModel):
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[4] = 4
+    schema_version: Literal[5] = 5
     provider_accounts: dict[str, ProviderAccount] = Field(default_factory=dict)
     secret_stores: dict[str, SecretStore] = Field(
         default_factory=lambda: {"local-sops": SopsSecretStore()}
@@ -868,7 +908,7 @@ class ControlState(BaseModel):
                         f"resource {name} workload_secret_store must be a registered "
                         "AWS Secrets Manager store"
                     )
-                if isinstance(resource, AWSRDSPostgresResource):
+                if isinstance(resource, (AWSRDSPostgresResource, AWSElastiCacheValkeyResource)):
                     for target_name in resource.deployment_security_group_ids:
                         deployment_target = self.targets.get(target_name)
                         if deployment_target is None or deployment_target.role != "deployment":
@@ -900,9 +940,10 @@ class ControlState(BaseModel):
                 self.targets[deployment.target],
                 self.applications[deployment.application],
             )
+            valkey = deployment.resources.valkey
             for binding, kind in (
                 (deployment.resources.database, "postgres"),
-                (deployment.resources.cache, "valkey"),
+                (None if valkey is None else valkey.resource, "valkey"),
             ):
                 if binding is None:
                     continue
@@ -911,11 +952,6 @@ class ControlState(BaseModel):
                     raise ValueError(f"deployment {name} references unknown resource {binding}")
                 if resource.kind != kind:
                     raise ValueError(f"deployment {name} has an incompatible {kind} binding")
-                if isinstance(resource, AWSElastiCacheValkeyResource):
-                    raise ValueError(
-                        f"deployment {name} cannot bind managed Valkey resource {binding}: "
-                        "managed Valkey bindings are not implemented yet"
-                    )
                 if isinstance(resource, ResourceConfig):
                     if resource.target != deployment.target:
                         raise ValueError(f"deployment {name} has an incompatible {kind} binding")
@@ -926,9 +962,9 @@ class ControlState(BaseModel):
                     )
             is_static = self.applications[deployment.application].framework == "static"
             has_database = deployment.resources.database is not None
-            has_cache = deployment.resources.cache is not None
-            if is_static and (has_database or has_cache):
-                raise ValueError(f"static deployment {name} cannot bind database or cache")
+            has_valkey = valkey is not None
+            if is_static and (has_database or has_valkey):
+                raise ValueError(f"static deployment {name} cannot bind database or Valkey")
             if is_static and deployment.secrets:
                 raise ValueError(f"static deployment {name} cannot receive runtime secrets")
             if deployment.recovery is not None:
@@ -941,9 +977,13 @@ class ControlState(BaseModel):
                         f"deployment {name} requires a bound database to enable recovery"
                     )
             if not is_static and (
-                not has_database or not has_cache
+                not has_database or not has_valkey
             ):
-                raise ValueError(f"deployment {name} requires database and cache bindings")
+                raise ValueError(f"deployment {name} requires database and Valkey bindings")
+            if valkey is not None and runs_horizon(deployment.workers) and (
+                "queue" not in valkey.uses
+            ):
+                raise ValueError(f"deployment {name} runs Horizon and requires the queue use")
         return self
 
 
@@ -1050,7 +1090,7 @@ class StateStore:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
         document = self.raw_state()
-        if document.get("schema_version") != 4:
+        if document.get("schema_version") != 5:
             raise RuntimeError("state migration required; call plan_state_migration")
         return ControlState.model_validate(document)
 
@@ -1154,7 +1194,11 @@ class StateStore:
                     ),
                     resources=ResourceBindings(
                         database=f"{target_name}-postgres",
-                        cache=f"{target_name}-valkey",
+                        valkey=ValkeyBinding(
+                            resource=f"{target_name}-valkey",
+                            uses=["cache", "queue"] if runs_horizon(definition.workers)
+                            else ["cache"],
+                        ),
                     ) if app.framework != "static" else ResourceBindings(),
                     placement=Placement(
                         instance=environment_instance(app_name, environment),
@@ -1194,11 +1238,15 @@ class StateStore:
         if not self.exists():
             return self.legacy_migration(observations)
         document = self.raw_state()
+        if document.get("schema_version") == 5:
+            raise ValueError("schema-v5 state already exists")
         if document.get("schema_version") == 4:
-            raise ValueError("schema-v4 state already exists")
+            migrated = json.loads(json.dumps(document))
+            self._migrate_valkey_bindings(migrated)
+            return ControlState.model_validate(migrated)
         if document.get("schema_version") == 3:
             migrated = json.loads(json.dumps(document))
-            migrated["schema_version"] = 4
+            migrated["schema_version"] = 5
             migrated["provider_accounts"] = {}
             migrated["secret_stores"] = {"local-sops": {"provider": "sops"}}
             deployments = migrated.get("deployments")
@@ -1223,16 +1271,17 @@ class StateStore:
                         "field": parts[-1],
                     }
                 deployment["secrets"] = converted
+            self._migrate_valkey_bindings(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") != 2:
-            raise ValueError("only schema-v2 or schema-v3 state can be migrated")
+            raise ValueError("only schema-v2, schema-v3, or schema-v4 state can be migrated")
         targets = document.get("targets")
         applications = document.get("applications")
         deployments = document.get("deployments")
         if not all(isinstance(value, dict) for value in (targets, applications, deployments)):
             raise ValueError("schema-v2 state collections are invalid")
         migrated = json.loads(json.dumps(document))
-        migrated["schema_version"] = 4
+        migrated["schema_version"] = 5
         migrated["provider_accounts"] = {}
         migrated["secret_stores"] = {"local-sops": {"provider": "sops"}}
         migrated["resources"] = {}
@@ -1305,7 +1354,36 @@ class StateStore:
                 deployment["resources"] = {"database": None, "cache": None}
         for target in migrated["targets"].values():
             target.pop("_gimme_old_toolchains", None)
+        self._migrate_valkey_bindings(migrated)
         return ControlState.model_validate(migrated)
+
+    @staticmethod
+    def _migrate_valkey_bindings(document: dict[str, object]) -> None:
+        """Rewrite the schema-v4 resources.cache string as a typed resources.valkey binding
+        of the cache use, plus queue for a running Horizon; session is never inferred. Any
+        shape that cannot be read unambiguously fails the migration, and no reader for the old
+        shape remains."""
+        document["schema_version"] = 5
+        deployments = document.get("deployments")
+        if not isinstance(deployments, dict):
+            raise ValueError("deployments are invalid")
+        for name, deployment in deployments.items():
+            resources = deployment.get("resources", {}) if isinstance(deployment, dict) else None
+            if not isinstance(resources, dict) or not set(resources) <= {"database", "cache"}:
+                raise ValueError(f"deployment {name} resource bindings are ambiguous")
+            cache = resources.pop("cache", None)
+            workers = deployment.get("workers")
+            if cache is not None and not isinstance(cache, str):
+                raise ValueError(f"deployment {name} cache binding is ambiguous")
+            if workers is not None and not (
+                isinstance(workers, dict) and workers.get("driver") in ("queue", "horizon")
+            ):
+                raise ValueError(f"deployment {name} workers are ambiguous")
+            resources["valkey"] = None if cache is None else {
+                "resource": cache,
+                "uses": ["cache", "queue"] if runs_horizon(workers) else ["cache"],
+            }
+            deployment["resources"] = resources
 
     @staticmethod
     def _observed(observations: dict[str, str], name: str) -> str:

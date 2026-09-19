@@ -32,7 +32,7 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "state_migration",
-            "schema_version": 4,
+            "schema_version": 5,
             "state_directory": state_directory,
             "provider_accounts": sorted(state.provider_accounts),
             "secret_stores": state.model_dump(mode="json")["secret_stores"],
@@ -56,7 +56,7 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
                 for name, deployment in sorted(state.deployments.items())
             },
             "effects": [
-                "write one atomic schema-v4 desired-state document",
+                "write one atomic schema-v5 desired-state document",
                 "migrate local secret references to the fixed local-sops store",
                 "pin observed runtime and target-local resource versions explicitly",
                 "preserve existing remote paths, identities, databases, cache prefixes, and URLs",

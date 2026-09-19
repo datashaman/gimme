@@ -220,14 +220,6 @@ def test_state_requires_the_network_administration_target_and_workload_store() -
             ControlState.model_validate(broken)
 
 
-def test_a_deployment_cannot_bind_a_managed_valkey_resource_yet() -> None:
-    document = json.loads(EXAMPLE.read_text())
-    document["deployments"]["example-local"]["resources"]["cache"] = NAME
-
-    with pytest.raises(ValidationError, match="managed Valkey bindings are not implemented"):
-        ControlState.model_validate(document)
-
-
 def test_registration_makes_no_aws_call_and_lists_the_resource(tmp_path, monkeypatch) -> None:
     use_state(tmp_path, monkeypatch, registered=False)
 
