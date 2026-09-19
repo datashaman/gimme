@@ -5,6 +5,15 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Managed AWS RDS PostgreSQL Resource updates are now validated locally against the ADR 0008
+  allowlist: `plan_update_resource` and `update_resource` refuse a changed `aws_network`, engine
+  major version, decreased `allocated_storage_gb`, changed `workload_secret_store` while
+  allocations exist, a removed deployment Target security group still used by a bound
+  Deployment, and a change between managed and target-local providers, each with a fixed
+  `aws_rds_update_forbidden_<field>` error. `inspect_resource` now reports secret-free `drift`
+  (engine version, instance class, storage, security groups, and whether a modification is
+  pending) after a successful live read; nothing is applied to AWS. `plan_apply_resource` now
+  says an existing instance is only polled, never modified.
 - Managed AWS RDS PostgreSQL binds now verify the server certificate: `psql` runs with
   `sslmode=verify-full` against a pinned AWS commercial-region root bundle
   (`deploy/aws-rds-global-bundle.pem`) uploaded per bind beside the secret file, checked by
