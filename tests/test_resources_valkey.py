@@ -99,6 +99,7 @@ class FakeValkey:
         self.dependents_pending = False
         self.snapshots: list[SnapshotInfo] = []
         self.deleted_snapshots: list[str] = []
+        self.deleted_secrets: list[str] = []
         self.create_args: list[dict[str, object]] = []
         # deployment -> credential versions, oldest first; the last one is current
         self.credentials: dict[str, list[str]] = {}
@@ -160,6 +161,10 @@ class FakeValkey:
                 self.snapshots.pop(index)
                 return True
         return False
+
+    def delete_retained_secrets(self, account, store, store_name, resource_name, secret_names):
+        self.deleted_secrets.extend(secret_names)
+        return len(secret_names)
 
     def _version(self, deployment_name):
         return f"{len(self.credentials[deployment_name]):032d}"
@@ -2499,6 +2504,24 @@ def test_a_destroyed_resources_final_snapshot_can_be_purged_with_an_exact_plan(
     assert result["changed"] is True and result["resource"] == NAME and result["purged"] is True
     assert adapter.deleted_snapshots == [destroyed["final_snapshot"]]
     assert resources_valkey_module.load_destroyed_receipt(server_module.store.root, NAME) is None
+
+
+def test_a_destroyed_resources_credentials_can_be_purged_with_an_exact_plan(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    destroy()
+
+    plan = server_module.plan_purge_retained_secrets(NAME)
+
+    assert plan["credentials"] == 1
+    result = server_module.apply_purge_retained_secrets(
+        NAME, str(plan["plan_id"]), str(plan["confirmation"])
+    )
+
+    assert result["changed"] is True and result["purged"] == 1
+    assert adapter.deleted_secrets == ["_admin"]
+    assert resources_valkey_module.load_destroyed_secrets(server_module.store.root, NAME) is None
 
 
 def test_a_group_still_deleting_returns_pending_and_a_repeat_continues(

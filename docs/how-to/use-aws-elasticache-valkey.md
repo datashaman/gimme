@@ -498,6 +498,11 @@ delete exactly that final snapshot through the destructive role. The tool accept
 does not touch manual snapshots or Secrets Manager credentials, and removes the receipt whether AWS
 reports that exact snapshot as already absent or successfully deletes it.
 
+`plan_purge_retained_secrets` and `apply_purge_retained_secrets` (confirmation
+`PURGE RETAINED SECRETS <name>`) separately remove the administrative and recorded Deployment
+credentials after inspecting each secret's `gimme:resource` and `gimme:secret-store` tags. They
+never accept a secret name or value, and never delete a secret whose ownership cannot be verified.
+
 ## Security group
 
 `inspect_resource` and every describe read the inbound rules of the group's security group

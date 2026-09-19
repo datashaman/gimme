@@ -258,6 +258,11 @@ class ElastiCacheAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork, snapshot_name: str
     ) -> bool: ...
 
+    def delete_retained_secrets(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, store_name: str,
+        resource_name: str, secret_names: list[str],
+    ) -> int: ...
+
     def begin_rotation(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str, deployment_name: str, generation: int,
@@ -837,6 +842,41 @@ class BotoElastiCacheAdapter(AWSAdapter):
                 return False
             raise error from None
         return True
+
+    def delete_retained_secrets(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, store_name: str,
+        resource_name: str, secret_names: list[str],
+    ) -> int:
+        """Force-delete only exact, receipt-recorded secrets after verifying Gimme ownership."""
+        reader = self._session(account, account.inspection_role_arn, "elasticache-secret-verify")
+        verify = reader.client("secretsmanager", region_name=store.region)
+        destroy = self._session(account, account.destructive_role_arn, "elasticache-secret-destroy")
+        killer = destroy.client("secretsmanager", region_name=store.region)
+        deleted = 0
+        for name in secret_names:
+            secret_id = f"{store.prefix}/{resource_name}/{name}"
+            try:
+                described = verify.describe_secret(SecretId=secret_id)
+            except Exception as exc:
+                error = _provider_error(exc, "secret_verify", self.error_prefix)
+                if "missing" in str(error):
+                    continue
+                raise error from None
+            tags = _tags(described)
+            if (
+                tags.get("gimme:resource") != resource_name
+                or tags.get("gimme:secret-store") != store_name
+            ):
+                raise ResourceError("aws_elasticache_destroy_secret_ownership_mismatch")
+            try:
+                killer.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+            except Exception as exc:
+                error = _provider_error(exc, "secret_delete", self.error_prefix)
+                if "missing" in str(error):
+                    continue
+                raise error from None
+            deleted += 1
+        return deleted
 
     def _read_secret(
         self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
@@ -1488,6 +1528,51 @@ def load_destroyed_receipt(root: Path, resource_name: str) -> dict[str, str] | N
 
 def clear_destroyed_receipt(root: Path, resource_name: str) -> None:
     _destroyed_receipt_path(root, resource_name).unlink(missing_ok=True)
+
+
+def _destroyed_secrets_receipt_path(root: Path, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None:
+        raise ResourceError("resource_name_invalid")
+    return root / "destroyed-secret-resources" / f"{resource_name}.json"
+
+
+def record_destroyed_secrets(
+    root: Path, resource_name: str, store_name: str, secret_names: list[str]
+) -> None:
+    if any(DEPLOYMENT_NAME.fullmatch(name) is None and name != "_admin" for name in secret_names):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    _write_json(_destroyed_secrets_receipt_path(root, resource_name), {
+        "schema_version": 1, "resource": resource_name, "store": store_name,
+        "secrets": sorted(set(secret_names)),
+    }, resource_name)
+
+
+def load_destroyed_secrets(root: Path, resource_name: str) -> tuple[str, list[str]] | None:
+    path = _destroyed_secrets_receipt_path(root, resource_name)
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_OBSERVED_BYTES:
+        return None
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid") from None
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema_version", "resource", "store", "secrets"
+    } or (
+        receipt.get("schema_version") != 1 or receipt.get("resource") != resource_name
+        or not isinstance(receipt.get("store"), str)
+        or not isinstance(receipt.get("secrets"), list)
+        or any(
+            not isinstance(name, str)
+            or (name != "_admin" and DEPLOYMENT_NAME.fullmatch(name) is None)
+            for name in receipt["secrets"]
+        )
+    ):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    return cast(str, receipt["store"]), sorted(set(cast(list[str], receipt["secrets"])))
+
+
+def clear_destroyed_secrets(root: Path, resource_name: str) -> None:
+    _destroyed_secrets_receipt_path(root, resource_name).unlink(missing_ok=True)
 
 
 def destruction_targets(root: Path, resource_name: str) -> tuple[str, list[str]]:
