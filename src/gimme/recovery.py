@@ -28,6 +28,23 @@ FORMAT_ID = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 RESOURCE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,63}$")
 MAX_MANIFEST_BYTES = 8 * 1024
 REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+RESTORE_STATES = (
+    "started", "maintenance_entered", "safety_verified", "safety_not_required",
+    "artifact_verified", "shadow_verified", "data_replaced", "verification_failed",
+    "completed",
+)
+RESTORE_TRANSITIONS = {
+    None: {"started"},
+    "started": {"maintenance_entered"},
+    "maintenance_entered": {"safety_verified", "safety_not_required"},
+    "safety_verified": {"artifact_verified"},
+    "safety_not_required": {"artifact_verified"},
+    "artifact_verified": {"shadow_verified"},
+    "shadow_verified": {"data_replaced"},
+    "data_replaced": {"verification_failed", "completed"},
+    "verification_failed": {"verification_failed", "completed"},
+    "completed": set(),
+}
 
 
 class RecoveryError(RuntimeError):
@@ -318,6 +335,183 @@ def restore_event_key(deployment: str, request_id: str, sequence: int) -> str:
     return f"{RESTORE_PREFIX}/{deployment}/{request_id}/{sequence:06d}.json"
 
 
+def _validate_restore_event(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version", "deployment", "request_id", "sequence", "state", "created_at",
+        "source_recovery_point_id", "destination", "safety_recovery_point_id",
+    }:
+        raise RecoveryError("restore_record_invalid")
+    destination = document.get("destination")
+    if (
+        document.get("schema_version") != 2
+        or not isinstance(document.get("deployment"), str)
+        or not isinstance(document.get("request_id"), str)
+        or REQUEST_ID.fullmatch(str(document["request_id"])) is None
+        or not isinstance(document.get("sequence"), int)
+        or isinstance(document.get("sequence"), bool)
+        or not 0 <= int(document["sequence"]) <= 999999
+        or document.get("state") not in RESTORE_STATES
+        or RECOVERY_POINT_ID.fullmatch(str(document.get("source_recovery_point_id"))) is None
+        or not isinstance(destination, dict)
+        or set(destination) != {"provider", "kind", "version"}
+        or destination.get("provider") != "target_local"
+        or destination.get("kind") != "postgres"
+        or RESOURCE_VERSION.fullmatch(str(destination.get("version"))) is None
+        or (
+            document.get("safety_recovery_point_id") is not None
+            and RECOVERY_POINT_ID.fullmatch(
+                str(document.get("safety_recovery_point_id"))
+            ) is None
+        )
+    ):
+        raise RecoveryError("restore_record_invalid")
+    try:
+        created_at = datetime.fromisoformat(str(document.get("created_at")))
+    except ValueError:
+        raise RecoveryError("restore_record_invalid") from None
+    if created_at.tzinfo is None:
+        raise RecoveryError("restore_record_invalid")
+    return document
+
+
+def _restore_events(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, request_id: str,
+) -> list[dict[str, object]]:
+    if REQUEST_ID.fullmatch(request_id) is None:
+        raise RecoveryError("restore_request_identity_invalid")
+    prefix = f"{RESTORE_PREFIX}/{deployment}/{request_id}/"
+    keys = sorted(adapter.list_keys(destination, credentials, prefix))
+    if len(keys) > 100:
+        raise RecoveryError("restore_record_limit")
+    events: list[dict[str, object]] = []
+    for sequence, key in enumerate(keys):
+        if key != restore_event_key(deployment, request_id, sequence):
+            raise RecoveryError("restore_record_invalid")
+        metadata = adapter.head_object(destination, credentials, key)
+        if (
+            metadata is None or metadata.bytes > MAX_MANIFEST_BYTES
+            or metadata.version_id is None
+            or VERSION_ID.fullmatch(metadata.version_id) is None
+            or metadata.server_side_encryption == ""
+        ):
+            raise RecoveryError("restore_record_invalid")
+        raw = adapter.get_object(destination, credentials, key, metadata.version_id)
+        if (
+            len(raw) > MAX_MANIFEST_BYTES
+            or hashlib.sha256(raw).hexdigest() != metadata.sha256
+        ):
+            raise RecoveryError("restore_record_invalid")
+        try:
+            event = _validate_restore_event(json.loads(raw))
+        except (json.JSONDecodeError, UnicodeError):
+            raise RecoveryError("restore_record_invalid") from None
+        if (
+            event["deployment"] != deployment
+            or event["request_id"] != request_id
+            or event["sequence"] != sequence
+        ):
+            raise RecoveryError("restore_record_invalid")
+        events.append(event)
+    return events
+
+
+def append_restore_event(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, request_id: str, state: str, *,
+    source_recovery_point_id: str, destination_provider: str,
+    destination_kind: str, destination_version: str,
+    safety_recovery_point_id: str | None = None,
+) -> dict[str, object]:
+    """Append and round-trip one immutable, secret-safe Restore transition."""
+    events = _restore_events(destination, credentials, adapter, deployment, request_id)
+    previous = events[-1] if events else None
+    identity = {
+        "source_recovery_point_id": source_recovery_point_id,
+        "destination": {
+            "provider": destination_provider,
+            "kind": destination_kind,
+            "version": destination_version,
+        },
+        "safety_recovery_point_id": safety_recovery_point_id,
+    }
+    if previous is not None and any(previous[key] != value for key, value in identity.items()):
+        raise RecoveryError("restore_request_conflict")
+    previous_state = None if previous is None else str(previous["state"])
+    if state not in RESTORE_TRANSITIONS.get(previous_state, set()):
+        raise RecoveryError("restore_transition_invalid")
+    sequence = len(events)
+    event = _validate_restore_event({
+        "schema_version": 2, "deployment": deployment, "request_id": request_id,
+        "sequence": sequence, "state": state, "created_at": datetime.now(UTC).isoformat(),
+        **identity,
+    })
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    key = restore_event_key(deployment, request_id, sequence)
+    if adapter.head_object(destination, credentials, key) is not None:
+        raise RecoveryError("restore_record_conflict")
+    written = adapter.put_object(
+        destination, credentials, key, encoded, hashlib.sha256(encoded).hexdigest()
+    )
+    if (
+        written.version_id is None
+        or VERSION_ID.fullmatch(written.version_id) is None
+        or written.server_side_encryption == ""
+        or adapter.get_object(destination, credentials, key, written.version_id) != encoded
+    ):
+        raise RecoveryError("restore_record_verification_failed")
+    return event
+
+
+def load_restore_record(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, request_id: str,
+) -> dict[str, object]:
+    events = _restore_events(destination, credentials, adapter, deployment, request_id)
+    if not events:
+        raise RecoveryError("restore_record_missing")
+    latest = events[-1]
+    return {
+        "deployment": latest["deployment"], "request_id": latest["request_id"],
+        "source_recovery_point_id": latest["source_recovery_point_id"],
+        "destination": latest["destination"], "state": latest["state"],
+        "updated_at": latest["created_at"], "events": len(events),
+        "safety_recovery_point_id": next(
+            (event["safety_recovery_point_id"] for event in reversed(events)
+             if event["safety_recovery_point_id"] is not None),
+            None,
+        ),
+    }
+
+
+def list_restore_records(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str,
+) -> list[dict[str, object]]:
+    prefix = f"{RESTORE_PREFIX}/{deployment}/"
+    keys = adapter.list_keys(destination, credentials, prefix)
+    if len(keys) > 10_000:
+        raise RecoveryError("restore_record_limit")
+    request_ids: set[str] = set()
+    for key in keys:
+        remainder = key[len(prefix):]
+        request_id, separator, event_name = remainder.partition("/")
+        if (
+            separator != "/" or REQUEST_ID.fullmatch(request_id) is None
+            or re.fullmatch(r"[0-9]{6}\.json", event_name) is None
+        ):
+            raise RecoveryError("restore_record_invalid")
+        request_ids.add(request_id)
+    if len(request_ids) > 100:
+        raise RecoveryError("restore_record_limit")
+    records = [
+        load_restore_record(destination, credentials, adapter, deployment, request_id)
+        for request_id in request_ids
+    ]
+    records.sort(key=lambda record: str(record["updated_at"]), reverse=True)
+    return records
+
+
 def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
     """Project a private manifest without storage identities or checksums."""
     return {
@@ -361,6 +555,22 @@ def safety_recovery_point_protected(
     keys = sorted(adapter.list_keys(destination, credentials, prefix))
     if not keys or len(keys) > 100:
         return True
+    try:
+        events = _restore_events(destination, credentials, adapter, deployment, request_id)
+        latest = events[-1]
+        safety_ids = {
+            event["safety_recovery_point_id"]
+            for event in events if event["safety_recovery_point_id"] is not None
+        }
+        return not (
+            latest["state"] == "completed"
+            and safety_ids == {manifest["recovery_point_id"]}
+        )
+    except RecoveryError:
+        # Schema 1 records were emitted by the recovery-point deletion foundation.
+        # Continue with its strict parser so already-published safety points retain
+        # their original protection semantics.
+        pass
     latest_sequence = -1
     latest_state = ""
     allowed_states = {

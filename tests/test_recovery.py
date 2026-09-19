@@ -9,11 +9,14 @@ from gimme.recovery import (
     ComponentDump,
     ObjectMetadata,
     RecoveryError,
+    append_restore_event,
     component_key,
     create_recovery_point,
     delete_recovery_point_versions,
     find_recovery_point,
     list_recovery_points,
+    list_restore_records,
+    load_restore_record,
     manifest_key,
     preflight_backup_destination,
     recovery_point_deletion_targets,
@@ -335,6 +338,97 @@ def test_safety_point_is_protected_until_its_restore_record_completes(tmp_path: 
         adapter.put_object(
             destination(), None, restore_event_key("checkout", "restore-1", sequence),
             body, hashlib.sha256(body).hexdigest(),
+        )
+
+    assert safety_recovery_point_protected(
+        destination(), None, adapter, "checkout", manifest
+    ) is False
+
+
+def test_restore_events_are_append_only_validated_and_listed_newest_first() -> None:
+    adapter = FakeS3()
+    identity = {
+        "source_recovery_point_id": recovery_point_id("checkout", "primary", "source-1"),
+        "destination_provider": "target_local",
+        "destination_kind": "postgres",
+        "destination_version": "17.2",
+    }
+
+    started = append_restore_event(
+        destination(), None, adapter, "checkout", "restore-1", "started", **identity,
+    )
+    entered = append_restore_event(
+        destination(), None, adapter, "checkout", "restore-1", "maintenance_entered",
+        **identity,
+    )
+    append_restore_event(
+        destination(), None, adapter, "checkout", "restore-2", "started", **identity,
+    )
+
+    assert started["sequence"] == 0
+    assert entered["sequence"] == 1
+    assert load_restore_record(
+        destination(), None, adapter, "checkout", "restore-1"
+    )["state"] == "maintenance_entered"
+    records = list_restore_records(destination(), None, adapter, "checkout")
+    assert [item["request_id"] for item in records] == ["restore-2", "restore-1"]
+    assert all("object" not in key and "database" not in key for key in records[0])
+
+
+def test_restore_event_conflicting_retry_fails_closed() -> None:
+    adapter = FakeS3()
+    point = recovery_point_id("checkout", "primary", "source-1")
+    append_restore_event(
+        destination(), None, adapter, "checkout", "restore-1", "started",
+        source_recovery_point_id=point, destination_provider="target_local",
+        destination_kind="postgres", destination_version="17.2",
+    )
+
+    with pytest.raises(RecoveryError, match="^restore_request_conflict$"):
+        append_restore_event(
+            destination(), None, adapter, "checkout", "restore-1", "maintenance_entered",
+            source_recovery_point_id=point, destination_provider="target_local",
+            destination_kind="postgres", destination_version="16.6",
+        )
+
+
+def test_restore_event_rejects_invalid_transition_without_writing() -> None:
+    adapter = FakeS3()
+
+    with pytest.raises(RecoveryError, match="^restore_transition_invalid$"):
+        append_restore_event(
+            destination(), None, adapter, "checkout", "restore-1", "data_replaced",
+            source_recovery_point_id=recovery_point_id("checkout", "primary", "source-1"),
+            destination_provider="target_local", destination_kind="postgres",
+            destination_version="17.2",
+        )
+
+    assert adapter.objects == {}
+
+
+def test_completed_authoritative_restore_record_releases_its_safety_point(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+    safety_id = recovery_point_id("checkout", "primary", "safety-1")
+    source_id = recovery_point_id("checkout", "primary", "source-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", safety_id, dump(tmp_path),
+        safety_restore_request_id="restore-1",
+    )
+    identity = {
+        "source_recovery_point_id": source_id,
+        "destination_provider": "target_local",
+        "destination_kind": "postgres",
+        "destination_version": "17.2",
+        "safety_recovery_point_id": safety_id,
+    }
+    for state in (
+        "started", "maintenance_entered", "safety_verified", "artifact_verified",
+        "shadow_verified", "data_replaced", "completed",
+    ):
+        append_restore_event(
+            destination(), None, adapter, "checkout", "restore-1", state, **identity,
         )
 
     assert safety_recovery_point_protected(

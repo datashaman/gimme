@@ -37,7 +37,7 @@ from gimme.control import (
 )
 from gimme.deployer import CommandResult
 from gimme.recovery import ObjectMetadata, RecoveryError
-from gimme.recovery import restore_event_key
+from gimme.recovery import append_restore_event, recovery_point_id, restore_event_key
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
@@ -302,6 +302,7 @@ async def test_hard_v4_tool_surface() -> None:
         "plan_create_recovery_point",
         "create_recovery_point",
         "list_recovery_points",
+        "list_restores",
     }
     assert {str(resource.uri) for resource in resources} == {
         "gimme://state", "gimme://operations"
@@ -316,6 +317,7 @@ async def test_hard_v4_tool_surface() -> None:
         "gimme://secret-stores/{name}",
         "gimme://backup-destinations/{name}",
         "gimme://aws-networks/{name}/valkey-options",
+        "gimme://deployments/{name}/restores/{request_id}",
     }
     assert all(tool.annotations is not None for tool in tools)
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
@@ -637,6 +639,28 @@ def test_create_recovery_point_end_to_end_and_duplicate_apply_is_a_no_op(
     assert "pg-dump-bytes" not in encoded
     assert "gimme/recovery-points" not in encoded
     assert "version_id" not in encoded
+
+
+def test_restore_record_tool_and_resource_are_destination_authoritative(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    point = recovery_point_id("example-app", "primary", "source-1")
+    append_restore_event(
+        server_module.store.load().backup_destinations["primary"], None, adapter,
+        "example-app", "restore-1", "started", source_recovery_point_id=point,
+        destination_provider="target_local", destination_kind="postgres",
+        destination_version="17.2",
+    )
+
+    listed = server_module.list_restores("example-app")
+    resource = server_module.restore_record_resource("example-app", "restore-1")
+
+    assert listed["restores"] == [resource]
+    assert resource["state"] == "started"
+    assert "gimme/restores" not in str(listed)
 
 
 def test_delete_recovery_point_requires_both_confirmations_for_the_last_point(
