@@ -219,7 +219,10 @@ characters, so a long or irregular name gets a hash suffix.
 
 Creation takes several minutes. `apply_resource` polls for at most 30 seconds and returns
 `phase: pending`; plan and apply again to resume, which describes the group and never creates
-a second one.
+a second one. Once AWS acknowledges the create request, Gimme records a local `provisioning`
+operation before the first follow-up read. If that read is temporarily unavailable,
+`inspect_resource` reports `phase: pending`, `operation: provisioning`, and a bounded refresh
+error; repeat the same apply after AWS is reachable again.
 
 ## Update an existing group
 
