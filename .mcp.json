@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "gimme": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "gimme-mcp"
+      ],
+      "env": {}
+    }
+  }
+}

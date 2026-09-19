@@ -16,6 +16,8 @@ config/apps.json
 config/.gimme.lock
 config/.gimme-journal.lock
 config/state.json
+# Migration and hand-made backups of the operational inventory.
+config/state.json*.bak
 config/secrets*.json
 config/operations.jsonl
 config/applied-secrets/
