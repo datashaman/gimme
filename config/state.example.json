@@ -170,6 +170,20 @@
       "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
       "workload_secret_store": "workload-secrets",
       "retain_on_removal": true
+    },
+    "example-elasticache-valkey": {
+      "kind": "valkey",
+      "provider": "aws_elasticache_valkey",
+      "aws_network": "primary",
+      "administration_target": "adminbox",
+      "engine_version": "9.0",
+      "node_type": "cache.m7g.large",
+      "security_group_id": "sg-0123456789abcdef2",
+      "snapshot_window": "03:00-04:00",
+      "snapshot_retention_days": 7,
+      "maintenance_window": "sun:05:00-sun:06:00",
+      "workload_secret_store": "workload-secrets",
+      "retain_on_removal": true
     }
   },
   "deployments": {

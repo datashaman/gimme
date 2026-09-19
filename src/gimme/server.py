@@ -18,8 +18,10 @@ from pydantic import Field
 
 from gimme import recovery as recovery_module
 from gimme import resources_postgres as resources_postgres_module
+from gimme import resources_valkey as resources_valkey_module
 from gimme.control import (
-    AWSProviderAccount, AWSRDSPostgresResource, AWSSecretsManagerStore, ApplicationConfig,
+    AWSElastiCacheValkeyResource, AWSProviderAccount, AWSRDSPostgresResource,
+    AWSSecretsManagerStore, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
     ResourceConfig, S3BackupDestination, SecretStore, StateStore, TargetConfig, legacy_app,
     legacy_server, new_placement, target_sites,
@@ -1073,6 +1075,16 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
     state = store.load()
     current = state.resources.get(name)
     if current is not None and (
+        isinstance(current, AWSElastiCacheValkeyResource)
+        or isinstance(definition, AWSElastiCacheValkeyResource)
+    ):
+        if not (
+            isinstance(current, AWSElastiCacheValkeyResource)
+            and isinstance(definition, AWSElastiCacheValkeyResource)
+        ):
+            raise ResourceError("aws_elasticache_update_forbidden_provider")
+        resources_valkey_module.validate_update(current, definition)
+    if current is not None and (
         isinstance(current, AWSRDSPostgresResource)
         or isinstance(definition, AWSRDSPostgresResource)
     ):
@@ -1155,6 +1167,12 @@ def inspect_resource(name: Name) -> dict[str, object]:
     resource = state.resources.get(name)
     if resource is None:
         raise KeyError(f"resource '{name}' is not registered")
+    if isinstance(resource, AWSElastiCacheValkeyResource):
+        # Provisioning and live observation arrive with the replication group adapter.
+        return {
+            "resource": name, "provider": resource.provider, "kind": resource.kind,
+            "engine_version": resource.engine_version, "phase": "registered",
+        }
     if not isinstance(resource, AWSRDSPostgresResource):
         return {
             "resource": name, "provider": resource.provider, "target": resource.target,

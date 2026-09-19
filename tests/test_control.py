@@ -299,6 +299,7 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
     document.pop("aws_networks", None)
     document["targets"].pop("adminbox", None)
     document["resources"].pop("example-rds-postgres", None)
+    document["resources"].pop("example-elasticache-valkey", None)
     document["deployments"]["example-local"]["secrets"] = {
         "MAIL_PASSWORD": "example-local/mail/MAIL_PASSWORD"
     }
