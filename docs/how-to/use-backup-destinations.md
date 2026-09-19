@@ -85,8 +85,9 @@ Recovery Point never becomes visible until verification succeeds.
 
 `list_recovery_points(deployment)` reads Recovery Manifests directly from the bound
 destination — authoritative inventory even if the Target is gone — and returns only
-bounded, secret-safe metadata (recovery point ID, creation time, and each component's
-key, byte count, and checksum). A manifest whose referenced component object no longer
+bounded, secret-safe metadata (recovery point ID, creation time, state, and each
+component's kind and byte count). Keys, checksums, and S3 version IDs remain private. A
+manifest whose referenced component object no longer
 matches its declared checksum is rejected and excluded from `recovery_points`, but does
 not fail the rest of the listing; its ID is reported under `rejected`.
 
@@ -97,6 +98,24 @@ destination bucket — Gimme assumes a single operator per Deployment, the same
 trusted-operator model the plan/apply split already relies on elsewhere. Running more
 than one control plane against the same Deployment's recovery destination at once is
 unsupported and can race.
+
+## Delete a Recovery Point manually
+
+Inspect `plan_delete_recovery_point(deployment, recovery_point_id)`, then pass its
+`plan_id` and exact `confirmation` to `delete_recovery_point`. If the plan identifies the
+point as the final verified Recovery Point, also pass its exact
+`last_recovery_point_confirmation`.
+
+Manual deletion and automatic retention have different intent. Automatic retention may
+prune only after a verified replacement exists and never below `retain_last`. Manual
+deletion is an explicit operator decision and may reduce inventory below that value.
+Neither mode may delete a Safety Recovery Point while its Restore is unresolved.
+
+Deletion uses only exact versions named by the selected immutable manifest. It deletes
+components first and the manifest last; there is no arbitrary object or prefix deletion
+interface. A partial failure leaves the point in `deletion_failed` with bounded progress
+counts. Retry the original call with the same plan and confirmations; already-absent exact
+versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destination policy.
 
 ## What this issue does not cover
 

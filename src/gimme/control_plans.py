@@ -259,6 +259,47 @@ def recovery_point_creation_plan(
     )
 
 
+def recovery_point_deletion_plan(
+    deployment_name: str,
+    destination_name: str,
+    point_id: str,
+    *,
+    components: int,
+    bytes: int,
+    final_verified_point: bool,
+    safety_protected: bool,
+    inventory_fingerprint: str,
+    manifest_fingerprint: str,
+    state: str,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "recovery_point_deletion",
+            "deployment": deployment_name,
+            "destination": destination_name,
+            "recovery_point_id": point_id,
+            "state": state,
+            "components": components,
+            "bytes": bytes,
+            "safety_protected": safety_protected,
+            "final_verified_point": final_verified_point,
+            "inventory_fingerprint": inventory_fingerprint,
+            "manifest_fingerprint": manifest_fingerprint,
+            "confirmation": f"DELETE RECOVERY POINT {deployment_name} {point_id}",
+            "last_recovery_point_confirmation": (
+                f"DELETE LAST RECOVERY POINT {deployment_name} {point_id}"
+                if final_verified_point else None
+            ),
+            "effects": [
+                "delete only the exact component versions named by the immutable manifest",
+                "verify every exact component version is absent before continuing",
+                "delete and verify the exact immutable manifest version last",
+                "leave policy, unrelated versions, and every other Recovery Point unchanged",
+            ],
+        }
+    )
+
+
 def resource_provision_plan(
     resource_name: str,
     resource: AWSRDSPostgresResource,

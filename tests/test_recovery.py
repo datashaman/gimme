@@ -10,11 +10,15 @@ from gimme.recovery import (
     ObjectMetadata,
     RecoveryError,
     create_recovery_point,
+    delete_recovery_point_versions,
     find_recovery_point,
     list_recovery_points,
     manifest_key,
     preflight_backup_destination,
+    recovery_point_deletion_targets,
     recovery_point_id,
+    restore_event_key,
+    safety_recovery_point_protected,
 )
 
 
@@ -39,20 +43,24 @@ class FakeS3:
             version_id=version_id,
         )
 
-    def head_object(self, destination, credentials, key) -> ObjectMetadata | None:
+    def head_object(self, destination, credentials, key, version_id=None) -> ObjectMetadata | None:
         body = self.objects.get(key)
-        if body is None:
+        if body is None or (version_id is not None and self.versions.get(key) != version_id):
             return None
         return ObjectMetadata(
             bytes=len(body), sha256=hashlib.sha256(body).hexdigest(),
             server_side_encryption="AES256", version_id=self.versions.get(key),
         )
 
-    def get_object(self, destination, credentials, key) -> bytes:
+    def get_object(self, destination, credentials, key, version_id=None) -> bytes:
+        if version_id is not None and self.versions.get(key) != version_id:
+            raise KeyError(key)
         return self.objects[key]
 
     def delete_object(self, destination, credentials, key, version_id=None) -> None:
         self.deletes.append((key, version_id))
+        if version_id is not None and self.versions.get(key) != version_id:
+            return
         self.objects.pop(key, None)
         self.versions.pop(key, None)
 
@@ -145,7 +153,110 @@ def test_create_recovery_point_publishes_manifest_after_verification(tmp_path: P
 
     assert manifest["recovery_point_id"] == point_id
     assert manifest["components"][0]["kind"] == "postgres"
+    assert manifest["components"][0]["version_id"] == "v1"
     assert adapter.puts == 2  # component, then manifest
+
+
+def test_deletion_targets_are_resolved_only_from_the_published_manifest(tmp_path: Path) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+
+    targets = recovery_point_deletion_targets(
+        "primary", destination(), None, adapter, "checkout", point_id
+    )
+
+    assert targets["recovery_point_id"] == point_id
+    assert targets["components"] == 1 and targets["bytes"] == len(b"pg-dump-bytes")
+    assert targets["manifest_version_id"] == "v2"
+
+
+def test_delete_removes_exact_component_versions_then_exact_manifest_version(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+
+    result = delete_recovery_point_versions(
+        "primary", destination(), None, adapter, "checkout", point_id
+    )
+
+    assert result["state"] == "deleted"
+    assert adapter.deletes[-2:] == [
+        (manifest["components"][0]["key"], "v1"),
+        (manifest_key("checkout", point_id), "v2"),
+    ]
+    assert adapter.objects == {}
+
+
+def test_partial_delete_stays_visible_and_retry_is_idempotent(tmp_path: Path) -> None:
+    class FailManifestOnce(FakeS3):
+        failed = False
+
+        def delete_object(self, destination, credentials, key, version_id=None) -> None:
+            if key.endswith("/manifest.json") and not self.failed:
+                self.failed = True
+                raise RuntimeError("access denied: private provider detail")
+            super().delete_object(destination, credentials, key, version_id)
+
+    adapter = FailManifestOnce()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+
+    with pytest.raises(RecoveryError, match="^recovery_point_deletion_failed$"):
+        delete_recovery_point_versions(
+            "primary", destination(), None, adapter, "checkout", point_id
+        )
+    inventory = list_recovery_points(
+        "primary", destination(), None, adapter, "checkout"
+    )
+    [partial] = inventory["recovery_points"]
+    assert partial["state"] == "deletion_failed"
+    assert partial["deleted_components"] == 1
+
+    result = delete_recovery_point_versions(
+        "primary", destination(), None, adapter, "checkout", point_id
+    )
+    assert result["state"] == "deleted"
+    assert adapter.objects == {}
+
+
+def test_safety_point_is_protected_until_its_restore_record_completes(tmp_path: Path) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "safety-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path),
+        safety_restore_request_id="restore-1",
+    )
+
+    assert safety_recovery_point_protected(
+        destination(), None, adapter, "checkout", manifest
+    ) is True
+    for sequence, state in enumerate(("started", "completed")):
+        event = {
+            "schema_version": 1,
+            "deployment": "checkout",
+            "request_id": "restore-1",
+            "sequence": sequence,
+            "state": state,
+            "safety_recovery_point_id": point_id,
+        }
+        body = json.dumps(event, sort_keys=True).encode()
+        adapter.put_object(
+            destination(), None, restore_event_key("checkout", "restore-1", sequence),
+            body, hashlib.sha256(body).hexdigest(),
+        )
+
+    assert safety_recovery_point_protected(
+        destination(), None, adapter, "checkout", manifest
+    ) is False
 
 
 def test_duplicate_apply_is_a_deterministic_no_op(tmp_path: Path) -> None:
@@ -311,7 +422,7 @@ def test_list_recovery_points_rejects_tampered_manifest_without_failing_the_call
 
 
 @pytest.mark.parametrize("corrupt", [
-    lambda m: {**m, "schema_version": 2},
+        lambda m: {**m, "schema_version": 1},
     lambda m: {**m, "recovery_point_id": "not-an-id"},
     lambda m: {**m, "components": []},
     lambda m: {**m, "components": [{**m["components"][0], "bytes": -1}]},
@@ -375,12 +486,15 @@ def test_a_manifest_cannot_borrow_another_recovery_points_component(tmp_path: Pa
 
 def test_load_manifest_rejects_oversized_object_without_reading_its_body() -> None:
     class ExplodingReadS3(FakeS3):
-        def head_object(self, destination, credentials, key) -> ObjectMetadata | None:
+        def head_object(
+            self, destination, credentials, key, version_id=None
+        ) -> ObjectMetadata | None:
             return ObjectMetadata(
                 bytes=1024 * 1024, sha256="0" * 64, server_side_encryption="AES256",
+                version_id="v1",
             )
 
-        def get_object(self, destination, credentials, key) -> bytes:
+        def get_object(self, destination, credentials, key, version_id=None) -> bytes:
             raise AssertionError("must not read an oversized manifest body")
 
     adapter = ExplodingReadS3()

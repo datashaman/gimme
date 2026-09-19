@@ -37,6 +37,7 @@ from gimme.control import (
 )
 from gimme.deployer import CommandResult
 from gimme.recovery import ObjectMetadata, RecoveryError
+from gimme.recovery import restore_event_key
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
@@ -127,7 +128,9 @@ class FakeS3:
     def __init__(self, *, versioning: str = "Enabled") -> None:
         self.versioning = versioning
         self.objects: dict[str, bytes] = {}
+        self.versions: dict[str, str] = {}
         self.puts = 0
+        self.deletes: list[tuple[str, str | None]] = []
 
     def bucket_versioning(self, destination, credentials) -> str:
         return self.versioning
@@ -135,22 +138,33 @@ class FakeS3:
     def put_object(self, destination, credentials, key, body, sha256) -> ObjectMetadata:
         self.puts += 1
         self.objects[key] = body
-        return ObjectMetadata(bytes=len(body), sha256=sha256, server_side_encryption="AES256")
+        version_id = f"v{self.puts}"
+        self.versions[key] = version_id
+        return ObjectMetadata(
+            bytes=len(body), sha256=sha256, server_side_encryption="AES256",
+            version_id=version_id,
+        )
 
-    def head_object(self, destination, credentials, key) -> ObjectMetadata | None:
+    def head_object(self, destination, credentials, key, version_id=None) -> ObjectMetadata | None:
         body = self.objects.get(key)
-        if body is None:
+        if body is None or (version_id is not None and self.versions.get(key) != version_id):
             return None
         return ObjectMetadata(
             bytes=len(body), sha256=hashlib.sha256(body).hexdigest(),
-            server_side_encryption="AES256",
+            server_side_encryption="AES256", version_id=self.versions[key],
         )
 
-    def get_object(self, destination, credentials, key) -> bytes:
+    def get_object(self, destination, credentials, key, version_id=None) -> bytes:
+        if version_id is not None and self.versions.get(key) != version_id:
+            raise KeyError(key)
         return self.objects[key]
 
     def delete_object(self, destination, credentials, key, version_id=None) -> None:
+        self.deletes.append((key, version_id))
+        if version_id is not None and self.versions.get(key) != version_id:
+            return
         self.objects.pop(key, None)
+        self.versions.pop(key, None)
 
     def list_keys(self, destination, credentials, prefix) -> list[str]:
         return [key for key in self.objects if key.startswith(prefix)]
@@ -621,6 +635,136 @@ def test_create_recovery_point_end_to_end_and_duplicate_apply_is_a_no_op(
     )
     encoded = str(inventory)
     assert "pg-dump-bytes" not in encoded
+    assert "gimme/recovery-points" not in encoded
+    assert "version_id" not in encoded
+
+
+def test_delete_recovery_point_requires_both_confirmations_for_the_last_point(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+
+    def fake_run(*args, **kwargs):
+        content = b"pg-dump-bytes"
+        kwargs["backup_local_path"].write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        return CommandResult(["dep"], 0, f"GIMME_BACKUP|{digest}|{len(content)}")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    creation = server_module.plan_create_recovery_point("example-app", "req-1")
+    created = server_module.create_recovery_point(
+        "example-app", "req-1", str(creation["plan_id"])
+    )
+    point_id = str(created["recovery_point"]["recovery_point_id"])
+    plan = server_module.plan_delete_recovery_point("example-app", point_id)
+
+    assert plan["components"] == 1
+    assert plan["bytes"] == len(b"pg-dump-bytes")
+    assert "gimme/recovery-points" not in str(plan)
+    with pytest.raises(ValueError, match="last Recovery Point"):
+        server_module.delete_recovery_point(
+            "example-app", point_id, str(plan["plan_id"]), str(plan["confirmation"])
+        )
+
+    result = server_module.delete_recovery_point(
+        "example-app", point_id, str(plan["plan_id"]), str(plan["confirmation"]),
+        str(plan["last_recovery_point_confirmation"]),
+    )
+    assert result["state"] == "deleted"
+    assert server_module.list_recovery_points("example-app")["recovery_points"] == []
+
+
+def test_partial_recovery_point_deletion_is_visible_and_same_plan_retry_completes(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+
+    class FailManifestOnce(FakeS3):
+        failed = False
+
+        def delete_object(self, destination, credentials, key, version_id=None):
+            if key.endswith("/manifest.json") and not self.failed:
+                self.failed = True
+                raise RuntimeError("private endpoint and credential details")
+            super().delete_object(destination, credentials, key, version_id)
+
+    adapter = FailManifestOnce()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+
+    def fake_run(*args, **kwargs):
+        content = b"pg-dump-bytes"
+        kwargs["backup_local_path"].write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        return CommandResult(["dep"], 0, f"GIMME_BACKUP|{digest}|{len(content)}")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    creation = server_module.plan_create_recovery_point("example-app", "req-1")
+    created = server_module.create_recovery_point(
+        "example-app", "req-1", str(creation["plan_id"])
+    )
+    point_id = str(created["recovery_point"]["recovery_point_id"])
+    plan = server_module.plan_delete_recovery_point("example-app", point_id)
+    arguments = (
+        "example-app", point_id, str(plan["plan_id"]), str(plan["confirmation"]),
+        str(plan["last_recovery_point_confirmation"]),
+    )
+
+    with pytest.raises(RecoveryError, match="^recovery_point_deletion_failed$") as raised:
+        server_module.delete_recovery_point(*arguments)
+    assert "private" not in str(raised.value)
+    [partial] = server_module.list_recovery_points("example-app")["recovery_points"]
+    assert partial["state"] == "deletion_failed"
+    with pytest.raises(RecoveryError, match="^recovery_point_deletion_failed$"):
+        server_module.plan_delete_recovery_point("example-app", point_id)
+
+    result = server_module.delete_recovery_point(*arguments)
+    assert result["state"] == "deleted"
+    duplicate = server_module.delete_recovery_point(*arguments)
+    assert duplicate["changed"] is False
+
+
+def test_unresolved_safety_recovery_point_cannot_be_deleted(tmp_path, monkeypatch) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    content = b"safety-dump"
+    local = tmp_path / "safety.dump"
+    local.write_bytes(content)
+    point_id = server_module.recovery_module.recovery_point_id(
+        "example-app", "primary", "safety-1"
+    )
+    server_module.recovery_module.create_recovery_point(
+        "primary", recovery_state().backup_destinations["primary"], None, adapter,
+        "example-app", point_id,
+        server_module.ComponentDump(
+            kind="postgres", local_path=local,
+            sha256=hashlib.sha256(content).hexdigest(), bytes=len(content),
+        ),
+        safety_restore_request_id="restore-1",
+    )
+    plan = server_module.plan_delete_recovery_point("example-app", point_id)
+    assert plan["safety_protected"] is True
+
+    with pytest.raises(RecoveryError, match="^recovery_point_safety_protected$"):
+        server_module.delete_recovery_point(
+            "example-app", point_id, str(plan["plan_id"]), str(plan["confirmation"]),
+            str(plan["last_recovery_point_confirmation"]),
+        )
+
+    event = {
+        "schema_version": 1, "deployment": "example-app", "request_id": "restore-1",
+        "sequence": 0, "state": "completed", "safety_recovery_point_id": point_id,
+    }
+    body = json.dumps(event, sort_keys=True).encode()
+    adapter.put_object(
+        recovery_state().backup_destinations["primary"], None,
+        restore_event_key("example-app", "restore-1", 0), body,
+        hashlib.sha256(body).hexdigest(),
+    )
+    completed_plan = server_module.plan_delete_recovery_point("example-app", point_id)
+    assert completed_plan["safety_protected"] is False
 
 
 def test_create_recovery_point_requires_a_bound_recovery_policy(tmp_path, monkeypatch) -> None:

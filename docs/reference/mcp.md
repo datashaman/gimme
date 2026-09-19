@@ -261,6 +261,8 @@ Recovery Points are then created and listed with:
 | --- | --- | --- |
 | `plan_create_recovery_point` | Read | Plan one on-demand PostgreSQL Recovery Point for a recovery-bound deployment |
 | `create_recovery_point` | Remote + destination write | Dump, upload, verify, and publish one Recovery Point |
+| `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
+| `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 
 `create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
 identity is derived from `(deployment, destination, request_id)`, never from wall-clock
@@ -278,6 +280,18 @@ a failed or partial upload is cleaned up rather than left dangling. `list_recove
 reads manifests directly from the bound destination — authoritative even if the owning
 Target is gone — and rejects (without failing the whole call) any manifest whose
 referenced component object no longer matches its declared checksum.
+
+Manual deletion is separate from automatic retention. `retain_last` is an automatic
+pruning floor after a verified replacement exists; it does not prevent an operator from
+manually reducing inventory below that number. Deleting the final verified point requires
+both exact confirmations returned by the plan.
+
+Deletion accepts only a registered Deployment and Recovery Point ID. The private manifest
+supplies every object key and exact S3 version; callers cannot provide a key, prefix, path,
+or version. Components are deleted and verified one at a time, with the exact manifest
+version last. A partial failure remains visible as `deletion_failed`; retry the original
+apply with the same plan and confirmations. Safety points remain protected until their
+authoritative Restore record is `completed`, and Object Lock or legal hold is never bypassed.
 
 ## Application operation tools
 

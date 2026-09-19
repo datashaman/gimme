@@ -390,7 +390,10 @@ def verify_backup_destination() -> None:
     if inventory["rejected"]:
         raise AssertionError(f"inventory unexpectedly rejected a manifest: {inventory}")
 
-    tamper_component(result["recovery_point"]["components"][0]["key"])
+    tamper_component(
+        "gimme/recovery-points/"
+        f"{RECOVERY_DEPLOYMENT}/{result['recovery_point']['recovery_point_id']}/postgres.dump"
+    )
     tampered_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
     tampered_ids = {item["recovery_point_id"] for item in tampered_inventory["recovery_points"]}
     point_id = result["recovery_point"]["recovery_point_id"]

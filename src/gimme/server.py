@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
 import os
 import re
 import socket
@@ -31,7 +33,8 @@ from gimme.control import (
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
-    exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
+    exact_plan, migration_plan, recovery_point_creation_plan, recovery_point_deletion_plan,
+    registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
     resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
     valkey_provision_plan, valkey_restore_plan, valkey_rotation_plan,
@@ -75,6 +78,7 @@ SnapshotName = Annotated[
 CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
 RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
+RecoveryPointId = Annotated[str, Field(pattern=r"^rp_[a-f0-9]{20}$")]
 P = ParamSpec("P")
 R = TypeVar("R", bound=dict[str, object])
 _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", default=False)
@@ -1043,7 +1047,10 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
             destination_name, destination, credentials, backup_s3, name, point_id
         )
         if existing is not None:
-            return {"changed": False, "recovery_point": existing}
+            return {
+                "changed": False,
+                "recovery_point": recovery_module.public_recovery_point(existing),
+            }
         with tempfile.TemporaryDirectory(prefix="gimme-recovery-") as directory:
             local_path = Path(directory) / "postgres.dump"
             result = _run_deployment(
@@ -1070,7 +1077,10 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
             manifest = recovery_module.create_recovery_point(
                 destination_name, destination, credentials, backup_s3, name, point_id, dump,
             )
-    return {"changed": True, "recovery_point": manifest}
+    return {
+        "changed": True,
+        "recovery_point": recovery_module.public_recovery_point(manifest),
+    }
 
 
 @mcp.tool(annotations=READ)
@@ -1078,9 +1088,144 @@ def list_recovery_points(name: Name) -> dict[str, object]:
     """List one deployment's Recovery Points from destination-authoritative inventory."""
     state, _deployment, destination_name, destination = _recovery_context(name)
     _, credentials = _backup_destination_credentials(state, destination)
-    return recovery_module.list_recovery_points(
+    inventory = recovery_module.list_recovery_points(
         destination_name, destination, credentials, backup_s3, name
     )
+    return {
+        **inventory,
+        "recovery_points": [
+            recovery_module.public_recovery_point(item)
+            for item in inventory["recovery_points"]  # type: ignore[union-attr]
+        ],
+    }
+
+
+def _recovery_point_deletion_plan(
+    name: str, point_id: str, *, allow_partial: bool = False
+) -> dict[str, object]:
+    state, _deployment, destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    inventory = recovery_module.list_recovery_points(
+        destination_name, destination, credentials, backup_s3, name
+    )
+    selected = next(
+        (
+            item for item in inventory["recovery_points"]  # type: ignore[union-attr]
+            if item["recovery_point_id"] == point_id
+        ),
+        None,
+    )
+    if selected is None:
+        raise RecoveryError("recovery_manifest_missing")
+    if selected["state"] == "deletion_failed" and not allow_partial:
+        raise RecoveryError("recovery_point_deletion_failed")
+    targets = recovery_module.recovery_point_deletion_targets(
+        destination_name, destination, credentials, backup_s3, name, point_id
+    )
+    effective_verified = sum(
+        item["state"] == "verified"
+        and not recovery_module.safety_recovery_point_protected(
+            destination, credentials, backup_s3, name, item
+        )
+        for item in inventory["recovery_points"]  # type: ignore[union-attr]
+    ) + (1 if selected["state"] == "deletion_failed" else 0)
+    safety_protected = recovery_module.safety_recovery_point_protected(
+        destination, credentials, backup_s3, name, targets["manifest"]  # type: ignore[arg-type]
+    )
+    normalized_inventory = sorted(
+        (
+            str(item["recovery_point_id"]),
+            "verified"
+            if item is selected and item["state"] == "deletion_failed"
+            else str(item["state"]),
+        )
+        for item in inventory["recovery_points"]  # type: ignore[union-attr]
+    )
+    inventory_fingerprint = hashlib.sha256(
+        json.dumps(normalized_inventory, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "manifest": targets["manifest"],
+                "version": targets["manifest_version_id"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return recovery_point_deletion_plan(
+        name,
+        destination_name,
+        point_id,
+        components=int(targets["components"]),
+        bytes=int(targets["bytes"]),
+        final_verified_point=effective_verified == 1,
+        safety_protected=safety_protected,
+        inventory_fingerprint=inventory_fingerprint,
+        manifest_fingerprint=manifest_fingerprint,
+        state="verified",
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("delete_recovery_point", "name")
+def plan_delete_recovery_point(
+    name: Name, recovery_point_id: RecoveryPointId
+) -> dict[str, object]:
+    """Plan deletion of one manifest-owned Recovery Point without exposing S3 identities."""
+    return _recovery_point_deletion_plan(name, recovery_point_id)
+
+
+def _matching_delete_retry(name: str, plan_id: str) -> bool:
+    events = _journal().list(limit=200, operation="delete_recovery_point", subject=name)
+    applies = [
+        event for event in events
+        if event.phase == "apply" and event.plan_id == plan_id
+    ]
+    return len(applies) >= 2 and _journal().plan_correlation(
+        plan_id, "delete_recovery_point"
+    ) is not None
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("delete_recovery_point", "name")
+def delete_recovery_point(
+    name: Name,
+    recovery_point_id: RecoveryPointId,
+    plan_id: PlanId,
+    confirmation: str,
+    last_recovery_point_confirmation: str | None = None,
+) -> dict[str, object]:
+    """Delete only exact manifest-owned versions, with the immutable manifest last."""
+    retry = _matching_delete_retry(name, plan_id)
+    with _deployment_resource_lock(name):
+        try:
+            expected = _recovery_point_deletion_plan(
+                name, recovery_point_id, allow_partial=retry
+            )
+        except RecoveryError as exc:
+            if retry and str(exc) == "recovery_manifest_missing":
+                return {
+                    "changed": False,
+                    "recovery_point_id": recovery_point_id,
+                    "state": "deleted",
+                }
+            raise
+        _assert_plan(expected, plan_id)
+        if expected["safety_protected"]:
+            raise RecoveryError("recovery_point_safety_protected")
+        if confirmation != expected["confirmation"]:
+            raise ValueError("recovery point deletion confirmation is invalid")
+        required_last = expected["last_recovery_point_confirmation"]
+        if required_last is not None and last_recovery_point_confirmation != required_last:
+            raise ValueError("last Recovery Point deletion confirmation is invalid")
+        state, _deployment, destination_name, destination = _recovery_context(name)
+        _, credentials = _backup_destination_credentials(state, destination)
+        result = recovery_module.delete_recovery_point_versions(
+            destination_name, destination, credentials, backup_s3, name, recovery_point_id
+        )
+    return {"changed": True, **result}
 
 
 @mcp.tool(annotations=WRITE)
