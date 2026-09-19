@@ -1620,6 +1620,11 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
     state = store.load()
     resource = cast(AWSElastiCacheValkeyResource, state.resources[name])
     network = state.aws_networks[resource.aws_network]
+    observed = resources_valkey_module.load_observed(store.root, name)
+    secret_names = (
+        ["_admin", *sorted(cast(dict[str, object], observed["allocations"]))]
+        if observed else ["_admin"]
+    )
     result = resources_valkey_module.apply_destroy(
         elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
         network, name, str(expected["identity_fingerprint"]),
@@ -1629,6 +1634,9 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
         store.save(_delete(store.load(), "resources", name))
         resources_valkey_module.record_destroyed_group(
             store.root, name, resource.aws_network, str(expected["identity_fingerprint"])
+        )
+        resources_valkey_module.record_destroyed_secrets(
+            store.root, name, resource.workload_secret_store, secret_names
         )
     return {"changed": True, **result}
 
@@ -1714,6 +1722,60 @@ def apply_purge_final_snapshot(
     )
     resources_valkey_module.clear_destroyed_receipt(store.root, name)
     return {"changed": deleted, "resource": name, "purged": deleted}
+
+
+def _retained_secret_purge_plan(name: str) -> dict[str, object]:
+    state = store.load()
+    if name in state.resources:
+        raise ValueError(f"resource {name} is still registered")
+    receipt = resources_valkey_module.load_destroyed_secrets(store.root, name)
+    if receipt is None:
+        raise KeyError(f"no destroyed Valkey credentials named '{name}'")
+    store_name, secrets = receipt
+    secret_store = state.secret_stores.get(store_name)
+    if not isinstance(secret_store, AWSSecretsManagerStore):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    account = state.provider_accounts[secret_store.provider_account]
+    if account.destructive_role_arn is None:
+        raise ResourceError("aws_elasticache_destroy_role_missing")
+    return exact_plan({
+        "kind": "valkey_retained_secret_purge", "resource": name,
+        "confirmation": f"PURGE RETAINED SECRETS {name}", "credentials": len(secrets),
+        "destroys": ["Gimme-owned Valkey administrative and deployment credentials"],
+        "authority": "the Provider Account's destructive role, assumed only during apply",
+        "irreversible": True,
+    })
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("purge_retained_secrets", "name")
+def plan_purge_retained_secrets(name: Name) -> dict[str, object]:
+    """Plan deleting only exact Gimme-owned credentials recorded after a Valkey destroy."""
+    return _retained_secret_purge_plan(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("purge_retained_secrets", "name")
+def apply_purge_retained_secrets(
+    name: Name, plan_id: PlanId, confirmation: str
+) -> dict[str, object]:
+    """Force-delete receipt-recorded credentials only after ownership verification and
+    confirmation."""
+    expected = _retained_secret_purge_plan(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    store_name, secret_names = cast(
+        tuple[str, list[str]], resources_valkey_module.load_destroyed_secrets(store.root, name)
+    )
+    state = store.load()
+    secret_store = cast(AWSSecretsManagerStore, state.secret_stores[store_name])
+    account = state.provider_accounts[secret_store.provider_account]
+    deleted = elasticache_valkey.delete_retained_secrets(
+        account, secret_store, store_name, name, secret_names
+    )
+    resources_valkey_module.clear_destroyed_secrets(store.root, name)
+    return {"changed": deleted > 0, "resource": name, "purged": deleted}
 
 
 def _binds(state: ControlState, deployment: str, name: str) -> bool:
