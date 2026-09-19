@@ -18,11 +18,14 @@ from gimme.control import (
 )
 
 RECOVERY_POINT_PREFIX = "gimme/recovery-points"
+RESTORE_PREFIX = "gimme/restores"
 PREFLIGHT_PREFIX = "gimme/preflight"
 RECOVERY_POINT_ID = re.compile(r"^rp_[0-9a-f]{20}$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 COMPONENT_KIND = re.compile(r"^postgres$")
+VERSION_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
 MAX_MANIFEST_BYTES = 8 * 1024
+REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 
 class RecoveryError(RuntimeError):
@@ -51,11 +54,13 @@ class S3Adapter(Protocol):
     ) -> ObjectMetadata: ...
 
     def head_object(
-        self, destination: S3BackupDestination, credentials: Credentials, key: str
+        self, destination: S3BackupDestination, credentials: Credentials, key: str,
+        version_id: str | None = None,
     ) -> ObjectMetadata | None: ...
 
     def get_object(
-        self, destination: S3BackupDestination, credentials: Credentials, key: str
+        self, destination: S3BackupDestination, credentials: Credentials, key: str,
+        version_id: str | None = None,
     ) -> bytes: ...
 
     def delete_object(
@@ -157,11 +162,13 @@ class BotoS3Adapter:
         )
 
     def head_object(
-        self, destination: S3BackupDestination, credentials: Credentials, key: str
+        self, destination: S3BackupDestination, credentials: Credentials, key: str,
+        version_id: str | None = None,
     ) -> ObjectMetadata | None:
         try:
+            kwargs: dict[str, str] = {"VersionId": version_id} if version_id is not None else {}
             response = self._client(destination, credentials).head_object(
-                Bucket=destination.bucket, Key=key
+                Bucket=destination.bucket, Key=key, **kwargs
             )
         except Exception as exc:
             error = _provider_error(exc, "head")
@@ -174,14 +181,17 @@ class BotoS3Adapter:
             bytes=int(response.get("ContentLength") or 0),
             sha256=sha256,
             server_side_encryption=str(response.get("ServerSideEncryption") or ""),
+            version_id=response.get("VersionId"),
         )
 
     def get_object(
-        self, destination: S3BackupDestination, credentials: Credentials, key: str
+        self, destination: S3BackupDestination, credentials: Credentials, key: str,
+        version_id: str | None = None,
     ) -> bytes:
         try:
+            kwargs: dict[str, str] = {"VersionId": version_id} if version_id is not None else {}
             response = self._client(destination, credentials).get_object(
-                Bucket=destination.bucket, Key=key
+                Bucket=destination.bucket, Key=key, **kwargs
             )
             return response["Body"].read()
         except Exception as exc:
@@ -302,6 +312,82 @@ def manifest_key(deployment: str, point_id: str) -> str:
     return f"{RECOVERY_POINT_PREFIX}/{deployment}/{point_id}/manifest.json"
 
 
+def restore_event_key(deployment: str, request_id: str, sequence: int) -> str:
+    return f"{RESTORE_PREFIX}/{deployment}/{request_id}/{sequence:06d}.json"
+
+
+def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
+    """Project a private manifest without storage identities or checksums."""
+    return {
+        "recovery_point_id": manifest["recovery_point_id"],
+        "deployment": manifest["deployment"],
+        "destination": manifest["destination"],
+        "created_at": manifest["created_at"],
+        "safety": manifest["safety"],
+        "restore_request_id": manifest["restore_request_id"],
+        "components": [
+            {"kind": item["kind"], "bytes": item["bytes"]}
+            for item in manifest["components"]  # type: ignore[union-attr]
+        ],
+        **{
+            key: manifest[key]
+            for key in ("state", "deleted_components", "remaining_components")
+            if key in manifest
+        },
+    }
+
+
+def safety_recovery_point_protected(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, manifest: dict[str, object],
+) -> bool:
+    """Fail closed unless the Safety point's authoritative Restore stream completed."""
+    if manifest.get("safety") is not True:
+        return False
+    request_id = manifest.get("restore_request_id")
+    if not isinstance(request_id, str) or REQUEST_ID.fullmatch(request_id) is None:
+        return True
+    prefix = f"{RESTORE_PREFIX}/{deployment}/{request_id}/"
+    keys = sorted(adapter.list_keys(destination, credentials, prefix))
+    if not keys or len(keys) > 100:
+        return True
+    latest_sequence = -1
+    latest_state = ""
+    allowed_states = {
+        "started", "maintenance_entered", "safety_verified", "safety_not_required",
+        "artifact_verified", "shadow_verified", "data_replaced", "verification_failed",
+        "completed",
+    }
+    try:
+        for key in keys:
+            raw = adapter.get_object(destination, credentials, key)
+            if len(raw) > MAX_MANIFEST_BYTES:
+                return True
+            event = json.loads(raw)
+            if (
+                not isinstance(event, dict)
+                or set(event) != {
+                    "schema_version", "deployment", "request_id", "sequence", "state",
+                    "safety_recovery_point_id",
+                }
+                or event["schema_version"] != 1
+                or event["deployment"] != deployment
+                or event["request_id"] != request_id
+                or event["safety_recovery_point_id"] != manifest["recovery_point_id"]
+                or not isinstance(event["sequence"], int)
+                or not 0 <= event["sequence"] <= 999999
+                or event["state"] not in allowed_states
+                or key != restore_event_key(deployment, request_id, event["sequence"])
+            ):
+                return True
+            if event["sequence"] > latest_sequence:
+                latest_sequence = event["sequence"]
+                latest_state = event["state"]
+    except Exception:
+        return True
+    return latest_state != "completed"
+
+
 @dataclass(frozen=True)
 class ComponentDump:
     kind: str
@@ -325,7 +411,8 @@ def find_recovery_point(
 
 def create_recovery_point(
     destination_name: str, destination: S3BackupDestination, credentials: Credentials,
-    adapter: S3Adapter, deployment: str, point_id: str, dump: ComponentDump,
+    adapter: S3Adapter, deployment: str, point_id: str, dump: ComponentDump, *,
+    safety_restore_request_id: str | None = None,
 ) -> dict[str, object]:
     """Upload one verified PostgreSQL component and publish its immutable manifest."""
     existing = find_recovery_point(
@@ -333,6 +420,11 @@ def create_recovery_point(
     )
     if existing is not None:
         return existing
+    if (
+        safety_restore_request_id is not None
+        and REQUEST_ID.fullmatch(safety_restore_request_id) is None
+    ):
+        raise RecoveryError("restore_request_identity_invalid")
     if COMPONENT_KIND.fullmatch(dump.kind) is None:
         raise RecoveryError("recovery_component_kind_invalid")
     key = component_key(deployment, point_id, dump.kind)
@@ -358,18 +450,24 @@ def create_recovery_point(
             version_id=written.version_id if written is not None else None,
         )
         raise
+    if written.version_id is None or VERSION_ID.fullmatch(written.version_id) is None:
+        adapter.delete_object(destination, credentials, key, version_id=written.version_id)
+        raise RecoveryError("recovery_component_version_missing")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "recovery_point_id": point_id,
         "deployment": deployment,
         "destination": destination_name,
         "created_at": datetime.now(UTC).isoformat(),
+        "safety": safety_restore_request_id is not None,
+        "restore_request_id": safety_restore_request_id,
         "components": [
             {
                 "kind": dump.kind,
                 "key": key,
                 "bytes": dump.bytes,
                 "sha256": dump.sha256,
+                "version_id": written.version_id,
             }
         ],
     }
@@ -400,43 +498,57 @@ def create_recovery_point(
 def _validate_manifest(document: object) -> dict[str, object]:
     if not isinstance(document, dict) or set(document) != {
         "schema_version", "recovery_point_id", "deployment", "destination",
-        "created_at", "components",
+        "created_at", "safety", "restore_request_id", "components",
     }:
         raise RecoveryError("recovery_manifest_invalid")
-    if document.get("schema_version") != 1:
+    if document.get("schema_version") != 2:
         raise RecoveryError("recovery_manifest_invalid")
     if RECOVERY_POINT_ID.fullmatch(str(document.get("recovery_point_id"))) is None:
         raise RecoveryError("recovery_manifest_invalid")
     components = document.get("components")
+    safety = document.get("safety")
+    restore_request_id = document.get("restore_request_id")
+    if (
+        not isinstance(safety, bool)
+        or (safety and (
+            not isinstance(restore_request_id, str)
+            or REQUEST_ID.fullmatch(restore_request_id) is None
+        ))
+        or (not safety and restore_request_id is not None)
+    ):
+        raise RecoveryError("recovery_manifest_invalid")
     if not isinstance(components, list) or not components or len(components) > 8:
         raise RecoveryError("recovery_manifest_invalid")
     for component in components:
         if (
             not isinstance(component, dict)
-            or set(component) != {"kind", "key", "bytes", "sha256"}
+            or set(component) != {"kind", "key", "bytes", "sha256", "version_id"}
             or COMPONENT_KIND.fullmatch(str(component.get("kind"))) is None
             or not isinstance(component.get("key"), str)
             or not isinstance(component.get("bytes"), int)
             or component["bytes"] < 0
             or SHA256_HEX.fullmatch(str(component.get("sha256"))) is None
+            or VERSION_ID.fullmatch(str(component.get("version_id"))) is None
         ):
             raise RecoveryError("recovery_manifest_invalid")
     return document
 
 
-def _load_manifest(
+def _load_manifest_record(
     destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
-    deployment: str, destination_name: str, point_id: str,
-) -> dict[str, object]:
+    deployment: str, destination_name: str, point_id: str, *, allow_missing: bool = False,
+) -> tuple[dict[str, object], ObjectMetadata, int]:
     key = manifest_key(deployment, point_id)
     # Check size via head_object before ever reading the body: an object planted at a
     # manifest key with an oversized body must not be pulled fully into memory to reject it.
     probe = adapter.head_object(destination, credentials, key)
     if probe is None:
-        raise RecoveryError("recovery_manifest_invalid")
+        raise RecoveryError("recovery_manifest_missing")
     if probe.bytes > MAX_MANIFEST_BYTES:
         raise RecoveryError("recovery_manifest_too_large")
-    raw = adapter.get_object(destination, credentials, key)
+    if probe.version_id is None or VERSION_ID.fullmatch(probe.version_id) is None:
+        raise RecoveryError("recovery_manifest_version_missing")
+    raw = adapter.get_object(destination, credentials, key, probe.version_id)
     if len(raw) > MAX_MANIFEST_BYTES:
         raise RecoveryError("recovery_manifest_too_large")
     try:
@@ -450,19 +562,42 @@ def _load_manifest(
         or manifest["destination"] != destination_name
     ):
         raise RecoveryError("recovery_manifest_invalid")
-    expected_prefix = f"{RECOVERY_POINT_PREFIX}/{deployment}/{point_id}/"
+    missing = 0
+    seen: set[tuple[str, str]] = set()
     for component in manifest["components"]:  # type: ignore[union-attr]
         component_key_value = str(component["key"])
-        if not component_key_value.startswith(expected_prefix):
+        version_id = str(component["version_id"])
+        if component_key_value != component_key(
+            deployment, point_id, str(component["kind"])
+        ):
             raise RecoveryError("recovery_manifest_invalid")
-        confirmed = adapter.head_object(destination, credentials, component_key_value)
+        identity = component_key_value, version_id
+        if identity in seen:
+            raise RecoveryError("recovery_manifest_invalid")
+        seen.add(identity)
+        confirmed = adapter.head_object(
+            destination, credentials, component_key_value, version_id
+        )
+        if confirmed is None:
+            missing += 1
+            continue
         if (
-            confirmed is None
-            or confirmed.bytes != component["bytes"]
+            confirmed.bytes != component["bytes"]
             or confirmed.sha256 != component["sha256"]
         ):
             raise RecoveryError("recovery_manifest_tampered")
-    return manifest
+    if missing and not allow_missing:
+        raise RecoveryError("recovery_manifest_tampered")
+    return manifest, probe, missing
+
+
+def _load_manifest(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, destination_name: str, point_id: str,
+) -> dict[str, object]:
+    return _load_manifest_record(
+        destination, credentials, adapter, deployment, destination_name, point_id
+    )[0]
 
 
 def list_recovery_points(
@@ -478,11 +613,16 @@ def list_recovery_points(
             continue
         point_id = key[len(prefix):].split("/", 1)[0]
         try:
-            manifests.append(
-                _load_manifest(
-                    destination, credentials, adapter, deployment, destination_name, point_id
-                )
+            manifest, _metadata, missing = _load_manifest_record(
+                destination, credentials, adapter, deployment, destination_name, point_id,
+                allow_missing=True,
             )
+            manifests.append({
+                **manifest,
+                "state": "deletion_failed" if missing else "verified",
+                "deleted_components": missing,
+                "remaining_components": len(manifest["components"]) - missing,
+            })
         except RecoveryError:
             rejected.append(point_id if RECOVERY_POINT_ID.fullmatch(point_id) else "unknown")
     manifests.sort(key=lambda item: str(item["created_at"]), reverse=True)
@@ -491,4 +631,76 @@ def list_recovery_points(
         "deployment": deployment,
         "recovery_points": manifests,
         "rejected": sorted(set(rejected)),
+    }
+
+
+def recovery_point_deletion_targets(
+    destination_name: str, destination: S3BackupDestination, credentials: Credentials,
+    adapter: S3Adapter, deployment: str, point_id: str,
+) -> dict[str, object]:
+    """Resolve one immutable manifest into the only objects a future delete may touch."""
+    manifest, metadata, missing = _load_manifest_record(
+        destination, credentials, adapter, deployment, destination_name, point_id,
+        allow_missing=True,
+    )
+    components = manifest["components"]
+    return {
+        "recovery_point_id": point_id,
+        "components": len(components),
+        "bytes": sum(int(component["bytes"]) for component in components),
+        "missing_components": missing,
+        "manifest_version_id": metadata.version_id,
+        "manifest": manifest,
+    }
+
+
+def delete_recovery_point_versions(
+    destination_name: str, destination: S3BackupDestination, credentials: Credentials,
+    adapter: S3Adapter, deployment: str, point_id: str,
+) -> dict[str, object]:
+    """Delete only exact versions authorized by a validated manifest, manifest last."""
+    manifest, manifest_metadata, _missing = _load_manifest_record(
+        destination, credentials, adapter, deployment, destination_name, point_id,
+        allow_missing=True,
+    )
+    components = sorted(
+        manifest["components"], key=lambda item: (str(item["kind"]), str(item["key"]))
+    )
+    deleted = 0
+    def deletion_error(exc: Exception) -> RecoveryError:
+        if isinstance(exc, RecoveryError) and "access_denied" in str(exc):
+            return RecoveryError("recovery_point_deletion_denied")
+        return RecoveryError("recovery_point_deletion_failed")
+
+    try:
+        for component in components:
+            key = str(component["key"])
+            version_id = str(component["version_id"])
+            if adapter.head_object(destination, credentials, key, version_id) is None:
+                deleted += 1
+                continue
+            adapter.delete_object(destination, credentials, key, version_id)
+            if adapter.head_object(destination, credentials, key, version_id) is not None:
+                raise RecoveryError("recovery_point_deletion_failed")
+            deleted += 1
+    except Exception as exc:
+        raise deletion_error(exc) from None
+    manifest_version = manifest_metadata.version_id
+    if manifest_version is None:  # guarded by _load_manifest_record; keeps typing explicit
+        raise RecoveryError("recovery_manifest_version_missing")
+    manifest_object_key = manifest_key(deployment, point_id)
+    try:
+        adapter.delete_object(
+            destination, credentials, manifest_object_key, manifest_version
+        )
+        if adapter.head_object(
+            destination, credentials, manifest_object_key, manifest_version
+        ) is not None:
+            raise RecoveryError("recovery_point_deletion_failed")
+    except Exception as exc:
+        raise deletion_error(exc) from None
+    return {
+        "recovery_point_id": point_id,
+        "state": "deleted",
+        "deleted_components": deleted,
     }
