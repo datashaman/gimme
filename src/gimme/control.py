@@ -82,6 +82,14 @@ RESERVED_ENV_KEYS = {
 }
 
 
+# Values the laravel-cluster-v1 contract injects for a managed Valkey binding. The prefix is
+# always protected; the adapter keys are protected for a Deployment bound to a managed Resource.
+VALKEY_ENV_PREFIX = "GIMME_VALKEY_"
+MANAGED_VALKEY_ENV_KEYS = frozenset(
+    {"CACHE_STORE", "SESSION_DRIVER", "QUEUE_CONNECTION", "HORIZON_PREFIX"}
+)
+
+
 class TargetNetwork(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -941,6 +949,17 @@ class ControlState(BaseModel):
                 self.applications[deployment.application],
             )
             valkey = deployment.resources.valkey
+            managed = valkey is not None and isinstance(
+                self.resources.get(valkey.resource), AWSElastiCacheValkeyResource
+            )
+            for key in (*deployment.variables, *deployment.secrets):
+                if key.startswith(VALKEY_ENV_PREFIX) or (
+                    managed and key in MANAGED_VALKEY_ENV_KEYS
+                ):
+                    raise ValueError(
+                        f"deployment {name} environment key is managed by the Valkey "
+                        f"contract: {key}"
+                    )
             for binding, kind in (
                 (deployment.resources.database, "postgres"),
                 (None if valkey is None else valkey.resource, "valkey"),

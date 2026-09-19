@@ -5,6 +5,23 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the `laravel-cluster-v1` application contract and pre-switchover probes for a Deployment
+  bound to a managed `aws_elasticache_valkey` Resource (slice 5 of #14). Gimme injects protected
+  `GIMME_VALKEY_*` values (TLS cluster endpoint, fixed client settings with bounded retry and
+  jitter, no replica reads, derived namespaces) and selects the Redis adapter for exactly the
+  declared uses, pinning undeclared uses to `file`/`file`/`sync`; the Resource Credential is
+  referenced like any secret and resolved at apply time. State validation refuses any
+  `GIMME_VALKEY_*` key, and `SESSION_DRIVER` when bound to a managed Resource, in a Deployment's
+  `variables` or `secrets`. A Horizon prefix set by the contract is no longer overwritten when
+  processes are provisioned. `plan_deployment_resources` shows the secret-free contract and
+  `plan_deployment` refuses until the Resource is ready and the Deployment bound. `deploy` now
+  runs a fixed stdlib probe on the Target before the symlink switch, ahead of the candidate
+  health check (cluster mode, TLS with hostname verification, auth, primary read-after-write,
+  namespace enforcement, each declared use, and Horizon compatibility from `composer.lock`:
+  laravel/framework 13.5.0 and laravel/horizon 5.46.0 or later); a failed probe fails the deploy
+  and leaves the current release live, and probe keys are namespaced, short-lived, and removed.
+  No privilege change. Verified only against a local TLS, cluster-mode, ACL-enforcing Redis: the
+  disposable Laravel tests and any ElastiCache behavior are not yet exercised.
 - Replaced the Deployment's `resources.cache` string with a typed `resources.valkey` binding
   (`resource` plus `uses` of `cache`, `session`, and `queue`) and bumped desired state to
   **schema v5** (slice 4 of #14). `plan_state_migration` migrates v2, v3, and v4 state one way:

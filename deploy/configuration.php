@@ -363,6 +363,15 @@ function configured_environment_values(): array
     return $decoded;
 }
 
+function horizon_prefix(string $cachePrefix): string
+{
+    // A managed Valkey binding fixes the prefix inside its ACL namespace; otherwise it is derived.
+    $values = configured_environment_values();
+    return isset($values['GIMME_VALKEY_CONTRACT'], $values['HORIZON_PREFIX'])
+        ? $values['HORIZON_PREFIX']
+        : "{$cachePrefix}horizon:";
+}
+
 function configured_health(): array
 {
     $decoded = json_decode(required_env('GIMME_HEALTH_JSON'), true, flags: JSON_THROW_ON_ERROR);

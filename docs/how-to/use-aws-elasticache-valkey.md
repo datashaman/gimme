@@ -10,11 +10,13 @@ finished: see the list below.
 Implemented: registering the Resource, provisioning one replication group (with its subnet
 group, parameter group, user group, and administrative user), reviewed updates and drift,
 live inspection with fixed readiness codes, typed Deployment bindings with a per-Deployment ACL
-user, namespace, and credential, and retention-by-default removal.
+user, namespace, and credential, the `laravel-cluster-v1` application contract with its
+pre-switchover probes, and retention-by-default removal.
 
-Not implemented yet (tracked in #14): the Laravel application contract (a bound Deployment does
-not yet receive `GIMME_VALKEY_*` values or activation probes), destruction, snapshots and
-restore, and credential rotation.
+Not implemented yet (tracked in #14): destruction, snapshots and restore, and credential
+rotation. The disposable Laravel test suite the ADR calls for (cache, session, queue, and
+Horizon driven through a real Laravel application, and ACL denials seen from it) does not
+exist yet; the probes below use the Redis protocol directly.
 
 The AWS calls have only been exercised against botocore stubs. Nothing here has run against a
 live account, so the IAM statement and the ACL access strings below are unverified.
@@ -227,8 +229,8 @@ access string.
 
 Binding returns once ElastiCache accepts the change; the user group may stay `modifying` for a
 short while, during which another binding fails with `aws_elasticache_user_group_bind_invalid_state`
-and can simply be retried. The credential is not proven to work until the activation probes of a
-later slice.
+and can simply be retried. The credential is proven at the next deploy by the activation
+probes below.
 
 Binding needs a `ready` Resource by a fresh live read, so a `degraded` one, including unsafe
 security group drift, takes no new binding and existing Deployments keep running. Binding again
@@ -237,6 +239,70 @@ recorded allocation but already has a user gets a fresh credential. Removing a D
 from `deployment_security_group_ids` while a Deployment on it is bound, and moving
 `workload_secret_store` once credentials exist, are refused by `plan_update_resource`, and a
 bound Resource cannot be removed.
+
+## The Laravel contract and activation probes
+
+A Deployment bound to a managed Resource receives the fixed `laravel-cluster-v1` contract. Gimme
+never patches application source and accepts no paths: it writes protected `GIMME_VALKEY_*`
+values to the shared `.env` and selects the Redis adapter for exactly the declared uses
+(`CACHE_STORE`, `SESSION_DRIVER`, `QUEUE_CONNECTION`, and `HORIZON_PREFIX` with `queue`). A use the
+Deployment did not declare is pinned to `file`, `file`, or `sync`, so the Target-local Redis
+defaults can never be used. None of those keys, and nothing beginning `GIMME_VALKEY_`, can be
+set through the Deployment's `variables` or `secrets`; state validation refuses it.
+
+The application must read them in its own cluster-aware PhpRedis or Predis configuration:
+
+| Key | Value |
+| --- | --- |
+| `GIMME_VALKEY_CONTRACT` | `laravel-cluster-v1` |
+| `GIMME_VALKEY_HOST`, `_PORT` | the configuration endpoint; the client discovers the nodes |
+| `GIMME_VALKEY_SCHEME`, `_CLUSTER`, `_VERIFY_PEER` | `tls`, `true`, `true` |
+| `GIMME_VALKEY_READ_REPLICAS` | `false`; primary reads only |
+| `GIMME_VALKEY_TIMEOUT_SECONDS`, `_RETRIES`, `_BACKOFF_MS`, `_BACKOFF_CAP_MS`, `_JITTER` | `2`, `3`, `100`, `2000`, `true` |
+| `GIMME_VALKEY_USES` | the declared uses, comma-separated |
+| `GIMME_VALKEY_CACHE_PREFIX`, `_SESSION_PREFIX`, `_QUEUE_PREFIX`, `_HORIZON_PREFIX` | the derived namespaces |
+| `GIMME_VALKEY_USERNAME`, `_PASSWORD` | the Resource Credential, resolved from Secrets Manager at apply time |
+
+The credential is read by the Provider Account's resolver role, so its `GetSecretValue`
+permission must cover `<prefix>/<resource>/<deployment>` in the workload Secret Store (see
+[AWS secret stores](use-aws-secret-stores.md)); a credential it cannot read fails
+`apply_deployment_resources` with a bounded secret error.
+
+`plan_deployment_resources` shows the contract (uses, namespaces, adapters, the fixed probe
+names, a digest of the injected values) but never the endpoint or a credential, and reports
+`valkey_resource_not_ready` or `valkey_binding_missing` until the Resource is ready and the
+Deployment is bound; `plan_deployment` refuses in the same cases.
+
+Before the release symlink switches, `deploy` runs a fixed probe program on the Target, ahead of
+the candidate health check. It reads only the shared `.env` and the candidate's `composer.lock`,
+takes no path or command from a caller, and stops at the first failure. The order is:
+
+1. `environment`: the `.env` matches the planned contract and holds a credential.
+2. `horizon-compatibility` (only when the Deployment runs Horizon): the locked `laravel/framework` is 13.5.0 or later and
+   `laravel/horizon` 5.46.0 or later.
+3. `tls`: the server certificate verifies against the Target's system trust store, with hostname
+   checking. There is no way to disable it or to supply a certificate.
+4. `auth` and `default-user`: the credential authenticates, and the default user cannot be used
+   without one.
+5. `cluster`: `cluster_state:ok` and exactly one shard serving slots 0 to 16383.
+6. `read-after-write`: a write to the primary reads back. At most two `MOVED` redirects are
+   followed, and only to a host in the configuration endpoint's own domain; anything else fails
+   closed.
+7. `namespace`: a key, a channel, and read-only administrative commands outside the namespace
+   are all denied with `NOPERM`. No destructive command is ever sent to prove a denial.
+8. `use-cache`, `use-session`, `use-queue`, and `use-horizon` (only with Horizon): a bounded
+   write, read, and delete per declared use, including TTLs, counters, `SET NX`, lists, sorted sets, hashes, and a Lua script.
+9. `cleanup`: the probe keys are removed.
+
+Probe keys live under `<namespace>_probe:<random>:` with a 30 to 60 second TTL and are also
+deleted on failure. Output is only `GIMME_VALKEY_PROBE|<check>|ready|failed|<code>`; credentials,
+values, and server messages are never printed. A failed probe fails the deploy before the
+symlink switches, so the current release stays live.
+
+What this does not prove: the probes speak the Redis protocol directly, not through Laravel's
+Redis adapters, and they have only run against a local TLS, cluster-mode, ACL-enforcing Redis,
+not against ElastiCache. Whether real Laravel and Horizon traffic stays inside the `laravel-v1`
+command profile is unverified.
 
 ## Security group
 

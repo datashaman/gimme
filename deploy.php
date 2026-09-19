@@ -470,6 +470,30 @@ task('gimme:diagnose:deployment', function () use (
     }
 });
 
+task('gimme:probe:valkey', function (): void {
+    $config = json_decode(getenv('GIMME_VALKEY_PROBE_JSON') ?: '', true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($config) || !is_string($config['host'] ?? null) ||
+        !preg_match('/^[a-zA-Z0-9.-]{1,255}$/', $config['host']) ||
+        !is_int($config['port'] ?? null) || $config['port'] < 1 || $config['port'] > 65535) {
+        throw new \RuntimeException('Unsafe Valkey probe input');
+    }
+    try {
+        $output = run(
+            'printf %s ' . escapeshellarg(base64_encode(valkey_probe_script())) .
+            ' | base64 -d | python3 - ' .
+            escapeshellarg(get('deploy_path') . '/shared/.env') . ' ' .
+            escapeshellarg('{{release_path}}/composer.lock') . ' ' .
+            escapeshellarg(base64_encode(json_encode($config, JSON_THROW_ON_ERROR)))
+        );
+    } catch (\Throwable $failure) {
+        throw new \RuntimeException(
+            'Valkey activation probe failed; the current release stays live',
+            previous: $failure,
+        );
+    }
+    writeln($output);
+});
+
 if ($health !== []) {
     task('gimme:health:candidate', function () use ($health, $siteHost): void {
         $host = $siteHost;
@@ -552,6 +576,12 @@ if ($health !== []) {
 
     before('deploy:symlink', 'gimme:health:candidate');
     after('deploy:symlink', 'gimme:health:live');
+}
+
+// Deployer runs the most recently registered `before` hook first, so the probe is registered
+// after the health gate and runs ahead of it.
+if (getenv('GIMME_VALKEY_PROBE_JSON')) {
+    before('deploy:symlink', 'gimme:probe:valkey');
 }
 
 task('gimme:inspect', function () use (
@@ -1194,7 +1224,7 @@ BASH;
         }
         $runtimeValues = json_encode([
             ...configured_environment_values(),
-            'HORIZON_PREFIX' => "{$cachePrefix}horizon:",
+            'HORIZON_PREFIX' => horizon_prefix($cachePrefix),
             'APP_ENV' => $appEnv,
             'APP_DEBUG' => $appDebug,
         ], JSON_THROW_ON_ERROR);
@@ -1427,6 +1457,7 @@ task('gimme:provision:processes', function () use ($app, $instance, $appsRoot, $
         $deployPath = get('deploy_path');
         $envPath = "{$deployPath}/shared/.env";
         $currentPath = "{$deployPath}/current";
+        $horizonPrefix = horizon_prefix($cachePrefix);
         $quotedEnvPath = escapeshellarg($envPath);
         $configureRedis = <<<BASH
 set -eu
@@ -1441,9 +1472,9 @@ else
     printf '\nQUEUE_CONNECTION=redis\n' >> "\$env_path"
 fi
 if grep -q '^HORIZON_PREFIX=' "\$env_path"; then
-    sed -i 's|^HORIZON_PREFIX=.*|HORIZON_PREFIX={$cachePrefix}horizon:|' "\$env_path"
+    sed -i 's|^HORIZON_PREFIX=.*|HORIZON_PREFIX={$horizonPrefix}|' "\$env_path"
 else
-    printf 'HORIZON_PREFIX=%s\n' '{$cachePrefix}horizon:' >> "\$env_path"
+    printf 'HORIZON_PREFIX=%s\n' '{$horizonPrefix}' >> "\$env_path"
 fi
 chmod 0600 "\$env_path"
 BASH;

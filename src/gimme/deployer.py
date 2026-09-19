@@ -123,6 +123,7 @@ class DeployerRunner:
         mise_version: str | None = None,
         php_extensions: Sequence[str] = (),
         variables: dict[str, str] | None = None,
+        valkey_probe: dict[str, object] | None = None,
         secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
         backup_local_path: Path | None = None,
@@ -174,6 +175,8 @@ class DeployerRunner:
                 "GIMME_VARIABLES_JSON": json.dumps(variables or {}),
             }
         )
+        if valkey_probe is not None:
+            environment["GIMME_VALKEY_PROBE_JSON"] = json.dumps(valkey_probe)
         if sites is not None:
             environment["GIMME_SITES_JSON"] = json.dumps(list(sites))
         if interactive_sudo:
