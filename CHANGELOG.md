@@ -5,6 +5,19 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- `apply_resource` now converges an existing managed AWS RDS PostgreSQL instance onto desired
+  state with one immediate `ModifyDBInstance` (`ApplyImmediately`, never a major-version
+  upgrade) carrying only the fields that differ: same-major `engine_version`,
+  `instance_class`, an increased `allocated_storage_gb`, the security-group set, and the
+  Resource-owned parameter group. Apply describes the live instance first and refuses a
+  storage decrease, minor-version downgrade, or major mismatch (`aws_rds_modify_forbidden_*`)
+  before any change; values already pending are not re-sent, so a resumed apply is safe. It
+  reboots once, without forced failover, when the parameter group is `pending-reboot`, which
+  includes the first apply after creation. A pending change to a managed field now keeps the
+  phase `pending`. `plan_apply_resource` remains local, names the disruption, and binds the
+  security-group set. Privilege impact: the inspection role gains `rds:ModifyDBInstance` and
+  `rds:RebootDBInstance` on `db:gimme-*` and `pg:gimme-*`; existing deployments of the policy
+  must add them (see the RDS how-to).
 - Managed AWS RDS PostgreSQL Resource updates are now validated locally against the ADR 0008
   allowlist: `plan_update_resource` and `update_resource` refuse a changed `aws_network`, engine
   major version, decreased `allocated_storage_gb`, changed `workload_secret_store` while

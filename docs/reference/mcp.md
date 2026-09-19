@@ -124,8 +124,8 @@ decreased storage, and the other changes listed in the how-to; a refused update 
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_apply_resource` | Read | Plan creating one managed instance; an existing instance is only polled |
-| `apply_resource` | Remote write | Create the RDS instance, or poll an existing one, without returning a credential |
+| `plan_apply_resource` | Read | Plan creating one managed instance or converging an existing one; makes no AWS call |
+| `apply_resource` | Remote write | Create the RDS instance, or converge an existing one with one immediate modification, without returning a credential |
 | `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations and, after a successful live read, `drift` against desired state; falls back to the last observed state with a bounded `refresh_error` and no drift |
 | `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret |
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
@@ -135,7 +135,12 @@ decreased storage, and the other changes listed in the how-to; a refused update 
 `apply_resource` creates the instance with `ManageMasterUserPassword=True` so the master
 credential is generated and stored by AWS, never by Gimme, and polls for at most 30
 seconds before returning a bounded `pending` phase; a later call resumes by describing
-the existing instance rather than recreating it. `bind_resource` requires the resource to
+the existing instance rather than recreating it. For an existing `available` instance it sends
+one `ModifyDBInstance` with `ApplyImmediately` and only the changed fields (same-major engine
+version, instance class, increased storage, security groups, and the Resource-owned parameter
+group), never a major upgrade, and reboots once without forced failover when the parameter
+group is `pending-reboot`; a storage decrease, version downgrade, or major mismatch is refused
+before any change, and the response lists `modified_fields` and `rebooted`. `bind_resource` requires the resource to
 already report `phase: ready`; it resolves the master credential through the account's
 distinct resolver role only at apply time, creates or reconciles the deployment's isolated
 database and role through the Administration Target over `psql` with `verify-full` TLS

@@ -1134,8 +1134,9 @@ def plan_apply_resource(name: Name) -> dict[str, object]:
 @mcp.tool(annotations=WRITE)
 @_journal_apply("apply_resource", "name")
 def apply_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
-    """Create or reconcile the RDS instance, polling at most 30 seconds before
-    returning a bounded pending phase. Never returns a decrypted credential."""
+    """Create the RDS instance, or converge an existing one onto desired state with one
+    immediate modification, polling at most 30 seconds before returning a bounded pending
+    phase. Never returns a decrypted credential."""
     expected = _resource_provision_plan(name)
     _assert_plan(expected, plan_id)
     state, resource = _managed_resource(name)
@@ -1179,7 +1180,7 @@ def inspect_resource(name: Name) -> dict[str, object]:
         result["refresh_error"] = refresh_error
     if live is not None:
         result.update(
-            phase="ready" if live.status == "available" else "pending",
+            phase="ready" if live.status == "available" and not live.converging else "pending",
             status=live.status, engine_version=live.engine_version, identity=live.identity,
             endpoint=live.endpoint, port=live.port,
             drift=resources_postgres_module.instance_drift(resource, live),

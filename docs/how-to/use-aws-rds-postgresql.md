@@ -11,8 +11,9 @@ the target design and this page is the current behavior.
 
 ## Current scope
 
-Implemented: registration, provisioning, live inspection with drift reporting, creating a
-Deployment's database and workload secret, and non-destructive removal.
+Implemented: registration, provisioning, converging an existing instance onto reviewed
+updates, live inspection with drift reporting, creating a Deployment's database and workload
+secret, and non-destructive removal.
 
 Not implemented yet:
 
@@ -21,9 +22,8 @@ Not implemented yet:
   readiness issue, `plan_deployment` refuses, and Recovery Points reject it;
 - workload credential rotation, Detached Allocation rebind, and Retained Resource forget;
 - destructive deletion. Removal never deletes the instance;
-- applying version, instance class, or storage edits to a running instance: an edit is
-  registered locally, but `apply_resource` only polls an existing instance, and
-  `inspect_resource` reports the difference as drift.
+- major-version upgrades, storage decreases, backup and maintenance-window policy, and moving
+  a Resource to another Network or region, all of which need a new Resource.
 Differences from the ADR: two roles are used instead of four, the Administration Target
 runs plain `psql` instead of a root-owned helper (verifying the certificate against a bundle
 delivered per bind rather than one that helper installs), and secret-free observations are
@@ -83,6 +83,18 @@ secrets. It does not read secret values. Replace `<region>`, `<account>`, and
         "arn:aws:rds:<region>:<account>:pg:gimme-*",
         "arn:aws:rds:<region>:<account>:pg:default.*",
         "arn:aws:rds:<region>:<account>:og:default:*"
+      ]
+    },
+    {
+      "Sid": "RdsModifyAndReboot",
+      "Effect": "Allow",
+      "Action": [
+        "rds:ModifyDBInstance",
+        "rds:RebootDBInstance"
+      ],
+      "Resource": [
+        "arn:aws:rds:<region>:<account>:db:gimme-*",
+        "arn:aws:rds:<region>:<account>:pg:gimme-*"
       ]
     },
     {
@@ -172,8 +184,9 @@ The **resolver role** reads only the RDS-managed master credential, and only at 
 ```
 
 Both policies were exercised against a live account with the AWS-managed `aws/rds` and
-`aws/secretsmanager` keys, except the `RdsParameterGroup` statement and the `pg:gimme-*`
-resource on `RdsCreateAndDescribe`, which have only been exercised against botocore stubs. A customer-managed KMS key for storage, the master secret, or the
+`aws/secretsmanager` keys, except the `RdsParameterGroup` statement, the `RdsModifyAndReboot` statement, and the
+`pg:gimme-*` resource on `RdsCreateAndDescribe`, which have only been exercised against
+botocore stubs. A customer-managed KMS key for storage, the master secret, or the
 workload Secret Store needs a key policy that admits these roles and RDS; that has not been
 verified. Trust policies should name only the identity that runs Gimme.
 
@@ -231,7 +244,7 @@ an increased `allocated_storage_gb`, `administration_target`,
 ## Provision
 
 `plan_apply_resource` then `apply_resource` creates the DB subnet group, the DB parameter
-group (with `rds.force_ssl` set to `1`), and the instance. An existing instance is only polled, never modified.
+group (with `rds.force_ssl` set to `1`), and the instance.
 The instance is tagged `gimme:resource=<name>` and its AWS identifier is derived from the
 Resource name (`gimme-<name>`). Gimme refuses an instance whose tag does not derive that
 identifier, and never adopts an unrelated instance.
@@ -240,7 +253,35 @@ Multi-AZ creation takes roughly 12 to 15 minutes. `apply_resource` polls for at 
 seconds and returns `phase: pending`. Request a new plan and apply again to resume; a
 resume describes the instance and never creates a second one. The plan changes as the
 instance advances, so an earlier plan is rejected as stale. The result is `phase: ready`
-once AWS reports `available`.
+once AWS reports `available` with no unapplied managed change.
+
+### Updating an existing instance
+
+Edit desired state with `plan_update_resource` and `update_resource`, then plan and apply
+again. For an existing `available` instance, `apply_resource` describes it, compares it with
+desired state, and sends one `ModifyDBInstance` with `ApplyImmediately` and only the fields
+that differ: a same-major `engine_version`, `instance_class`, an increased
+`allocated_storage_gb`, the security-group set, and the Resource-owned parameter group (which
+also moves an instance created before `rds.force_ssl` was managed onto it). It never sets
+`AllowMajorVersionUpgrade` and sends no other field. The result lists `modified_fields`
+(names only) and `rebooted`.
+
+Changes are disruptive and start immediately, so review the plan's effects first: an instance
+class change fails over a Multi-AZ instance, and an engine version change or attaching the
+parameter group restarts it. RDS may also refuse a change, for example a storage increase
+under 10%, with the generic `aws_rds_modify_unavailable`; read the reason with the same AWS
+API and role in your own terminal.
+
+Because planning cannot call AWS, apply checks the live instance and refuses, before any
+change, `aws_rds_modify_forbidden_allocated_storage_gb` (desired is below the live value),
+`aws_rds_modify_forbidden_engine_downgrade`, and `aws_rds_modify_forbidden_engine_major`.
+Values AWS already has pending count as applied, so applying again while a modification is in
+flight sends nothing and reports `phase: pending`.
+
+When the parameter group reports `pending-reboot`, the instance is `available`, and nothing is
+pending, apply reboots it once without forced failover, then polls. That includes the first
+apply after creation, which restarts the new instance once so `rds.force_ssl` takes effect.
+If a modification is still settling when the 30 seconds end, the next apply does the reboot.
 
 ## Bind a Deployment
 
@@ -307,6 +348,8 @@ Provider failures become fixed `aws_rds_<operation>_<reason>` codes, for example
 are never included. Instance creation reports `subnet_group`, `parameter_group` (create),
 `parameter_group_verify` (reading an existing group's tags and family), and
 `parameter_group_modify` (the `rds.force_ssl` setting) as operations before `create`.
+Updating an existing instance reports `modify` and `reboot`, and `aws_rds_modify_field_forbidden`
+means the adapter was asked to send a field outside its allowlist.
 `aws_rds_parameter_group_ownership_mismatch` means a same-named group exists that this
 Resource does not own; rename or delete it yourself, since Gimme never deletes one.
 

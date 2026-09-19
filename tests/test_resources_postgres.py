@@ -1,3 +1,4 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from gimme.resources_postgres import (
     derive_instance_identifier,
     generate_workload_password,
     load_observed,
+    modification_for,
     persist_binding,
 )
 
@@ -793,3 +795,385 @@ def test_workload_secret_rotation_writes_a_new_version_when_the_secret_exists(mo
         )
 
     assert version.startswith("6f1f3f0e")
+
+
+IDENTIFIER = derive_instance_identifier("devbox-postgres")
+
+
+def live_instance(**updates) -> InstanceObservation:
+    values = {
+        "identity": f"arn:aws:rds:us-east-1:123456789012:db:{IDENTIFIER}",
+        "status": "available", "engine_version": "17.2", "endpoint": "db.example.test",
+        "port": 5432, "master_secret_arn": "arn:aws:secretsmanager:us-east-1:1:secret:m",
+        "instance_class": "db.t3.medium", "allocated_storage_gb": 20,
+        "security_group_ids": ("sg-0123456789abcdef0", "sg-0123456789abcdef1"),
+        "parameter_group_name": f"{IDENTIFIER}-params", "parameter_group_status": "in-sync",
+    }
+    values.update(updates)
+    return InstanceObservation(**values)  # type: ignore[arg-type]
+
+
+def desired(**updates) -> AWSRDSPostgresResource:
+    return resource().model_copy(update=updates)
+
+
+class ConvergingAdapter:
+    """An existing instance. AWS applies a modification immediately: the changed values
+    become pending and the status 'modifying' until `settle_polls` describes have passed."""
+
+    _FIELDS = {
+        "EngineVersion": ("engine_version", "pending_engine_version"),
+        "DBInstanceClass": ("instance_class", "pending_instance_class"),
+        "AllocatedStorage": ("allocated_storage_gb", "pending_allocated_storage_gb"),
+    }
+
+    def __init__(self, live: InstanceObservation, *, settle_polls: int = 0) -> None:
+        self.live = live
+        self.settle_polls = settle_polls
+        self.modify_calls: list[dict[str, object]] = []
+        self.reboot_calls = 0
+        self.create_calls = 0
+        self._polls = 0
+        self._on_settle: dict[str, object] = {}
+
+    def describe_instance(self, account, network, aws_instance_identifier):
+        if self.live.status in ("modifying", "rebooting"):
+            self._polls += 1
+            if self._polls > self.settle_polls:
+                self.live = dataclasses.replace(
+                    self.live, status="available", modification_pending=False,
+                    pending_engine_version=None, pending_instance_class=None,
+                    pending_allocated_storage_gb=None, **self._on_settle,  # type: ignore[arg-type]
+                )
+                self._on_settle = {}
+        return self.live
+
+    def modify_instance(self, account, network, resource, name, identifier, changes):
+        self.modify_calls.append(dict(changes))
+        self._polls = 0
+        pending: dict[str, object] = {}
+        for field, (live_name, pending_name) in self._FIELDS.items():
+            if field in changes:
+                pending[pending_name] = changes[field]
+                self._on_settle[live_name] = changes[field]
+        if "VpcSecurityGroupIds" in changes:
+            self._on_settle["security_group_ids"] = tuple(changes["VpcSecurityGroupIds"])  # type: ignore[arg-type]
+        if "DBParameterGroupName" in changes:
+            self._on_settle.update(
+                parameter_group_name=changes["DBParameterGroupName"],
+                parameter_group_status="pending-reboot",
+            )
+        self.live = dataclasses.replace(
+            self.live, status="modifying", modification_pending=True, **pending  # type: ignore[arg-type]
+        )
+        return self.live
+
+    def reboot_instance(self, account, network, identifier):
+        self.reboot_calls += 1
+        self._polls = 0
+        self._on_settle = {"parameter_group_status": "in-sync"}
+        self.live = dataclasses.replace(self.live, status="rebooting")
+        return self.live
+
+    def create_instance(self, *args, **kwargs):
+        self.create_calls += 1
+        raise AssertionError("an existing instance must not be recreated")
+
+
+def converge(adapter: ConvergingAdapter, tmp_path: Path, **resource_updates) -> dict[str, object]:
+    clock = FakeClock()
+    return apply_provision(
+        adapter, tmp_path, account(), network(), desired(**resource_updates), "devbox-postgres",
+        sleep=clock.sleep, now=clock.now,
+    )
+
+
+@pytest.mark.parametrize(
+    ("live", "updates", "expected"),
+    [
+        ({}, {}, {}),
+        ({}, {"engine_version": "17.5"}, {"EngineVersion": "17.5"}),
+        ({}, {"instance_class": "db.m6g.large"}, {"DBInstanceClass": "db.m6g.large"}),
+        ({}, {"allocated_storage_gb": 100}, {"AllocatedStorage": 100}),
+        (
+            {"security_group_ids": ("sg-0123456789abcdef0",)}, {},
+            {"VpcSecurityGroupIds": ["sg-0123456789abcdef0", "sg-0123456789abcdef1"]},
+        ),
+        (
+            {"parameter_group_name": "default.postgres17"}, {},
+            {"DBParameterGroupName": f"{IDENTIFIER}-params"},
+        ),
+        (
+            {}, {"engine_version": "17.5", "allocated_storage_gb": 40},
+            {"EngineVersion": "17.5", "AllocatedStorage": 40},
+        ),
+        # Values AWS already has pending are treated as applied and never re-sent.
+        (
+            {"pending_engine_version": "17.5", "pending_allocated_storage_gb": 40},
+            {"engine_version": "17.5", "allocated_storage_gb": 40}, {},
+        ),
+        # Fields the observation did not report are left alone.
+        ({"instance_class": None, "allocated_storage_gb": None, "security_group_ids": None,
+          "parameter_group_name": None}, {"instance_class": "db.m6g.large"}, {}),
+    ],
+)
+def test_modification_sends_only_the_changed_fields(live, updates, expected) -> None:
+    assert modification_for(desired(**updates), live_instance(**live), IDENTIFIER) == expected
+
+
+@pytest.mark.parametrize(
+    ("live", "updates", "code"),
+    [
+        ({"allocated_storage_gb": 100}, {"allocated_storage_gb": 50},
+         "aws_rds_modify_forbidden_allocated_storage_gb"),
+        ({"pending_allocated_storage_gb": 100}, {"allocated_storage_gb": 50},
+         "aws_rds_modify_forbidden_allocated_storage_gb"),
+        ({"engine_version": "17.5"}, {"engine_version": "17.2"},
+         "aws_rds_modify_forbidden_engine_downgrade"),
+        ({"engine_version": "16.4"}, {"engine_version": "17.2"},
+         "aws_rds_modify_forbidden_engine_major"),
+    ],
+)
+def test_apply_refuses_what_the_allowlist_forbids_before_any_modify_call(
+    tmp_path: Path, live, updates, code
+) -> None:
+    adapter = ConvergingAdapter(live_instance(**live))
+
+    with pytest.raises(ResourceError, match=f"^{code}$"):
+        converge(adapter, tmp_path, **updates)
+
+    assert adapter.modify_calls == [] and adapter.reboot_calls == 0
+
+
+def test_apply_modifies_an_existing_instance_once_and_polls_to_ready(tmp_path: Path) -> None:
+    adapter = ConvergingAdapter(live_instance(), settle_polls=2)
+
+    first = converge(adapter, tmp_path, instance_class="db.m6g.large", allocated_storage_gb=40)
+    second = converge(adapter, tmp_path, instance_class="db.m6g.large", allocated_storage_gb=40)
+
+    assert adapter.modify_calls == [
+        {"DBInstanceClass": "db.m6g.large", "AllocatedStorage": 40}
+    ]
+    assert first["modified_fields"] == ["AllocatedStorage", "DBInstanceClass"]
+    assert first["phase"] == "ready" and first["rebooted"] is False
+    assert second["modified_fields"] == [] and second["phase"] == "ready"
+    assert adapter.create_calls == 0
+
+
+def test_a_second_apply_during_a_modification_makes_no_modify_call_and_reports_pending(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(live_instance(), settle_polls=1000)
+
+    first = converge(adapter, tmp_path, engine_version="17.5")
+    resumed = converge(adapter, tmp_path, engine_version="17.5")
+
+    assert first["phase"] == "pending" and resumed["phase"] == "pending"
+    assert adapter.modify_calls == [{"EngineVersion": "17.5"}]
+    assert resumed["modified_fields"] == []
+    observed = load_observed(tmp_path, "devbox-postgres")
+    assert observed is not None and observed["phase"] == "pending"
+
+
+def test_an_available_instance_with_a_matching_pending_change_is_polled_not_remodified(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(live_instance(
+        pending_engine_version="17.5", modification_pending=True,
+    ))
+
+    result = converge(adapter, tmp_path, engine_version="17.5")
+
+    assert adapter.modify_calls == []
+    assert result["phase"] == "pending", "a pending managed change holds readiness"
+
+
+def test_a_parameter_group_pending_reboot_triggers_exactly_one_reboot(tmp_path: Path) -> None:
+    adapter = ConvergingAdapter(live_instance(parameter_group_status="pending-reboot"))
+
+    first = converge(adapter, tmp_path)
+    second = converge(adapter, tmp_path)
+
+    assert adapter.reboot_calls == 1
+    assert first["rebooted"] is True and first["phase"] == "ready"
+    assert second["rebooted"] is False
+    assert adapter.modify_calls == []
+
+
+def test_attaching_the_parameter_group_reboots_once_after_the_modification_settles(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(live_instance(parameter_group_name="default.postgres17"))
+
+    result = converge(adapter, tmp_path)
+
+    assert adapter.modify_calls == [{"DBParameterGroupName": f"{IDENTIFIER}-params"}]
+    assert adapter.reboot_calls == 1
+    assert result["modified_fields"] == ["DBParameterGroupName"] and result["rebooted"] is True
+
+
+def test_no_reboot_while_the_instance_is_unsettled_or_a_modification_is_pending(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(
+        live_instance(parameter_group_status="pending-reboot", pending_engine_version="17.5"),
+    )
+
+    result = converge(adapter, tmp_path, engine_version="17.5")
+
+    assert adapter.reboot_calls == 0 and result["rebooted"] is False
+    assert result["phase"] == "pending"
+
+
+def test_a_modify_failure_surfaces_a_bounded_code_and_persists_nothing_new(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(live_instance())
+
+    def denied(*args, **kwargs):
+        raise ResourceError("aws_rds_modify_access_denied")
+
+    adapter.modify_instance = denied  # type: ignore[method-assign]
+
+    with pytest.raises(ResourceError, match="^aws_rds_modify_access_denied$"):
+        converge(adapter, tmp_path, instance_class="db.m6g.large")
+
+    assert load_observed(tmp_path, "devbox-postgres") is None
+
+
+def _modify_stub(monkeypatch):
+    rds, stub = _stubbed("rds")
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: _StubbedSession({"rds": rds}))
+    return adapter, stub
+
+
+def _describe_stub(stub) -> None:
+    stub.add_response(
+        "describe_db_instances",
+        {"DBInstances": [_instance_response(IDENTIFIER, tag="devbox-postgres")]},
+        {"DBInstanceIdentifier": IDENTIFIER},
+    )
+
+
+def test_modify_instance_sends_only_the_changed_field_immediately_and_never_a_major_upgrade(
+    monkeypatch,
+) -> None:
+    adapter, stub = _modify_stub(monkeypatch)
+    stub.add_response(
+        "modify_db_instance", {},
+        {
+            "DBInstanceIdentifier": IDENTIFIER, "ApplyImmediately": True,
+            "DBInstanceClass": "db.m6g.large",
+        },
+    )
+    _describe_stub(stub)
+
+    with stub:
+        adapter.modify_instance(
+            account(), network(), desired(instance_class="db.m6g.large"), "devbox-postgres",
+            IDENTIFIER, {"DBInstanceClass": "db.m6g.large"},
+        )
+        stub.assert_no_pending_responses()
+
+
+def test_modify_instance_attaching_the_parameter_group_first_ensures_the_owned_group(
+    monkeypatch,
+) -> None:
+    adapter, stub = _modify_stub(monkeypatch)
+    stub.add_response("create_db_parameter_group", {}, _parameter_group_request(IDENTIFIER, 17))
+    stub.add_response("modify_db_parameter_group", {}, _force_ssl_request(IDENTIFIER))
+    stub.add_response(
+        "modify_db_instance", {},
+        {
+            "DBInstanceIdentifier": IDENTIFIER, "ApplyImmediately": True,
+            "DBParameterGroupName": f"{IDENTIFIER}-params",
+        },
+    )
+    _describe_stub(stub)
+
+    with stub:
+        adapter.modify_instance(
+            account(), network(), resource(), "devbox-postgres", IDENTIFIER,
+            {"DBParameterGroupName": f"{IDENTIFIER}-params"},
+        )
+        stub.assert_no_pending_responses()
+
+
+def test_modify_instance_refuses_fields_outside_the_allowlist_without_any_aws_call(
+    monkeypatch,
+) -> None:
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: pytest.fail("must not reach AWS")
+    )
+
+    for changes in ({}, {"AllowMajorVersionUpgrade": True}, {"MultiAZ": False},
+                    {"DBInstanceClass": "db.m6g.large", "DeletionProtection": False}):
+        with pytest.raises(ResourceError, match="^aws_rds_modify_field_forbidden$"):
+            adapter.modify_instance(
+                account(), network(), resource(), "devbox-postgres", IDENTIFIER, changes
+            )
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected"),
+    [("AccessDenied", "aws_rds_modify_access_denied"),
+     ("InvalidDBInstanceState", "aws_rds_modify_invalid_state"),
+     ("InvalidParameterCombination", "aws_rds_modify_unavailable")],
+)
+def test_modify_instance_bounds_provider_failures(monkeypatch, provider_code, expected) -> None:
+    adapter, stub = _modify_stub(monkeypatch)
+    stub.add_client_error(
+        "modify_db_instance", service_error_code=provider_code,
+        service_message="arn:aws:rds:secret-detail must never leak",
+    )
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.modify_instance(
+            account(), network(), resource(), "devbox-postgres", IDENTIFIER,
+            {"AllocatedStorage": 40},
+        )
+
+    assert str(raised.value) == expected
+
+
+def test_reboot_instance_never_forces_a_failover(monkeypatch) -> None:
+    adapter, stub = _modify_stub(monkeypatch)
+    stub.add_response(
+        "reboot_db_instance", {}, {"DBInstanceIdentifier": IDENTIFIER, "ForceFailover": False}
+    )
+    _describe_stub(stub)
+
+    with stub:
+        adapter.reboot_instance(account(), network(), IDENTIFIER)
+        stub.assert_no_pending_responses()
+
+
+def test_observation_parses_pending_values_and_the_parameter_group_status() -> None:
+    response = {
+        **_instance_response(IDENTIFIER, tag="devbox-postgres"),
+        "PendingModifiedValues": {
+            "EngineVersion": "17.5", "DBInstanceClass": "db.m6g.large",
+            "AllocatedStorage": 40, "BackupRetentionPeriod": 14,
+        },
+        "DBParameterGroups": [
+            {"DBParameterGroupName": f"{IDENTIFIER}-params",
+             "ParameterApplyStatus": "pending-reboot"}
+        ],
+    }
+
+    observed = BotoRDSAdapter._observation(response, IDENTIFIER)
+
+    assert (observed.pending_engine_version, observed.pending_instance_class,
+            observed.pending_allocated_storage_gb) == ("17.5", "db.m6g.large", 40)
+    assert (observed.parameter_group_name, observed.parameter_group_status) == (
+        f"{IDENTIFIER}-params", "pending-reboot",
+    )
+    assert observed.converging is True
+    other = BotoRDSAdapter._observation(
+        {**_instance_response(IDENTIFIER, tag="devbox-postgres"),
+         "PendingModifiedValues": {"BackupRetentionPeriod": 14}},
+        IDENTIFIER,
+    )
+    assert other.modification_pending is True and other.converging is False
