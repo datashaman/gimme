@@ -97,6 +97,7 @@ For guided workflows, see:
 - [`docs/how-to/migrate-a-runtime-to-mise.md`](docs/how-to/migrate-a-runtime-to-mise.md)
 - [`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md)
 - [`docs/how-to/use-backup-destinations.md`](docs/how-to/use-backup-destinations.md)
+- [`docs/how-to/restore-a-postgresql-deployment.md`](docs/how-to/restore-a-postgresql-deployment.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
 ## Target bootstrap

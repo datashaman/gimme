@@ -33,4 +33,6 @@ def test_disposable_vm_fixture_writes_current_isolated_state(tmp_path: Path) -> 
     assert state.deployments["smoke-default"].placement != (
         state.deployments["smoke-preview"].placement
     )
+    assert state.applications["smoke"].default_health is not None
+    assert state.applications["smoke"].default_health.path == "/up"
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600

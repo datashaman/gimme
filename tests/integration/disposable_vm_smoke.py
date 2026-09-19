@@ -145,7 +145,16 @@ def setup() -> None:
                 "framework": "laravel",
                 "frontend": None,
                 "artisan": None,
-                "default_health": None,
+                "default_health": {
+                    "name": "primary",
+                    "phases": ["candidate", "live"],
+                    "path": "/up",
+                    "expected_status": 200,
+                    "attempts": 2,
+                    "delay_seconds": 0,
+                    "timeout_seconds": 5,
+                },
+                "health_probes": [],
                 "php_extensions": [],
             }
         },
@@ -405,6 +414,281 @@ def create_minio_bucket() -> None:
     )
 
 
+def install_restore_fixture() -> None:
+    """Install the smallest Laravel-shaped current release needed for private health."""
+    deploy_path = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}"
+    files = {
+        "current/artisan": """#!/usr/bin/env php
+<?php
+$env = parse_ini_file(__DIR__ . '/../shared/.env', false, INI_SCANNER_RAW);
+$connection = pg_connect(sprintf(
+    'host=%s port=%s dbname=%s user=%s password=%s',
+    $env['DB_HOST'], $env['DB_PORT'], $env['DB_DATABASE'],
+    $env['DB_USERNAME'], $env['DB_PASSWORD']
+));
+if ($connection === false || !in_array('migrate:status', $argv, true)) {
+    exit(1);
+}
+$result = pg_query($connection, 'SELECT value FROM gimme_restore_probe WHERE id = 1');
+exit($result !== false && pg_fetch_result($result, 0, 0) === 'before' ? 0 : 1);
+""",
+        "current/vendor/autoload.php": r"""<?php
+namespace Illuminate\Contracts\Http {
+    interface Kernel {}
+}
+namespace Illuminate\Http {
+    final class Request {
+        public static function create(...$arguments): self { return new self(); }
+    }
+}
+namespace Smoke {
+    final class Response {
+        public function __construct(private int $status) {}
+        public function getStatusCode(): int { return $this->status; }
+    }
+    final class Kernel implements \Illuminate\Contracts\Http\Kernel {
+        public function handle($request): Response {
+            $root = dirname(__DIR__, 2);
+            if (is_file($root . '/shared/force-health-failure')) {
+                return new Response(500);
+            }
+            $env = parse_ini_file($root . '/shared/.env', false, INI_SCANNER_RAW);
+            $connection = pg_connect(sprintf(
+                'host=%s port=%s dbname=%s user=%s password=%s',
+                $env['DB_HOST'], $env['DB_PORT'], $env['DB_DATABASE'],
+                $env['DB_USERNAME'], $env['DB_PASSWORD']
+            ));
+            if ($connection === false) { return new Response(500); }
+            $result = pg_query(
+                $connection,
+                'SELECT value FROM gimme_restore_probe WHERE id = 1'
+            );
+            $ready = $result !== false && pg_fetch_result($result, 0, 0) === 'before';
+            return new Response($ready ? 200 : 500);
+        }
+        public function terminate($request, $response): void {}
+    }
+    final class App {
+        public function make($contract): Kernel { return new Kernel(); }
+    }
+}
+""",
+        "current/bootstrap/app.php": "<?php return new \\Smoke\\App();\n",
+        "current/public/index.php": "<?php http_response_code(200); echo 'ready';\n",
+    }
+    ssh_python(textwrap.dedent(
+        f"""
+        import os
+        from pathlib import Path
+
+        root = Path({deploy_path!r})
+        files = {files!r}
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            mode = (
+                0o700 if relative.endswith("artisan")
+                else 0o644 if relative.endswith("public/index.php")
+                else 0o600
+            )
+            os.chmod(path, mode)
+        """
+    ))
+
+
+def set_restore_probe(value: str) -> None:
+    database = json.loads(STATE_PATH.read_text())["deployments"][
+        RECOVERY_DEPLOYMENT
+    ]["placement"]["database_identifier"]
+    if value not in {"before", "after"}:
+        raise AssertionError("invalid fixed restore probe value")
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
+        raise AssertionError("invalid fixed integration database identity")
+    statement = (
+        f"SET ROLE {database}; "
+        "CREATE TABLE IF NOT EXISTS gimme_restore_probe "
+        "(id integer PRIMARY KEY, value text NOT NULL); "
+        f"INSERT INTO gimme_restore_probe VALUES (1, '{value}') "
+        "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value"
+    )
+    ssh_python(textwrap.dedent(
+        f"""
+        import subprocess
+        subprocess.run(
+            ["psql", "-v", "ON_ERROR_STOP=1", "-d", {database!r}, "-c", {statement!r}],
+            check=True,
+        )
+        """
+    ))
+
+
+def restore_probe_value() -> str:
+    database = json.loads(STATE_PATH.read_text())["deployments"][
+        RECOVERY_DEPLOYMENT
+    ]["placement"]["database_identifier"]
+    return ssh_python_output(textwrap.dedent(
+        f"""
+        import subprocess
+        result = subprocess.run(
+            ["psql", "-Atq", "-d", {database!r}, "-c",
+             "SELECT value FROM gimme_restore_probe WHERE id = 1"],
+            check=True, text=True, capture_output=True,
+        )
+        print(result.stdout.strip())
+        """
+    ))
+
+
+def verify_postgres_restore(gimme) -> None:
+    """Exercise non-empty, failed verification/retry, and empty-replacement Restore."""
+    from gimme.control import DeploymentRegistration, RecoveryPolicy
+    from gimme.recovery import RecoveryError
+
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    proposed = DeploymentRegistration.from_deployment(current).model_copy(
+        update={"recovery": RecoveryPolicy(
+            destination=BACKUP_DESTINATION, valkey=False, quiesce_wait_seconds=1,
+        )}
+    )
+    policy_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, proposed, str(policy_plan["plan_id"])
+    )
+    install_restore_fixture()
+    set_restore_probe("before")
+    capture = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-postgres-source"
+    )
+    created = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
+    )
+    point_id = str(created["recovery_point"]["recovery_point_id"])
+
+    state = gimme.store.load()
+    resource = state.resources["integration-postgres"]
+    incompatible = resource.model_copy(
+        update={"version": f"{resource.version}.999"}
+    )
+    version_plan = gimme.plan_update_resource("integration-postgres", incompatible)
+    gimme.update_resource(
+        "integration-postgres", incompatible, str(version_plan["plan_id"])
+    )
+    rejected = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-version-reject"
+    )
+    if rejected["readiness_issues"] != ["source_version_incompatible"]:
+        raise AssertionError(f"exact-version mismatch was not rejected: {rejected}")
+    revert_plan = gimme.plan_update_resource("integration-postgres", resource)
+    gimme.update_resource(
+        "integration-postgres", resource, str(revert_plan["plan_id"])
+    )
+
+    set_restore_probe("after")
+    restore = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore"
+    )
+    if not restore["ready"] or restore["destination"]["empty"]:
+        raise AssertionError(f"non-empty Restore did not require Safety capture: {restore}")
+    applied = gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
+        str(restore["plan_id"]), str(restore["confirmation"]),
+    )
+    if applied["state"] != "data_replaced" or restore_probe_value() != "before":
+        raise AssertionError(f"PostgreSQL data was not replaced: {applied}")
+    record = gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
+    )
+    safety_id = record["safety_recovery_point_id"]
+    if safety_id is None:
+        raise AssertionError("non-empty Restore did not publish a Safety Recovery Point")
+    safety_plan = gimme.plan_delete_recovery_point(
+        RECOVERY_DEPLOYMENT, str(safety_id)
+    )
+    if not safety_plan["safety_protected"]:
+        raise AssertionError("unresolved Safety Recovery Point was not protected")
+
+    gate = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/shared/force-health-failure"
+    ssh("touch", gate)
+    verification = gimme.plan_verify_restore(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
+    )
+    try:
+        gimme.apply_verify_restore(
+            RECOVERY_DEPLOYMENT, "ci-nonempty-restore",
+            str(verification["plan_id"]),
+        )
+    except RecoveryError as exc:
+        if str(exc) != "restore_verification_failed":
+            raise AssertionError(f"Restore failure was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("forced private health failure unexpectedly passed")
+    if gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
+    )["state"] != "verification_failed":
+        raise AssertionError("failed verification was not recorded")
+    maintenance_status = ssh(
+        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
+        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
+    )
+    if maintenance_status != "503":
+        raise AssertionError("failed verification exposed restored data")
+    ssh("rm", "-f", gate)
+    retry = gimme.plan_verify_restore(RECOVERY_DEPLOYMENT, "ci-nonempty-restore")
+    completed = gimme.apply_verify_restore(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore", str(retry["plan_id"])
+    )
+    if completed["state"] != "completed":
+        raise AssertionError(f"Restore retry did not complete: {completed}")
+    live_status = ssh(
+        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
+        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
+    )
+    if live_status != "200":
+        raise AssertionError(f"completed Restore did not recover the route: {live_status}")
+    if gimme.plan_delete_recovery_point(
+        RECOVERY_DEPLOYMENT, str(safety_id)
+    )["safety_protected"]:
+        raise AssertionError("completed Restore did not release its Safety point")
+
+    database = gimme.store.deployment(
+        RECOVERY_DEPLOYMENT
+    ).placement.database_identifier
+    ssh("dropdb", database)
+    ssh("createdb", "--owner", database, database)
+    replacement = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-empty-replacement"
+    )
+    if not replacement["ready"] or not replacement["destination"]["empty"]:
+        raise AssertionError(f"empty replacement was not recognized: {replacement}")
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-empty-replacement",
+        str(replacement["plan_id"]), str(replacement["confirmation"]),
+    )
+    finish = gimme.plan_verify_restore(
+        RECOVERY_DEPLOYMENT, "ci-empty-replacement"
+    )
+    gimme.apply_verify_restore(
+        RECOVERY_DEPLOYMENT, "ci-empty-replacement", str(finish["plan_id"])
+    )
+    replacement_record = gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, "ci-empty-replacement"
+    )
+    if replacement_record["safety_recovery_point_id"] is not None:
+        raise AssertionError("empty replacement unexpectedly created a Safety point")
+    if restore_probe_value() != "before":
+        raise AssertionError("empty replacement Restore did not recover PostgreSQL")
+    replacement_status = ssh(
+        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
+        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
+    )
+    if replacement_status != "200":
+        raise AssertionError("empty replacement Restore did not recover the application")
+
+
 def verify_backup_destination() -> None:
     """Register a real S3-compatible destination, bind recovery, and prove the tracer."""
     require_disposable_host()
@@ -490,6 +774,8 @@ def verify_backup_destination() -> None:
     for service in ("postgresql", "valkey-server", "caddy"):
         if "Active: active" not in str(gimme.target_service_status(TARGET, service)["output"]):
             raise AssertionError(f"{service} was not running after recovery capture")
+
+    verify_postgres_restore(gimme)
 
     tamper_component(
         "gimme/recovery-points/"
