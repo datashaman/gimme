@@ -7,6 +7,8 @@ vendor/
 .env
 .env.*
 !.env.example
+# Drop files awaiting absorption by the personal knowledge base (scribe sync).
+.claude/KnowledgeBase/
 # Legacy 0.4 manifests may contain machine/client identifiers and are migration input only.
 config/server.json
 config/stack.json
