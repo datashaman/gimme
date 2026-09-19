@@ -267,6 +267,10 @@ def _run_deployment(
     recovery_action: str | None = None,
     recovery_request_id: str | None = None,
     recovery_quiesce_wait: int | None = None,
+    postgres_restore_action: str | None = None,
+    postgres_restore_request_id: str | None = None,
+    postgres_restore_sha256: str | None = None,
+    postgres_restore_bytes: int | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -314,6 +318,10 @@ def _run_deployment(
         recovery_action=recovery_action,
         recovery_request_id=recovery_request_id,
         recovery_quiesce_wait=recovery_quiesce_wait,
+        postgres_restore_action=postgres_restore_action,
+        postgres_restore_request_id=postgres_restore_request_id,
+        postgres_restore_sha256=postgres_restore_sha256,
+        postgres_restore_bytes=postgres_restore_bytes,
         timeout=timeout,
     )
 

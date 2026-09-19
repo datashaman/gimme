@@ -1170,6 +1170,65 @@ SQL;
     run('bash -c ' . escapeshellarg($command), timeout: 60);
 });
 
+task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {
+    $action = required_env('GIMME_POSTGRES_RESTORE_ACTION');
+    $request = required_env('GIMME_POSTGRES_RESTORE_REQUEST_ID');
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    $sha256 = required_env('GIMME_POSTGRES_RESTORE_SHA256');
+    $bytes = required_env('GIMME_POSTGRES_RESTORE_BYTES');
+    if (!in_array($action, ['prepare', 'swap', 'cleanup'], true) ||
+        !preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $request) ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[0-9a-f]{64}$/', $sha256) ||
+        !preg_match('/^[0-9]{1,9}$/', $bytes) || (int) $bytes > 536870912) {
+        throw new \RuntimeException('Unsafe PostgreSQL restore request');
+    }
+    $directory = "{$appsRoot}/.gimme/restores/{$instance}";
+    $statePath = "{$directory}/{$request}.json";
+    $artifactPath = "{$directory}/{$request}.dump";
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    if ($action === 'prepare') {
+        $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');
+        if (is_link($localPath) || !is_file($localPath)) {
+            throw new \RuntimeException('Unsafe PostgreSQL restore artifact');
+        }
+        if (!test('[ -e ' . escapeshellarg($statePath) . ' ]')) {
+            $document = json_encode([
+                'schema_version' => 1, 'deployment' => $instance,
+                'request_id' => $request, 'database' => $database, 'role' => $database,
+                'sha256' => $sha256, 'bytes' => (int) $bytes, 'phase' => 'pending',
+                'live_oid' => null, 'shadow_oid' => null,
+            ], JSON_THROW_ON_ERROR);
+            $temporaryStatePath = "{$statePath}.new";
+            run(
+                'umask 077; printf %s ' . escapeshellarg(base64_encode($document)) .
+                ' | base64 -d > ' . escapeshellarg($temporaryStatePath) .
+                ' && mv ' . escapeshellarg($temporaryStatePath) . ' ' .
+                escapeshellarg($statePath)
+            );
+        }
+        upload($localPath, $artifactPath);
+        run('chmod 0600 ' . escapeshellarg($artifactPath));
+    }
+    $program = file_get_contents(__DIR__ . '/scripts/gimme-restore-postgres');
+    if ($program === false) {
+        throw new \RuntimeException('Missing PostgreSQL restore program');
+    }
+    $program = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $program,
+    );
+    run(
+        'printf %s ' . escapeshellarg(base64_encode($program)) .
+        ' | base64 -d | python3 - ' . escapeshellarg($action) . ' ' .
+        escapeshellarg($statePath) . ' ' . escapeshellarg($artifactPath) . ' ' .
+        escapeshellarg($database) . ' ' . escapeshellarg($sha256) . ' ' .
+        escapeshellarg($bytes),
+        timeout: 3600,
+    );
+});
+
 task('gimme:recovery:maintenance', function () use ($appsRoot, $instance): void {
     $action = required_env('GIMME_RECOVERY_ACTION');
     $request = required_env('GIMME_RECOVERY_REQUEST_ID');

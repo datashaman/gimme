@@ -718,6 +718,24 @@ def test_postgres_restore_preflight_uses_only_fixed_catalog_inspection() -> None
     assert "ALTER " not in task
 
 
+def test_postgres_restore_task_uses_request_scoped_protected_atomic_state() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:postgres'", 1)[1].split(
+        "task('gimme:recovery:maintenance'", 1
+    )[0]
+
+    assert "required_env('GIMME_POSTGRES_RESTORE_REQUEST_ID')" in task
+    assert "install -d -m 0700" in task
+    assert "umask 077; printf %s" in task
+    assert "&& mv " in task
+    assert "chmod 0600" in task
+    assert "upload($localPath, $artifactPath)" in task
+    assert "python3 - " in task
+    assert "escapeshellarg($database)" in task
+    assert "escapeshellarg($sha256)" in task
+    assert "escapeshellarg($bytes)" in task
+
+
 def _fake_psql(tmp_path: Path, *, fail: bool = False, message: str | None = None) -> Path:
     """A stand-in psql that records argv and stdin. It cannot judge SQL semantics, so the
     statements it receives are additionally exercised against a real server by hand; these
