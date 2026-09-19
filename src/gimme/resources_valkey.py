@@ -254,6 +254,10 @@ class ElastiCacheAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
     ) -> list["SnapshotInfo"]: ...
 
+    def delete_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, snapshot_name: str
+    ) -> bool: ...
+
     def begin_rotation(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str, deployment_name: str, generation: int,
@@ -819,6 +823,20 @@ class BotoElastiCacheAdapter(AWSAdapter):
             if not marker:
                 break
         return sorted(found, key=lambda info: (info.created or "", info.name), reverse=True)
+
+    def delete_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, snapshot_name: str
+    ) -> bool:
+        """Delete one final snapshot named in Gimme's immutable destruction receipt."""
+        client = self._destructive_client(account, network)
+        try:
+            client.delete_snapshot(SnapshotName=snapshot_name)
+        except Exception as exc:
+            error = _provider_error(exc, "final_snapshot_delete", self.error_prefix)
+            if "missing" in str(error):
+                return False
+            raise error from None
+        return True
 
     def _read_secret(
         self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
@@ -1421,6 +1439,55 @@ def final_snapshot_id(group_id: str, fingerprint: str) -> str:
     """Deterministic per group incarnation, so a retried delete never makes a second snapshot
     and a reused name fails closed as `snapshot_exists`."""
     return f"{group_id}-final-{fingerprint[:8]}"
+
+
+def _destroyed_receipt_path(root: Path, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None:
+        raise ResourceError("resource_name_invalid")
+    return root / "destroyed-resources" / f"{resource_name}.json"
+
+
+def record_destroyed_group(
+    root: Path, resource_name: str, aws_network: str, fingerprint: str
+) -> dict[str, object]:
+    """Keep only the exact final snapshot identity after destructive cleanup completes."""
+    group_id = derive_group_id(resource_name)
+    receipt = {
+        "schema_version": 1, "resource": resource_name, "aws_network": aws_network,
+        "replication_group_id": group_id, "identity_fingerprint": fingerprint,
+        "final_snapshot": final_snapshot_id(group_id, fingerprint),
+    }
+    _write_json(_destroyed_receipt_path(root, resource_name), receipt, resource_name)
+    return receipt
+
+
+def load_destroyed_receipt(root: Path, resource_name: str) -> dict[str, str] | None:
+    path = _destroyed_receipt_path(root, resource_name)
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_OBSERVED_BYTES:
+        return None
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid") from None
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema_version", "resource", "aws_network", "replication_group_id",
+        "identity_fingerprint", "final_snapshot",
+    } or receipt.get("schema_version") != 1 or any(
+        not isinstance(receipt.get(key), str)
+        for key in ("resource", "aws_network", "replication_group_id", "identity_fingerprint",
+                    "final_snapshot")
+    ):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    group_id = derive_group_id(resource_name)
+    if receipt["resource"] != resource_name or receipt["replication_group_id"] != group_id or (
+        receipt["final_snapshot"] != final_snapshot_id(group_id, receipt["identity_fingerprint"])
+    ):
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    return cast(dict[str, str], receipt)
+
+
+def clear_destroyed_receipt(root: Path, resource_name: str) -> None:
+    _destroyed_receipt_path(root, resource_name).unlink(missing_ok=True)
 
 
 def destruction_targets(root: Path, resource_name: str) -> tuple[str, list[str]]:

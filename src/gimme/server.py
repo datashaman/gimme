@@ -1627,6 +1627,9 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
     if result["destroyed"]:
         # Reloaded: the destruction can outlast other edits to desired state.
         store.save(_delete(store.load(), "resources", name))
+        resources_valkey_module.record_destroyed_group(
+            store.root, name, resource.aws_network, str(expected["identity_fingerprint"])
+        )
     return {"changed": True, **result}
 
 
@@ -1656,6 +1659,61 @@ def list_resource_snapshots(name: Name) -> dict[str, object]:
         account, network, resources_valkey_module.derive_group_id(name)
     )
     return {"resource": name, "snapshots": [vars(item) for item in snapshots]}
+
+
+def _final_snapshot_purge_plan(name: str) -> dict[str, object]:
+    state = store.load()
+    if name in state.resources:
+        raise ValueError(f"resource {name} is still registered")
+    receipt = resources_valkey_module.load_destroyed_receipt(store.root, name)
+    if receipt is None:
+        raise KeyError(f"no destroyed Valkey resource named '{name}'")
+    network = state.aws_networks.get(receipt["aws_network"])
+    if network is None:
+        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
+    account = state.provider_accounts[network.provider_account]
+    if account.destructive_role_arn is None:
+        raise ResourceError("aws_elasticache_destroy_role_missing")
+    return exact_plan({
+        "kind": "valkey_final_snapshot_purge", "resource": name,
+        "confirmation": f"PURGE FINAL SNAPSHOT {name}",
+        "snapshot": receipt["final_snapshot"],
+        "destroys": ["the final snapshot retained after this Resource was destroyed"],
+        "retains": ["manual snapshots and Secrets Manager credentials"],
+        "authority": "the Provider Account's destructive role, assumed only during apply",
+        "irreversible": True,
+    })
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("purge_final_snapshot", "name")
+def plan_purge_final_snapshot(name: Name) -> dict[str, object]:
+    """Plan deleting only the deterministic final snapshot left by a destroyed Valkey Resource."""
+    return _final_snapshot_purge_plan(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("purge_final_snapshot", "name")
+def apply_purge_final_snapshot(
+    name: Name, plan_id: PlanId, confirmation: str
+) -> dict[str, object]:
+    """Delete the exact final snapshot in a reviewed destruction receipt, never a caller-supplied
+    snapshot identifier."""
+    expected = _final_snapshot_purge_plan(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    receipt = resources_valkey_module.load_destroyed_receipt(store.root, name)
+    if receipt is None:
+        raise KeyError(f"no destroyed Valkey resource named '{name}'")
+    state = store.load()
+    network = state.aws_networks[receipt["aws_network"]]
+    account = state.provider_accounts[network.provider_account]
+    deleted = elasticache_valkey.delete_final_snapshot(
+        account, network, receipt["final_snapshot"]
+    )
+    resources_valkey_module.clear_destroyed_receipt(store.root, name)
+    return {"changed": deleted, "resource": name, "purged": deleted}
 
 
 def _binds(state: ControlState, deployment: str, name: str) -> bool:

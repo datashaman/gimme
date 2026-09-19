@@ -133,6 +133,7 @@ assume it (for example behind an MFA condition):
   "Action": [
     "elasticache:DeleteReplicationGroup",
     "elasticache:CreateSnapshot",
+    "elasticache:DeleteSnapshot",
     "elasticache:DeleteUserGroup",
     "elasticache:DeleteUser",
     "elasticache:DeleteCacheParameterGroup",
@@ -487,6 +488,15 @@ a user be deleted while it is still a member of a user group is also unverified.
 tombstone. `plan_forget_resource` and `apply_forget_resource` (confirmation `FORGET <name>`) delete
 only that local file, and only when no Resource of that name is registered. They make no AWS call
 and do not make the retained group adoptable again; to delete it, use the AWS console or CLI. It works for RDS tombstones too.
+
+## Purge a final snapshot
+
+After a successful destructive Valkey removal, Gimme keeps a private destruction receipt containing
+only the derived final-snapshot name and its AWS network. `plan_purge_final_snapshot` and
+`apply_purge_final_snapshot` (confirmation `PURGE FINAL SNAPSHOT <name>`) use that receipt to
+delete exactly that final snapshot through the destructive role. The tool accepts no snapshot name,
+does not touch manual snapshots or Secrets Manager credentials, and removes the receipt whether AWS
+reports that exact snapshot as already absent or successfully deletes it.
 
 ## Security group
 

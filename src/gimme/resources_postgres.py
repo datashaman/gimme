@@ -133,6 +133,7 @@ def _provider_error(
             "CacheParameterGroupNotFound": "missing",
             "CacheClusterNotFound": "missing",
             "CacheSubnetGroupNotFoundFault": "missing",
+            "SnapshotNotFoundFault": "missing",
             "ReplicationGroupAlreadyExists": "already_exists",
             "UserAlreadyExists": "already_exists",
             "UserGroupAlreadyExists": "already_exists",

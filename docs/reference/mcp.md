@@ -148,6 +148,8 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
 | `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey Resource and its data; reads only local state and never assumes the destructive role |
 | `apply_destroy_resource` | Remote write (destructive) | Delete the replication group with a final snapshot and what Gimme created around it, through the Provider Account's destructive role, after exact confirmation `DESTROY RESOURCE <name>` |
+| `plan_purge_final_snapshot` | Read | Plan deleting only the deterministic final snapshot retained after a destroyed Valkey Resource; reads a local receipt only |
+| `apply_purge_final_snapshot` | Remote write (destructive) | Delete that exact final snapshot through the destructive role after exact confirmation `PURGE FINAL SNAPSHOT <name>` |
 | `list_resource_snapshots` | Remote read | List a managed Valkey Resource's snapshots, including the final snapshot of a destroyed group, by name and status only |
 | `plan_restore_resource` | Read | Plan re-creating a lost managed Valkey replication group from one of its snapshots; reads only local state |
 | `apply_restore_resource` | Remote write | Create the group from the snapshot only if absent, restore each recorded Deployment credential unchanged, and verify every Deployment before the Resource is `ready`; repeat the same call while `restoring` |
