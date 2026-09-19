@@ -268,6 +268,8 @@ On-demand Recovery Points are created and listed with:
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
 | `plan_restore_deployment` | Destination + remote read | Verify a PostgreSQL-only source, exact destination compatibility, and database emptiness; return exact effects and confirmation without mutation |
 | `apply_restore_deployment` | Remote + destination write | Enter request-owned maintenance, protect non-empty current data with a Safety Recovery Point, verify and prepare the exact source artifact in a shadow database, then atomically swap the database while remaining in maintenance for verification |
+| `plan_verify_restore` | Destination read | Plan private application and managed-process verification for a data-replaced Restore |
+| `apply_verify_restore` | Remote + destination write | Resume managed processes behind maintenance, verify database connectivity and configured live-health probes privately, re-quiesce on failure, and restore routing only after retry-safe cleanup and final verification |
 
 `create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
 identity is derived from `(deployment, destination, request_id)`, never from wall-clock
@@ -300,7 +302,8 @@ supplies every object key and exact S3 version; callers cannot provide a key, pr
 or version. Components are deleted and verified one at a time, with the exact manifest
 version last. A partial failure remains visible as `deletion_failed`; retry the original
 apply with the same plan and confirmations. Safety points remain protected until their
-authoritative Restore record is `completed`, and Object Lock or legal hold is never bypassed.
+authoritative Restore record is `completed`; source Recovery Points are likewise protected
+while any Restore using them is incomplete. Object Lock or legal hold is never bypassed.
 
 Restore transitions are append-only, immutable objects in the bound Backup Destination.
 `list_restores` and `gimme://deployments/{name}/restores/{request_id}` expose only the
@@ -321,6 +324,13 @@ maintenance, Safety Recovery Point protection (when the destination was non-empt
 artifact verification, shadow verification, and atomic data replacement. A failed or successful
 data swap remains behind the fixed maintenance route; the separate verification apply is the only
 path back online.
+
+`apply_verify_restore` boots each configured live-health request directly through the current
+Laravel application while the public Caddy route continues to return 503. It resumes only the
+managed units recorded as active before maintenance. Any failed database, application, or process
+check re-quiesces those units and appends `verification_failed`; a retry is required. After two
+successful private checks around idempotent previous-database cleanup, it restores the saved route
+and appends `completed`.
 
 The request-owned maintenance helper also supports internal `resume` and `quiesce`
 transitions for Restore verification. `resume` starts only the managed units recorded as

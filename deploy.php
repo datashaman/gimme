@@ -1229,6 +1229,61 @@ task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {
     );
 });
 
+task('gimme:recovery:verify-application', function () use (
+    $app,
+    $framework,
+    $health,
+    $siteHost,
+): void {
+    if ($app === '' || $framework !== 'laravel') {
+        throw new \RuntimeException('Restore verification requires a Laravel application');
+    }
+    $currentPath = get('deploy_path') . '/current';
+    $artisan = "{$currentPath}/artisan";
+    if (!test('[ -f ' . escapeshellarg($artisan) . ' ]')) {
+        throw new \RuntimeException('Restore verification requires a current release');
+    }
+    $php = escapeshellarg(configured_php_binary());
+    $database = trim(run(
+        'if ' . $php . ' ' . escapeshellarg($artisan) .
+        ' --no-interaction migrate:status >/dev/null 2>&1; ' .
+        'then printf ready; else printf failed; fi'
+    ));
+    if ($database !== 'ready') {
+        throw new \RuntimeException('Restored database connectivity verification failed');
+    }
+    foreach ($health as $probe) {
+        if (!in_array('live', $probe['phases'], true)) {
+            continue;
+        }
+        $expected = $probe['expected_status'];
+        $command = 'cd ' . escapeshellarg($currentPath) . ' && ' .
+            'GIMME_HEALTH_PATH=' . escapeshellarg($probe['path']) . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($siteHost) . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $expected) . ' ' .
+            '/usr/bin/timeout --signal=TERM ' .
+            escapeshellarg((string) $probe['timeout_seconds']) . 's ' .
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        for ($attempt = 1; $attempt <= $probe['attempts']; $attempt++) {
+            $output = trim(run($command, secrets: [
+                'health_script' => escapeshellarg(laravel_candidate_health_script()),
+            ]));
+            if ($output === "GIMME_HEALTH_STATUS|{$expected}") {
+                continue 2;
+            }
+            if ($attempt < $probe['attempts'] && $probe['delay_seconds'] > 0) {
+                run('/usr/bin/sleep ' . escapeshellarg(
+                    (string) $probe['delay_seconds']
+                ));
+            }
+        }
+        throw new \RuntimeException(
+            "Private restore health probe {$probe['name']} failed"
+        );
+    }
+    writeln('GIMME_RESTORE_VERIFY|ready');
+});
+
 task('gimme:recovery:maintenance', function () use ($appsRoot, $instance): void {
     $action = required_env('GIMME_RECOVERY_ACTION');
     $request = required_env('GIMME_RECOVERY_REQUEST_ID');
