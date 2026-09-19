@@ -51,7 +51,8 @@ server rejects unencrypted connections on every PostgreSQL version, not only 15 
 Gimme reuses an existing group of that name only if it carries this Resource's
 `gimme:resource` tag and the expected family; otherwise it refuses with
 `aws_rds_parameter_group_ownership_mismatch` and changes nothing.
-The group is attached only when Gimme creates the instance; it does not change an existing one.
+Creation attaches the group; a later apply re-attaches it to an existing instance that reports a
+different one (see [Updating an existing instance](#updating-an-existing-instance)).
 Multi-AZ doubles the instance cost; Gimme reports structure but does not price it.
 
 ## IAM roles
@@ -184,9 +185,11 @@ The **resolver role** reads only the RDS-managed master credential, and only at 
 ```
 
 Both policies were exercised against a live account with the AWS-managed `aws/rds` and
-`aws/secretsmanager` keys, except the `RdsParameterGroup` statement, the `RdsModifyAndReboot` statement, and the
-`pg:gimme-*` resource on `RdsCreateAndDescribe`, which have only been exercised against
-botocore stubs. A customer-managed KMS key for storage, the master secret, or the
+`aws/secretsmanager` keys. The `RdsParameterGroup` and `RdsModifyAndReboot` statements and the
+`pg:gimme-*` resource on `RdsCreateAndDescribe` were exercised live in `eu-central-1` (create,
+a combined instance class, storage, and security-group modification, re-attaching the
+parameter group, and the reboot), with the statements copied verbatim from this page; the
+security-group change needed no `ec2:` action beyond `Ec2Describe`. A customer-managed KMS key for storage, the master secret, or the
 workload Secret Store needs a key policy that admits these roles and RDS; that has not been
 verified. Trust policies should name only the identity that runs Gimme.
 
@@ -279,8 +282,10 @@ Values AWS already has pending count as applied, so applying again while a modif
 flight sends nothing and reports `phase: pending`.
 
 When the parameter group reports `pending-reboot`, the instance is `available`, and nothing is
-pending, apply reboots it once without forced failover, then polls. That includes the first
-apply after creation, which restarts the new instance once so `rds.force_ssl` takes effect.
+pending, apply reboots it once without forced failover, then polls. A new instance is created
+with the group already attached and `rds.force_ssl` is a dynamic parameter, so RDS reports it
+`in-sync` and the first apply after creation does not reboot; the reboot follows re-attaching
+the group to an older instance.
 If a modification is still settling when the 30 seconds end, the next apply does the reboot.
 
 ## Bind a Deployment
@@ -328,8 +333,8 @@ returns the last observed state with a bounded `refresh_error` and no drift.
 After a successful live read it also reports `drift`: `fields` lists, for each of
 `engine_version`, `instance_class`, `allocated_storage_gb` and `security_group_ids` that differs
 from desired state, its `desired` and `live` values, and `modification_pending` says whether
-AWS has a pending modification. Drift is informational and is not stored. Gimme does not yet
-apply it (an existing instance is only polled by `apply_resource`).
+AWS has a pending modification. Drift is informational and is not stored. `apply_resource`
+applies it (see [Updating an existing instance](#updating-an-existing-instance)).
 
 `plan_cleanup_resource` and `apply_cleanup_resource` require the exact confirmation
 `RETAIN <name>` and are refused while a Deployment references the Resource. They remove

@@ -12,8 +12,8 @@ may contain deliberate schema and MCP API breaks.
   Resource-owned parameter group. Apply describes the live instance first and refuses a
   storage decrease, minor-version downgrade, or major mismatch (`aws_rds_modify_forbidden_*`)
   before any change; values already pending are not re-sent, so a resumed apply is safe. It
-  reboots once, without forced failover, when the parameter group is `pending-reboot`, which
-  includes the first apply after creation. A pending change to a managed field now keeps the
+  reboots once, without forced failover, when the parameter group is `pending-reboot`, as after
+  re-attaching it to an older instance. A pending change to a managed field now keeps the
   phase `pending`. `plan_apply_resource` remains local, names the disruption, and binds the
   security-group set. Privilege impact: the inspection role gains `rds:ModifyDBInstance` and
   `rds:RebootDBInstance` on `db:gimme-*` and `pg:gimme-*`; existing deployments of the policy
@@ -25,8 +25,7 @@ may contain deliberate schema and MCP API breaks.
   Deployment, and a change between managed and target-local providers, each with a fixed
   `aws_rds_update_forbidden_<field>` error. `inspect_resource` now reports secret-free `drift`
   (engine version, instance class, storage, security groups, and whether a modification is
-  pending) after a successful live read; nothing is applied to AWS. `plan_apply_resource` now
-  says an existing instance is only polled, never modified.
+  pending) after a successful live read.
 - Managed AWS RDS PostgreSQL binds now verify the server certificate: `psql` runs with
   `sslmode=verify-full` against a pinned AWS commercial-region root bundle
   (`deploy/aws-rds-global-bundle.pem`) uploaded per bind beside the secret file, checked by
