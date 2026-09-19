@@ -249,6 +249,20 @@ def _deployment_diagnostics(result: CommandResult) -> dict[str, object]:
     }
 
 
+def _bounded_marker_values(
+    output: str, prefix: str, allowed: set[str],
+) -> set[str]:
+    values: set[str] = set()
+    for line in output.splitlines():
+        marker = line.find(prefix)
+        if marker < 0:
+            continue
+        match = re.match(r"[a-z][a-z0-9_-]{0,63}", line[marker + len(prefix):])
+        if match is not None and match.group(0) in allowed:
+            values.add(match.group(0))
+    return values
+
+
 def _replace(state: ControlState, collection: str, name: str, value: object) -> ControlState:
     document = state.model_dump(mode="json")
     document[collection][name] = value.model_dump(mode="json")  # type: ignore[attr-defined]
@@ -1317,13 +1331,9 @@ def _deployment_restore_plan(
     observation = _run_deployment(
         "gimme:recovery:inspect-postgres", name, timeout=60
     )
-    states = {
-        line.split("|", 1)[1]
-        for raw in observation.output.splitlines()
-        if (line := raw.split("] ", 1)[-1].strip()).startswith(
-            "GIMME_POSTGRES_RESTORE_PREFLIGHT|"
-        )
-    }
+    states = _bounded_marker_values(
+        observation.output, "GIMME_POSTGRES_RESTORE_PREFLIGHT|", {"empty", "nonempty"}
+    )
     if len(states) != 1 or not states <= {"empty", "nonempty"}:
         raise RecoveryError("restore_destination_inspection_failed")
     try:
@@ -1611,14 +1621,10 @@ def apply_verify_restore(
                 result = _run_deployment(
                     "gimme:recovery:verify-application", name, timeout=900
                 )
-                markers = {
-                    line
-                    for raw in result.output.splitlines()
-                    if (line := raw.split("] ", 1)[-1].strip()).startswith(
-                        "GIMME_RESTORE_VERIFY|"
-                    )
-                }
-                if markers != {"GIMME_RESTORE_VERIFY|ready"}:
+                markers = _bounded_marker_values(
+                    result.output, "GIMME_RESTORE_VERIFY|", {"ready"}
+                )
+                if markers != {"ready"}:
                     raise RecoveryError("restore_verification_failed")
             except Exception:
                 quiesce_failed = False

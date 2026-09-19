@@ -79,5 +79,10 @@ jobs:
           echo "AWS_CA_BUNDLE=$RUNNER_TEMP/minio-certs/public.crt" >> "$GITHUB_ENV"
           echo "AWS_ACCESS_KEY_ID=gimme-ci" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=gimme-ci-secret" >> "$GITHUB_ENV"
-      - name: Register a Backup Destination and create an on-demand Recovery Point
+      - name: Exercise Recovery Point capture and PostgreSQL Restore
         run: uv run python tests/integration/disposable_vm_smoke.py verify-backup-destination
+      - name: Stop disposable services
+        if: always()
+        run: |
+          docker rm -f gimme-ci-minio >/dev/null 2>&1 || true
+          sudo systemctl stop caddy postgresql valkey-server ssh || true

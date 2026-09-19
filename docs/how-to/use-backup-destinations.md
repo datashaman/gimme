@@ -141,7 +141,8 @@ point as the final verified Recovery Point, also pass its exact
 Manual deletion and automatic retention have different intent. Automatic retention may
 prune only after a verified replacement exists and never below `retain_last`. Manual
 deletion is an explicit operator decision and may reduce inventory below that value.
-Neither mode may delete a Safety Recovery Point while its Restore is unresolved.
+Neither mode may delete a Safety Recovery Point or source Recovery Point while its Restore
+is unresolved.
 
 Deletion uses only exact versions named by the selected immutable manifest. It deletes
 components first and the manifest last; there is no arbitrary object or prefix deletion
@@ -149,9 +150,7 @@ interface. A partial failure leaves the point in `deletion_failed` with bounded 
 counts. Retry the original call with the same plan and confirmations; already-absent exact
 versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destination policy.
 
-## What this issue does not cover
-
-Restore, Safety Recovery Points, scheduled/systemd-timer cadences, and `retain_last`
-pruning are separate work described in
-[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md) and are not implemented by
-this tracer.
+For the PostgreSQL Restore procedure, Target-loss replacement, and failed-verification
+recovery, see [Restore a PostgreSQL Deployment](restore-a-postgresql-deployment.md).
+Scheduled/systemd-timer cadences and automatic `retain_last` pruning remain separate work
+described in [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).

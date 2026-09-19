@@ -777,6 +777,20 @@ def test_restore_plan_reports_multi_component_and_version_incompatibility(
     ]
 
 
+def test_restore_markers_survive_deployer_prefixes_and_ansi_colours() -> None:
+    output = (
+        "[integration] \x1b[39mGIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\x1b[0m\n"
+        "[integration] \x1b[32mGIMME_RESTORE_VERIFY|ready\x1b[0m\n"
+    )
+
+    assert server_module._bounded_marker_values(
+        output, "GIMME_POSTGRES_RESTORE_PREFLIGHT|", {"empty", "nonempty"}
+    ) == {"nonempty"}
+    assert server_module._bounded_marker_values(
+        output, "GIMME_RESTORE_VERIFY|", {"ready"}
+    ) == {"ready"}
+
+
 def test_restore_plan_rejects_a_changed_destination_after_request_start(
     tmp_path, monkeypatch
 ) -> None:
