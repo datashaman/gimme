@@ -53,7 +53,8 @@ PORT = 6379
 # Gimme-owned key and channel prefixes and a fixed maintenance command set.
 DEFAULT_ACCESS_STRING = "off ~* -@all"
 ADMIN_ACCESS_STRING = (
-    "on ~{gimme:* &{gimme:* -@all +ping +info +get +set +del +exists +ttl +type +scan"
+    "on ~{gimme:* &{gimme:* -@all +ping +info +get +set +del +exists +ttl +type +scan "
+    "+dump +pexpiretime +eval"
 )
 ADMIN_USER_NAME = "gimme-admin"
 # The Gimme-owned `laravel` ACL profile, version 1: only these commands, only on the
@@ -897,6 +898,32 @@ class BotoElastiCacheAdapter(AWSAdapter):
         ):
             raise ResourceError("aws_elasticache_credential_read_invalid")
         return payload
+
+    def resolve_admin_credential(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore,
+        resource_name: str,
+    ) -> dict[str, str]:
+        """Resolve the fixed administrative capture identity immediately before use."""
+        payload = self._read_secret(account, store, f"{resource_name}/_admin")
+        if set(payload) != {"username", "password"} or payload.get("username") != (
+            ADMIN_USER_NAME
+        ):
+            raise ResourceError("aws_elasticache_admin_credential_invalid")
+        return payload
+
+    def ensure_admin_capture_access(
+        self, account: AWSProviderAccount, network: AWSNetwork,
+        resource_name: str,
+    ) -> None:
+        """Converge an existing Resource's fixed admin ACL before bounded capture."""
+        client = self._client(account, network, "elasticache-capture-access")
+        try:
+            client.modify_user(
+                UserId=_derived(derive_group_id(resource_name), "admin"),
+                AccessString=ADMIN_ACCESS_STRING,
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "capture_access", self.error_prefix) from None
 
     def begin_rotation(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,

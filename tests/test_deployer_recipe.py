@@ -643,15 +643,20 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "NOPASSWD: ALL" not in recipe
     assert "SUDO_USER" in helper
     process_helper = (ROOT / "scripts" / "gimme-provision-processes").read_text()
+    recovery_helper = (ROOT / "scripts" / "gimme-recovery-maintenance").read_text()
 
     assert "len(sys.argv) != 1" in helper
     assert "len(sys.argv) != 2" in process_helper
+    assert "len(sys.argv) != 4" in recovery_helper
     assert "ALLOWED_PACKAGES" in helper
     assert "ALLOWED_SERVICES" in helper
     assert "EXPECTED_HOSTNAME" in helper
     assert "GIMME_POLICY_ID" in helper
     assert "'helper_source_sha256' => privileged_helper_source_hashes()" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-processes" in recipe
+    assert "NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *" in recipe
+    assert "maintenance is owned by another request" in recovery_helper
+    assert 'action not in {"enter", "exit"}' in recovery_helper
     assert "shell_exec" not in helper
     assert "GIMME_HELPER|" in recipe
     assert "chown {$user}:{$user}" in recipe
@@ -678,6 +683,24 @@ def test_managed_postgres_bind_uses_no_sudo_and_shreds_its_secret_file() -> None
     ), "uploads must sit inside the try so a failed upload still cleans up"
     assert "upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile)" in task
     assert "managed_postgres_bind_script" in task
+
+
+def test_valkey_recovery_capture_is_binary_safe_prefix_bounded_and_non_global() -> None:
+    recipe = deployer_source()
+    program = (ROOT / "scripts" / "gimme-capture-valkey").read_text()
+    task = recipe.split("task('gimme:backup:capture-valkey'", 1)[1].split(
+        "task('gimme:provision:app'", 1
+    )[0]
+
+    assert 'session.call("SCAN", cursor, "MATCH", prefix + b"*", "COUNT", 1000)' in program
+    assert "redis.call('DUMP',KEYS[1])" in program
+    assert "redis.call('PEXPIRETIME',KEYS[1])" in program
+    assert "base64.b64encode(result[0])" in program
+    assert "key.startswith(prefix)" in program
+    assert "GIMME_VALKEY_BACKUP|" in program
+    assert all(command not in program for command in ('"KEYS"', '"SAVE"', '"BGSAVE"', '"FLUSHALL"'))
+    assert "download($remotePath, $localPath)" in task
+    assert "rm -f " in task
 
 
 def _fake_psql(tmp_path: Path, *, fail: bool = False, message: str | None = None) -> Path:

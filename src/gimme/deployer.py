@@ -127,6 +127,9 @@ class DeployerRunner:
         secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
         backup_local_path: Path | None = None,
+        recovery_action: str | None = None,
+        recovery_request_id: str | None = None,
+        recovery_quiesce_wait: int | None = None,
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
         resource_trust_bundle_sha256: str | None = None,
@@ -211,6 +214,18 @@ class DeployerRunner:
             environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
+        if any(value is not None for value in (
+            recovery_action, recovery_request_id, recovery_quiesce_wait
+        )):
+            if (
+                recovery_action not in {"enter", "exit"}
+                or recovery_request_id is None
+                or recovery_quiesce_wait is None
+            ):
+                raise ValueError("recovery maintenance inputs must be complete")
+            environment["GIMME_RECOVERY_ACTION"] = recovery_action
+            environment["GIMME_RECOVERY_REQUEST_ID"] = recovery_request_id
+            environment["GIMME_RECOVERY_QUIESCE_WAIT"] = str(recovery_quiesce_wait)
         if resource_endpoint is not None:
             host, port = resource_endpoint
             environment["GIMME_RESOURCE_ENDPOINT"] = host

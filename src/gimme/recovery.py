@@ -7,7 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from gimme.control import (
@@ -428,6 +428,7 @@ def create_recovery_point(
     adapter: S3Adapter, deployment: str, point_id: str,
     dump: ComponentDump | list[ComponentDump], *,
     safety_restore_request_id: str | None = None,
+    before_publish: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Upload every verified component and publish one immutable manifest last."""
     existing = find_recovery_point(
@@ -509,6 +510,8 @@ def create_recovery_point(
     try:
         _validate_manifest(manifest)
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        if before_publish is not None:
+            before_publish()
     except Exception:
         cleanup_uploaded()
         raise

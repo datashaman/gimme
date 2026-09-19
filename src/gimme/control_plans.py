@@ -254,10 +254,8 @@ def recovery_point_creation_plan(
                 "postgres", *(["valkey"] if policy.valkey else [])
             ],
             "quiesce_wait_seconds": policy.quiesce_wait_seconds,
-            "ready": not policy.valkey,
-            "readiness_issues": (
-                [] if not policy.valkey else ["Valkey recovery capture is not installed"]
-            ),
+            "ready": True,
+            "readiness_issues": [],
             "effects": [
                 *(
                     [

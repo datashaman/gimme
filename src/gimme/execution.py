@@ -11,6 +11,8 @@ REQUIRED_FILES = (
     "deploy/aws-rds-global-bundle.pem",
     "scripts/gimme-provision-stack",
     "scripts/gimme-provision-processes",
+    "scripts/gimme-recovery-maintenance",
+    "scripts/gimme-capture-valkey",
     "vendor/deployer/deployer/bin/dep",
     "pyproject.toml",
     "uv.lock",

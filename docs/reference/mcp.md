@@ -254,13 +254,15 @@ migration, and failure behavior.
 
 A Deployment opts into recovery by setting `recovery.destination` to one registered
 Backup Destination name through the existing `plan_update_deployment` /
-`update_deployment` pair; a bound database resource is required. On-demand PostgreSQL
-Recovery Points are then created and listed with:
+`update_deployment` pair; a bound database resource is required. PostgreSQL is always
+selected. Valkey requires both an explicit `recovery.valkey: true` and a bound Valkey
+Resource; `quiesce_wait_seconds` defaults to 30 and is bounded from 1 through 300.
+On-demand Recovery Points are created and listed with:
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_create_recovery_point` | Read | Plan one on-demand PostgreSQL Recovery Point for a recovery-bound deployment |
-| `create_recovery_point` | Remote + destination write | Dump, upload, verify, and publish one Recovery Point |
+| `plan_create_recovery_point` | Read | Plan one on-demand Recovery Point and its selected components |
+| `create_recovery_point` | Remote + destination write | Quiesce when required, capture, upload, verify, restore runtime, and publish one Recovery Point |
 | `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 
@@ -275,8 +277,12 @@ uploaded from there with server-side encryption, because on-demand capture runs 
 MCP server is live. (Scheduled, systemd-timer-driven capture is separate, future work and
 may instead use the Target's own ambient or credential-referenced identity, per
 [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).) The component upload is
-verified against its declared SHA-256 before the immutable Recovery Manifest is published;
-a failed or partial upload is cleaned up rather than left dangling. `list_recovery_points`
+verified against its declared SHA-256 before the immutable Recovery Manifest is published.
+For a Valkey-inclusive point, only the selected Deployment route and registered managed
+writers are quiesced; a binary-safe bounded scan captures only its registered prefix with
+absolute expiry timestamps. Normal runtime is restored after every component upload is
+verified and before the sole manifest is published. A failed or partial capture or upload
+publishes no manifest and is cleaned up rather than left dangling. `list_recovery_points`
 reads manifests directly from the bound destination — authoritative even if the owning
 Target is gone — and rejects (without failing the whole call) any manifest whose
 referenced component object no longer matches its declared checksum.

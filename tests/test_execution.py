@@ -13,6 +13,8 @@ def write_execution_tree(root: Path) -> None:
         "deploy/configuration.php": "configuration-v1\n",
         "scripts/gimme-provision-stack": "stack-helper-v1\n",
         "scripts/gimme-provision-processes": "process-helper-v1\n",
+        "scripts/gimme-recovery-maintenance": "recovery-helper-v1\n",
+        "scripts/gimme-capture-valkey": "valkey-capture-v1\n",
         "vendor/deployer/deployer/bin/dep": "deployer-bin-v1\n",
         "vendor/deployer/deployer/src/functions.php": "deployer-functions-v1\n",
         "pyproject.toml": "python-project-v1\n",

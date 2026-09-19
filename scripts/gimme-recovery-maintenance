@@ -1,0 +1,262 @@
+#!/usr/bin/python3
+# GIMME_POLICY_ID=__GIMME_POLICY_ID__
+"""Enter or exit request-owned maintenance for one registered Deployment."""
+
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+STACK_STATE = EXPECTED_APPS_ROOT / ".gimme" / "stack.json"
+PROCESS_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "processes"
+REQUEST_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "recovery-requests"
+MARKER_ROOT = Path("/var/lib/gimme/recovery")
+CADDY_ROOT = Path("/etc/caddy/gimme")
+CADDYFILE = Path("/etc/caddy/Caddyfile")
+IDENTITY = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
+REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+DNS_NAME = re.compile(
+    r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$"
+)
+UNIT = re.compile(
+    r"^gimme-(?:worker-[a-z0-9-]+@[1-9][0-9]*|horizon-[a-z0-9-]+|"
+    r"scheduler-[a-z0-9-]+)\.(?:service|timer)$"
+)
+EXECUTABLES = {
+    "caddy": "/usr/bin/caddy",
+    "sleep": "/usr/bin/sleep",
+    "systemctl": "/usr/bin/systemctl",
+}
+MAX_STATE_BYTES = 64 * 1024
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def run(command: list[str]) -> None:
+    if not command or command[0] not in EXECUTABLES:
+        fail("maintenance helper attempted an unexpected executable")
+    subprocess.run(  # nosec B603
+        [EXECUTABLES[command[0]], *command[1:]], check=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def succeeds(command: list[str]) -> bool:
+    if not command or command[0] != "systemctl":
+        fail("maintenance helper attempted an unexpected observation")
+    return subprocess.run(  # nosec B603
+        [EXECUTABLES["systemctl"], *command[1:]], check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def atomic_write(path: Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def load_json(path: Path, owner: int) -> dict[str, Any]:
+    if path.is_symlink():
+        fail("maintenance authority must not be a symlink")
+    details = path.stat()
+    if (
+        not stat.S_ISREG(details.st_mode) or details.st_uid != owner
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size > MAX_STATE_BYTES
+    ):
+        fail("maintenance authority is not a protected regular file")
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        fail("maintenance authority must be an object")
+    return value
+
+
+def selected_units(instance: str, process: dict[str, Any]) -> list[str]:
+    units: list[str] = []
+    workers = process.get("workers")
+    if isinstance(workers, dict) and workers.get("enabled") is True:
+        if workers.get("driver") == "queue" and isinstance(workers.get("processes"), int):
+            count = workers["processes"]
+            if isinstance(count, bool) or not 1 <= count <= 16:
+                fail("invalid queue process count")
+            units.extend(
+                f"gimme-worker-{instance}@{index}.service"
+                for index in range(1, count + 1)
+            )
+        elif workers.get("driver") == "horizon":
+            units.append(f"gimme-horizon-{instance}.service")
+        else:
+            fail("invalid managed worker policy")
+    scheduler = process.get("scheduler")
+    if isinstance(scheduler, dict) and scheduler.get("enabled") is True:
+        units.extend([
+            f"gimme-scheduler-{instance}.service",
+            f"gimme-scheduler-{instance}.timer",
+        ])
+    if any(UNIT.fullmatch(unit) is None for unit in units):
+        fail("derived an invalid managed process unit")
+    return sorted(units)
+
+
+def load_authority(instance: str, request_id: str, owner: int, sudo_user: str) -> dict[str, Any]:
+    stack = load_json(STACK_STATE, owner)
+    process = load_json(PROCESS_ROOT / f"{instance}.json", owner)
+    request = load_json(REQUEST_ROOT / f"{instance}.json", owner)
+    sites = stack.get("sites")
+    site = sites.get(instance) if isinstance(sites, dict) else None
+    wait = request.get("quiesce_wait_seconds")
+    if (
+        stack.get("remote_user") != sudo_user
+        or process.get("application") != instance
+        or process.get("remote_user") != sudo_user
+        or request.get("deployment") != instance
+        or request.get("request_id") != request_id
+        or not isinstance(wait, int) or isinstance(wait, bool) or not 1 <= wait <= 300
+        or not isinstance(site, dict)
+        or not isinstance(site.get("site_host"), str)
+        or DNS_NAME.fullmatch(site["site_host"]) is None
+    ):
+        fail("maintenance authority identity mismatch")
+    return {
+        "site_host": site["site_host"],
+        "site_path": CADDY_ROOT / f"{instance}.caddy",
+        "units": selected_units(instance, process),
+        "wait_seconds": wait,
+    }
+
+
+def marker_paths(instance: str) -> tuple[Path, Path]:
+    return MARKER_ROOT / f"{instance}.json", MARKER_ROOT / f"{instance}.caddy"
+
+
+def read_marker(instance: str) -> dict[str, Any] | None:
+    marker_path, _backup = marker_paths(instance)
+    if not marker_path.exists():
+        return None
+    value = load_json(marker_path, os.geteuid())
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "deployment", "request_id", "active_units"}
+        or value.get("schema_version") != 1
+        or value.get("deployment") != instance
+        or not isinstance(value.get("request_id"), str)
+        or not isinstance(value.get("active_units"), list)
+        or any(not isinstance(unit, str) or UNIT.fullmatch(unit) is None
+               for unit in value["active_units"])
+    ):
+        fail("maintenance marker is invalid")
+    return value
+
+
+def reload_caddy() -> None:
+    run(["caddy", "validate", "--config", str(CADDYFILE), "--adapter", "caddyfile"])
+    run(["systemctl", "reload", "caddy"])
+
+
+def enter(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+    authority = load_authority(instance, request_id, owner, sudo_user)
+    marker_path, backup_path = marker_paths(instance)
+    marker = read_marker(instance)
+    if marker is not None and marker["request_id"] != request_id:
+        fail("maintenance is owned by another request")
+    site_path = authority["site_path"]
+    if marker is None:
+        if site_path.is_symlink() or not site_path.is_file():
+            fail("deployment route is not a regular file")
+        original = site_path.read_bytes()
+        if len(original) > MAX_STATE_BYTES:
+            fail("deployment route is too large")
+        active = [
+            unit for unit in authority["units"]
+            if succeeds(["systemctl", "is-active", "--quiet", unit])
+        ]
+        atomic_write(backup_path, original, 0o600)
+        atomic_write(marker_path, json.dumps({
+            "schema_version": 1, "deployment": instance,
+            "request_id": request_id, "active_units": active,
+        }, sort_keys=True, separators=(",", ":")).encode(), 0o600)
+    else:
+        active = marker["active_units"]
+    maintenance = f"{authority['site_host']} {{\n\trespond 503\n}}\n".encode()
+    atomic_write(site_path, maintenance, 0o644)
+    reload_caddy()
+    run(["sleep", str(authority["wait_seconds"])])
+    for unit in authority["units"]:
+        if succeeds(["systemctl", "is-active", "--quiet", unit]):
+            run(["systemctl", "stop", unit])
+        if succeeds(["systemctl", "is-active", "--quiet", unit]):
+            fail("managed process did not stop")
+
+
+def exit_maintenance(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+    authority = load_authority(instance, request_id, owner, sudo_user)
+    marker_path, backup_path = marker_paths(instance)
+    marker = read_marker(instance)
+    if marker is None or marker["request_id"] != request_id:
+        fail("maintenance is owned by another request")
+    for unit in sorted(marker["active_units"]):
+        run(["systemctl", "start", unit])
+        if not succeeds(["systemctl", "is-active", "--quiet", unit]):
+            fail("managed process did not restart")
+    if backup_path.is_symlink() or not backup_path.is_file():
+        fail("maintenance route backup is invalid")
+    backup = backup_path.stat()
+    if (
+        backup.st_uid != os.geteuid()
+        or backup.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or backup.st_size > MAX_STATE_BYTES
+    ):
+        fail("maintenance route backup is invalid")
+    atomic_write(authority["site_path"], backup_path.read_bytes(), 0o644)
+    reload_caddy()
+    marker_path.unlink()
+    backup_path.unlink()
+
+
+def main() -> None:
+    if os.geteuid() != 0 or len(sys.argv) != 4:
+        fail("maintenance helper requires fixed action, Deployment, and request identity")
+    action, instance, request_id = sys.argv[1:]
+    if action not in {"enter", "exit"} or IDENTITY.fullmatch(instance) is None or (
+        REQUEST_ID.fullmatch(request_id) is None
+    ):
+        fail("invalid maintenance request")
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if not sudo_user:
+        fail("missing sudo caller")
+    owner = pwd.getpwnam(sudo_user).pw_uid
+    (enter if action == "enter" else exit_maintenance)(
+        instance, request_id, owner, sudo_user
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
+        print("GIMME_RECOVERY_MAINTENANCE_FAILED|maintenance_failed", file=sys.stderr)
+        raise SystemExit(1) from None

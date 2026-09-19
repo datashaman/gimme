@@ -203,6 +203,74 @@ def ssh_python(program: str) -> None:
     )
 
 
+def ssh_python_output(program: str) -> str:
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", HOSTNAME, "python3", "-"],
+        input=program,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def seed_recovery_valkey_state() -> dict[str, object]:
+    """Seed two Deployment prefixes with binary, persistent, expiring, and expired keys."""
+    output = ssh_python_output(textwrap.dedent(
+        """
+        import base64
+        import json
+        import socket
+        import time
+
+        connection = socket.create_connection(("127.0.0.1", 6379), timeout=10)
+        reader = connection.makefile("rb")
+
+        def call(*arguments):
+            parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+            connection.sendall(
+                b"*%d\\r\\n" % len(parts)
+                + b"".join(b"$%d\\r\\n%s\\r\\n" % (len(item), item) for item in parts)
+            )
+            line = reader.readline()
+            kind, value = line[:1], line[1:-2]
+            if kind == b"+":
+                return value
+            if kind == b":":
+                return int(value)
+            if kind == b"$":
+                size = int(value)
+                if size < 0:
+                    return None
+                return reader.read(size + 2)[:-2]
+            raise RuntimeError("unexpected Valkey response")
+
+        binary_key = b"gimme:smoke-default:\\x00binary"
+        persistent_key = b"gimme:smoke-default:persistent"
+        expiring_key = b"gimme:smoke-default:expiring"
+        expired_key = b"gimme:smoke-default:expired"
+        unrelated_key = b"gimme:smoke-preview:unrelated"
+        call("SET", binary_key, b"\\x00binary-value\\xff")
+        call("SET", persistent_key, b"persistent")
+        call("SET", expiring_key, b"expiring", "PX", 3600000)
+        call("SET", expired_key, b"expired", "PX", 1)
+        call("SET", unrelated_key, b"must-not-appear")
+        time.sleep(0.05)
+        expected = {}
+        for key in (binary_key, persistent_key, expiring_key):
+            expected[base64.b64encode(key).decode()] = {
+                "dump": base64.b64encode(call("DUMP", key)).decode(),
+                "expiry": call("PEXPIRETIME", key),
+            }
+        print(json.dumps({
+            "expected": expected,
+            "expired": base64.b64encode(expired_key).decode(),
+            "unrelated": base64.b64encode(unrelated_key).decode(),
+        }))
+        """
+    ))
+    return json.loads(output)
+
+
 def observed_version(output: str, pattern: str, name: str) -> str:
     match = re.search(pattern, output)
     if match is None:
@@ -361,11 +429,14 @@ def verify_backup_destination() -> None:
     from gimme.control import DeploymentRegistration, RecoveryPolicy
 
     proposed = DeploymentRegistration.from_deployment(current).model_copy(
-        update={"recovery": RecoveryPolicy(destination=BACKUP_DESTINATION)}
+        update={"recovery": RecoveryPolicy(
+            destination=BACKUP_DESTINATION, valkey=True, quiesce_wait_seconds=1,
+        )}
     )
     update_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
     gimme.update_deployment(RECOVERY_DEPLOYMENT, proposed, str(update_plan["plan_id"]))
 
+    seeded = seed_recovery_valkey_state()
     plan = gimme.plan_create_recovery_point(RECOVERY_DEPLOYMENT, "ci-smoke-1")
     result = gimme.create_recovery_point(
         RECOVERY_DEPLOYMENT, "ci-smoke-1", str(plan["plan_id"])
@@ -390,13 +461,42 @@ def verify_backup_destination() -> None:
     if inventory["rejected"]:
         raise AssertionError(f"inventory unexpectedly rejected a manifest: {inventory}")
 
+    point_id = result["recovery_point"]["recovery_point_id"]
+    valkey_key = f"gimme/recovery-points/{RECOVERY_DEPLOYMENT}/{point_id}/valkey.dump"
+    archive = minio_client().get_object(Bucket=BACKUP_BUCKET, Key=valkey_key)["Body"].read()
+    records = [json.loads(line) for line in archive.splitlines()[1:]]
+    captured = {record["key"]: record for record in records}
+    expected = seeded["expected"]
+    if set(captured) != set(expected):
+        raise AssertionError("Valkey archive did not isolate the selected Deployment prefix")
+    for key, metadata in expected.items():
+        if captured[key]["dump"] != metadata["dump"]:
+            raise AssertionError("Valkey archive did not preserve a binary DUMP payload")
+        expected_expiry = metadata["expiry"]
+        actual_expiry = captured[key]["expires_at_ms"]
+        if expected_expiry == -1 and actual_expiry is not None:
+            raise AssertionError("persistent Valkey key became expiring")
+        if expected_expiry > 0 and actual_expiry != expected_expiry:
+            raise AssertionError("absolute Valkey expiry changed during capture")
+    if seeded["expired"] in captured or seeded["unrelated"] in captured:
+        raise AssertionError("expired or unrelated Valkey key appeared in the archive")
+
+    route_status = ssh(
+        "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+        f"http://{RECOVERY_DEPLOYMENT}.gimme-ci.local",
+    )
+    if route_status == "503":
+        raise AssertionError("Recovery Point capture left the Deployment in maintenance")
+    for service in ("postgresql", "valkey-server", "caddy"):
+        if "Active: active" not in str(gimme.target_service_status(TARGET, service)["output"]):
+            raise AssertionError(f"{service} was not running after recovery capture")
+
     tamper_component(
         "gimme/recovery-points/"
         f"{RECOVERY_DEPLOYMENT}/{result['recovery_point']['recovery_point_id']}/postgres.dump"
     )
     tampered_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
     tampered_ids = {item["recovery_point_id"] for item in tampered_inventory["recovery_points"]}
-    point_id = result["recovery_point"]["recovery_point_id"]
     if point_id in tampered_ids:
         raise AssertionError(f"tampered component was not rejected: {tampered_inventory}")
     if point_id not in tampered_inventory["rejected"]:
