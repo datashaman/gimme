@@ -5,6 +5,21 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added destruction of a managed `aws_elasticache_valkey` Resource with separate authority (slice 6
+  of #14). `AWSProviderAccount` gains an optional `destructive_role_arn` (same account, distinct
+  from the inspection and resolver roles), assumed only while applying a destruction and never
+  while planning, registering, or inspecting. `plan_destroy_resource` (local, secret-free) and
+  `apply_destroy_resource` (exact confirmation `DESTROY RESOURCE <name>`) delete the replication
+  group with a final snapshot, then the user group, users, parameter group, and subnet group Gimme
+  created, then the local registration. It requires no referencing Deployment or live allocation,
+  a prior observation, and a live group with the planned identity and ownership tag; each
+  dependent's ownership tag is checked before it is deleted, an already-missing object counts as
+  done, and a group still deleting after 30 seconds returns `phase: deleting` so the same call
+  resumes. A destruction in progress blocks provisioning and binding. The final snapshot, manual
+  snapshots, and workload secrets are retained. New `plan_forget_resource` and
+  `apply_forget_resource` (`FORGET <name>`) delete a Retained Resource tombstone, RDS or Valkey,
+  locally only. Privilege impact: a new optional role needs the delete statement documented in the
+  ElastiCache how-to; no existing role changes. Not verified against a live account.
 - Added the `laravel-cluster-v1` application contract and pre-switchover probes for a Deployment
   bound to a managed `aws_elasticache_valkey` Resource (slice 5 of #14). Gimme injects protected
   `GIMME_VALKEY_*` values (TLS cluster endpoint, fixed client settings with bounded retry and

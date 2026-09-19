@@ -32,7 +32,7 @@ from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
-    valkey_binding_plan,
+    resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
     valkey_provision_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
@@ -1546,6 +1546,97 @@ def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
         resources_postgres_module.retain_resource(store.root, name, resource.aws_network)
     store.save(_delete(state, "resources", name))
     return {"changed": True, "resource": name, "retained": retained}
+
+
+def _resource_destroy_plan(name: str) -> dict[str, object]:
+    state = store.load()
+    resource = state.resources.get(name)
+    if not isinstance(resource, AWSElastiCacheValkeyResource):
+        raise ValueError(f"resource {name} is not a managed ElastiCache Valkey resource")
+    if any(
+        getattr(deployment.resources.valkey, "resource", None) == name
+        for deployment in state.deployments.values()
+    ):
+        raise ValueError(f"resource {name} is still referenced by a deployment")
+    observed = resources_valkey_module.load_observed(store.root, name)
+    if observed is not None and set(cast(dict[str, object], observed["allocations"])) & set(
+        state.deployments
+    ):
+        raise ResourceError("aws_elasticache_destroy_bindings_remain")
+    account = state.provider_accounts[state.aws_networks[resource.aws_network].provider_account]
+    if account.destructive_role_arn is None:
+        raise ResourceError("aws_elasticache_destroy_role_missing")
+    fingerprint, users = resources_valkey_module.destruction_targets(store.root, name)
+    return valkey_destroy_plan(
+        name, fingerprint,
+        resources_valkey_module.final_snapshot_id(
+            resources_valkey_module.derive_group_id(name), fingerprint
+        ),
+        len(users),
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("destroy_resource", "name")
+def plan_destroy_resource(name: Name) -> dict[str, object]:
+    """Plan destroying a managed ElastiCache Valkey Resource and its data, keeping a final
+    snapshot. Reads only local state; the destructive role is never assumed while planning."""
+    return _resource_destroy_plan(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("destroy_resource", "name")
+def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
+    """Irreversibly delete the replication group (with a final snapshot) and what Gimme created
+    around it, using the Provider Account's destructive role. A group still deleting after 30
+    seconds returns phase 'deleting'; repeat the same call to continue."""
+    expected = _resource_destroy_plan(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    state = store.load()
+    resource = cast(AWSElastiCacheValkeyResource, state.resources[name])
+    network = state.aws_networks[resource.aws_network]
+    result = resources_valkey_module.apply_destroy(
+        elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
+        network, name, str(expected["identity_fingerprint"]),
+    )
+    if result["destroyed"]:
+        # Reloaded: the destruction can outlast other edits to desired state.
+        store.save(_delete(store.load(), "resources", name))
+    return {"changed": True, **result}
+
+
+def _resource_forget_plan(name: str) -> dict[str, object]:
+    if name in store.load().resources:
+        raise ValueError(f"resource {name} is still registered; only a retained one is forgotten")
+    try:
+        retained = resources_postgres_module.load_retained(store.root, name) is not None
+    except ResourceError:
+        retained = True  # a corrupt tombstone can still be forgotten
+    if not retained:
+        raise KeyError(f"no retained resource named '{name}'")
+    return resource_forget_plan(name)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("forget_resource", "name")
+def plan_forget_resource(name: Name) -> dict[str, object]:
+    """Plan deleting a Retained Resource tombstone. Local only."""
+    return _resource_forget_plan(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("forget_resource", "name")
+def apply_forget_resource(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
+    """Delete a Retained Resource tombstone after exact confirmation. The infrastructure it
+    named is not touched and cannot be adopted again."""
+    expected = _resource_forget_plan(name)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    resources_postgres_module.forget_retained(store.root, name)
+    return {"changed": True, "resource": name}
 
 
 @mcp.tool(annotations=WRITE)

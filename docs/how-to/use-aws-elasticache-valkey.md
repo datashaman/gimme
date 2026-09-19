@@ -11,15 +11,17 @@ Implemented: registering the Resource, provisioning one replication group (with 
 group, parameter group, user group, and administrative user), reviewed updates and drift,
 live inspection with fixed readiness codes, typed Deployment bindings with a per-Deployment ACL
 user, namespace, and credential, the `laravel-cluster-v1` application contract with its
-pre-switchover probes, and retention-by-default removal.
+pre-switchover probes, retention-by-default removal, forgetting a retained tombstone, and
+destruction with a separate destructive role.
 
-Not implemented yet (tracked in #14): destruction, snapshots and restore, and credential
-rotation. The disposable Laravel test suite the ADR calls for (cache, session, queue, and
+Not implemented yet (tracked in #14): snapshot inventory and restore, and credential rotation.
+The disposable Laravel test suite the ADR calls for (cache, session, queue, and
 Horizon driven through a real Laravel application, and ACL denials seen from it) does not
 exist yet; the probes below use the Redis protocol directly.
 
 The AWS calls have only been exercised against botocore stubs. Nothing here has run against a
-live account, so the IAM statement and the ACL access strings below are unverified.
+live account, so the IAM statements (destructive role included) and the ACL access strings below
+are unverified.
 
 ## Prerequisites
 
@@ -98,6 +100,42 @@ Four read-only calls do not support resource-level permissions, so they need `"R
 The administrative user's secret is written with the existing `WorkloadSecrets` statement from
 the RDS page, so the Secret Store prefix must match it. The IAM statements are not yet verified
 against a live account.
+
+The **destructive role** is a third, optional role on the Provider Account
+(`destructive_role_arn`, in the same account and distinct from the other two). It is assumed only
+while applying a confirmed destruction, never while planning, registering, updating, or
+inspecting, so registering it does not test it. Give it only these deletes, and let only a person
+assume it (for example behind an MFA condition):
+
+```json
+{
+  "Sid": "ElastiCacheDestroyGimmeOwned",
+  "Effect": "Allow",
+  "Action": [
+    "elasticache:DeleteReplicationGroup",
+    "elasticache:CreateSnapshot",
+    "elasticache:DeleteUserGroup",
+    "elasticache:DeleteUser",
+    "elasticache:DeleteCacheParameterGroup",
+    "elasticache:DeleteCacheSubnetGroup"
+  ],
+  "Resource": [
+    "arn:aws:elasticache:<region>:<account>:replicationgroup:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:cluster:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:snapshot:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:usergroup:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:user:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:parametergroup:gimme-*",
+    "arn:aws:elasticache:<region>:<account>:subnetgroup:gimme-*"
+  ]
+}
+```
+
+Privilege impact: this is the only Gimme role that can delete anything, and it can delete any
+`gimme-*` ElastiCache object in the account, so Gimme's own checks (below) are the second line of
+defense, not the only one. It has no Secrets Manager permission: destruction never deletes
+secrets. Whether the final snapshot needs `CreateSnapshot` on the snapshot resource, and whether
+deleting a `default`-named user is allowed, are unverified.
 
 ## Register the Resource
 
@@ -304,6 +342,52 @@ Redis adapters, and they have only run against a local TLS, cluster-mode, ACL-en
 not against ElastiCache. Whether real Laravel and Horizon traffic stays inside the `laravel-v1`
 command profile is unverified.
 
+## Destroy a Resource
+
+`plan_destroy_resource` then `apply_destroy_resource` permanently deletes the replication group
+and its data, and what Gimme created around it: the user group, the default, administrative, and
+per-Deployment users, the parameter group, and the subnet group. Then it removes the local
+registration. Nothing else changes, and there is no tombstone because nothing is retained.
+
+Preconditions, all checked again at apply:
+
+- the Provider Account has a `destructive_role_arn` (`aws_elasticache_destroy_role_missing`);
+- no Deployment references the Resource, and the observation records no allocation for a
+  Deployment that still exists (`aws_elasticache_destroy_bindings_remain`);
+- the Resource has been provisioned and observed (`aws_elasticache_destroy_not_observed`; run
+  `inspect_resource` to refresh a lost cache);
+- the live group is the one that was planned: the same identity as observed when the plan was
+  made (`aws_elasticache_destroy_identity_changed`, and a changed observation makes the plan
+  stale), it carries this Resource's ownership tag (`aws_elasticache_group_ownership_mismatch`),
+  and it is `available` or already `deleting` (`aws_elasticache_destroy_invalid_state`);
+- the exact confirmation `DESTROY RESOURCE <name>`.
+
+Planning reads only local state, and `plan_destroy_resource` lists what is destroyed and what is
+retained. The group is deleted with a final snapshot named `<group>-final-<8 hex>`, derived from
+the group's identity so a retry never creates a second one; a name that already exists fails with
+`aws_elasticache_destroy_group_snapshot_exists`. **The final snapshot, manual snapshots, and the
+workload secrets (the administrative secret and each Deployment's credential) are retained and keep
+costing money until you delete them.** A later Resource of the same name reuses and overwrites those
+secrets.
+
+Deleting a group takes minutes, so apply polls for 30 seconds and returns `phase: deleting`. Repeat
+the same call, with the same plan, to continue: it deletes nothing twice, then removes the
+dependents in dependency order, reading each object's `gimme:resource` tag with the inspection role
+before deleting it with the destructive role (`aws_elasticache_destroy_ownership_mismatch` stops the
+sequence for an object that is not this Resource's). An object that is already gone counts as done.
+A user whose binding crashed before its allocation was recorded is not known to Gimme and is left;
+delete it yourself. While a destruction is in progress the Resource cannot be provisioned or bound again
+(`aws_elasticache_destroy_in_progress`). A failure part-way leaves the registration and the
+progress marker in place, and the same call resumes. `apply_cleanup_resource` abandons a stuck
+destruction and retains what is left.
+
+## Forget a retained tombstone
+
+`plan_cleanup_resource` and `apply_cleanup_resource` retain the infrastructure and write a
+tombstone. `plan_forget_resource` and `apply_forget_resource` (confirmation `FORGET <name>`) delete
+only that local file, and only when no Resource of that name is registered. They make no AWS call
+and do not make the retained group adoptable again; to delete it, use the AWS console or CLI. It works for RDS tombstones too.
+
 ## Security group
 
 `inspect_resource` and every describe read the inbound rules of the group's security group
@@ -324,7 +408,8 @@ with a bounded `refresh_error`.
 `plan_cleanup_resource` and `apply_cleanup_resource` require `RETAIN <name>` and remove only the
 local registration, writing a Retained Resource tombstone. The replication group, its data,
 snapshots, users, secrets, and the subnet and parameter groups remain in AWS and keep costing
-money until you delete them yourself. Destruction is a later slice.
+money until you delete them yourself. To delete them through Gimme instead, use
+[Destroy a Resource](#destroy-a-resource) before removing the registration.
 
 ## Failure codes
 

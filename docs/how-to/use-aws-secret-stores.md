@@ -16,6 +16,10 @@ ARNs:
 - the resolver role permits `secretsmanager:GetSecretValue` for that namespace and, when
   selected, `kms:Decrypt` for one exact customer-managed key.
 
+A Provider Account may also carry an optional third `destructive_role_arn`, used only to
+apply confirmed destructions (see the ElastiCache how-to); it is never assumed while
+registering, planning, or resolving.
+
 The ambient identity must be able to assume both roles. Registration assumes each role and
 verifies the resulting account identity. Planning code assumes only the inspection role.
 Apply assumes the resolver role only after metadata has been revalidated against the plan.

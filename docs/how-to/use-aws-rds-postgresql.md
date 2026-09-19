@@ -20,7 +20,8 @@ Not implemented yet:
 - runtime wiring of a managed database into a Deployment. A Deployment whose database
   binding is a managed Resource is fenced off: `plan_deployment_resources` reports a
   readiness issue, `plan_deployment` refuses, and Recovery Points reject it;
-- workload credential rotation, Detached Allocation rebind, and Retained Resource forget;
+- workload credential rotation and Detached Allocation rebind (`plan_forget_resource` does
+  delete an RDS Retained Resource tombstone, locally only);
 - destructive deletion. Removal never deletes the instance;
 - major-version upgrades, storage decreases, backup and maintenance-window policy, and moving
   a Resource to another Network or region, all of which need a new Resource.

@@ -146,6 +146,10 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
+| `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey Resource and its data; reads only local state and never assumes the destructive role |
+| `apply_destroy_resource` | Remote write (destructive) | Delete the replication group with a final snapshot and what Gimme created around it, through the Provider Account's destructive role, after exact confirmation `DESTROY RESOURCE <name>` |
+| `plan_forget_resource` | Read | Plan deleting a Retained Resource tombstone |
+| `apply_forget_resource` | Local write | Delete the tombstone after exact confirmation `FORGET <name>`; the retained infrastructure is untouched |
 
 `apply_resource` creates the instance with `ManageMasterUserPassword=True` so the master
 credential is generated and stored by AWS, never by Gimme, and polls for at most 30
@@ -163,7 +167,8 @@ against a pinned AWS trust bundle (`us-gov-*` and `cn-*` regions are refused whe
 planning or applying a managed Resource), and stores a
 generation-1 workload credential as a tagged Secrets Manager secret — the response
 contains only the `{store, secret}` reference. Workload credential rotation, Detached
-Allocation rebind, and the Retained Resource "forget" workflow are not implemented yet.
+Allocation rebind is not implemented yet. A tombstone is deleted only by
+`apply_forget_resource`, which never touches AWS.
 
 Runtime wiring of a managed database into a Deployment is not implemented yet, so a
 Deployment whose database binding is a managed Resource is fenced off rather than half
@@ -175,8 +180,9 @@ to the Deployer recipe.
 `apply_cleanup_resource` is non-destructive by default: a managed AWS RDS resource is
 left running with its data intact, and Gimme instead writes a secret-free Retained
 Resource tombstone recording the resource's AWS Network so it can be re-adopted later;
-only the local registration is removed. Destructive instance deletion is a deliberately
-separate, not-yet-implemented capability. Cleanup is refused while any Deployment still
+only the local registration is removed. Destructive RDS instance deletion is a deliberately
+separate, not-yet-implemented capability; an ElastiCache Valkey Resource can be destroyed with
+`plan_destroy_resource` and `apply_destroy_resource` (see its how-to). Cleanup is refused while any Deployment still
 references the resource.
 
 ## Target and runtime tools
