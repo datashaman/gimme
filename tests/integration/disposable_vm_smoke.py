@@ -567,13 +567,6 @@ def verify_postgres_restore(gimme) -> None:
     )
     install_restore_fixture()
     set_restore_probe("before")
-    capture = gimme.plan_create_recovery_point(
-        RECOVERY_DEPLOYMENT, "ci-postgres-source"
-    )
-    created = gimme.create_recovery_point(
-        RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
-    )
-    point_id = str(created["recovery_point"]["recovery_point_id"])
 
     state = gimme.store.load()
     resource = state.resources["integration-postgres"]
@@ -584,15 +577,32 @@ def verify_postgres_restore(gimme) -> None:
     gimme.update_resource(
         "integration-postgres", incompatible, str(version_plan["plan_id"])
     )
-    rejected = gimme.plan_restore_deployment(
-        RECOVERY_DEPLOYMENT, point_id, "ci-version-reject"
+    incompatible_capture = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-version-source"
     )
-    if rejected["readiness_issues"] != ["source_version_incompatible"]:
-        raise AssertionError(f"exact-version mismatch was not rejected: {rejected}")
+    incompatible_created = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-version-source", str(incompatible_capture["plan_id"])
+    )
+    incompatible_point_id = str(
+        incompatible_created["recovery_point"]["recovery_point_id"]
+    )
     revert_plan = gimme.plan_update_resource("integration-postgres", resource)
     gimme.update_resource(
         "integration-postgres", resource, str(revert_plan["plan_id"])
     )
+    rejected = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, incompatible_point_id, "ci-version-reject"
+    )
+    if rejected["readiness_issues"] != ["source_version_incompatible"]:
+        raise AssertionError(f"exact-version mismatch was not rejected: {rejected}")
+
+    capture = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-postgres-source"
+    )
+    created = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
+    )
+    point_id = str(created["recovery_point"]["recovery_point_id"])
 
     set_restore_probe("after")
     restore = gimme.plan_restore_deployment(

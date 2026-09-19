@@ -81,3 +81,8 @@ jobs:
           echo "AWS_SECRET_ACCESS_KEY=gimme-ci-secret" >> "$GITHUB_ENV"
       - name: Exercise Recovery Point capture and PostgreSQL Restore
         run: uv run python tests/integration/disposable_vm_smoke.py verify-backup-destination
+      - name: Stop disposable services
+        if: always()
+        run: |
+          docker rm -f gimme-ci-minio >/dev/null 2>&1 || true
+          sudo systemctl stop caddy postgresql valkey-server ssh || true
