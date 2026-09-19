@@ -59,7 +59,11 @@ database) cannot bind recovery either.
 
 ```json
 {
-  "recovery": {"destination": "primary"}
+  "recovery": {
+    "destination": "primary",
+    "valkey": false,
+    "quiesce_wait_seconds": 30
+  }
 }
 ```
 

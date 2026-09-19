@@ -574,6 +574,22 @@ class RecoveryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     destination: str = Field(pattern=BACKUP_DESTINATION_NAME.pattern)
+    valkey: bool = False
+    quiesce_wait_seconds: int = Field(default=30, ge=1, le=300)
+
+    @field_validator("quiesce_wait_seconds", mode="before")
+    @classmethod
+    def strict_quiesce_wait(cls, value: object) -> object:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("quiesce_wait_seconds must be an integer")
+        return value
+
+    @field_validator("valkey", mode="before")
+    @classmethod
+    def strict_valkey_selection(cls, value: object) -> object:
+        if not isinstance(value, bool):
+            raise ValueError("valkey must be a boolean")
+        return value
 
 
 def _looks_like_ip(value: str) -> bool:
@@ -1000,6 +1016,10 @@ class ControlState(BaseModel):
                 if not has_database:
                     raise ValueError(
                         f"deployment {name} requires a bound database to enable recovery"
+                    )
+                if deployment.recovery.valkey and not has_valkey:
+                    raise ValueError(
+                        f"deployment {name} requires a bound Valkey resource for Valkey recovery"
                     )
             if not is_static and (
                 not has_database or not has_valkey

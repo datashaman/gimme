@@ -219,7 +219,9 @@
         "valkey": {"resource": "devbox-valkey", "uses": ["cache"]}
       },
       "recovery": {
-        "destination": "primary"
+        "destination": "primary",
+        "valkey": false,
+        "quiesce_wait_seconds": 30
       },
       "placement": {
         "instance": "example-local",
