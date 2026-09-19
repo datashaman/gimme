@@ -988,6 +988,17 @@ def test_an_available_instance_with_a_matching_pending_change_is_polled_not_remo
     assert result["phase"] == "pending", "a pending managed change holds readiness"
 
 
+def test_an_unsettled_instance_is_diffed_after_it_settles_not_reported_ready_with_drift(
+    tmp_path: Path,
+) -> None:
+    adapter = ConvergingAdapter(live_instance(status="modifying"), settle_polls=1)
+
+    result = converge(adapter, tmp_path, instance_class="db.m6g.large")
+
+    assert adapter.modify_calls == [{"DBInstanceClass": "db.m6g.large"}]
+    assert result["modified_fields"] == ["DBInstanceClass"] and result["phase"] == "ready"
+
+
 def test_a_parameter_group_pending_reboot_triggers_exactly_one_reboot(tmp_path: Path) -> None:
     adapter = ConvergingAdapter(live_instance(parameter_group_status="pending-reboot"))
 

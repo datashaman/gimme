@@ -695,19 +695,6 @@ def apply_provision(
     security_group_ids = list(desired_security_group_ids(resource))
     modified_fields: list[str] = []
     rebooted = False
-    observed = adapter.describe_instance(account, network, aws_instance_identifier)
-    if observed is None:
-        observed = adapter.create_instance(
-            account, network, resource, resource_name, aws_instance_identifier,
-            security_group_ids,
-        )
-    elif observed.status == "available":
-        changes = modification_for(resource, observed, aws_instance_identifier)
-        if changes:
-            observed = adapter.modify_instance(
-                account, network, resource, resource_name, aws_instance_identifier, changes
-            )
-            modified_fields = sorted(changes)
     deadline = now() + POLL_BUDGET_SECONDS
 
     def settle(observed: InstanceObservation) -> InstanceObservation:
@@ -721,6 +708,23 @@ def apply_provision(
             observed = refreshed
         return observed
 
+    observed = adapter.describe_instance(account, network, aws_instance_identifier)
+    if observed is None:
+        observed = adapter.create_instance(
+            account, network, resource, resource_name, aws_instance_identifier,
+            security_group_ids,
+        )
+    else:
+        if observed.status not in ("available", "failed"):
+            # Diff against the settled instance so drift is not reported as ready.
+            observed = settle(observed)
+        if observed.status == "available":
+            changes = modification_for(resource, observed, aws_instance_identifier)
+            if changes:
+                observed = adapter.modify_instance(
+                    account, network, resource, resource_name, aws_instance_identifier, changes
+                )
+                modified_fields = sorted(changes)
     observed = settle(observed)
     # ponytail: at most one reboot per apply, decided from the live status. A second apply
     # racing RDS's status flip could reboot again; add a journal entry if that ever matters.
