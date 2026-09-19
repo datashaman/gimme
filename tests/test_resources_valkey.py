@@ -618,9 +618,10 @@ def expect_describe(
         "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": NAME}]},
         {"ResourceName": ARN},
     )
-    stub.add_response(
-        "describe_update_actions", {"UpdateActions": actions or []}, ANY_UPDATE_ACTIONS
-    )
+    if updates.get("Status", "available") == "available":
+        stub.add_response(
+            "describe_update_actions", {"UpdateActions": actions or []}, ANY_UPDATE_ACTIONS
+        )
     stub.add_response(
         "describe_cache_clusters",
         {"CacheClusters": [{
@@ -683,7 +684,6 @@ def test_describe_tolerates_a_member_cluster_that_does_not_exist_yet(monkeypatch
     stub.add_response(
         "list_tags_for_resource", {"TagList": TAG}, {"ResourceName": ARN},
     )
-    stub.add_response("describe_update_actions", {"UpdateActions": []}, ANY_UPDATE_ACTIONS)
     stub.add_client_error("describe_cache_clusters", "CacheClusterNotFound")
     adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
     account, network, _ = context()
@@ -977,6 +977,23 @@ def test_a_group_that_settles_within_the_poll_is_diffed_once_it_is_available(tmp
 
     assert adapter.modify_calls == [{"SnapshotRetentionLimit": 14}]
     assert result["modified_fields"] == ["SnapshotRetentionLimit"]
+
+
+def test_a_reviewed_update_reaches_the_group_through_the_mcp_apply(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey(observation())
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    larger = valkey(node_type="cache.m7g.xlarge", snapshot_retention_days=14)
+    update = server_module.plan_update_resource(NAME, larger)
+    server_module.update_resource(NAME, larger, str(update["plan_id"]))
+
+    plan = server_module.plan_apply_resource(NAME)
+    result = server_module.apply_resource(NAME, str(plan["plan_id"]))
+
+    assert result["changed"] is True and result["phase"] == "ready"
+    assert result["modified_fields"] == ["CacheNodeType", "SnapshotRetentionLimit"]
+    assert adapter.modify_calls == [
+        {"CacheNodeType": "cache.m7g.xlarge", "SnapshotRetentionLimit": 14}
+    ]
 
 
 def test_a_modification_that_settles_during_the_poll_is_ready_and_recorded(tmp_path) -> None:

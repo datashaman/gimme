@@ -20,8 +20,8 @@ may contain deliberate schema and MCP API breaks.
   with `aws_elasticache_node_type_unavailable`, so Valkey registration now reads from AWS.
   Privilege impact: the inspection role needs `elasticache:ModifyReplicationGroup` and
   `ListAllowedNodeTypeModifications` on the group, plus `DescribeUpdateActions`,
-  `DescribeCacheEngineVersions`, and `DescribeReservedCacheNodesOfferings` on `*`, and every
-  describe now also reads update actions. Not yet verified against a live account.
+  `DescribeCacheEngineVersions`, and `DescribeReservedCacheNodesOfferings` on `*`; describing an
+  available group now also reads its update actions. Not yet verified against a live account.
 - `apply_resource` now provisions an `aws_elasticache_valkey` Resource (slice 2 of #14): a cache
   subnet group, a parameter group (`cluster-enabled yes`, `maxmemory-policy noeviction`), a user
   group with a default user that cannot authenticate, an administrative user whose generated

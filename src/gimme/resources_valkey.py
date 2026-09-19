@@ -43,7 +43,7 @@ MODIFIABLE_FIELDS = frozenset({
     "EngineVersion", "CacheNodeType", "SnapshotRetentionLimit", "SnapshotWindow",
     "PreferredMaintenanceWindow",
 })
-NODE_TYPE = "cache."
+NODE_TYPE_PREFIX = "cache."
 UPDATE_ACTIONS_DONE = ("complete", "not-applicable")
 ENGINE_VERSION_FLOOR = 9
 PORT = 6379
@@ -211,7 +211,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
             if isinstance(member, dict) and isinstance(member.get("PreferredAvailabilityZone"), str)
         ))
         cluster: dict[str, object] = {}
-        overdue = self._service_update_overdue(client, group_id)
+        # Only an available group can be degraded, so a polling describe skips this call.
+        overdue = status == "available" and self._service_update_overdue(client, group_id)
         if member_ids:
             try:
                 clusters = client.describe_cache_clusters(CacheClusterId=member_ids[0])
@@ -349,7 +350,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
                 (v for v in engine_versions if _version_tuple(v)[:1] >= (ENGINE_VERSION_FLOOR,)),
                 key=_version_tuple,
             )),
-            tuple(sorted(t for t in node_types if t.startswith(NODE_TYPE))),
+            tuple(sorted(t for t in node_types if t.startswith(NODE_TYPE_PREFIX))),
         )
 
     def _tolerate_existing(self, operation: str, call: Callable[[], object]) -> None:
