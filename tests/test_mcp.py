@@ -775,6 +775,7 @@ def test_unresolved_safety_recovery_point_cannot_be_deleted(tmp_path, monkeypatc
         server_module.ComponentDump(
             kind="postgres", local_path=local,
             sha256=hashlib.sha256(content).hexdigest(), bytes=len(content),
+            resource_version="17.2",
         ),
         safety_restore_request_id="restore-1",
     )

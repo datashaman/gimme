@@ -9,6 +9,7 @@ import socket
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from functools import wraps
 from inspect import signature
 from pathlib import Path
@@ -1073,8 +1074,13 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
                 or local_path.stat().st_size != size
             ):
                 raise RecoveryError("recovery_dump_metadata_invalid")
+            database_name = deployment.resources.database
+            database = state.resources[database_name] if database_name is not None else None
+            if not isinstance(database, ResourceConfig):
+                raise RecoveryError("recovery_database_provenance_invalid")
             dump = ComponentDump(
-                kind="postgres", local_path=local_path, sha256=sha256, bytes=size
+                kind="postgres", local_path=local_path, sha256=sha256, bytes=size,
+                resource_version=database.version, captured_at=datetime.now(UTC).isoformat(),
             )
             manifest = recovery_module.create_recovery_point(
                 destination_name, destination, credentials, backup_s3, name, point_id, dump,
