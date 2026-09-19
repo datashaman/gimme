@@ -60,7 +60,7 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v4 desired state, provider accounts, stores, and pins
+state.json          # schema-v5 desired state, provider accounts, stores, and pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence

@@ -24,6 +24,7 @@ from gimme.control import (
     Placement,
     RecoveryPolicy,
     ResourceBindings,
+    ValkeyBinding,
     ResourceConfig,
     RuntimePin,
     S3BackupDestination,
@@ -40,6 +41,9 @@ from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservatio
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
 from gimme.server import mcp
+
+
+LOCAL_VALKEY = ValkeyBinding(resource="devbox-valkey", uses=["cache"])
 
 
 def sample_state() -> ControlState:
@@ -69,7 +73,7 @@ def sample_state() -> ControlState:
             "php": RuntimePin(provider="system", version="8.4.1"),
             "composer": RuntimePin(provider="system", version="2.8.4"),
         },
-        resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey"),
+        resources=ResourceBindings(database="devbox-postgres", valkey=LOCAL_VALKEY),
         placement=Placement(
             instance="example-app",
             relative_path="deployments/example-app",
@@ -400,6 +404,10 @@ def test_deploy_blocks_before_activation_when_process_helper_is_stale(
     managed = state.deployments["example-app"].model_copy(update={
         "workers": HorizonWorkerConfig(),
         "scheduler": SchedulerConfig(),
+        "resources": ResourceBindings(
+            database="devbox-postgres",
+            valkey=ValkeyBinding(resource="devbox-valkey", uses=["cache", "queue"]),
+        ),
     })
     selected.save(state.model_copy(update={
         "deployments": {**state.deployments, "example-app": managed}
@@ -484,7 +492,7 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 4
+    assert value["schema_version"] == 5
     assert "deployments" in value
 
 
@@ -701,7 +709,7 @@ def rds_state(*, bound: bool, recovery: bool = False) -> ControlState:
     deployment = base.deployments["example-app"]
     if bound:
         deployment = deployment.model_copy(
-            update={"resources": ResourceBindings(database="primary-rds", cache="devbox-valkey")}
+            update={"resources": ResourceBindings(database="primary-rds", valkey=LOCAL_VALKEY)}
         )
     if recovery:
         deployment = deployment.model_copy(

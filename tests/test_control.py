@@ -19,6 +19,7 @@ from gimme.control import (
     RecoveryPolicy,
     Resource,
     ResourceBindings,
+    ValkeyBinding,
     ResourceConfig,
     RuntimePin,
     S3BackupDestination,
@@ -31,6 +32,9 @@ from gimme.control import (
     TargetRuntimePolicy,
     new_placement,
 )
+
+
+LOCAL_VALKEY = ValkeyBinding(resource="devbox-valkey", uses=["cache"])
 
 
 def target(mode: str = "local_mdns") -> TargetConfig:
@@ -71,7 +75,7 @@ def deployment(target_config: TargetConfig, **updates: object) -> DeploymentConf
             "php": RuntimePin(provider="system", version="8.4.1"),
             "composer": RuntimePin(provider="system", version="2.8.4"),
         },
-        "resources": ResourceBindings(database="devbox-postgres", cache="devbox-valkey"),
+        "resources": ResourceBindings(database="devbox-postgres", valkey=LOCAL_VALKEY),
         "placement": new_placement("example-local", target_config),
     }
     values.update(updates)
@@ -94,7 +98,7 @@ def test_control_state_references_registered_target_and_application() -> None:
         deployments={"example-local": deployment(devbox)},
     )
 
-    assert state.schema_version == 4
+    assert state.schema_version == 5
     assert state.deployments["example-local"].placement.site_host == (
         "example-local.devbox.local"
     )
@@ -115,7 +119,7 @@ def test_production_policy_is_hard() -> None:
             "php": {"provider": "system", "version": "8.4.1"},
             "composer": {"provider": "system", "version": "2.8.4"},
         },
-        "resources": {"database": "devbox-postgres", "cache": "devbox-valkey"},
+        "resources": {"database": "devbox-postgres", "valkey": LOCAL_VALKEY.model_dump()},
         "placement": new_placement(
             "example-production", public, domain="app.example.test"
         ),
@@ -201,7 +205,7 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     store.save(state)
 
     assert store.load() == state
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 4
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 5
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -210,7 +214,7 @@ def test_canonical_state_example_validates_against_current_schema() -> None:
 
     state = ControlState.model_validate_json(example.read_text())
 
-    assert state.schema_version == 4
+    assert state.schema_version == 5
     assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
 
 
@@ -285,7 +289,7 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
         }
     })
 
-    assert migrated.schema_version == 4
+    assert migrated.schema_version == 5
     assert migrated.deployments["example-local"].placement.model_dump(mode="json") == old_placement
     assert migrated.deployments["example-local"].runtimes["node"].provider == "system"
     assert migrated.deployments["example-local"].resources.database == "devbox-postgres"
@@ -303,13 +307,19 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
     document["deployments"]["example-local"]["secrets"] = {
         "MAIL_PASSWORD": "example-local/mail/MAIL_PASSWORD"
     }
+    document["deployments"]["example-local"]["resources"] = {
+        "database": "devbox-postgres", "cache": "devbox-valkey"
+    }
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "state.json").write_text(json.dumps(document))
 
     migrated = StateStore(tmp_path).state_migration({})
 
-    assert migrated.schema_version == 4
+    assert migrated.schema_version == 5
     assert migrated.secret_stores["local-sops"].provider == "sops"
+    assert migrated.deployments["example-local"].resources.valkey == ValkeyBinding(
+        resource="devbox-valkey", uses=["cache"]
+    )
     reference = migrated.deployments["example-local"].secrets["MAIL_PASSWORD"]
     assert reference.model_dump() == {
         "store": "local-sops", "secret": "example-local/mail", "field": "MAIL_PASSWORD"
@@ -571,7 +581,7 @@ def test_aws_rds_resource_deployment_security_groups_must_be_exact() -> None:
 
 def test_control_state_binds_a_deployment_to_a_managed_postgres_resource() -> None:
     state = _rds_state(
-        resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey")
+        resources=ResourceBindings(database="devbox-postgres", valkey=LOCAL_VALKEY)
     )
 
     assert state.resources["devbox-postgres"].provider == "aws_rds_postgres"
@@ -643,7 +653,7 @@ def test_deployment_cannot_bind_managed_postgres_from_an_ineligible_target() -> 
                       "devbox-valkey": resources()["devbox-valkey"]},
             deployments={"example-local": deployment(
                 devbox,
-                resources=ResourceBindings(database="devbox-postgres", cache="devbox-valkey"),
+                resources=ResourceBindings(database="devbox-postgres", valkey=LOCAL_VALKEY),
             )},
         )
 

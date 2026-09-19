@@ -69,7 +69,7 @@ def deployment(
         },
         "resources": {
             "database": "integration-postgres",
-            "cache": "integration-valkey",
+            "valkey": {"resource": "integration-valkey", "uses": ["cache"]},
         },
         "placement": {
             "instance": name,
@@ -114,7 +114,7 @@ def setup() -> None:
         "composer",
     ]
     state = {
-        "schema_version": 4,
+        "schema_version": 5,
         "provider_accounts": {},
         "secret_stores": {"local-sops": {"provider": "sops"}},
         "targets": {

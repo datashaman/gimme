@@ -5,6 +5,24 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Replaced the Deployment's `resources.cache` string with a typed `resources.valkey` binding
+  (`resource` plus `uses` of `cache`, `session`, and `queue`) and bumped desired state to
+  **schema v5** (slice 4 of #14). `plan_state_migration` migrates v2, v3, and v4 state one way:
+  the old string becomes a `cache` use, plus `queue` for a running Horizon, `session` is never
+  inferred, and any ambiguous shape fails the migration without writing; no reader for the old
+  shape remains, so a v4 file must be migrated before it loads. Uses must be unique and
+  non-empty, and Horizon requires `queue`. `plan_bind_resource` and `bind_resource` now also
+  bind a managed `aws_elasticache_valkey` Resource: a per-Deployment ElastiCache ACL user
+  limited to the derived namespace `{gimme:<deployment>}:<use>:` and the fixed Gimme-owned
+  `laravel-v1` command profile, and a Resource Credential secret with exactly `username` and a
+  48-character `password`, never returned, stored in state, or logged. A Resource that a fresh
+  live read does not report ready takes no new binding. The Valkey Resource gains
+  `administration_security_group_id` and `deployment_security_group_ids` (required for a
+  managed Resource), and inbound rules on its security group are read and reported as the
+  `security_group` issue, degrading the Resource; Gimme never edits the group. Privilege impact:
+  the inspection role needs `elasticache:ModifyUser`, `ModifyUserGroup`, `DescribeUserGroups`
+  and `ec2:DescribeSecurityGroupRules`. The state schema is a breaking change. Not yet
+  verified against a live account; the ACL access string in particular is unverified.
 - `apply_resource` now converges an existing `aws_elasticache_valkey` replication group (slice 3
   of #14) with one immediate `ModifyReplicationGroup` carrying only the fields that differ:
   same-major `engine_version`, `node_type`, snapshot retention and window, and maintenance
