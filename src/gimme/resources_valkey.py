@@ -25,6 +25,7 @@ from gimme.resources_postgres import (
     _observed_path,
     _provider_error,
     _tombstone_path,
+    _version_tuple,
     _write_json,
 )
 
@@ -34,8 +35,17 @@ GROUP_PHASE = ("pending", "ready", "degraded", "failed")
 ISSUES = (
     "cluster_mode", "topology", "availability_zones", "multi_az", "automatic_failover", "tls",
     "encryption_at_rest", "durability", "authentication", "snapshot_policy",
-    "maintenance_policy", "automatic_minor_upgrade",
+    "maintenance_policy", "automatic_minor_upgrade", "service_update_overdue",
 )
+# The only ISSUES an apply can repair; every other live difference fails apply closed.
+REPAIRABLE_ISSUES = ("snapshot_policy", "maintenance_policy", "service_update_overdue")
+MODIFIABLE_FIELDS = frozenset({
+    "EngineVersion", "CacheNodeType", "SnapshotRetentionLimit", "SnapshotWindow",
+    "PreferredMaintenanceWindow",
+})
+NODE_TYPE_PREFIX = "cache."
+UPDATE_ACTIONS_DONE = ("complete", "not-applicable")
+ENGINE_VERSION_FLOOR = 9
 PORT = 6379
 # The default user can never authenticate; the administrative identity is limited to
 # Gimme-owned key and channel prefixes and a fixed maintenance command set.
@@ -113,6 +123,17 @@ class GroupObservation:
     automatic_minor_upgrade: bool | None
     endpoint: str | None
     port: int | None
+    # Values AWS has accepted but not finished applying count as applied, so a resumed apply
+    # never re-sends them.
+    pending_engine_version: str | None = None
+    pending_node_type: str | None = None
+    service_update_overdue: bool = False
+
+
+@dataclass(frozen=True)
+class ValkeyOptions:
+    engine_versions: tuple[str, ...]
+    node_types: tuple[str, ...]
 
 
 class ElastiCacheAdapter(Protocol):
@@ -124,6 +145,15 @@ class ElastiCacheAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
         store: AWSSecretsManagerStore, store_name: str,
+    ) -> GroupObservation: ...
+
+    def allowed_node_types(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
+    ) -> frozenset[str]: ...
+
+    def modify_group(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
+        changes: dict[str, object],
     ) -> GroupObservation: ...
 
 
@@ -181,6 +211,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
             if isinstance(member, dict) and isinstance(member.get("PreferredAvailabilityZone"), str)
         ))
         cluster: dict[str, object] = {}
+        # Only an available group can be degraded, so a polling describe skips this call.
+        overdue = status == "available" and self._service_update_overdue(client, group_id)
         if member_ids:
             try:
                 clusters = client.describe_cache_clusters(CacheClusterId=member_ids[0])
@@ -199,6 +231,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
         version = cluster.get("EngineVersion")
         window = cluster.get("PreferredMaintenanceWindow")
         minor = cluster.get("AutoMinorVersionUpgrade")
+        pending = cluster.get("PendingModifiedValues")
+        pending = pending if isinstance(pending, dict) else {}
         return GroupObservation(
             identity=arn, status=status,
             engine_version=version if isinstance(version, str) else None,
@@ -219,6 +253,25 @@ class BotoElastiCacheAdapter(AWSAdapter):
             automatic_minor_upgrade=minor if isinstance(minor, bool) else None,
             endpoint=address if isinstance(address, str) else None,
             port=port if isinstance(port, int) else None,
+            pending_engine_version=_text(pending.get("EngineVersion")),
+            pending_node_type=_text(pending.get("CacheNodeType")),
+            service_update_overdue=overdue,
+        )
+
+    def _service_update_overdue(self, client, group_id: str) -> bool:
+        """True when AWS says a service update missed its recommended apply-by date and is
+        not finished. ponytail: one page of 100 actions for one group; page if that overflows."""
+        try:
+            response = client.describe_update_actions(
+                ReplicationGroupIds=[group_id], ServiceUpdateStatus=["available"], MaxRecords=100,
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "update_actions", self.error_prefix) from None
+        actions = response.get("UpdateActions") or []
+        return any(
+            isinstance(action, dict) and action.get("SlaMet") == "no"
+            and action.get("UpdateActionStatus") not in UPDATE_ACTIONS_DONE
+            for action in actions
         )
 
     def describe_group(
@@ -236,6 +289,69 @@ class BotoElastiCacheAdapter(AWSAdapter):
         if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
             raise ResourceError("aws_elasticache_group_identity_invalid")
         return self._observation(client, groups[0], group_id)
+
+    def allowed_node_types(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
+    ) -> frozenset[str]:
+        client = self._client(account, network, "elasticache-inspect")
+        try:
+            response = client.list_allowed_node_type_modifications(ReplicationGroupId=group_id)
+        except Exception as exc:
+            raise _provider_error(exc, "node_types", self.error_prefix) from None
+        return frozenset(
+            item for key in ("ScaleUpModifications", "ScaleDownModifications")
+            for item in response.get(key) or [] if isinstance(item, str)
+        )
+
+    def modify_group(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
+        changes: dict[str, object],
+    ) -> GroupObservation:
+        """One immediate modification of exactly the given fields."""
+        if not changes or not set(changes) <= MODIFIABLE_FIELDS:
+            raise ResourceError("aws_elasticache_modify_field_forbidden")
+        client = self._client(account, network, "elasticache-modify")
+        try:
+            client.modify_replication_group(
+                ReplicationGroupId=group_id, ApplyImmediately=True, **changes
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "modify", self.error_prefix) from None
+        observed = self.describe_group(account, network, group_id)
+        if observed is None:
+            raise ResourceError("aws_elasticache_group_disappeared")
+        return observed
+
+    def live_options(self, account: AWSProviderAccount, network: AWSNetwork) -> ValkeyOptions:
+        """Exact Valkey versions and cache node types the registered account offers in the
+        network's region. ponytail: AWS exposes no per-network or per-durability filter, so
+        the node types are the region's reserved-node offerings; a type that cannot run
+        Durability=sync fails at create with a bounded error."""
+        client = self._client(account, network, "elasticache-options")
+        try:
+            versions = client.get_paginator("describe_cache_engine_versions").paginate(
+                Engine="valkey"
+            )
+            offerings = client.get_paginator("describe_reserved_cache_nodes_offerings").paginate()
+            engine_versions = {
+                item["EngineVersion"] for page in versions
+                for item in page.get("CacheEngineVersions") or []
+                if isinstance(item.get("EngineVersion"), str)
+            }
+            node_types = {
+                item["CacheNodeType"] for page in offerings
+                for item in page.get("ReservedCacheNodesOfferings") or []
+                if isinstance(item.get("CacheNodeType"), str)
+            }
+        except Exception as exc:
+            raise _provider_error(exc, "options", self.error_prefix) from None
+        return ValkeyOptions(
+            tuple(sorted(
+                (v for v in engine_versions if _version_tuple(v)[:1] >= (ENGINE_VERSION_FLOOR,)),
+                key=_version_tuple,
+            )),
+            tuple(sorted(t for t in node_types if t.startswith(NODE_TYPE_PREFIX))),
+        )
 
     def _tolerate_existing(self, operation: str, call: Callable[[], object]) -> None:
         try:
@@ -400,6 +516,7 @@ def structural_issues(
         ),
         "maintenance_policy": observed.maintenance_window == resource.maintenance_window,
         "automatic_minor_upgrade": observed.automatic_minor_upgrade is False,
+        "service_update_overdue": not observed.service_update_overdue,
     }
     return [code for code in ISSUES if not checks[code]]
 
@@ -407,9 +524,91 @@ def structural_issues(
 def group_phase(observed: GroupObservation, issues: list[str]) -> str:
     if observed.status == "create-failed":
         return "failed"
-    if observed.status != "available":
+    if (
+        observed.status != "available"
+        or observed.pending_engine_version or observed.pending_node_type
+    ):
         return "pending"
     return "degraded" if issues else "ready"
+
+
+def _version_order(desired: str, live: str) -> int:
+    """1 when desired is newer than live, -1 when older, 0 when live is desired or a patch of
+    it: a desired 9.0 is satisfied by a live 9.0.3, so a resumed apply never re-sends it."""
+    wanted = _version_tuple(desired)
+    running = _version_tuple(live)[:len(wanted)]
+    return (wanted > running) - (wanted < running)
+
+
+def modification_for(
+    resource: AWSElastiCacheValkeyResource, live: GroupObservation, group_id: str
+) -> dict[str, object]:
+    """The exact modify_replication_group fields that bring an available group onto desired
+    state, or {} when nothing differs. Values AWS already has pending count as applied.
+    Refuses, before any call, a group that is outside the contract or the allowlist; a group
+    with nothing to change is left alone and reported degraded instead."""
+    changes: dict[str, object] = {}
+    version = live.pending_engine_version or live.engine_version
+    if version is not None:
+        if version.split(".")[0] != resource.engine_version.split(".")[0]:
+            raise ResourceError("aws_elasticache_modify_forbidden_engine_major")
+        order = _version_order(resource.engine_version, version)
+        if order < 0:
+            raise ResourceError("aws_elasticache_modify_forbidden_engine_downgrade")
+        if order > 0:
+            changes["EngineVersion"] = resource.engine_version
+    node_type = live.pending_node_type or live.node_type
+    if node_type is not None and node_type != resource.node_type:
+        changes["CacheNodeType"] = resource.node_type
+    for field, desired, actual in (
+        ("SnapshotRetentionLimit", resource.snapshot_retention_days, live.snapshot_retention_days),
+        ("SnapshotWindow", resource.snapshot_window, live.snapshot_window),
+        ("PreferredMaintenanceWindow", resource.maintenance_window, live.maintenance_window),
+    ):
+        if actual is not None and actual != desired:
+            changes[field] = desired
+    if changes:
+        for code in structural_issues(resource, live, group_id):
+            if code not in REPAIRABLE_ISSUES:
+                raise ResourceError(f"aws_elasticache_modify_forbidden_{code}")
+    return changes
+
+
+def group_drift(
+    resource: AWSElastiCacheValkeyResource, live: GroupObservation
+) -> dict[str, object]:
+    """Desired-versus-live differences for a successful live read; unobserved fields are
+    skipped, and nothing here is persisted."""
+    pairs = {
+        "engine_version": (
+            resource.engine_version, live.engine_version,
+            live.engine_version is not None
+            and _version_order(resource.engine_version, live.engine_version) != 0,
+        ),
+        "node_type": (resource.node_type, live.node_type, live.node_type != resource.node_type),
+        "snapshot_retention_days": (
+            resource.snapshot_retention_days, live.snapshot_retention_days,
+            live.snapshot_retention_days != resource.snapshot_retention_days,
+        ),
+        "snapshot_window": (
+            resource.snapshot_window, live.snapshot_window,
+            live.snapshot_window != resource.snapshot_window,
+        ),
+        "maintenance_window": (
+            resource.maintenance_window, live.maintenance_window,
+            live.maintenance_window != resource.maintenance_window,
+        ),
+    }
+    return {
+        "fields": {
+            field: {"desired": desired, "live": actual}
+            for field, (desired, actual, differs) in pairs.items()
+            if actual is not None and differs
+        },
+        "modification_pending": bool(
+            live.status == "modifying" or live.pending_engine_version or live.pending_node_type
+        ),
+    }
 
 
 def _validate_observed(document: object) -> dict[str, object]:
@@ -468,22 +667,41 @@ def apply_provision(
     store: AWSSecretsManagerStore, store_name: str,
     *, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
-    """Create the replication group if absent, then poll up to a bounded 30 seconds. A
-    still-provisioning group is recorded as phase 'pending'; a later call resumes by
-    describing rather than re-creating. An existing group is never modified here."""
+    """Create the replication group if absent, otherwise converge an available one with one
+    immediate modification of only the fields that differ, then poll up to a bounded 30
+    seconds. A still-provisioning or still-modifying group is recorded as phase 'pending';
+    a later call resumes by describing, so it re-creates and re-sends nothing."""
     group_id = derive_group_id(resource_name)
+    modified_fields: list[str] = []
+    deadline = now() + POLL_BUDGET_SECONDS
+
+    def settle(observed: GroupObservation) -> GroupObservation:
+        while observed.status not in ("available", "create-failed") and now() < deadline:
+            sleep(POLL_INTERVAL_SECONDS)
+            refreshed = adapter.describe_group(account, network, group_id)
+            if refreshed is None:
+                raise ResourceError("aws_elasticache_group_disappeared")
+            observed = refreshed
+        return observed
+
     observed = adapter.describe_group(account, network, group_id)
     if observed is None:
         observed = adapter.create_group(
             account, network, resource, resource_name, group_id, store, store_name
         )
-    deadline = now() + POLL_BUDGET_SECONDS
-    while observed.status not in ("available", "create-failed") and now() < deadline:
-        sleep(POLL_INTERVAL_SECONDS)
-        refreshed = adapter.describe_group(account, network, group_id)
-        if refreshed is None:
-            raise ResourceError("aws_elasticache_group_disappeared")
-        observed = refreshed
+    else:
+        # Diff against the settled group, so a modification already under way is not repeated.
+        observed = settle(observed)
+        if observed.status == "available":
+            changes = modification_for(resource, observed, group_id)
+            if "CacheNodeType" in changes and resource.node_type not in adapter.allowed_node_types(
+                account, network, group_id
+            ):
+                raise ResourceError("aws_elasticache_modify_forbidden_node_type")
+            if changes:
+                observed = adapter.modify_group(account, network, group_id, changes)
+                modified_fields = sorted(changes)
+    observed = settle(observed)
     issues = structural_issues(resource, observed, group_id)
     document = _group_document(resource_name, group_id, observed, issues)
     _write_json(_observed_path(root, resource_name), _validate_observed(document), resource_name)
@@ -491,6 +709,7 @@ def apply_provision(
         "resource": resource_name, "status": observed.status, "phase": document["phase"],
         "engine_version": observed.engine_version,
         "effective_durability": observed.effective_durability, "issues": issues,
+        "modified_fields": modified_fields,
     }
 
 

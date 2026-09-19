@@ -234,6 +234,7 @@ Read-only resources:
 - `gimme://provider-accounts/{name}`
 - `gimme://secret-stores/{name}`
 - `gimme://resources/{name}`
+- `gimme://aws-networks/{name}/valkey-options`
 - `gimme://deployments/{name}`
 - `gimme://operations/{correlation_id}`
 
@@ -257,7 +258,7 @@ Resource provider coverage:
 | Resource | Local (target-local) | AWS (managed) |
 | --- | --- | --- |
 | PostgreSQL | ✅ | ✅ (RDS; see [ADR 0008](docs/adr/0008-aws-rds-postgresql-resources.md)) |
-| Valkey | ✅ | provisioning and inspection only (ElastiCache; see [ADR 0009](docs/adr/0009-synchronously-durable-aws-valkey.md)) |
+| Valkey | ✅ | provisioning, updates, and inspection only (ElastiCache; see [ADR 0009](docs/adr/0009-synchronously-durable-aws-valkey.md)) |
 
 The managed AWS RDS PostgreSQL provider covers registration, provisioning, deployment
 binding, and non-destructive-by-default cleanup for a single generation of credentials.

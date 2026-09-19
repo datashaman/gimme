@@ -522,6 +522,21 @@ def managed_resource(name: str) -> dict[str, object]:
     return store.load().resources[name].model_dump(mode="json")
 
 
+@mcp.resource("gimme://aws-networks/{name}/valkey-options")
+def valkey_options(name: str) -> dict[str, object]:
+    """Exact Valkey versions and cache node types the registered account offers in one AWS
+    Network's region. Read-only; nothing is stored."""
+    state = store.load()
+    network = state.aws_networks[name]
+    options = elasticache_valkey.live_options(
+        state.provider_accounts[network.provider_account], network
+    )
+    return {
+        "aws_network": name, "engine_versions": list(options.engine_versions),
+        "node_types": list(options.node_types),
+    }
+
+
 @mcp.resource("gimme://deployments/{name}")
 def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
@@ -1066,6 +1081,8 @@ def register_resource(name: Name, definition: Resource) -> dict[str, object]:
         raise ValueError("resource already exists; use plan_update_resource")
     if isinstance(definition, AWSRDSPostgresResource):
         _refuse_unverifiable_tls_region(state, definition)
+    if isinstance(definition, AWSElastiCacheValkeyResource):
+        _refuse_unavailable_node_type(state, definition)
     store.save(_replace(state, "resources", name, definition))
     return {"changed": True, "resource": name}
 
@@ -1086,6 +1103,8 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
         ):
             raise ResourceError("aws_elasticache_update_forbidden_provider")
         resources_valkey_module.validate_update(current, definition)
+        if definition.node_type != current.node_type:
+            _refuse_unavailable_node_type(state, definition)
     if current is not None and (
         isinstance(current, AWSRDSPostgresResource)
         or isinstance(definition, AWSRDSPostgresResource)
@@ -1119,6 +1138,19 @@ def _refuse_unverifiable_tls_region(state: ControlState, resource: AWSRDSPostgre
     network = state.aws_networks.get(resource.aws_network)
     if network is not None and network.region.startswith(("us-gov-", "cn-")):
         raise ResourceError("aws_rds_tls_region_unsupported")
+
+
+def _refuse_unavailable_node_type(
+    state: ControlState, resource: AWSElastiCacheValkeyResource
+) -> None:
+    # The one AWS read registration makes: a node type the account cannot buy in the region
+    # would only fail later, at create.
+    network = state.aws_networks[resource.aws_network]
+    options = elasticache_valkey.live_options(
+        state.provider_accounts[network.provider_account], network
+    )
+    if resource.node_type not in options.node_types:
+        raise ResourceError("aws_elasticache_node_type_unavailable")
 
 
 def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
@@ -1266,6 +1298,7 @@ def _inspect_valkey(
             phase=resources_valkey_module.group_phase(live, issues), status=live.status,
             engine_version=live.engine_version,
             effective_durability=live.effective_durability, issues=issues,
+            drift=resources_valkey_module.group_drift(resource, live),
         )
     elif observed is not None:
         result.update(
