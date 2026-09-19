@@ -11,13 +11,15 @@ from botocore.stub import ANY
 from pydantic import ValidationError
 
 from gimme.control import (
-    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, StateStore,
+    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, ResourceBindings,
+    StateStore, ValkeyBinding,
 )
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
-    ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, MODIFIABLE_FIELDS,
-    ValkeyOptions, apply_provision, derive_group_id, derive_user_group_id, group_drift,
-    load_observed, modification_for, structural_issues,
+    ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, LARAVEL_COMMANDS,
+    MODIFIABLE_FIELDS, ValkeyOptions, apply_binding, apply_provision, derive_binding_user_id,
+    derive_group_id, derive_user_group_id, group_drift, laravel_access_string, load_observed,
+    modification_for, namespace_prefixes, structural_issues,
 )
 import gimme.server as server_module
 
@@ -33,6 +35,9 @@ def valkey(**updates) -> AWSElastiCacheValkeyResource:
 GROUP_ID = derive_group_id(NAME)
 ARN = f"arn:aws:elasticache:eu-central-1:123456789012:replicationgroup:{GROUP_ID}"
 PASSWORD = "p" * 48
+GROUP_SG = "sg-0123456789abcdef2"
+ADMIN_SG = "sg-0123456789abcdef0"
+DEVBOX_SG = "sg-0123456789abcdef1"
 ANY_UPDATE_ACTIONS = {
     "ReplicationGroupIds": [GROUP_ID], "ServiceUpdateStatus": ["available"], "MaxRecords": 100,
 }
@@ -47,6 +52,7 @@ def observation(**updates) -> GroupObservation:
         user_group_ids=(derive_user_group_id(GROUP_ID),), snapshot_retention_days=7,
         snapshot_window="03:00-04:00", maintenance_window="sun:05:00-sun:06:00",
         automatic_minor_upgrade=False, endpoint="cfg.example.cache.amazonaws.com", port=6379,
+        security_group_ids=(GROUP_SG,), ingress_sources=(ADMIN_SG, DEVBOX_SG),
     )
     values.update(updates)
     return GroupObservation(**values)  # type: ignore[arg-type]
@@ -75,6 +81,8 @@ class FakeValkey:
         self.describe_calls = 0
         self.modify_calls: list[dict[str, object]] = []
         self.options = OPTIONS
+        self.binding_calls: list[tuple[str, bool]] = []
+        self.users: set[str] = set()
         self._polls = 0
 
     def describe_group(self, account, network, group_id):
@@ -100,6 +108,18 @@ class FakeValkey:
 
     def live_options(self, account, network):
         return self.options
+
+    def ensure_binding(
+        self, account, network, store, store_name, resource_name, group_id, deployment_name,
+        keep_credential,
+    ):
+        self.binding_calls.append((deployment_name, keep_credential))
+        user_id = derive_binding_user_id(group_id, deployment_name)
+        if user_id in self.users and keep_credential:
+            return None
+        self.users.add(user_id)
+        arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{user_id}"
+        return user_id, arn, "v" * 32
 
     def create_group(self, account, network, resource, name, group_id, store, store_name):
         self.create_calls += 1
@@ -400,6 +420,7 @@ BROKEN = {
     "maintenance_policy": {"maintenance_window": "mon:01:00-mon:02:00"},
     "automatic_minor_upgrade": {"automatic_minor_upgrade": True},
     "service_update_overdue": {"service_update_overdue": True},
+    "security_group": {"ingress_sources": (ADMIN_SG, DEVBOX_SG, "0.0.0.0/0")},
 }
 
 
@@ -498,7 +519,7 @@ def test_the_observation_cache_is_private_and_secret_free(tmp_path, monkeypatch)
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert set(json.loads(path.read_text())) == {
         "schema_version", "resource", "replication_group_id", "identity", "status", "phase",
-        "engine_version", "effective_durability", "issues", "endpoint", "port",
+        "engine_version", "effective_durability", "issues", "endpoint", "port", "allocations",
     }
     path.write_text(json.dumps({"schema_version": 1}))
     with pytest.raises(ResourceError, match="^observed_resource_invalid$"):
@@ -599,8 +620,25 @@ def group_response(**updates) -> dict[str, object]:
     return values
 
 
+def rule(source, *, egress=False, protocol="tcp", low=6379, high=6379) -> dict[str, object]:
+    key = "ReferencedGroupInfo" if source.startswith("sg-") else "CidrIpv4"
+    return {
+        "SecurityGroupRuleId": "sgr-0123456789abcdef0", "GroupId": GROUP_SG, "IsEgress": egress,
+        "IpProtocol": protocol, "FromPort": low, "ToPort": high,
+        key: {"GroupId": source} if key == "ReferencedGroupInfo" else source,
+    }
+
+
+COMPLIANT_RULES = [
+    rule(ADMIN_SG), rule(DEVBOX_SG, low=6000, high=7000), rule(ADMIN_SG, protocol="-1", low=-1,
+                                                             high=-1),
+    rule("0.0.0.0/0", low=22, high=22), rule("0.0.0.0/0", egress=True, protocol="-1", low=-1,
+                                             high=-1),
+]
+
+
 def expect_describe(
-    stub, cache_client_stub, *, actions=None, pending=None, **updates
+    stub, ec2_stub, *, actions=None, pending=None, rules=None, groups=None, **updates
 ) -> None:
     stub.add_response(
         "describe_replication_groups", {"ReplicationGroups": [group_response(**updates)]},
@@ -614,14 +652,22 @@ def expect_describe(
         stub.add_response(
             "describe_update_actions", {"UpdateActions": actions or []}, ANY_UPDATE_ACTIONS
         )
+    attached = [{"SecurityGroupId": sg, "Status": "active"} for sg in groups or [GROUP_SG]]
     stub.add_response(
         "describe_cache_clusters",
         {"CacheClusters": [{
             "EngineVersion": "9.0", "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
             "AutoMinorVersionUpgrade": False, "PendingModifiedValues": pending or {},
+            "SecurityGroups": attached,
         }]},
         {"CacheClusterId": f"{GROUP_ID}-0001-001"},
     )
+    if updates.get("Status", "available") == "available":
+        ec2_stub.add_response(
+            "describe_security_group_rules",
+            {"SecurityGroupRules": COMPLIANT_RULES if rules is None else rules},
+            {"Filters": [{"Name": "group-id", "Values": sorted(groups or [GROUP_SG])}]},
+        )
 
 
 TAG = [{"Key": "gimme:resource", "Value": NAME}]
@@ -629,11 +675,12 @@ TAG = [{"Key": "gimme:resource", "Value": NAME}]
 
 def test_describe_parses_a_live_group(monkeypatch) -> None:
     client, stub = stubbed("elasticache")
-    expect_describe(stub, stub)
-    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    ec2, ec2_stub = stubbed("ec2")
+    expect_describe(stub, ec2_stub)
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)), ("ec2", (ec2, ec2_stub)))
     account, network, _ = context()
 
-    with stub:
+    with stub, ec2_stub:
         observed = adapter.describe_group(account, network, GROUP_ID)
 
     assert observed == observation()
@@ -786,7 +833,7 @@ def expect_create(
             "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
         },
     )
-    expect_describe(stub, stub, Status="creating")
+    expect_describe(stub, None, Status="creating")
 
 
 def test_create_sends_exactly_the_fixed_contract_and_writes_the_admin_secret(
@@ -1114,8 +1161,9 @@ def test_the_live_options_resource_lists_versions_and_node_types(
 
 def test_describe_reads_pending_values_and_overdue_service_updates(monkeypatch) -> None:
     client, stub = stubbed("elasticache")
+    ec2, ec2_stub = stubbed("ec2")
     expect_describe(
-        stub, stub,
+        stub, ec2_stub,
         actions=[
             {"SlaMet": "yes", "UpdateActionStatus": "not-applied"},
             {"SlaMet": "no", "UpdateActionStatus": "complete"},
@@ -1123,10 +1171,10 @@ def test_describe_reads_pending_values_and_overdue_service_updates(monkeypatch) 
         ],
         pending={"EngineVersion": "9.1", "CacheNodeType": "cache.m7g.xlarge"},
     )
-    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)), ("ec2", (ec2, ec2_stub)))
     account, network, _ = context()
 
-    with stub:
+    with stub, ec2_stub:
         observed = adapter.describe_group(account, network, GROUP_ID)
 
     assert observed == observation(
@@ -1141,11 +1189,12 @@ def test_describe_reads_pending_values_and_overdue_service_updates(monkeypatch) 
 )
 def test_only_an_unfinished_action_past_its_apply_by_date_is_overdue(monkeypatch, action) -> None:
     client, stub = stubbed("elasticache")
-    expect_describe(stub, stub, actions=[action])
-    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    ec2, ec2_stub = stubbed("ec2")
+    expect_describe(stub, ec2_stub, actions=[action])
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)), ("ec2", (ec2, ec2_stub)))
     account, network, _ = context()
 
-    with stub:
+    with stub, ec2_stub:
         assert adapter.describe_group(account, network, GROUP_ID).service_update_overdue is False
 
 
@@ -1173,7 +1222,7 @@ def test_modify_sends_only_the_given_fields_immediately_then_describes(monkeypat
         {"ReplicationGroupId": GROUP_ID, "ApplyImmediately": True, "EngineVersion": "9.1",
          "SnapshotRetentionLimit": 14},
     )
-    expect_describe(stub, stub, Status="modifying")
+    expect_describe(stub, None, Status="modifying")
     adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
     account, network, _ = context()
 
@@ -1287,3 +1336,494 @@ def test_live_options_failures_are_bounded(monkeypatch) -> None:
 
     with stub, pytest.raises(ResourceError, match="^aws_elasticache_options_access_denied$"):
         adapter.live_options(account, network)
+
+
+# --- bindings: ACL users, namespaces, credentials ---------------------------------------
+
+DEPLOYMENT = "example-local"
+
+
+def use_bound(tmp_path, monkeypatch, adapter: FakeValkey | None = None) -> FakeValkey:
+    adapter = adapter or FakeValkey(observation())
+    state = use_state(tmp_path, monkeypatch, adapter=adapter)
+    bound = state.deployments[DEPLOYMENT].model_copy(update={"resources": ResourceBindings(
+        database="devbox-postgres",
+        valkey=ValkeyBinding(resource=NAME, uses=["cache", "queue"]),
+    )})
+    server_module.store.save(state.model_copy(update={
+        "deployments": {**state.deployments, DEPLOYMENT: bound}
+    }))
+    return adapter
+
+
+def provisioned(tmp_path, monkeypatch, adapter: FakeValkey | None = None) -> FakeValkey:
+    adapter = use_bound(tmp_path, monkeypatch, adapter)
+    plan = server_module.plan_apply_resource(NAME)
+    server_module.apply_resource(NAME, str(plan["plan_id"]))
+    return adapter
+
+
+def bind(name: str = DEPLOYMENT) -> dict[str, object]:
+    plan = server_module.plan_bind_resource(name)
+    return server_module.bind_resource(name, str(plan["plan_id"]))
+
+
+def test_the_binding_plan_names_namespaces_and_profile_and_is_secret_free(
+    tmp_path, monkeypatch
+) -> None:
+    use_bound(tmp_path, monkeypatch)
+
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+
+    valkey = cast(dict[str, object], plan["valkey"])
+    assert plan["kind"] == "resource_binding" and plan["database"] is None
+    assert valkey["acl_profile"] == "laravel-v1" and valkey["resource_ready"] is False
+    assert valkey["namespaces"] == {
+        "cache": "{gimme:example-local}:cache:", "queue": "{gimme:example-local}:queue:",
+        "horizon": "{gimme:example-local}:horizon:",
+    }
+    text = json.dumps(plan).lower()
+    assert "password" not in text.replace("generated 48-character password", "")
+
+
+def test_a_binding_needs_a_ready_resource_and_a_current_plan(tmp_path, monkeypatch) -> None:
+    adapter = use_bound(tmp_path, monkeypatch)
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.bind_resource(DEPLOYMENT, "plan_" + "0" * 20)
+    with pytest.raises(ValueError, match="not ready"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+    assert adapter.binding_calls == []
+    server_module.apply_resource(NAME, str(server_module.plan_apply_resource(NAME)["plan_id"]))
+    stale = server_module.plan_bind_resource(DEPLOYMENT)
+    assert stale["plan_id"] != plan["plan_id"], "readiness is part of the plan"
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+
+def test_binding_records_a_secret_free_allocation_and_returns_no_credential(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+
+    result = bind()
+
+    user_id = derive_binding_user_id(GROUP_ID, DEPLOYMENT)
+    valkey = cast(dict[str, object], result["valkey"])
+    assert valkey["secret_reference"] == {
+        "store": "workload-secrets", "secret": f"{NAME}/{DEPLOYMENT}",
+    }
+    assert adapter.binding_calls == [(DEPLOYMENT, False)]
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None
+    allocation = cast(dict[str, dict[str, object]], observed["allocations"])[DEPLOYMENT]
+    assert allocation["user_id"] == user_id and allocation["status"] == "active"
+    assert set(allocation) == {"user_id", "secret_arn", "secret_version_id", "status"}
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["allocations"] == {DEPLOYMENT: {"status": "active"}}
+    for output in (result, inspected):
+        text = json.dumps(output)
+        assert user_id not in text and "password" not in text and "username" not in text
+
+
+def test_a_second_bind_keeps_the_credential_and_the_allocation(tmp_path, monkeypatch) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+    bind()
+    first = load_observed(server_module.store.root, NAME)
+
+    bind()
+
+    assert adapter.binding_calls == [(DEPLOYMENT, False), (DEPLOYMENT, True)]
+    assert load_observed(server_module.store.root, NAME) == first
+
+
+def test_a_rerun_of_provisioning_keeps_allocations(tmp_path, monkeypatch) -> None:
+    provisioned(tmp_path, monkeypatch)
+    bind()
+
+    server_module.apply_resource(NAME, str(server_module.plan_apply_resource(NAME)["plan_id"]))
+
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None and list(cast(dict, observed["allocations"])) == [DEPLOYMENT]
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"effective_durability": "async"},
+        {"ingress_sources": (ADMIN_SG, "0.0.0.0/0")},
+        {"security_group_ids": ("sg-0123456789abcdef9",)},
+        {"status": "modifying"},
+        {"service_update_overdue": True},
+    ],
+)
+def test_a_group_that_a_live_read_does_not_call_ready_takes_no_new_binding(
+    tmp_path, monkeypatch, live
+) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+    adapter.settle_polls = 1000
+    adapter.live = dataclasses.replace(adapter.live, **live)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_binding_resource_not_ready$"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+    assert adapter.binding_calls == []
+
+
+def test_a_vanished_group_takes_no_binding(tmp_path, monkeypatch) -> None:
+    adapter = provisioned(tmp_path, monkeypatch)
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+    adapter.live = None
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_binding_resource_not_ready$"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+
+def test_each_deployment_gets_a_distinct_user_namespace_and_secret() -> None:
+    names = ["a", "a-b", "b", "orders", "orders-2", "x" * 64]
+    users = {derive_binding_user_id(GROUP_ID, name) for name in names}
+    tags = {namespace_prefixes(name, ["cache"])["cache"] for name in names}
+
+    assert len(users) == len(tags) == len(names)
+    for user in users:
+        assert re.fullmatch(r"[a-z][a-z0-9-]{0,39}", user)
+        assert user not in (f"{GROUP_ID}-default", f"{GROUP_ID}-admin")
+    assert derive_binding_user_id(GROUP_ID, "a") != derive_binding_user_id("gimme-other", "a")
+
+
+def test_a_namespace_pattern_never_matches_another_deployments_keys() -> None:
+    import fnmatch
+
+    for own, other in (("a", "a-b"), ("a-b", "a"), ("orders", "orders-2"), ("a", "ab")):
+        tag = re.search(r"~(\S+)", laravel_access_string(own))
+        assert tag is not None
+        for use, prefix in namespace_prefixes(other, ["cache", "session", "queue"]).items():
+            assert not fnmatch.fnmatchcase(prefix + "key", tag.group(1)), (own, other, use)
+    own = re.search(r"~(\S+)", laravel_access_string("a"))
+    assert own is not None
+    for prefix in namespace_prefixes("a", ["cache", "queue"]).values():
+        assert fnmatch.fnmatchcase(prefix + "key", own.group(1))
+
+
+def test_the_laravel_profile_allows_only_the_deployment_namespace_and_listed_commands() -> None:
+    tokens = laravel_access_string("orders").split()
+
+    assert tokens[:4] == ["on", "~{gimme:orders}:*", "&{gimme:orders}:*", "-@all"]
+    assert tokens[4:] == list(LARAVEL_COMMANDS)
+    assert not any(token.startswith(("+@", "allkeys", "allchannels", "~*", "&*", ">", "nopass"))
+                   for token in tokens), "no category, wildcard, or password grants"
+    granted = {token.removeprefix("+") for token in tokens[4:]}
+    for forbidden in (
+        "flushall", "flushdb", "config", "acl", "keys", "scan", "shutdown", "debug", "save",
+        "bgsave", "replicaof", "slaveof", "monitor", "client|kill", "client|list", "script|flush",
+        "cluster|reset", "cluster|failover", "info", "role", "migrate", "move", "swapdb",
+        "object", "dbsize", "randomkey", "pubsub", "sync", "psync", "module", "select",
+    ):
+        assert forbidden not in granted, forbidden
+    assert len(granted) == len(LARAVEL_COMMANDS), "no duplicate grants"
+
+
+def test_namespaces_share_one_hash_tag_and_horizon_accompanies_queue_only() -> None:
+    prefixes = namespace_prefixes("orders", ["cache", "session"])
+    assert prefixes == {
+        "cache": "{gimme:orders}:cache:", "session": "{gimme:orders}:session:",
+    }
+    both = namespace_prefixes("orders", ["queue"])
+    assert both == {
+        "queue": "{gimme:orders}:queue:", "horizon": "{gimme:orders}:horizon:",
+    }
+    assert {value.split("}")[0] for value in both.values()} == {"{gimme:orders"}
+
+
+def test_updates_cannot_drop_a_security_group_of_a_bound_target(tmp_path, monkeypatch) -> None:
+    provisioned(tmp_path, monkeypatch)
+    dropped = valkey(deployment_security_group_ids={})
+
+    with pytest.raises(
+        ResourceError, match="^aws_elasticache_update_forbidden_deployment_security_group_ids$"
+    ):
+        server_module.plan_update_resource(NAME, dropped)
+
+
+def test_updates_cannot_move_the_secret_store_once_credentials_exist(
+    tmp_path, monkeypatch
+) -> None:
+    provisioned(tmp_path, monkeypatch)
+    bind()
+
+    with pytest.raises(
+        ResourceError, match="^aws_elasticache_update_forbidden_workload_secret_store$"
+    ):
+        server_module.plan_update_resource(NAME, valkey(workload_secret_store="other-store"))
+
+
+def test_a_bound_resource_cannot_be_removed(tmp_path, monkeypatch) -> None:
+    provisioned(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="still referenced by a deployment"):
+        server_module.plan_cleanup_resource(NAME)
+
+
+def test_apply_binding_rejects_an_unsafe_deployment_name(tmp_path) -> None:
+    state = ControlState.model_validate(json.loads(EXAMPLE.read_text()))
+    network = state.aws_networks["primary"]
+    with pytest.raises(ResourceError, match="^deployment_name_invalid$"):
+        apply_binding(
+            FakeValkey(observation()), tmp_path,
+            state.provider_accounts[network.provider_account], network, valkey(), NAME,
+            cast(AWSSecretsManagerStore, state.secret_stores["workload-secrets"]),
+            "workload-secrets", "Bad Name", ["cache"],
+        )
+
+
+# --- the boto adapter: security group ingress and binding users -------------------------
+
+
+def sources_of(monkeypatch, rules, groups=None) -> tuple[str, ...] | None:
+    client, stub = stubbed("elasticache")
+    ec2, ec2_stub = stubbed("ec2")
+    expect_describe(stub, ec2_stub, rules=rules, groups=groups)
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)), ("ec2", (ec2, ec2_stub)))
+    account, network, _ = context()
+    with stub, ec2_stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+    assert observed is not None
+    return observed.ingress_sources
+
+
+def test_only_inbound_rules_that_reach_the_valkey_port_are_sources(monkeypatch) -> None:
+    rules = [
+        rule(ADMIN_SG), rule(ADMIN_SG), rule(DEVBOX_SG, low=6000, high=7000),
+        rule("sg-0123456789abcdef7", protocol="-1", low=-1, high=-1),
+        rule("0.0.0.0/0", low=22, high=22), rule("0.0.0.0/0", low=6380, high=6380),
+        rule("0.0.0.0/0", egress=True, protocol="-1", low=-1, high=-1),
+        rule("10.0.0.0/8", protocol="udp", low=6379, high=6379),
+    ]
+
+    assert sources_of(monkeypatch, rules) == (ADMIN_SG, DEVBOX_SG, "sg-0123456789abcdef7")
+
+
+def bare(**fields) -> dict[str, object]:
+    """A rule with no referenced group, then the given source fields."""
+    base = {k: v for k, v in rule(ADMIN_SG).items() if k != "ReferencedGroupInfo"}
+    return {**base, **fields}
+
+
+def test_cidr_prefix_list_and_unrecognised_sources_are_reported(monkeypatch) -> None:
+    rules = [
+        rule("10.0.0.0/8"), bare(CidrIpv6="::/0"), bare(PrefixListId="pl-0123456789abcdef0"),
+    ]
+
+    assert sources_of(monkeypatch, rules) == ("10.0.0.0/8", "::/0", "pl:pl-0123456789abcdef0")
+
+
+def test_a_rule_with_no_recognisable_source_is_unknown_not_safe(monkeypatch) -> None:
+    assert sources_of(monkeypatch, [bare()]) == ("unknown",)
+
+
+def test_a_group_with_no_inbound_rule_has_no_sources(monkeypatch) -> None:
+    assert sources_of(monkeypatch, []) == ()
+
+
+def test_every_attached_security_group_is_read(monkeypatch) -> None:
+    other = "sg-0123456789abcdef9"
+
+    assert sources_of(monkeypatch, [rule(ADMIN_SG)], groups=[other, GROUP_SG]) == (ADMIN_SG,)
+
+
+def test_a_security_group_read_failure_is_bounded(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    ec2, ec2_stub = stubbed("ec2")
+    expect_describe(stub, ec2_stub)
+    ec2_stub._queue.clear()  # noqa: SLF001 - replace the queued rules response with a fault
+    ec2_stub.add_client_error(
+        "describe_security_group_rules", "UnauthorizedOperation", service_message="arn:secret"
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)), ("ec2", (ec2, ec2_stub)))
+    account, network, _ = context()
+
+    with stub, ec2_stub, pytest.raises(ResourceError) as raised:
+        adapter.describe_group(account, network, GROUP_ID)
+
+    assert str(raised.value) == "aws_elasticache_security_group_unavailable"
+
+
+def test_the_adapter_has_no_way_to_edit_a_security_group() -> None:
+    names = {name for name in dir(BotoElastiCacheAdapter) if not name.startswith("__")}
+
+    assert not {name for name in names if "security" in name and "ingress" not in name}
+    assert not {name for name in names if name.startswith(("authorize", "revoke"))}
+
+
+class Capture:
+    """Matches anything and keeps what it was compared with."""
+
+    value: object = None
+
+    def __eq__(self, other: object) -> bool:
+        self.value = other
+        return True
+
+
+USER = derive_binding_user_id(GROUP_ID, DEPLOYMENT)
+USER_TAGS = [
+    {"Key": "gimme:resource", "Value": NAME}, {"Key": "gimme:deployment", "Value": DEPLOYMENT},
+]
+SECRET_ARN = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:x"
+
+
+def expect_membership(stub, *, member: bool = False) -> None:
+    users = [f"{GROUP_ID}-default", f"{GROUP_ID}-admin", *([USER] if member else [])]
+    stub.add_response(
+        "describe_user_groups", {"UserGroups": [{"UserGroupId": derive_user_group_id(GROUP_ID),
+                                                 "UserIds": users}]},
+        {"UserGroupId": derive_user_group_id(GROUP_ID)},
+    )
+    if not member:
+        stub.add_response(
+            "modify_user_group", {},
+            {"UserGroupId": derive_user_group_id(GROUP_ID), "UserIdsToAdd": [USER]},
+        )
+
+
+def expect_secret(secrets_stub) -> Capture:
+    payload = Capture()
+    name = f"gimme/workload/{NAME}/{DEPLOYMENT}"
+    secrets_stub.add_response(
+        "create_secret", {"ARN": SECRET_ARN},
+        {"Name": name, "SecretString": payload, "Tags": [
+            {"Key": "gimme:deployment", "Value": DEPLOYMENT},
+            {"Key": "gimme:resource", "Value": NAME},
+            {"Key": "gimme:secret-store", "Value": "workload-secrets"}]},
+    )
+    secrets_stub.add_response(
+        "put_secret_value", {"ARN": SECRET_ARN, "VersionId": "v" * 32},
+        {"SecretId": name, "SecretString": ANY},
+    )
+    return payload
+
+
+def binder(monkeypatch, sizes: list[int] | None = None):
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    if sizes is not None:
+        monkeypatch.setattr(
+            "gimme.resources_valkey.secrets_module.token_urlsafe",
+            lambda size: sizes.append(size) or PASSWORD,
+        )
+    return adapter, stub, secrets_stub
+
+
+def ensure(adapter, *, keep: bool):
+    account, network, store = context()
+    return adapter.ensure_binding(
+        account, network, store, "workload-secrets", NAME, GROUP_ID, DEPLOYMENT, keep
+    )
+
+
+def test_a_new_binding_creates_the_secret_before_the_user_and_joins_the_user_group(
+    monkeypatch,
+) -> None:
+    sizes: list[int] = []
+    adapter, stub, secrets_stub = binder(monkeypatch, sizes)
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": USER})
+    payload = expect_secret(secrets_stub)
+    stub.add_response(
+        "create_user", {},
+        {"UserId": USER, "UserName": f"gimme-{DEPLOYMENT}", "Engine": "valkey",
+         "AccessString": laravel_access_string(DEPLOYMENT), "Passwords": [PASSWORD],
+         "Tags": USER_TAGS},
+    )
+    expect_membership(stub)
+
+    with stub, secrets_stub:
+        written = ensure(adapter, keep=False)
+
+    assert written == (USER, SECRET_ARN, "v" * 32)
+    assert sizes == [36], "36 random bytes make a 48-character URL-safe password"
+    assert json.loads(cast(str, payload.value)) == {
+        "password": PASSWORD, "username": f"gimme-{DEPLOYMENT}",
+    }
+    stub.assert_no_pending_responses()
+    secrets_stub.assert_no_pending_responses()
+
+
+def test_an_existing_user_with_a_recorded_credential_only_converges_profile_and_membership(
+    monkeypatch,
+) -> None:
+    adapter, stub, secrets_stub = binder(monkeypatch)
+    stub.add_response("describe_users", {"Users": [{"UserId": USER}]}, {"UserId": USER})
+    stub.add_response(
+        "modify_user", {}, {"UserId": USER, "AccessString": laravel_access_string(DEPLOYMENT)}
+    )
+    expect_membership(stub, member=True)
+
+    with stub, secrets_stub:
+        assert ensure(adapter, keep=True) is None
+
+    stub.assert_no_pending_responses()
+    secrets_stub.assert_no_pending_responses()
+
+
+def test_an_existing_user_with_no_recorded_credential_gets_a_new_one(monkeypatch) -> None:
+    adapter, stub, secrets_stub = binder(monkeypatch)
+    stub.add_response("describe_users", {"Users": [{"UserId": USER}]}, {"UserId": USER})
+    expect_secret(secrets_stub)
+    stub.add_response(
+        "modify_user", {},
+        {"UserId": USER, "AccessString": laravel_access_string(DEPLOYMENT),
+         "Passwords": [PASSWORD]},
+    )
+    expect_membership(stub, member=True)
+
+    with stub, secrets_stub:
+        written = ensure(adapter, keep=False)
+
+    assert written is not None and written[0] == USER
+    stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    ("failing", "code"),
+    [("create_user", "user_bind"), ("modify_user_group", "user_group_bind")],
+)
+def test_binding_failures_are_bounded_and_never_carry_the_password(
+    monkeypatch, failing, code
+) -> None:
+    adapter, stub, secrets_stub = binder(monkeypatch)
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": USER})
+    expect_secret(secrets_stub)
+    if failing == "create_user":
+        stub.add_client_error("create_user", "AccessDenied", service_message=f"bad {PASSWORD}")
+    else:
+        stub.add_response("create_user", {}, None)
+        stub.add_response(
+            "describe_user_groups", {"UserGroups": []},
+            {"UserGroupId": derive_user_group_id(GROUP_ID)},
+        )
+        stub.add_client_error(
+            "modify_user_group", "InvalidUserGroupState", service_message=f"bad {PASSWORD}"
+        )
+
+    with stub, secrets_stub, pytest.raises(ResourceError) as raised:
+        ensure(adapter, keep=False)
+
+    assert PASSWORD not in repr(raised.value)
+    assert str(raised.value).startswith(f"aws_elasticache_{code}_")
+
+
+def test_a_user_read_failure_stops_before_any_secret_is_written(monkeypatch) -> None:
+    adapter, stub, secrets_stub = binder(monkeypatch)
+    stub.add_client_error("describe_users", "Throttling", expected_params={"UserId": USER})
+
+    with stub, secrets_stub, pytest.raises(ResourceError, match="user_describe_throttled"):
+        ensure(adapter, keep=False)
+
+    secrets_stub.assert_no_pending_responses()

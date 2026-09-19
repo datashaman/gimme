@@ -1,7 +1,7 @@
 # MCP reference
 
 Gimme is a local stdio MCP server built with FastMCP. Its desired state is stored in
-schema-v4 JSON; decrypted secrets are never returned by resources or tools.
+schema-v5 JSON; decrypted secrets are never returned by resources or tools.
 
 Runtime schemas returned by MCP discovery are authoritative. This page documents the
 stable intent, mutation boundary, and pairing of each primitive.
@@ -43,7 +43,7 @@ The nine parameterized URIs are resource templates. `gimme://state` and
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_state_migration` | Read | Inspect installed versions and plan migration to schema v4 |
+| `plan_state_migration` | Read | Inspect installed versions and plan migration to schema v5 |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
 | `list_applications` | Read | List application source/build definitions |
@@ -141,7 +141,7 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `plan_apply_resource` | Read | Plan creating one managed instance or converging an existing one; makes no AWS call |
 | `apply_resource` | Remote write | Create the RDS instance, or converge an existing one with one immediate modification, without returning a credential |
 | `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations and, after a successful live read, `drift` against desired state; falls back to the last observed state with a bounded `refresh_error` and no drift |
-| `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret |
+| `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret, and its Valkey ACL user, namespace, and credential |
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |

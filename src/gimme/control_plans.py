@@ -359,6 +359,40 @@ def resource_binding_plan(
     )
 
 
+def valkey_binding_plan(
+    deployment_name: str, resource_name: str, uses: list[str], namespaces: dict[str, str],
+    profile: str, observed: dict[str, Any] | None, database: dict[str, Any] | None,
+) -> dict[str, Any]:
+    allocations = observed["allocations"] if observed is not None else {}
+    return exact_plan(
+        {
+            "kind": "resource_binding",
+            "deployment": deployment_name,
+            "database": database,
+            "valkey": {
+                "resource": resource_name,
+                "uses": uses,
+                "namespaces": namespaces,
+                "acl_profile": profile,
+                "resource_ready": observed is not None and observed["phase"] == "ready",
+                "already_bound": deployment_name in allocations,
+            },
+            "effects": [
+                "create or reconcile this Deployment's own ElastiCache ACL user, limited to its "
+                "derived key and channel namespace and the fixed Gimme-owned laravel command "
+                "profile, and add it to the Resource's user group",
+                "write a Resource Credential secret holding exactly a username and a generated "
+                "48-character password to the workload Secret Store; an existing credential is "
+                "kept",
+                "refuse a Resource that a fresh live read does not report ready, degraded "
+                "included",
+                "never edit the Valkey security group, and never return, store, or log the "
+                "credential",
+            ],
+        }
+    )
+
+
 def resource_cleanup_plan(
     resource_name: str, *, managed: bool, subject: str = "RDS instance"
 ) -> dict[str, Any]:

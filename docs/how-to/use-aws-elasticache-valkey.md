@@ -7,14 +7,14 @@ finished: see the list below.
 
 ## Current scope
 
-Implemented: registering the Resource, local validation, provisioning one replication group
-(with its subnet group, parameter group, user group, and administrative user), live inspection
-with fixed readiness codes, and retention-by-default removal.
+Implemented: registering the Resource, provisioning one replication group (with its subnet
+group, parameter group, user group, and administrative user), reviewed updates and drift,
+live inspection with fixed readiness codes, typed Deployment bindings with a per-Deployment ACL
+user, namespace, and credential, and retention-by-default removal.
 
-Not implemented yet (tracked in #14): applying updates to an existing group and drift
-reconciliation, Deployment bindings and workload credentials, the application contract,
-destruction, snapshots and restore. A Deployment whose `resources.cache` names this Resource is
-refused when state is validated.
+Not implemented yet (tracked in #14): the Laravel application contract (a bound Deployment does
+not yet receive `GIMME_VALKEY_*` values or activation probes), destruction, snapshots and
+restore, and credential rotation.
 
 The AWS calls have only been exercised against botocore stubs. Nothing here has run against a
 live account, so the IAM statement and the ACL access strings below are unverified.
@@ -29,7 +29,9 @@ never edited:
   Provider Account, and an AWS Secrets Manager Secret Store, exactly as in
   [`use-aws-rds-postgresql.md`](use-aws-rds-postgresql.md);
 - one security group in that VPC for the Valkey nodes. Gimme attaches it and never edits it, so
-  allow TCP 6379 from the administration Target's security group yourself;
+  allow TCP 6379 yourself from the administration Target's security group and from the security
+  group of each Deployment Target that will bind the Resource, and from nothing else (see
+  [Security group](#security-group));
 - an administration Target (`"role": "administration"`);
 - the ElastiCache service-linked role. AWS creates `AWSServiceRoleForElastiCache` the first time
   a group is created if the caller may `iam:CreateServiceLinkedRole` for
@@ -53,13 +55,16 @@ delete action. This is a privilege increase for roles already deployed, includin
     "elasticache:CreateCacheParameterGroup",
     "elasticache:ModifyCacheParameterGroup",
     "elasticache:CreateUser",
+    "elasticache:ModifyUser",
     "elasticache:CreateUserGroup",
+    "elasticache:ModifyUserGroup",
     "elasticache:AddTagsToResource",
     "elasticache:ListTagsForResource",
     "elasticache:DescribeReplicationGroups",
     "elasticache:DescribeCacheClusters",
     "elasticache:DescribeCacheParameterGroups",
-    "elasticache:DescribeUsers"
+    "elasticache:DescribeUsers",
+    "elasticache:DescribeUserGroups"
   ],
   "Resource": [
     "arn:aws:elasticache:<region>:<account>:replicationgroup:gimme-*",
@@ -72,7 +77,7 @@ delete action. This is a privilege increase for roles already deployed, includin
 }
 ```
 
-Three read-only calls do not support resource-level permissions, so they need `"Resource": "*"`:
+Four read-only calls do not support resource-level permissions, so they need `"Resource": "*"`:
 
 ```json
 {
@@ -81,7 +86,8 @@ Three read-only calls do not support resource-level permissions, so they need `"
   "Action": [
     "elasticache:DescribeUpdateActions",
     "elasticache:DescribeCacheEngineVersions",
-    "elasticache:DescribeReservedCacheNodesOfferings"
+    "elasticache:DescribeReservedCacheNodesOfferings",
+    "ec2:DescribeSecurityGroupRules"
   ],
   "Resource": "*"
 }
@@ -104,6 +110,8 @@ against a live account.
   "engine_version": "9.0",
   "node_type": "cache.m7g.large",
   "security_group_id": "sg-0123456789abcdef2",
+  "administration_security_group_id": "sg-0123456789abcdef0",
+  "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
   "snapshot_window": "03:00-04:00",
   "snapshot_retention_days": 7,
   "maintenance_window": "sun:05:00-sun:06:00",
@@ -120,6 +128,10 @@ against a live account.
   that does not is only rejected at creation, with a bounded error. Read
   `gimme://aws-networks/<network>/valkey-options` for the exact Valkey versions and node types
   the account offers.
+- `administration_security_group_id` is the security group of the administration Target and
+  `deployment_security_group_ids` maps each Deployment Target that may bind the Resource to its
+  security group, exactly as for RDS. They are the only sources allowed to reach the Valkey
+  security group, and a Deployment on an unlisted Target cannot bind the Resource.
 - `snapshot_window` is a daily UTC `HH:MM-HH:MM` window of at least 60 minutes.
   `snapshot_retention_days` is 1 to 35. `maintenance_window` is a weekly UTC
   `ddd:HH:MM-ddd:HH:MM` window of exactly 60 minutes and must not overlap the snapshot window.
@@ -178,13 +190,58 @@ Phases are `pending`, `ready`, `degraded`, and `failed`. A `failed` group (AWS r
 meet the contract is `degraded` with fixed reason codes: `cluster_mode`, `topology`,
 `availability_zones`, `multi_az`, `automatic_failover`, `tls`, `encryption_at_rest`,
 `durability` (the effective durability is not `sync`), `authentication`, `snapshot_policy`,
-`maintenance_policy`, `automatic_minor_upgrade`, `service_update_overdue` (AWS reports a
+`maintenance_policy`, `automatic_minor_upgrade`, `security_group`, `service_update_overdue` (AWS reports a
 service update that missed its recommended apply-by date and is not finished). Apply the update
 yourself; Gimme does not.
 
 If creating the administrative user fails after its secret was written, the next apply
 generates and stores a fresh password before trying again. If the user already exists, its
 stored credential is left alone.
+
+## Bind a Deployment
+
+A Deployment binds the Resource with a typed binding, replacing the old `resources.cache`
+string:
+
+```json
+"resources": {
+  "database": "orders-postgres",
+  "valkey": {"resource": "shared-valkey", "uses": ["cache", "session", "queue"]}
+}
+```
+
+`uses` is a non-empty list of `cache`, `session`, and `queue`, each at most once, and a
+Deployment that runs Horizon must include `queue`. The namespaces are derived, never supplied:
+`{gimme:<deployment>}:cache:`, `:session:`, `:queue:`, and `:horizon:` (with `queue`). They share
+one hash tag so multi-key Laravel and Horizon operations stay in one cluster slot.
+
+`plan_bind_resource` then `bind_resource` gives the Deployment its own ACL user, restricted to
+its own key and channel namespace and to the fixed, Gimme-owned `laravel-v1` command profile, and
+adds it to the Resource's user group. Its Resource Credential is a secret at
+`<prefix>/<resource>/<deployment>` holding exactly `username` and a 48-character URL-safe
+`password`. Neither is ever returned, stored in state, plans, or observations, or logged. The
+profile denies administrative, configuration, ACL, persistence, replication, flush, and
+keyspace-scanning commands, so a Deployment cannot list or touch another Deployment's keys;
+`cache:clear` (which flushes the database) is therefore not permitted. Callers cannot supply an
+access string.
+
+Binding needs a `ready` Resource by a fresh live read, so a `degraded` one, including unsafe
+security group drift, takes no new binding and existing Deployments keep running. Binding again
+keeps the recorded credential and only re-applies the profile. A Deployment name that has no
+recorded allocation but already has a user gets a fresh credential. Removing a Deployment Target
+from `deployment_security_group_ids` while a Deployment on it is bound, and moving
+`workload_secret_store` once credentials exist, are refused by `plan_update_resource`, and a
+bound Resource cannot be removed.
+
+## Security group
+
+`inspect_resource` and every describe read the inbound rules of the group's security group
+through `ec2:DescribeSecurityGroupRules`. Any rule reaching TCP 6379 whose source is not the
+administration security group or a listed Deployment Target security group, including a CIDR,
+prefix list, or any unrelated group, and any attached group other than `security_group_id`,
+makes the Resource `degraded` with the `security_group` code. Gimme never edits the group, so
+fix it yourself. The allowed set is the listed Deployment Targets rather than only the bound
+ones.
 
 ## Inspect and remove
 
@@ -205,7 +262,7 @@ Provider failures become fixed `aws_elasticache_<operation>_<reason>` codes, for
 `invalid_state`, `throttled`, `revoked`, and `unavailable`, and AWS messages, ARNs, and values
 are never included. Operations include `subnet_group`, `parameter_group`,
 `parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
-`user_describe`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
+`user_describe`, `user_bind`, `user_group_bind`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
 `options`, `modify`, and `create`.
 `aws_elasticache_group_ownership_mismatch` and
 `aws_elasticache_parameter_group_ownership_mismatch` mean a same-named object exists that this

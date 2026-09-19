@@ -1,6 +1,6 @@
 # Use AWS Secrets Manager for Deployment secrets
 
-Gimme schema v4 supports AWS Secrets Manager as its first external Secret Store. The
+Gimme schema v4 and later support AWS Secrets Manager as its first external Secret Store. The
 control-plane process is the only component that receives AWS authority. Targets never
 receive AWS credentials, and AWS secret values are resolved only while applying an exact
 Deployment resource plan.

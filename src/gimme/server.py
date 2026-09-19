@@ -23,13 +23,14 @@ from gimme.control import (
     AWSElastiCacheValkeyResource, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
-    ResourceConfig, S3BackupDestination, SecretStore, StateStore, TargetConfig, legacy_app,
-    legacy_server, new_placement, target_sites,
+    ResourceConfig, S3BackupDestination, SecretStore, StateStore, TargetConfig, ValkeyBinding,
+    legacy_app, legacy_server, new_placement, target_sites,
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
+    valkey_binding_plan,
     valkey_provision_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
@@ -1103,7 +1104,13 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
             and isinstance(definition, AWSElastiCacheValkeyResource)
         ):
             raise ResourceError("aws_elasticache_update_forbidden_provider")
-        resources_valkey_module.validate_update(current, definition)
+        resources_valkey_module.validate_update(
+            current, definition, resources_valkey_module.load_observed(store.root, name),
+            {
+                d.target for d in state.deployments.values()
+                if d.resources.valkey is not None and d.resources.valkey.resource == name
+            },
+        )
         if definition.node_type != current.node_type:
             _refuse_unavailable_node_type(state, definition)
     if current is not None and (
@@ -1306,10 +1313,28 @@ def _inspect_valkey(
             status=observed["status"], engine_version=observed["engine_version"],
             effective_durability=observed["effective_durability"], issues=observed["issues"],
         )
+    if observed is not None:
+        result["allocations"] = {
+            deployment_name: {"status": allocation["status"]}
+            for deployment_name, allocation in cast(
+                dict[str, dict[str, object]], observed["allocations"]
+            ).items()
+        }
     return result
 
 
-def _resource_binding_plan(name: str) -> dict[str, object]:
+def _managed_valkey_binding(
+    name: str,
+) -> tuple[ControlState, DeploymentConfig, str, AWSElastiCacheValkeyResource] | None:
+    state, deployment, _target, _application = _context(name)
+    binding = deployment.resources.valkey
+    resource = None if binding is None else state.resources.get(binding.resource)
+    if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
+        return None
+    return state, deployment, binding.resource, resource
+
+
+def _database_binding_plan(name: str) -> dict[str, object]:
     _state, deployment, _target, _application = _context(name)
     resource_name = deployment.resources.database
     if resource_name is None:
@@ -1319,10 +1344,28 @@ def _resource_binding_plan(name: str) -> dict[str, object]:
     return resource_binding_plan(name, deployment, resource_name, observed)
 
 
+def _resource_binding_plan(name: str) -> dict[str, object]:
+    valkey = _managed_valkey_binding(name)
+    if valkey is None:
+        return _database_binding_plan(name)
+    state, deployment, resource_name, _resource = valkey
+    binding = cast(ValkeyBinding, deployment.resources.valkey)
+    database = deployment.resources.database
+    return valkey_binding_plan(
+        name, resource_name, binding.uses,
+        resources_valkey_module.namespace_prefixes(name, binding.uses),
+        resources_valkey_module.LARAVEL_PROFILE,
+        resources_valkey_module.load_observed(store.root, resource_name),
+        _database_binding_plan(name)
+        if isinstance(state.resources.get(database or ""), AWSRDSPostgresResource) else None,
+    )
+
+
 @mcp.tool(annotations=READ)
 @_journal_plan("bind_resource", "name")
 def plan_bind_resource(name: Name) -> dict[str, object]:
-    """Plan creating this deployment's isolated database, role, and workload secret."""
+    """Plan creating this deployment's isolated database, role, and workload secret, and
+    its Valkey ACL user, namespace, and credential when it binds a managed Valkey."""
     return _resource_binding_plan(name)
 
 
@@ -1333,6 +1376,31 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     Never returns the workload username or password."""
     expected = _resource_binding_plan(name)
     _assert_plan(expected, plan_id)
+    valkey = _managed_valkey_binding(name)
+    if valkey is None:
+        return {"changed": True, **_bind_database(name, expected)}
+    state, deployment, resource_name, resource = valkey
+    ready = cast(dict[str, object], expected["valkey"])["resource_ready"]
+    database = cast(dict[str, object] | None, expected["database"])
+    if not ready or (database is not None and not database["resource_ready"]):
+        raise ValueError("managed resource is not ready; run apply_resource first")
+    result: dict[str, object] = {"changed": True}
+    if database is not None:
+        result.update(_bind_database(name, database))
+    network = state.aws_networks[resource.aws_network]
+    workload_store = cast(
+        AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]
+    )
+    with _deployment_resource_lock(name):
+        result["valkey"] = resources_valkey_module.apply_binding(
+            elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
+            network, resource, resource_name, workload_store, resource.workload_secret_store,
+            name, cast(ValkeyBinding, deployment.resources.valkey).uses,
+        )
+    return result
+
+
+def _bind_database(name: str, expected: dict[str, object]) -> dict[str, object]:
     if not expected["resource_ready"]:
         raise ValueError("managed resource is not ready; run apply_resource first")
     state, deployment, _target, _application = _context(name)
@@ -1371,7 +1439,7 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
             database_identifier, database_identifier, workload_password,
             str(observed["endpoint"]), int(cast(int, observed["port"])),
         )
-    return {"changed": True, **summary}
+    return summary
 
 
 def _resource_cleanup_plan(name: str) -> dict[str, object]:

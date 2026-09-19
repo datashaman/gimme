@@ -14,6 +14,7 @@ from gimme.control import (
     AWSNetwork,
     AWSProviderAccount,
     AWSSecretsManagerStore,
+    DEPLOYMENT_NAME,
 )
 from gimme.resources_postgres import (
     MAX_OBSERVED_BYTES,
@@ -35,10 +36,11 @@ GROUP_PHASE = ("pending", "ready", "degraded", "failed")
 ISSUES = (
     "cluster_mode", "topology", "availability_zones", "multi_az", "automatic_failover", "tls",
     "encryption_at_rest", "durability", "authentication", "snapshot_policy",
-    "maintenance_policy", "automatic_minor_upgrade", "service_update_overdue",
+    "maintenance_policy", "automatic_minor_upgrade", "service_update_overdue", "security_group",
 )
 # The only ISSUES an apply can repair; every other live difference fails apply closed.
 REPAIRABLE_ISSUES = ("snapshot_policy", "maintenance_policy", "service_update_overdue")
+# Gimme never edits the security group: anything else that can reach the group is unsafe drift.
 MODIFIABLE_FIELDS = frozenset({
     "EngineVersion", "CacheNodeType", "SnapshotRetentionLimit", "SnapshotWindow",
     "PreferredMaintenanceWindow",
@@ -54,10 +56,32 @@ ADMIN_ACCESS_STRING = (
     "on ~{gimme:* &{gimme:* -@all +ping +info +get +set +del +exists +ttl +type +scan"
 )
 ADMIN_USER_NAME = "gimme-admin"
+# The Gimme-owned `laravel` ACL profile, version 1: only these commands, only on the
+# Deployment's own key and channel namespace. Administrative, configuration, ACL, persistence,
+# replication, flush, and keyspace-scanning commands are absent, so cross-prefix discovery is
+# denied. Callers can never supply an access string.
+LARAVEL_PROFILE = "laravel-v1"
+LARAVEL_COMMANDS = (
+    "+get", "+set", "+del", "+unlink", "+exists", "+type", "+ttl", "+pttl", "+expire",
+    "+pexpire", "+expireat", "+pexpireat", "+persist", "+incr", "+decr", "+incrby", "+decrby",
+    "+incrbyfloat", "+mget", "+mset", "+setex", "+psetex", "+setnx", "+getset", "+getdel",
+    "+append", "+strlen", "+touch", "+hget", "+hset", "+hsetnx", "+hdel", "+hgetall",
+    "+hincrby", "+hmget", "+hmset", "+hexists", "+hkeys", "+hvals", "+hlen", "+lpush", "+rpush",
+    "+lpop", "+rpop", "+llen", "+lrange", "+lrem", "+lindex", "+ltrim", "+lset", "+blpop",
+    "+brpop", "+sadd", "+srem", "+smembers", "+sismember", "+scard", "+spop", "+zadd", "+zrem",
+    "+zrange", "+zrangebyscore", "+zrevrange", "+zrevrangebyscore", "+zcard", "+zscore",
+    "+zcount", "+zincrby", "+zrank", "+zrevrank", "+zremrangebyscore", "+zremrangebyrank",
+    "+eval", "+evalsha", "+script|load", "+script|exists", "+multi", "+exec", "+discard",
+    "+watch", "+unwatch", "+publish", "+subscribe", "+unsubscribe", "+psubscribe",
+    "+punsubscribe", "+ping", "+echo", "+auth", "+hello", "+time", "+client|setinfo",
+    "+client|setname", "+cluster|slots", "+cluster|shards", "+cluster|nodes", "+cluster|info",
+)
+BINDING_STATUS = ("active",)
 
 
 def validate_update(
-    current: AWSElastiCacheValkeyResource, proposed: AWSElastiCacheValkeyResource
+    current: AWSElastiCacheValkeyResource, proposed: AWSElastiCacheValkeyResource,
+    observed: dict[str, object] | None, bound_targets: set[str],
 ) -> None:
     """Refuse the updates ADR 0009 says need a new Resource. Local: never calls AWS.
     Same-major engine, node type, windows, and retention are allowed and applied later."""
@@ -70,6 +94,16 @@ def validate_update(
         forbid("engine_major")
     if proposed.security_group_id != current.security_group_id:
         forbid("security_group_id")
+    if (
+        proposed.workload_secret_store != current.workload_secret_store
+        and observed is not None and observed["allocations"]
+    ):
+        forbid("workload_secret_store")
+    removed = set(current.deployment_security_group_ids) - set(
+        proposed.deployment_security_group_ids
+    )
+    if removed & bound_targets:
+        forbid("deployment_security_group_ids")
 
 
 def derive_group_id(resource_name: str) -> str:
@@ -95,6 +129,28 @@ def _derived(group_id: str, suffix: str) -> str:
 
 def derive_user_group_id(group_id: str) -> str:
     return _derived(group_id, "users")
+
+
+def derive_binding_user_id(group_id: str, deployment_name: str) -> str:
+    """One opaque ElastiCache user id per (group, Deployment): letters, digits, and hyphens,
+    at most 40 characters, and never equal to the default or administrative user."""
+    digest = hashlib.sha256(f"{group_id}/{deployment_name}".encode()).hexdigest()[:24]
+    return f"gimme-u-{digest}"
+
+
+def laravel_access_string(deployment_name: str) -> str:
+    namespace = f"{{gimme:{deployment_name}}}:*"
+    return f"on ~{namespace} &{namespace} -@all {' '.join(LARAVEL_COMMANDS)}"
+
+
+def namespace_prefixes(deployment_name: str, uses: list[str]) -> dict[str, str]:
+    """Immutable, derived key namespaces sharing one hash tag, so multi-key Laravel and
+    Horizon operations stay in a single cluster slot. Horizon accompanies queue."""
+    tag = f"{{gimme:{deployment_name}}}"
+    prefixes = {use: f"{tag}:{use}:" for use in uses}
+    if "queue" in uses:
+        prefixes["horizon"] = f"{tag}:horizon:"
+    return prefixes
 
 
 def _parameter_group_family(engine_version: str) -> str:
@@ -123,6 +179,9 @@ class GroupObservation:
     automatic_minor_upgrade: bool | None
     endpoint: str | None
     port: int | None
+    # What reaches the group on TCP 6379: None when not observed (the group is not available).
+    security_group_ids: tuple[str, ...] | None = None
+    ingress_sources: tuple[str, ...] | None = None
     # Values AWS has accepted but not finished applying count as applied, so a resumed apply
     # never re-sends them.
     pending_engine_version: str | None = None
@@ -156,6 +215,12 @@ class ElastiCacheAdapter(Protocol):
         changes: dict[str, object],
     ) -> GroupObservation: ...
 
+    def ensure_binding(
+        self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
+        store_name: str, resource_name: str, group_id: str, deployment_name: str,
+        keep_credential: bool,
+    ) -> tuple[str, str, str] | None: ...
+
 
 def _tags(response: dict[str, object]) -> dict[object, object]:
     tags = response.get("TagList") or []
@@ -183,7 +248,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
         return session.client("elasticache", region_name=network.region)
 
     def _observation(
-        self, client, response: dict[str, object], group_id: str
+        self, session, region: str, client, response: dict[str, object], group_id: str
     ) -> GroupObservation:
         arn = response.get("ARN")
         status = response.get("Status")
@@ -233,6 +298,15 @@ class BotoElastiCacheAdapter(AWSAdapter):
         minor = cluster.get("AutoMinorVersionUpgrade")
         pending = cluster.get("PendingModifiedValues")
         pending = pending if isinstance(pending, dict) else {}
+        attached = cluster.get("SecurityGroups")
+        group_ids = tuple(sorted(
+            item["SecurityGroupId"] for item in attached or []
+            if isinstance(item, dict) and isinstance(item.get("SecurityGroupId"), str)
+        )) if isinstance(attached, list) else None
+        sources = (
+            self._ingress_sources(session, region, group_ids)
+            if status == "available" and group_ids else None
+        )
         return GroupObservation(
             identity=arn, status=status,
             engine_version=version if isinstance(version, str) else None,
@@ -253,10 +327,43 @@ class BotoElastiCacheAdapter(AWSAdapter):
             automatic_minor_upgrade=minor if isinstance(minor, bool) else None,
             endpoint=address if isinstance(address, str) else None,
             port=port if isinstance(port, int) else None,
+            security_group_ids=group_ids if sources is not None else None,
+            ingress_sources=sources,
             pending_engine_version=_text(pending.get("EngineVersion")),
             pending_node_type=_text(pending.get("CacheNodeType")),
             service_update_overdue=overdue,
         )
+
+    def _ingress_sources(
+        self, session, region: str, group_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Every distinct source of an inbound rule that reaches TCP 6379 on these groups: a
+        security group id, a CIDR, or a prefix list. Read only; Gimme never edits the group."""
+        try:
+            pages = session.client("ec2", region_name=region).get_paginator(
+                "describe_security_group_rules"
+            ).paginate(Filters=[{"Name": "group-id", "Values": list(group_ids)}])
+            rules = [rule for page in pages for rule in page.get("SecurityGroupRules") or []]
+        except Exception as exc:
+            raise _provider_error(exc, "security_group", self.error_prefix) from None
+        sources: set[str] = set()
+        for rule in rules:
+            if not isinstance(rule, dict) or rule.get("IsEgress") is not False:
+                continue
+            low, high = rule.get("FromPort"), rule.get("ToPort")
+            if rule.get("IpProtocol") != "-1" and not (
+                rule.get("IpProtocol") == "tcp" and isinstance(low, int)
+                and isinstance(high, int) and low <= PORT <= high
+            ):
+                continue
+            referenced = rule.get("ReferencedGroupInfo")
+            source = (
+                referenced.get("GroupId") if isinstance(referenced, dict)
+                else rule.get("CidrIpv4") or rule.get("CidrIpv6")
+                or (f"pl:{rule['PrefixListId']}" if rule.get("PrefixListId") else None)
+            )
+            sources.add(source if isinstance(source, str) else "unknown")
+        return tuple(sorted(sources))
 
     def _service_update_overdue(self, client, group_id: str) -> bool:
         """True when AWS says a service update missed its recommended apply-by date and is
@@ -277,7 +384,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
     def describe_group(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
     ) -> GroupObservation | None:
-        client = self._client(account, network, "elasticache-inspect")
+        session = self._session(account, account.inspection_role_arn, "elasticache-inspect")
+        client = session.client("elasticache", region_name=network.region)
         try:
             response = client.describe_replication_groups(ReplicationGroupId=group_id)
         except Exception as exc:
@@ -288,7 +396,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
         groups = response.get("ReplicationGroups") or []
         if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
             raise ResourceError("aws_elasticache_group_identity_invalid")
-        return self._observation(client, groups[0], group_id)
+        return self._observation(session, network.region, client, groups[0], group_id)
 
     def allowed_node_types(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
@@ -451,6 +559,58 @@ class BotoElastiCacheAdapter(AWSAdapter):
         ))
         return user_group
 
+    def ensure_binding(
+        self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
+        store_name: str, resource_name: str, group_id: str, deployment_name: str,
+        keep_credential: bool,
+    ) -> tuple[str, str, str] | None:
+        """Create or converge this Deployment's ACL user and add it to the group's user group.
+        Returns (user id, secret ARN, secret version) when a credential was written, and None
+        when the recorded credential was kept. The password exists only here: it goes to the
+        Secret Store and to ElastiCache, never back to the caller."""
+        client = self._client(account, network, "elasticache-bind")
+        tag = [
+            {"Key": "gimme:resource", "Value": resource_name},
+            {"Key": "gimme:deployment", "Value": deployment_name},
+        ]
+        user_id = derive_binding_user_id(group_id, deployment_name)
+        username = f"gimme-{deployment_name}"
+        access = laravel_access_string(deployment_name)
+        exists = self._user_exists(client, user_id)
+        written: tuple[str, str, str] | None = None
+        if not (exists and keep_credential):
+            password = secrets_module.token_urlsafe(36)
+            arn, version = self.create_workload_secret(
+                account, store, f"{resource_name}/{deployment_name}",
+                {"gimme:secret-store": store_name, "gimme:resource": resource_name,
+                 "gimme:deployment": deployment_name},
+                {"username": username, "password": password},
+            )
+            written = (user_id, arn, version)
+            try:
+                if exists:
+                    client.modify_user(UserId=user_id, AccessString=access, Passwords=[password])
+                else:
+                    client.create_user(
+                        UserId=user_id, UserName=username, Engine="valkey",
+                        AccessString=access, Passwords=[password], Tags=tag,
+                    )
+            except Exception as exc:
+                raise _provider_error(exc, "user_bind", self.error_prefix) from None
+        else:
+            try:
+                client.modify_user(UserId=user_id, AccessString=access)
+            except Exception as exc:
+                raise _provider_error(exc, "user_bind", self.error_prefix) from None
+        user_group = derive_user_group_id(group_id)
+        try:
+            members = client.describe_user_groups(UserGroupId=user_group).get("UserGroups") or []
+            if not any(user_id in (group.get("UserIds") or []) for group in members):
+                client.modify_user_group(UserGroupId=user_group, UserIdsToAdd=[user_id])
+        except Exception as exc:
+            raise _provider_error(exc, "user_group_bind", self.error_prefix) from None
+        return written
+
     def create_group(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
@@ -517,6 +677,13 @@ def structural_issues(
         "maintenance_policy": observed.maintenance_window == resource.maintenance_window,
         "automatic_minor_upgrade": observed.automatic_minor_upgrade is False,
         "service_update_overdue": not observed.service_update_overdue,
+        "security_group": (
+            observed.security_group_ids == (resource.security_group_id,)
+            and set(observed.ingress_sources or ()) <= {
+                resource.administration_security_group_id,
+                *resource.deployment_security_group_ids.values(),
+            }
+        ),
     }
     return [code for code in ISSUES if not checks[code]]
 
@@ -614,17 +781,24 @@ def group_drift(
 def _validate_observed(document: object) -> dict[str, object]:
     if not isinstance(document, dict) or set(document) != {
         "schema_version", "resource", "replication_group_id", "identity", "status", "phase",
-        "engine_version", "effective_durability", "issues", "endpoint", "port",
+        "engine_version", "effective_durability", "issues", "endpoint", "port", "allocations",
     }:
         raise ResourceError("observed_resource_invalid")
     issues = document.get("issues")
     port = document.get("port")
+    allocations = document.get("allocations")
     if (
         document.get("schema_version") != 1
         or RESOURCE_NAME.fullmatch(str(document.get("resource"))) is None
         or document.get("phase") not in GROUP_PHASE
         or not isinstance(issues, list) or any(item not in ISSUES for item in issues)
         or (port is not None and not isinstance(port, int))
+        or not isinstance(allocations, dict) or any(
+            DEPLOYMENT_NAME.fullmatch(str(name)) is None or not isinstance(item, dict)
+            or set(item) != {"user_id", "secret_arn", "secret_version_id", "status"}
+            or item["status"] not in BINDING_STATUS
+            for name, item in allocations.items()
+        )
     ):
         raise ResourceError("observed_resource_invalid")
     return document
@@ -644,7 +818,8 @@ def load_observed(root: Path, resource_name: str) -> dict[str, object] | None:
 
 
 def _group_document(
-    resource_name: str, group_id: str, observed: GroupObservation, issues: list[str]
+    resource_name: str, group_id: str, observed: GroupObservation, issues: list[str],
+    allocations: dict[str, object],
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -658,6 +833,7 @@ def _group_document(
         "issues": issues,
         "endpoint": observed.endpoint,
         "port": observed.port,
+        "allocations": allocations,
     }
 
 
@@ -672,6 +848,8 @@ def apply_provision(
     seconds. A still-provisioning or still-modifying group is recorded as phase 'pending';
     a later call resumes by describing, so it re-creates and re-sends nothing."""
     group_id = derive_group_id(resource_name)
+    previous = load_observed(root, resource_name)
+    allocations = dict(cast(dict[str, object], previous["allocations"])) if previous else {}
     modified_fields: list[str] = []
     deadline = now() + POLL_BUDGET_SECONDS
 
@@ -703,13 +881,53 @@ def apply_provision(
                 modified_fields = sorted(changes)
     observed = settle(observed)
     issues = structural_issues(resource, observed, group_id)
-    document = _group_document(resource_name, group_id, observed, issues)
+    document = _group_document(resource_name, group_id, observed, issues, allocations)
     _write_json(_observed_path(root, resource_name), _validate_observed(document), resource_name)
     return {
         "resource": resource_name, "status": observed.status, "phase": document["phase"],
         "engine_version": observed.engine_version,
         "effective_durability": observed.effective_durability, "issues": issues,
         "modified_fields": modified_fields,
+    }
+
+
+def apply_binding(
+    adapter: ElastiCacheAdapter, root: Path, account: AWSProviderAccount, network: AWSNetwork,
+    resource: AWSElastiCacheValkeyResource, resource_name: str,
+    store: AWSSecretsManagerStore, store_name: str, deployment_name: str, uses: list[str],
+) -> dict[str, object]:
+    """Give one Deployment its own ACL user, namespace, and Resource Credential. A group that
+    is not ready by a fresh live read, degraded included, takes no new binding. An existing
+    allocation keeps its credential; a user with no recorded allocation gets a new one.
+    Never returns the username or password."""
+    if DEPLOYMENT_NAME.fullmatch(deployment_name) is None:
+        raise ResourceError("deployment_name_invalid")
+    document = load_observed(root, resource_name)
+    group_id = derive_group_id(resource_name)
+    live = adapter.describe_group(account, network, group_id)
+    if document is None or live is None:
+        raise ResourceError("aws_elasticache_binding_resource_not_ready")
+    if group_phase(live, structural_issues(resource, live, group_id)) != "ready":
+        raise ResourceError("aws_elasticache_binding_resource_not_ready")
+    allocations = dict(cast(dict[str, object], document["allocations"]))
+    written = adapter.ensure_binding(
+        account, network, store, store_name, resource_name, group_id, deployment_name,
+        keep_credential=deployment_name in allocations,
+    )
+    if written is not None:
+        user_id, secret_arn, version_id = written
+        allocations[deployment_name] = {
+            "user_id": user_id, "secret_arn": secret_arn, "secret_version_id": version_id,
+            "status": "active",
+        }
+        _write_json(
+            _observed_path(root, resource_name),
+            _validate_observed({**document, "allocations": allocations}), resource_name,
+        )
+    return {
+        "deployment": deployment_name, "resource": resource_name,
+        "namespaces": namespace_prefixes(deployment_name, uses),
+        "secret_reference": {"store": store_name, "secret": f"{resource_name}/{deployment_name}"},
     }
 
 
