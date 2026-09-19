@@ -18,9 +18,10 @@ uv run ruff check --stdin-filename gimme-provision-stack - < scripts/gimme-provi
 uv run ruff check --stdin-filename gimme-provision-processes - < scripts/gimme-provision-processes
 uv run ruff check --stdin-filename gimme-recovery-maintenance - < scripts/gimme-recovery-maintenance
 uv run ruff check --stdin-filename gimme-capture-valkey - < scripts/gimme-capture-valkey
+uv run ruff check --stdin-filename gimme-restore-postgres - < scripts/gimme-restore-postgres
 uv run bandit -q -r src
 uv run bandit -q scripts/gimme-provision-stack scripts/gimme-provision-processes \
-    scripts/gimme-recovery-maintenance scripts/gimme-capture-valkey
+    scripts/gimme-recovery-maintenance scripts/gimme-capture-valkey scripts/gimme-restore-postgres
 uv export --frozen --no-dev --no-emit-project | uv run pip-audit -r /dev/stdin
 uv run pytest -q
 vendor/bin/phpstan analyse deploy.php deploy --no-progress --level=5

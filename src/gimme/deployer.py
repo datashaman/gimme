@@ -130,6 +130,10 @@ class DeployerRunner:
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
         recovery_quiesce_wait: int | None = None,
+        postgres_restore_action: str | None = None,
+        postgres_restore_request_id: str | None = None,
+        postgres_restore_sha256: str | None = None,
+        postgres_restore_bytes: int | None = None,
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
         resource_trust_bundle_sha256: str | None = None,
@@ -226,6 +230,21 @@ class DeployerRunner:
             environment["GIMME_RECOVERY_ACTION"] = recovery_action
             environment["GIMME_RECOVERY_REQUEST_ID"] = recovery_request_id
             environment["GIMME_RECOVERY_QUIESCE_WAIT"] = str(recovery_quiesce_wait)
+        if any(value is not None for value in (
+            postgres_restore_action, postgres_restore_request_id,
+            postgres_restore_sha256, postgres_restore_bytes
+        )):
+            if (
+                postgres_restore_action not in {"prepare", "swap", "cleanup"}
+                or postgres_restore_request_id is None
+                or postgres_restore_sha256 is None
+                or postgres_restore_bytes is None
+            ):
+                raise ValueError("PostgreSQL restore inputs must be complete")
+            environment["GIMME_POSTGRES_RESTORE_ACTION"] = postgres_restore_action
+            environment["GIMME_POSTGRES_RESTORE_REQUEST_ID"] = postgres_restore_request_id
+            environment["GIMME_POSTGRES_RESTORE_SHA256"] = postgres_restore_sha256
+            environment["GIMME_POSTGRES_RESTORE_BYTES"] = str(postgres_restore_bytes)
         if resource_endpoint is not None:
             host, port = resource_endpoint
             environment["GIMME_RESOURCE_ENDPOINT"] = host
