@@ -562,13 +562,14 @@ def _load_manifest_record(
         or manifest["destination"] != destination_name
     ):
         raise RecoveryError("recovery_manifest_invalid")
-    expected_prefix = f"{RECOVERY_POINT_PREFIX}/{deployment}/{point_id}/"
     missing = 0
     seen: set[tuple[str, str]] = set()
     for component in manifest["components"]:  # type: ignore[union-attr]
         component_key_value = str(component["key"])
         version_id = str(component["version_id"])
-        if not component_key_value.startswith(expected_prefix):
+        if component_key_value != component_key(
+            deployment, point_id, str(component["kind"])
+        ):
             raise RecoveryError("recovery_manifest_invalid")
         identity = component_key_value, version_id
         if identity in seen:

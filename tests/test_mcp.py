@@ -725,6 +725,40 @@ def test_partial_recovery_point_deletion_is_visible_and_same_plan_retry_complete
     assert duplicate["changed"] is False
 
 
+def test_rejected_delete_apply_does_not_authorize_an_external_partial_state(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+
+    def fake_run(*args, **kwargs):
+        content = b"pg-dump-bytes"
+        kwargs["backup_local_path"].write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        return CommandResult(["dep"], 0, f"GIMME_BACKUP|{digest}|{len(content)}")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    creation = server_module.plan_create_recovery_point("example-app", "req-1")
+    created = server_module.create_recovery_point(
+        "example-app", "req-1", str(creation["plan_id"])
+    )
+    point_id = str(created["recovery_point"]["recovery_point_id"])
+    plan = server_module.plan_delete_recovery_point("example-app", point_id)
+    with pytest.raises(ValueError, match="confirmation"):
+        server_module.delete_recovery_point(
+            "example-app", point_id, str(plan["plan_id"]), "wrong"
+        )
+    component = f"gimme/recovery-points/example-app/{point_id}/postgres.dump"
+    adapter.delete_object(None, None, component, adapter.versions[component])
+
+    with pytest.raises(RecoveryError, match="^recovery_point_deletion_failed$"):
+        server_module.delete_recovery_point(
+            "example-app", point_id, str(plan["plan_id"]), str(plan["confirmation"]),
+            str(plan["last_recovery_point_confirmation"]),
+        )
+
+
 def test_unresolved_safety_recovery_point_cannot_be_deleted(tmp_path, monkeypatch) -> None:
     use_recovery_store(tmp_path, monkeypatch)
     adapter = FakeS3()

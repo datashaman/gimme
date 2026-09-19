@@ -1179,11 +1179,12 @@ def plan_delete_recovery_point(
 
 def _matching_delete_retry(name: str, plan_id: str) -> bool:
     events = _journal().list(limit=200, operation="delete_recovery_point", subject=name)
-    applies = [
+    outcomes = [
         event for event in events
-        if event.phase == "apply" and event.plan_id == plan_id
+        if event.phase == "outcome" and event.plan_id == plan_id
+        and event.status in {"failed", "succeeded"}
     ]
-    return len(applies) >= 2 and _journal().plan_correlation(
+    return bool(outcomes) and _journal().plan_correlation(
         plan_id, "delete_recovery_point"
     ) is not None
 

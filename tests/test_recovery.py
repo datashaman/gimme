@@ -484,6 +484,27 @@ def test_a_manifest_cannot_borrow_another_recovery_points_component(tmp_path: Pa
     assert inventory["rejected"] == [attacker_id]
 
 
+def test_a_manifest_cannot_name_a_noncanonical_key_inside_its_own_prefix(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+    original = manifest["components"][0]
+    alternate_key = f"gimme/recovery-points/checkout/{point_id}/alternate.dump"
+    adapter.objects[alternate_key] = adapter.objects[original["key"]]
+    adapter.versions[alternate_key] = original["version_id"]
+    changed = {**manifest, "components": [{**original, "key": alternate_key}]}
+    adapter.objects[manifest_key("checkout", point_id)] = json.dumps(changed).encode()
+
+    inventory = list_recovery_points("primary", destination(), None, adapter, "checkout")
+
+    assert inventory["recovery_points"] == []
+    assert inventory["rejected"] == [point_id]
+
+
 def test_load_manifest_rejects_oversized_object_without_reading_its_body() -> None:
     class ExplodingReadS3(FakeS3):
         def head_object(
