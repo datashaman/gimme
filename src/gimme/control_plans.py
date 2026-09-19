@@ -272,7 +272,8 @@ def resource_provision_plan(
             "current_phase": observed["phase"] if observed is not None else "absent",
             "effects": [
                 "create the RDS instance, its DB subnet group, and its DB parameter group "
-                "(rds.force_ssl=1) when absent, or reconcile it when present",
+                "(rds.force_ssl=1) when absent; an existing instance is only polled, "
+                "never modified",
                 "poll for at most 30 seconds and return a bounded pending phase if not yet ready",
                 "never returns, stores, or logs a decrypted credential",
             ],

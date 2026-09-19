@@ -11,7 +11,7 @@ the target design and this page is the current behavior.
 
 ## Current scope
 
-Implemented: registration, provisioning and reconciliation, live inspection, creating a
+Implemented: registration, provisioning, live inspection with drift reporting, creating a
 Deployment's database and workload secret, and non-destructive removal.
 
 Not implemented yet:
@@ -21,8 +21,9 @@ Not implemented yet:
   readiness issue, `plan_deployment` refuses, and Recovery Points reject it;
 - workload credential rotation, Detached Allocation rebind, and Retained Resource forget;
 - destructive deletion. Removal never deletes the instance;
-- in-place version, instance class, or storage updates.
-
+- applying version, instance class, or storage edits to a running instance: an edit is
+  registered locally, but `apply_resource` only polls an existing instance, and
+  `inspect_resource` reports the difference as drift.
 Differences from the ADR: two roles are used instead of four, the Administration Target
 runs plain `psql` instead of a root-owned helper (verifying the certificate against a bundle
 delivered per bind rather than one that helper installs), and secret-free observations are
@@ -216,10 +217,21 @@ must support Multi-AZ; otherwise creation fails at apply time. Every key of
 Targets may bind Deployments to the Resource. Use `register_resource`, or
 `plan_update_resource` and `update_resource` to change it.
 
+Updates are checked locally, with no AWS call, and refused with a fixed
+`aws_rds_update_forbidden_<field>` code when ADR 0008 says the change needs a new Resource:
+`aws_network`, an engine major version change (`engine_major`), a decrease of
+`allocated_storage_gb`, `workload_secret_store` while any allocation exists (active or
+detached), removing a Target from `deployment_security_group_ids` while a Deployment bound to
+this Resource is placed on it, and any change between a managed and a target-local Resource
+(`provider`). A refused update leaves desired state unchanged. Same-major engine versions, `instance_class`,
+an increased `allocated_storage_gb`, `administration_target`,
+`administration_security_group_id`, other `deployment_security_group_ids` changes,
+`retain_on_removal`, and `workload_secret_store` with no allocations register as before.
+
 ## Provision
 
 `plan_apply_resource` then `apply_resource` creates the DB subnet group, the DB parameter
-group (with `rds.force_ssl` set to `1`), and the instance, or reconciles an existing one.
+group (with `rds.force_ssl` set to `1`), and the instance. An existing instance is only polled, never modified.
 The instance is tagged `gimme:resource=<name>` and its AWS identifier is derived from the
 Resource name (`gimme-<name>`). Gimme refuses an instance whose tag does not derive that
 identifier, and never adopts an unrelated instance.
@@ -270,7 +282,13 @@ Deployment's environment.
 
 `inspect_resource` describes the instance through the inspection role and returns its
 identity, status, engine version, endpoint, and allocations. If AWS cannot be reached it
-returns the last observed state with a bounded `refresh_error`.
+returns the last observed state with a bounded `refresh_error` and no drift.
+
+After a successful live read it also reports `drift`: `fields` lists, for each of
+`engine_version`, `instance_class`, `allocated_storage_gb` and `security_group_ids` that differs
+from desired state, its `desired` and `live` values, and `modification_pending` says whether
+AWS has a pending modification. Drift is informational and is not stored. Gimme does not yet
+apply it (an existing instance is only polled by `apply_resource`).
 
 `plan_cleanup_resource` and `apply_cleanup_resource` require the exact confirmation
 `RETAIN <name>` and are refused while a Deployment references the Resource. They remove

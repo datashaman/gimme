@@ -364,6 +364,32 @@ def test_observation_requires_the_ownership_tag_to_derive_the_instance_identifie
             BotoRDSAdapter._observation(response, identifier)
 
 
+def test_observation_parses_the_secret_free_fields_used_for_drift() -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    response = {
+        **_instance_response(identifier, tag="devbox-postgres"),
+        "DBInstanceClass": "db.t3.medium", "AllocatedStorage": 20,
+        "VpcSecurityGroups": [
+            {"VpcSecurityGroupId": "sg-0123456789abcdef1", "Status": "active"},
+            {"VpcSecurityGroupId": "sg-0123456789abcdef0", "Status": "active"},
+        ],
+        "PendingModifiedValues": {"DBInstanceClass": "db.m6g.large"},
+    }
+
+    observed = BotoRDSAdapter._observation(response, identifier)
+
+    assert observed.instance_class == "db.t3.medium"
+    assert observed.allocated_storage_gb == 20
+    assert observed.security_group_ids == ("sg-0123456789abcdef0", "sg-0123456789abcdef1")
+    assert observed.modification_pending is True
+    bare = BotoRDSAdapter._observation(
+        _instance_response(identifier, tag="devbox-postgres"), identifier
+    )
+    assert (bare.instance_class, bare.security_group_ids, bare.modification_pending) == (
+        None, None, False,
+    )
+
+
 class _StubbedSession:
     def __init__(self, clients: dict[str, object]) -> None:
         self._clients = clients

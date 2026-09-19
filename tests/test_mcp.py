@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 from pathlib import Path
 
@@ -640,6 +641,9 @@ class FakeRDS:
             status="available", engine_version=resource.engine_version,
             endpoint="db.example.test", port=5432,
             master_secret_arn="arn:aws:secretsmanager:us-east-1:123456789012:secret:m",
+            instance_class=resource.instance_class,
+            allocated_storage_gb=resource.allocated_storage_gb,
+            security_group_ids=tuple(sorted(group_ids)),
         )
         return self.instances[identifier]
 
@@ -847,6 +851,146 @@ def test_govcloud_resources_are_refused_before_anything_is_created(
         "primary-rds", str(cleanup["plan_id"]), str(cleanup["confirmation"])
     )
     assert "primary-rds" not in server_module.store.load().resources
+
+
+def _with_second_network_and_store(monkeypatch) -> None:
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={
+        "aws_networks": {**state.aws_networks, "secondary": state.aws_networks["primary"]},
+        "secret_stores": {
+            **state.secret_stores,
+            "other-secrets": state.secret_stores["workload-secrets"],
+        },
+    }))
+
+
+def _bind_example_app(monkeypatch) -> None:
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *a, **k: CommandResult(["dep"], 0, "GIMME_RESOURCE_BOUND|gimme_example_app\n"),
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+
+
+def _assert_update_forbidden(code: str, **updates) -> None:
+    before = server_module.store.load()
+    definition = rds_definition(**{"allocated_storage_gb": 100, **updates})
+    with pytest.raises(ResourceError, match=f"^aws_rds_update_forbidden_{code}$"):
+        server_module.plan_update_resource("primary-rds", definition)
+    with pytest.raises(ResourceError, match=f"^aws_rds_update_forbidden_{code}$"):
+        server_module.update_resource("primary-rds", definition, "plan_" + "0" * 20)
+    assert server_module.store.load() == before
+
+
+def test_rds_updates_that_adr_0008_forbids_are_rejected_and_change_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    _with_second_network_and_store(monkeypatch)
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={"resources": {
+        **state.resources, "primary-rds": rds_definition(allocated_storage_gb=100),
+    }}))
+    _bind_example_app(monkeypatch)
+
+    _assert_update_forbidden("aws_network", aws_network="secondary")
+    _assert_update_forbidden("engine_major", engine_version="18.1")
+    _assert_update_forbidden("allocated_storage_gb", allocated_storage_gb=50)
+    _assert_update_forbidden("workload_secret_store", workload_secret_store="other-secrets")
+    _assert_update_forbidden("deployment_security_group_ids", deployment_security_group_ids={})
+    local = sample_state().resources["devbox-postgres"]
+    with pytest.raises(ResourceError, match="^aws_rds_update_forbidden_provider$"):
+        server_module.plan_update_resource("primary-rds", local)
+    with pytest.raises(ResourceError, match="^aws_rds_update_forbidden_provider$"):
+        server_module.plan_update_resource("devbox-postgres", rds_definition())
+    with pytest.raises(KeyError, match="no-such-resource"):
+        server_module.plan_update_resource("no-such-resource", rds_definition())
+
+
+def test_rds_updates_within_the_allowlist_register_as_before(tmp_path, monkeypatch) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=False)
+    _with_second_network_and_store(monkeypatch)
+    allowed = [
+        {"engine_version": "17.5"},
+        {"instance_class": "db.m6g.large"},
+        {"allocated_storage_gb": 100},
+        {"administration_security_group_id": "sg-0123456789abcdef9"},
+        {"deployment_security_group_ids": {}},
+        {"deployment_security_group_ids": {"devbox": "sg-0123456789abcdef2"}},
+        {"retain_on_removal": False},
+        {"workload_secret_store": "other-secrets"},
+    ]
+    for updates in allowed:
+        definition = rds_definition(**updates)
+        plan = server_module.plan_update_resource("primary-rds", definition)
+        server_module.update_resource("primary-rds", definition, str(plan["plan_id"]))
+        assert server_module.store.load().resources["primary-rds"] == definition
+        server_module.store.save(server_module.store.load().model_copy(update={
+            "resources": {**server_module.store.load().resources,
+                          "primary-rds": rds_definition()},
+        }))
+
+
+def test_a_target_security_group_can_be_removed_once_no_bound_deployment_uses_it(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=False)
+    definition = rds_definition(deployment_security_group_ids={})
+
+    plan = server_module.plan_update_resource("primary-rds", definition)
+    server_module.update_resource("primary-rds", definition, str(plan["plan_id"]))
+
+    assert server_module.store.load().resources["primary-rds"] == definition
+
+
+def test_inspect_resource_reports_drift_only_from_a_successful_live_read(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=False)
+    assert "drift" not in server_module.inspect_resource("primary-rds"), "absent instance"
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+
+    assert server_module.inspect_resource("primary-rds")["drift"] == {
+        "fields": {}, "modification_pending": False,
+    }
+
+    identifier = next(iter(adapter.instances))
+    adapter.instances[identifier] = dataclasses.replace(
+        adapter.instances[identifier], instance_class="db.t3.small", allocated_storage_gb=50,
+        security_group_ids=("sg-0123456789abcdef0",), modification_pending=True,
+    )
+    drift = server_module.inspect_resource("primary-rds")["drift"]
+    assert drift["modification_pending"] is True
+    assert drift["fields"] == {
+        "instance_class": {"desired": "db.t3.medium", "live": "db.t3.small"},
+        "allocated_storage_gb": {"desired": 20, "live": 50},
+        "security_group_ids": {
+            "desired": ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
+            "live": ["sg-0123456789abcdef0"],
+        },
+    }
+
+    adapter.fail_describe = True
+    cached = server_module.inspect_resource("primary-rds")
+    assert cached["refresh_error"] == "aws_rds_describe_throttled"
+    assert "drift" not in cached
+
+
+def test_resource_provision_plan_says_an_existing_instance_is_not_modified(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=False)
+    effects = " ".join(server_module.plan_apply_resource("primary-rds")["effects"])
+
+    assert "only polled, never modified" in effects
+    assert "reconcile it when present" not in effects
 
 
 def test_bind_resource_rejects_stale_plans_and_unready_resources(tmp_path, monkeypatch) -> None:

@@ -118,12 +118,15 @@ class, allocated storage, an AWS Network (VPC, exactly two private subnets), an
 Administration Target, fixed security groups, and the AWS Secrets Manager store that
 holds workload credentials. Registration makes no AWS calls; it is a local desired-state
 write like every other Resource.
+Updates are validated locally against the ADR 0008 allowlist and refused with a fixed
+`aws_rds_update_forbidden_<field>` code for a changed `aws_network`, engine major version,
+decreased storage, and the other changes listed in the how-to; a refused update changes nothing.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_apply_resource` | Read | Plan provisioning or reconciling one managed instance |
-| `apply_resource` | Remote write | Create or reconcile the RDS instance without returning a credential |
-| `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations; falls back to the last observed state with a bounded `refresh_error` |
+| `plan_apply_resource` | Read | Plan creating one managed instance; an existing instance is only polled |
+| `apply_resource` | Remote write | Create the RDS instance, or poll an existing one, without returning a credential |
+| `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations and, after a successful live read, `drift` against desired state; falls back to the last observed state with a bounded `refresh_error` and no drift |
 | `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret |
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |

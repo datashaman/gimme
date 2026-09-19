@@ -1071,6 +1071,20 @@ def register_resource(name: Name, definition: Resource) -> dict[str, object]:
 def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
     """Show the exact before/after state for a resource update."""
     state = store.load()
+    current = state.resources.get(name)
+    if current is not None and (
+        isinstance(current, AWSRDSPostgresResource)
+        or isinstance(definition, AWSRDSPostgresResource)
+    ):
+        if not (
+            isinstance(current, AWSRDSPostgresResource)
+            and isinstance(definition, AWSRDSPostgresResource)
+        ):
+            raise ResourceError("aws_rds_update_forbidden_provider")
+        resources_postgres_module.validate_update(
+            current, definition, resources_postgres_module.load_observed(store.root, name),
+            {d.target for d in state.deployments.values() if d.resources.database == name},
+        )
     _replace(state, "resources", name, definition)
     return registration_update_plan("resource_update", name, state.resources[name], definition)
 
@@ -1168,6 +1182,7 @@ def inspect_resource(name: Name) -> dict[str, object]:
             phase="ready" if live.status == "available" else "pending",
             status=live.status, engine_version=live.engine_version, identity=live.identity,
             endpoint=live.endpoint, port=live.port,
+            drift=resources_postgres_module.instance_drift(resource, live),
         )
     elif observed is not None:
         result.update(

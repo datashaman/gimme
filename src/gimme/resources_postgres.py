@@ -9,7 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, cast
+from typing import Callable, NoReturn, Protocol, cast
 
 from gimme.control import (
     AWSNetwork,
@@ -46,6 +46,11 @@ class InstanceObservation:
     endpoint: str | None
     port: int | None
     master_secret_arn: str | None
+    # Live-only, secret-free fields used for drift. None means "not observed".
+    instance_class: str | None = None
+    allocated_storage_gb: int | None = None
+    security_group_ids: tuple[str, ...] | None = None
+    modification_pending: bool = False
 
 
 class RDSAdapter(Protocol):
@@ -161,11 +166,22 @@ class BotoRDSAdapter:
         status = response.get("DBInstanceStatus")
         if not isinstance(engine_version, str) or not isinstance(status, str):
             raise ResourceError("aws_rds_instance_identity_invalid")
+        instance_class = response.get("DBInstanceClass")
+        storage = response.get("AllocatedStorage")
+        groups = response.get("VpcSecurityGroups")
+        pending = response.get("PendingModifiedValues")
         return InstanceObservation(
             identity=arn, status=status, engine_version=engine_version,
             endpoint=address if isinstance(address, str) else None,
             port=port if isinstance(port, int) else None,
             master_secret_arn=secret_arn if isinstance(secret_arn, str) else None,
+            instance_class=instance_class if isinstance(instance_class, str) else None,
+            allocated_storage_gb=storage if isinstance(storage, int) else None,
+            security_group_ids=tuple(sorted(
+                item["VpcSecurityGroupId"] for item in groups
+                if isinstance(item, dict) and isinstance(item.get("VpcSecurityGroupId"), str)
+            )) if isinstance(groups, list) else None,
+            modification_pending=bool(pending),
         )
 
     def describe_instance(
@@ -468,6 +484,63 @@ def _instance_document(
     }
 
 
+def desired_security_group_ids(resource: AWSRDSPostgresResource) -> tuple[str, ...]:
+    return tuple(sorted({
+        resource.administration_security_group_id,
+        *resource.deployment_security_group_ids.values(),
+    }))
+
+
+def validate_update(
+    current: AWSRDSPostgresResource, proposed: AWSRDSPostgresResource,
+    observed: dict[str, object] | None, bound_targets: set[str],
+) -> None:
+    """Refuse the updates ADR 0008 says need a new Resource. Local: never calls AWS."""
+    def forbid(field: str) -> NoReturn:
+        raise ResourceError(f"aws_rds_update_forbidden_{field}")
+
+    if proposed.aws_network != current.aws_network:
+        forbid("aws_network")
+    if proposed.engine_version.split(".")[0] != current.engine_version.split(".")[0]:
+        forbid("engine_major")
+    if proposed.allocated_storage_gb < current.allocated_storage_gb:
+        forbid("allocated_storage_gb")
+    if (
+        proposed.workload_secret_store != current.workload_secret_store
+        and observed is not None and observed["allocations"]
+    ):
+        forbid("workload_secret_store")
+    removed = set(current.deployment_security_group_ids) - set(
+        proposed.deployment_security_group_ids
+    )
+    if removed & bound_targets:
+        forbid("deployment_security_group_ids")
+
+
+def instance_drift(
+    resource: AWSRDSPostgresResource, live: InstanceObservation
+) -> dict[str, object]:
+    """Desired-versus-live differences for a successful live read; unobserved fields are
+    skipped, and nothing here is persisted."""
+    pairs = {
+        "engine_version": (resource.engine_version, live.engine_version),
+        "instance_class": (resource.instance_class, live.instance_class),
+        "allocated_storage_gb": (resource.allocated_storage_gb, live.allocated_storage_gb),
+        "security_group_ids": (
+            list(desired_security_group_ids(resource)),
+            None if live.security_group_ids is None else list(live.security_group_ids),
+        ),
+    }
+    return {
+        "fields": {
+            field: {"desired": desired, "live": actual}
+            for field, (desired, actual) in pairs.items()
+            if actual is not None and actual != desired
+        },
+        "modification_pending": live.modification_pending,
+    }
+
+
 def apply_provision(
     adapter: RDSAdapter, root: Path, account: AWSProviderAccount, network: AWSNetwork,
     resource: AWSRDSPostgresResource, resource_name: str,
@@ -481,10 +554,7 @@ def apply_provision(
     previous_allocations: dict[str, object] = (
         dict(cast(dict[str, object], previous["allocations"])) if previous is not None else {}
     )
-    security_group_ids = [
-        resource.administration_security_group_id,
-        *sorted(set(resource.deployment_security_group_ids.values())),
-    ]
+    security_group_ids = list(desired_security_group_ids(resource))
     observed = adapter.describe_instance(account, network, aws_instance_identifier)
     if observed is None:
         observed = adapter.create_instance(
