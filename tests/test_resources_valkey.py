@@ -98,6 +98,7 @@ class FakeValkey:
         self.dependents_error: ResourceError | None = None
         self.dependents_pending = False
         self.snapshots: list[SnapshotInfo] = []
+        self.deleted_snapshots: list[str] = []
         self.create_args: list[dict[str, object]] = []
         # deployment -> credential versions, oldest first; the last one is current
         self.credentials: dict[str, list[str]] = {}
@@ -151,6 +152,14 @@ class FakeValkey:
 
     def list_snapshots(self, account, network, group_id):
         return list(self.snapshots)
+
+    def delete_final_snapshot(self, account, network, snapshot_name):
+        self.deleted_snapshots.append(snapshot_name)
+        for index, snapshot in enumerate(self.snapshots):
+            if snapshot.name == snapshot_name:
+                self.snapshots.pop(index)
+                return True
+        return False
 
     def _version(self, deployment_name):
         return f"{len(self.credentials[deployment_name]):032d}"
@@ -2462,7 +2471,34 @@ def test_destruction_deletes_the_group_then_what_gimme_created_and_forgets_the_r
     assert load_observed(server_module.store.root, NAME) is None
     assert not (server_module.store.root / "destroying-resources" / f"{NAME}.json").exists()
     assert not (server_module.store.root / "retained-resources" / f"{NAME}.json").exists()
+    receipt = resources_valkey_module.load_destroyed_receipt(server_module.store.root, NAME)
+    assert receipt is not None and receipt["final_snapshot"] == result["final_snapshot"]
     assert bind_state["identity"] == ARN
+
+
+def test_a_destroyed_resources_final_snapshot_can_be_purged_with_an_exact_plan(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    destroyed = destroy()
+    adapter.snapshots = [SnapshotInfo(
+        name=str(destroyed["final_snapshot"]), source="system", status="available",
+        created=None, engine_version="9.0", shards=1,
+    )]
+
+    plan = server_module.plan_purge_final_snapshot(NAME)
+
+    assert plan["confirmation"] == f"PURGE FINAL SNAPSHOT {NAME}"
+    assert plan["snapshot"] == destroyed["final_snapshot"]
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_purge_final_snapshot(NAME, str(plan["plan_id"]), "PURGE")
+    result = server_module.apply_purge_final_snapshot(
+        NAME, str(plan["plan_id"]), str(plan["confirmation"])
+    )
+
+    assert result["changed"] is True and result["resource"] == NAME and result["purged"] is True
+    assert adapter.deleted_snapshots == [destroyed["final_snapshot"]]
+    assert resources_valkey_module.load_destroyed_receipt(server_module.store.root, NAME) is None
 
 
 def test_a_group_still_deleting_returns_pending_and_a_repeat_continues(
@@ -2684,6 +2720,29 @@ def test_without_a_destructive_role_nothing_is_assumed_or_deleted(monkeypatch) -
         adapter.delete_dependents(account, network, NAME, GROUP_ID, [])
 
     assert assumed == []
+
+
+def test_the_final_snapshot_is_deleted_by_name_with_the_destructive_role(monkeypatch) -> None:
+    adapter, account, network, (_reader_stub, killer_stub), _calls, assumed = destroyer(monkeypatch)
+    snapshot = resources_valkey_module.final_snapshot_id(GROUP_ID, "a" * 16)
+    killer_stub.add_response("delete_snapshot", {}, {"SnapshotName": snapshot})
+
+    with killer_stub:
+        assert adapter.delete_final_snapshot(account, network, snapshot) is True
+
+    assert assumed == [(DESTROYER, "elasticache-destroy")]
+    killer_stub.assert_no_pending_responses()
+
+
+def test_an_already_absent_final_snapshot_is_a_completed_purge(monkeypatch) -> None:
+    adapter, account, network, (_reader_stub, killer_stub), _calls, _assumed = destroyer(
+        monkeypatch
+    )
+    snapshot = resources_valkey_module.final_snapshot_id(GROUP_ID, "a" * 16)
+    killer_stub.add_client_error("delete_snapshot", "SnapshotNotFoundFault")
+
+    with killer_stub:
+        assert adapter.delete_final_snapshot(account, network, snapshot) is False
 
 
 @pytest.mark.parametrize(
