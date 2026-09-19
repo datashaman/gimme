@@ -1233,6 +1233,30 @@ def list_recovery_points(name: Name) -> dict[str, object]:
     }
 
 
+def _restore_records(name: str) -> list[dict[str, object]]:
+    state, _deployment, _destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    return recovery_module.list_restore_records(
+        destination, credentials, backup_s3, name
+    )
+
+
+@mcp.tool(annotations=READ)
+def list_restores(name: Name) -> dict[str, object]:
+    """List destination-authoritative, secret-safe Restore records newest first."""
+    return {"deployment": name, "restores": _restore_records(name)}
+
+
+@mcp.resource("gimme://deployments/{name}/restores/{request_id}")
+def restore_record_resource(name: str, request_id: str) -> dict[str, object]:
+    """Read the latest public Restore state for one request identity."""
+    state, _deployment, _destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    return recovery_module.load_restore_record(
+        destination, credentials, backup_s3, name, request_id
+    )
+
+
 def _recovery_point_deletion_plan(
     name: str, point_id: str, *, allow_partial: bool = False
 ) -> dict[str, object]:

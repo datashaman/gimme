@@ -265,6 +265,7 @@ On-demand Recovery Points are created and listed with:
 | `create_recovery_point` | Remote + destination write | Quiesce when required, capture, upload, verify, restore runtime, and publish one Recovery Point |
 | `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
+| `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
 
 `create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
 identity is derived from `(deployment, destination, request_id)`, never from wall-clock
@@ -298,6 +299,12 @@ or version. Components are deleted and verified one at a time, with the exact ma
 version last. A partial failure remains visible as `deletion_failed`; retry the original
 apply with the same plan and confirmations. Safety points remain protected until their
 authoritative Restore record is `completed`, and Object Lock or legal hold is never bypassed.
+
+Restore transitions are append-only, immutable objects in the bound Backup Destination.
+`list_restores` and `gimme://deployments/{name}/restores/{request_id}` expose only the
+Deployment and request identities, source Recovery Point identity, destination provider/kind/
+version, current bounded state, timestamps, event count, and Safety Recovery Point identity.
+Storage identities, database identities, paths, SQL, endpoints, and credentials remain private.
 
 ## Application operation tools
 
