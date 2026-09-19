@@ -9,6 +9,7 @@ def write_execution_tree(root: Path) -> None:
     files = {
         "src/gimme/server.py": "server-v1\n",
         "deploy.php": "recipe-v1\n",
+        "deploy/aws-rds-global-bundle.pem": "bundle-v1\n",
         "deploy/configuration.php": "configuration-v1\n",
         "scripts/gimme-provision-stack": "stack-helper-v1\n",
         "scripts/gimme-provision-processes": "process-helper-v1\n",
@@ -33,6 +34,14 @@ def test_execution_fingerprint_changes_with_executable_sources_only(tmp_path: Pa
     assert execution_fingerprint(tmp_path) == first
 
     (tmp_path / "deploy/configuration.php").write_text("configuration-v2\n")
+    assert execution_fingerprint(tmp_path) != first
+
+
+def test_execution_fingerprint_changes_with_the_pinned_rds_trust_bundle(tmp_path: Path) -> None:
+    write_execution_tree(tmp_path)
+    first = execution_fingerprint(tmp_path)
+
+    (tmp_path / "deploy/aws-rds-global-bundle.pem").write_text("bundle-v2\n")
     assert execution_fingerprint(tmp_path) != first
 
 

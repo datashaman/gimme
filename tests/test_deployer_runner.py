@@ -100,6 +100,26 @@ def test_macos_runner_replaces_an_empty_agent_with_the_launchd_agent(
     assert captured["SSH_AUTH_SOCK"] == str(launchd_path)
 
 
+def test_trust_bundle_digest_crosses_the_runner_boundary_under_the_name_the_recipe_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    runner(tmp_path).run(
+        "gimme:resource:bind-postgres", server(), resource_trust_bundle_sha256="a" * 64
+    )
+
+    assert captured["GIMME_RESOURCE_TRUST_BUNDLE_SHA256"] == "a" * 64
+    recipe = (Path(__file__).resolve().parents[1] / "deploy.php").read_text()
+    assert "required_env('GIMME_RESOURCE_TRUST_BUNDLE_SHA256')" in recipe
+
+
 def test_stack_tasks_can_connect_to_bootstrap_hostname(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, str] = {}
 

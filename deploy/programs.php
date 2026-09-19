@@ -194,6 +194,7 @@ PYTHON;
 function managed_postgres_bind_script(): string
 {
     return <<<'PYTHON'
+import hashlib
 import json
 import os
 import re
@@ -202,16 +203,23 @@ import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
-host, port, database, secret_path_argument = sys.argv[1:5]
+host, port, database, secret_path_argument, bundle_path_argument, bundle_digest = sys.argv[1:7]
 if not (1 <= int(port) <= 65535):
     raise SystemExit("unsafe port")
 if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
     raise SystemExit("unsafe database identifier")
+if re.fullmatch(r"[0-9a-f]{64}", bundle_digest) is None:
+    raise SystemExit("unsafe trust bundle digest")
 
 secret_path = Path(secret_path_argument)
 details = secret_path.lstat()
 if secret_path.is_symlink() or not stat.S_ISREG(details.st_mode):
     raise SystemExit("refusing to read a non-regular secret document")
+bundle_path = Path(bundle_path_argument)
+if bundle_path.is_symlink() or not stat.S_ISREG(bundle_path.lstat().st_mode):
+    raise SystemExit("refusing to read a non-regular trust bundle")
+if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle_digest:
+    raise SystemExit("trust bundle digest mismatch")
 secrets = json.loads(secret_path.read_text())
 if not isinstance(secrets, dict) or set(secrets) != {
     "master_username", "master_password", "workload_password",
@@ -229,7 +237,8 @@ role = database
 env = {
     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     "PGPASSWORD": secrets["master_password"],
-    "PGSSLMODE": "require",
+    "PGSSLMODE": "verify-full",
+    "PGSSLROOTCERT": str(bundle_path),
 }
 
 
@@ -237,6 +246,17 @@ def redacted(text: str) -> str:
     for value in (secrets["master_password"], secrets["workload_password"]):
         text = text.replace(value, "[redacted]")
     return text
+
+
+TLS_FAILURE = re.compile(r"certificate verify failed|does not match host name", re.IGNORECASE)
+
+
+def fail(result: subprocess.CompletedProcess[str], message: str) -> None:
+    # A verification failure never echoes psql output: it names the endpoint and certificate.
+    if TLS_FAILURE.search(result.stdout):
+        raise SystemExit("managed PostgreSQL TLS certificate verification failed")
+    print(redacted(result.stdout))
+    raise SystemExit(message)
 
 
 def psql(statements: str) -> subprocess.CompletedProcess[str]:
@@ -264,8 +284,7 @@ role_result = psql(
     "SELECT format('ALTER ROLE %I PASSWORD %L', :'role', :'workload_password') \\gexec\n"
 )
 if role_result.returncode != 0:
-    print(redacted(role_result.stdout))
-    raise SystemExit("managed PostgreSQL role reconciliation failed")
+    fail(role_result, "managed PostgreSQL role reconciliation failed")
 
 database_result = psql(
     f"\\set role '{role}'\n"
@@ -274,8 +293,7 @@ database_result = psql(
     "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database') \\gexec\n"
 )
 if database_result.returncode != 0:
-    print(redacted(database_result.stdout))
-    raise SystemExit("managed PostgreSQL database reconciliation failed")
+    fail(database_result, "managed PostgreSQL database reconciliation failed")
 
 print("GIMME_RESOURCE_BOUND|" + database)
 PYTHON;

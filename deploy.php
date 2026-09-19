@@ -1014,22 +1014,31 @@ task('gimme:resource:bind-postgres', function (): void {
         throw new \RuntimeException('Unsafe managed PostgreSQL binding identity');
     }
 
+    $bundleDigest = required_env('GIMME_RESOURCE_TRUST_BUNDLE_SHA256');
+    if (!preg_match('/^[0-9a-f]{64}$/', $bundleDigest)) {
+        throw new \RuntimeException('Unsafe trust bundle digest');
+    }
+
     $remoteDirectory = '/tmp/.gimme-resource-bind';
-    $remoteSecretFile = "{$remoteDirectory}/." . bin2hex(random_bytes(8)) . '.json';
+    $suffix = bin2hex(random_bytes(8));
+    $remoteSecretFile = "{$remoteDirectory}/.{$suffix}.json";
+    $remoteBundleFile = "{$remoteDirectory}/.{$suffix}.pem";
     run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
-    upload($localSecretFile, $remoteSecretFile);
-    run('chmod 0600 ' . escapeshellarg($remoteSecretFile));
 
     $bindProgram = escapeshellarg(base64_encode(managed_postgres_bind_script()));
     try {
+        upload($localSecretFile, $remoteSecretFile);
+        upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
         run(
             'printf %s ' . $bindProgram . ' | base64 -d | python3 - ' .
             escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
-            escapeshellarg($database) . ' ' . escapeshellarg($remoteSecretFile),
+            escapeshellarg($database) . ' ' . escapeshellarg($remoteSecretFile) . ' ' .
+            escapeshellarg($remoteBundleFile) . ' ' . escapeshellarg($bundleDigest),
             timeout: 120,
         );
     } finally {
-        run('rm -f ' . escapeshellarg($remoteSecretFile));
+        run('rm -f ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
     }
 });
 

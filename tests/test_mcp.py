@@ -35,7 +35,7 @@ from gimme.control import (
 )
 from gimme.deployer import CommandResult
 from gimme.recovery import ObjectMetadata, RecoveryError
-from gimme.resources_postgres import InstanceObservation, ResourceError
+from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
 from gimme.server import mcp
@@ -794,6 +794,7 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert seen["task"] == "gimme:resource:bind-postgres"
     assert seen["server"] == "adminbox"
     assert seen["resource_endpoint"] == ("db.example.test", 5432)
+    assert seen["resource_trust_bundle_sha256"] == RDS_TRUST_BUNDLE_SHA256
     assert document["master_password"] == MASTER_PASSWORD
     workload_password = document["workload_password"]
     assert not Path(seen["secret_file"]).exists(), "protected secret file must be shredded"
@@ -809,6 +810,25 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert MASTER_PASSWORD not in everything
     assert workload_password not in everything
     assert adapter.secret_payloads["primary-rds/example-app"]["password"] == workload_password
+
+
+def test_bind_resource_refuses_govcloud_regions_before_any_remote_work(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    state = server_module.store.load()
+    network = state.aws_networks["primary"].model_copy(update={"region": "us-gov-west-1"})
+    server_module.store.save(state.model_copy(update={"aws_networks": {"primary": network}}))
+    monkeypatch.setattr(
+        server_module.runner, "run", lambda *a, **k: pytest.fail("must not reach the target")
+    )
+    plan = server_module.plan_bind_resource("example-app")
+
+    with pytest.raises(ResourceError, match="aws_rds_tls_region_unsupported"):
+        server_module.bind_resource("example-app", str(plan["plan_id"]))
 
 
 def test_bind_resource_rejects_stale_plans_and_unready_resources(tmp_path, monkeypatch) -> None:
