@@ -3798,3 +3798,57 @@ def test_a_rotation_without_the_destructive_role_starts_nothing(tmp_path, monkey
     assert not marker_file("rotating").exists() and adapter.credentials[DEPLOYMENT] == [
         binding_username(DEPLOYMENT)
     ]
+
+
+def test_an_allocation_whose_deployment_is_gone_is_restored_but_not_verified(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    root = server_module.store.root
+    observed = load_observed(root, NAME)
+    assert observed is not None
+    allocations = cast(dict[str, dict[str, object]], observed["allocations"])
+    allocations["gone-deployment"] = {**allocations[DEPLOYMENT], "user_id": "gimme-u-orphan"}
+    (root / "observed-resources" / f"{NAME}.json").write_text(json.dumps(observed))
+
+    plan = server_module.plan_restore_resource(NAME, SNAPSHOT)
+    result = server_module.apply_restore_resource(NAME, SNAPSHOT, str(plan["plan_id"]))
+
+    assert plan["deployments"] == [DEPLOYMENT]
+    assert result["restored"] is True
+    assert cast(dict[str, object], adapter.create_args[-1]["restore_users"]).keys() == {
+        DEPLOYMENT, "gone-deployment"
+    }, "the orphan's user is still restored"
+    assert tasks(calls).count("gimme:probe:valkey:current") == 1
+
+
+def test_a_failed_verification_names_the_deployment_in_the_inspection(
+    tmp_path, monkeypatch, instant
+) -> None:
+    _adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    real = server_module.runner.run
+    monkeypatch.setattr(server_module.runner, "run", lambda task, *a, **k: (
+        (_ for _ in ()).throw(RuntimeError("secret detail")) if task == "gimme:probe:valkey:current"
+        else real(task, *a, **k)
+    ))
+
+    with pytest.raises(ResourceError, match="verification_failed"):
+        restore()
+
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["progress"] == {"verified": [], "failed": DEPLOYMENT}
+    assert "secret detail" not in json.dumps(inspected)
+
+
+def test_a_rotation_of_a_deployment_that_no_longer_binds_the_resource_is_refused(
+    tmp_path, monkeypatch
+) -> None:
+    rotatable(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": "devbox-valkey", "uses": ["cache"]
+    }
+    server_module.store.save(ControlState.model_validate(document))
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_binding_missing$"):
+        server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)

@@ -430,11 +430,13 @@ Deployment is handed the new endpoint by a deploy, until each recorded Deploymen
 verification: its environment is refreshed to the new endpoint, the activation probe runs against its
 current release (a Deployment that was never deployed skips the probe), and its workers restart.
 Repeat the same call to continue. A failed verification raises
-`aws_elasticache_restore_verification_failed` with the progress kept, so the repeat re-verifies only
-the Deployments that did not pass and never creates the group again. Only when every Deployment has
+`aws_elasticache_restore_verification_failed` with the progress kept (`inspect_resource` shows
+`progress.verified` and `progress.failed`), so the repeat re-verifies only the Deployments that did
+not pass and never creates the group again. An allocation whose Deployment no longer exists still
+has its ACL user restored but has nothing to verify. Only when every Deployment has
 passed does the Resource become `ready`. A group that fails to create
-(`aws_elasticache_restore_create_failed`) ends the restore. `apply_cleanup_resource` abandons a
-restore that cannot finish and retains what exists.
+(`aws_elasticache_restore_create_failed`) ends the restore. Once no Deployment references the
+Resource, `apply_cleanup_resource` abandons a restore that cannot finish and retains what exists.
 
 Verification takes the same per-Deployment lock as `apply_deployment_resources`, but nothing stops
 a deploy of a bound Deployment from running alongside a restore or rotation. Do not deploy one

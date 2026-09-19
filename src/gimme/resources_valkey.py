@@ -1329,6 +1329,18 @@ def busy_operation(root: Path, resource_name: str) -> str | None:
     )
 
 
+def operation_progress(root: Path, resource_name: str, kind: str) -> dict[str, object]:
+    """Registered names only, for `inspect_resource`: which Deployments have been verified or
+    have failed, so a repeat can be aimed."""
+    try:
+        marker = read_marker(root, kind, resource_name) or {}
+    except ResourceError:
+        return {}
+    return {
+        key: marker[key] for key in ("verified", "failed", "deployment", "phase") if key in marker
+    }
+
+
 def refuse_while_busy(root: Path, resource_name: str, *, allow: str | None = None) -> None:
     for kind, code in MARKERS.items():
         if kind != allow and _marker_path(root, kind, resource_name).is_file():

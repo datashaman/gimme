@@ -138,6 +138,9 @@ def apply_restore(
         try:
             verify(deployment)
         except Exception:
+            # Only the registered name is kept, so `inspect_resource` can say which one failed.
+            write_marker(root, "restoring", resource_name, {**marker, "verified": verified,
+                                                            "failed": deployment})
             raise ResourceError("aws_elasticache_restore_verification_failed") from None
         verified.append(deployment)
         write_marker(root, "restoring", resource_name, {**marker, "verified": verified})

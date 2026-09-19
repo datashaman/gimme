@@ -1375,6 +1375,9 @@ def _inspect_valkey(
     operation = resources_valkey_module.busy_operation(store.root, name)
     if operation is not None:
         result["operation"] = operation
+        progress = resources_valkey_module.operation_progress(store.root, name, operation)
+        if progress:
+            result["progress"] = progress
     if live is not None:
         issues = resources_valkey_module.structural_issues(resource, live, group_id)
         result.update(
@@ -1648,13 +1651,21 @@ def list_resource_snapshots(name: Name) -> dict[str, object]:
     return {"resource": name, "snapshots": [vars(item) for item in snapshots]}
 
 
+def _binds(state: ControlState, deployment: str, name: str) -> bool:
+    bound = state.deployments.get(deployment)
+    return bound is not None and getattr(bound.resources.valkey, "resource", None) == name
+
+
 def _restore_plan(name: str, snapshot: str | None) -> dict[str, object]:
-    _state, resource, _network, _account, _store = _valkey_context(name)
+    state, resource, _network, _account, _store = _valkey_context(name)
     observed = resources_valkey_module.load_observed(store.root, name)
     if snapshot is None and observed is None:
         raise ResourceError("aws_elasticache_recreate_not_needed")
+    # An allocation whose Deployment is gone still has its user restored, but has nothing to verify.
     return valkey_restore_plan(
-        name, snapshot, sorted(valkey_recovery.restore_targets(store.root, name)),
+        name, snapshot,
+        sorted(d for d in valkey_recovery.restore_targets(store.root, name)
+               if _binds(state, d, name)),
         resource.engine_version,
     )
 
@@ -1663,6 +1674,8 @@ def _restore_valkey(name: str, snapshot: str | None) -> dict[str, object]:
     state, resource, network, account, workload_store = _valkey_context(name)
 
     def verify(deployment: str) -> None:
+        if not _binds(store.load(), deployment, name):
+            return
         token = _restoring_ok.set(True)
         try:
             _apply_resources(deployment, _resource_plan(deployment))
@@ -1718,11 +1731,14 @@ def apply_recreate_empty_resource(name: Name, plan_id: PlanId, confirmation: str
 
 
 def _rotation_plan(name: str, deployment: str) -> dict[str, object]:
-    _state, _resource, _network, account, _store = _valkey_context(name)
+    state, _resource, _network, account, _store = _valkey_context(name)
     if account.destructive_role_arn is None:
         raise ResourceError("aws_elasticache_destroy_role_missing")
     observed = resources_valkey_module.load_observed(store.root, name)
-    if observed is None or deployment not in cast(dict[str, object], observed["allocations"]):
+    if (
+        observed is None or deployment not in cast(dict[str, object], observed["allocations"])
+        or not _binds(state, deployment, name)
+    ):
         raise ResourceError("aws_elasticache_rotate_binding_missing")
     return valkey_rotation_plan(
         name, deployment, resources_valkey_module.identity_fingerprint(str(observed["identity"]))
