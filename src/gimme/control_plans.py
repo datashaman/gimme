@@ -4,6 +4,7 @@ from typing import Any
 
 from gimme.control import (
     ApplicationConfig,
+    AWSElastiCacheValkeyResource,
     AWSRDSPostgresResource,
     ControlState,
     DeploymentConfig,
@@ -291,6 +292,43 @@ def resource_provision_plan(
     )
 
 
+def valkey_provision_plan(
+    resource_name: str,
+    resource: AWSElastiCacheValkeyResource,
+    observed: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_provision",
+            "resource": resource_name,
+            "aws_network": resource.aws_network,
+            "administration_target": resource.administration_target,
+            "engine_version": resource.engine_version,
+            "node_type": resource.node_type,
+            "security_group_id": resource.security_group_id,
+            "snapshot_window": resource.snapshot_window,
+            "snapshot_retention_days": resource.snapshot_retention_days,
+            "maintenance_window": resource.maintenance_window,
+            "current_phase": observed["phase"] if observed is not None else "absent",
+            "effects": [
+                "create, when absent, a cache subnet group, a parameter group "
+                "(cluster-enabled yes, maxmemory-policy noeviction), a user group whose default "
+                "user cannot authenticate, an administrative user, and one replication group "
+                "with one shard, one cross-AZ replica, Multi-AZ automatic failover, TLS, "
+                "encryption at rest, synchronous durability, and no automatic minor upgrades",
+                "write the administrative user's generated password to the workload Secret "
+                "Store; it is never returned, stored locally, or logged",
+                "never modify an existing replication group; applying updates and drift "
+                "reconciliation are not implemented yet",
+                "report the Resource degraded, with fixed reason codes, when an available "
+                "group does not meet the durability, topology, encryption, authentication, "
+                "snapshot, or maintenance contract",
+                "poll for at most 30 seconds and return a bounded pending phase if not yet ready",
+            ],
+        }
+    )
+
+
 def resource_binding_plan(
     deployment_name: str,
     deployment: DeploymentConfig,
@@ -316,7 +354,9 @@ def resource_binding_plan(
     )
 
 
-def resource_cleanup_plan(resource_name: str, *, managed: bool) -> dict[str, Any]:
+def resource_cleanup_plan(
+    resource_name: str, *, managed: bool, subject: str = "RDS instance"
+) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "resource_cleanup",
@@ -325,7 +365,7 @@ def resource_cleanup_plan(resource_name: str, *, managed: bool) -> dict[str, Any
             "effects": (
                 [
                     "remove local desired-state registration only",
-                    "leave the RDS instance and its data intact as a Retained Resource",
+                    f"leave the {subject} and its data intact as a Retained Resource",
                     "write a secret-free Retained Resource tombstone",
                 ]
                 if managed

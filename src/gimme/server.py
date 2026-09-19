@@ -30,6 +30,7 @@ from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
+    valkey_provision_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
@@ -47,6 +48,7 @@ runner = DeployerRunner(ROOT)
 aws_secrets = BotoAWSSecretAdapter()
 backup_s3 = recovery_module.BotoS3Adapter()
 rds_postgres = resources_postgres_module.BotoRDSAdapter()
+elasticache_valkey = resources_valkey_module.BotoElastiCacheAdapter()
 mcp = FastMCP(
     "Gimme",
     instructions=(
@@ -1130,7 +1132,16 @@ def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
     return state, resource
 
 
+def _managed_valkey(name: str) -> tuple[ControlState, AWSElastiCacheValkeyResource] | None:
+    state = store.load()
+    resource = state.resources.get(name)
+    return (state, resource) if isinstance(resource, AWSElastiCacheValkeyResource) else None
+
+
 def _resource_provision_plan(name: str) -> dict[str, object]:
+    if (valkey := _managed_valkey(name)) is not None:
+        observed = resources_valkey_module.load_observed(store.root, name)
+        return valkey_provision_plan(name, valkey[1], observed)
     _state, resource = _managed_resource(name)
     observed = resources_postgres_module.load_observed(store.root, name)
     return resource_provision_plan(name, resource, observed)
@@ -1139,7 +1150,8 @@ def _resource_provision_plan(name: str) -> dict[str, object]:
 @mcp.tool(annotations=READ)
 @_journal_plan("apply_resource", "name")
 def plan_apply_resource(name: Name) -> dict[str, object]:
-    """Plan provisioning or reconciling one managed AWS RDS PostgreSQL instance."""
+    """Plan provisioning or reconciling one managed AWS RDS PostgreSQL instance or
+    ElastiCache Valkey replication group."""
     return _resource_provision_plan(name)
 
 
@@ -1151,6 +1163,16 @@ def apply_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     phase. Never returns a decrypted credential."""
     expected = _resource_provision_plan(name)
     _assert_plan(expected, plan_id)
+    if (valkey := _managed_valkey(name)) is not None:
+        state, cache = valkey
+        network = state.aws_networks[cache.aws_network]
+        workload_store = cast(
+            AWSSecretsManagerStore, state.secret_stores[cache.workload_secret_store]
+        )
+        return {"changed": True, **resources_valkey_module.apply_provision(
+            elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
+            network, cache, name, workload_store, cache.workload_secret_store,
+        )}
     state, resource = _managed_resource(name)
     network = state.aws_networks[resource.aws_network]
     account = state.provider_accounts[network.provider_account]
@@ -1168,11 +1190,7 @@ def inspect_resource(name: Name) -> dict[str, object]:
     if resource is None:
         raise KeyError(f"resource '{name}' is not registered")
     if isinstance(resource, AWSElastiCacheValkeyResource):
-        # Provisioning and live observation arrive with the replication group adapter.
-        return {
-            "resource": name, "provider": resource.provider, "kind": resource.kind,
-            "engine_version": resource.engine_version, "phase": "registered",
-        }
+        return _inspect_valkey(state, name, resource)
     if not isinstance(resource, AWSRDSPostgresResource):
         return {
             "resource": name, "provider": resource.provider, "target": resource.target,
@@ -1217,6 +1235,43 @@ def inspect_resource(name: Name) -> dict[str, object]:
                 dict[str, dict[str, object]], observed["allocations"]
             ).items()
         }
+    return result
+
+
+def _inspect_valkey(
+    state: ControlState, name: str, resource: AWSElastiCacheValkeyResource
+) -> dict[str, object]:
+    """Bounded and secret-free: no endpoint, address, ARN, user, or secret identifier."""
+    observed = resources_valkey_module.load_observed(store.root, name)
+    network = state.aws_networks[resource.aws_network]
+    group_id = resources_valkey_module.derive_group_id(name)
+    live: resources_valkey_module.GroupObservation | None = None
+    refresh_error: str | None = None
+    try:
+        live = elasticache_valkey.describe_group(
+            state.provider_accounts[network.provider_account], network, group_id
+        )
+    except ResourceError as exc:
+        refresh_error = str(exc)
+    result: dict[str, object] = {
+        "resource": name, "provider": resource.provider, "kind": resource.kind,
+        "phase": "absent" if observed is None else observed["phase"],
+        "source": "cache" if live is None else "live",
+    }
+    if refresh_error is not None:
+        result["refresh_error"] = refresh_error
+    if live is not None:
+        issues = resources_valkey_module.structural_issues(resource, live, group_id)
+        result.update(
+            phase=resources_valkey_module.group_phase(live, issues), status=live.status,
+            engine_version=live.engine_version,
+            effective_durability=live.effective_durability, issues=issues,
+        )
+    elif observed is not None:
+        result.update(
+            status=observed["status"], engine_version=observed["engine_version"],
+            effective_durability=observed["effective_durability"], issues=observed["issues"],
+        )
     return result
 
 
@@ -1295,6 +1350,8 @@ def _resource_cleanup_plan(name: str) -> dict[str, object]:
         for deployment in state.deployments.values()
     ):
         raise ValueError(f"resource {name} is still referenced by a deployment")
+    if isinstance(resource, AWSElastiCacheValkeyResource):
+        return resource_cleanup_plan(name, managed=True, subject="ElastiCache replication group")
     return resource_cleanup_plan(name, managed=isinstance(resource, AWSRDSPostgresResource))
 
 
@@ -1316,8 +1373,10 @@ def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
         raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
     state = store.load()
     resource = state.resources[name]
-    retained = isinstance(resource, AWSRDSPostgresResource)
-    if retained:
+    retained = isinstance(resource, (AWSRDSPostgresResource, AWSElastiCacheValkeyResource))
+    if isinstance(resource, AWSElastiCacheValkeyResource):
+        resources_valkey_module.retain_group(store.root, name, resource.aws_network)
+    elif isinstance(resource, AWSRDSPostgresResource):
         resources_postgres_module.retain_resource(store.root, name, resource.aws_network)
     store.save(_delete(state, "resources", name))
     return {"changed": True, "resource": name, "retained": retained}
