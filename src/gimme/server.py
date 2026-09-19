@@ -1602,14 +1602,19 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
         network, name, str(expected["identity_fingerprint"]),
     )
     if result["destroyed"]:
-        store.save(_delete(state, "resources", name))
+        # Reloaded: the destruction can outlast other edits to desired state.
+        store.save(_delete(store.load(), "resources", name))
     return {"changed": True, **result}
 
 
 def _resource_forget_plan(name: str) -> dict[str, object]:
     if name in store.load().resources:
         raise ValueError(f"resource {name} is still registered; only a retained one is forgotten")
-    if resources_postgres_module.load_retained(store.root, name) is None:
+    try:
+        retained = resources_postgres_module.load_retained(store.root, name) is not None
+    except ResourceError:
+        retained = True  # a corrupt tombstone can still be forgotten
+    if not retained:
         raise KeyError(f"no retained resource named '{name}'")
     return resource_forget_plan(name)
 

@@ -2671,3 +2671,57 @@ def test_a_verification_that_cannot_be_read_stops_before_any_deletion(monkeypatc
         run()
 
     assert not any(call.startswith("delete:") for call in calls)
+
+
+def test_retaining_a_half_destroyed_resource_abandons_the_destruction(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    adapter.dependents_error = ResourceError("aws_elasticache_destroy_ownership_mismatch")
+    with pytest.raises(ResourceError):
+        destroy()
+    marker = server_module.store.root / "destroying-resources" / f"{NAME}.json"
+    assert marker.is_file()
+
+    cleanup = server_module.plan_cleanup_resource(NAME)
+    server_module.apply_cleanup_resource(
+        NAME, str(cleanup["plan_id"]), str(cleanup["confirmation"])
+    )
+
+    assert not marker.exists() and NAME not in server_module.store.load().resources
+
+
+def test_a_destruction_reloads_desired_state_before_forgetting_the_resource(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    original = adapter.delete_dependents
+
+    def edit_meanwhile(*args, **kwargs):
+        original(*args, **kwargs)
+        document = server_module.store.load().model_dump(mode="json")
+        document["deployments"][DEPLOYMENT]["variables"]["EDITED_MEANWHILE"] = "yes"
+        server_module.store.save(ControlState.model_validate(document))
+
+    adapter.delete_dependents = edit_meanwhile  # type: ignore[method-assign]
+
+    destroy()
+
+    state = server_module.store.load()
+    assert NAME not in state.resources
+    assert state.deployments[DEPLOYMENT].variables["EDITED_MEANWHILE"] == "yes"
+
+
+def test_a_corrupt_tombstone_can_still_be_forgotten(tmp_path, monkeypatch) -> None:
+    unreferenced(tmp_path, monkeypatch)
+    cleanup = server_module.plan_cleanup_resource(NAME)
+    server_module.apply_cleanup_resource(
+        NAME, str(cleanup["plan_id"]), str(cleanup["confirmation"])
+    )
+    tombstone = server_module.store.root / "retained-resources" / f"{NAME}.json"
+    tombstone.write_text("{not json")
+
+    plan = server_module.plan_forget_resource(NAME)
+    server_module.apply_forget_resource(NAME, str(plan["plan_id"]), f"FORGET {NAME}")
+
+    assert not tombstone.exists()

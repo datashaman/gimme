@@ -375,9 +375,11 @@ the same call, with the same plan, to continue: it deletes nothing twice, then r
 dependents in dependency order, reading each object's `gimme:resource` tag with the inspection role
 before deleting it with the destructive role (`aws_elasticache_destroy_ownership_mismatch` stops the
 sequence for an object that is not this Resource's). An object that is already gone counts as done.
-While a destruction is in progress the Resource cannot be provisioned or bound again
+A user whose binding crashed before its allocation was recorded is not known to Gimme and is left;
+delete it yourself. While a destruction is in progress the Resource cannot be provisioned or bound again
 (`aws_elasticache_destroy_in_progress`). A failure part-way leaves the registration and the
-progress marker in place, and the same call resumes.
+progress marker in place, and the same call resumes. `apply_cleanup_resource` abandons a stuck
+destruction and retains what is left.
 
 ## Forget a retained tombstone
 

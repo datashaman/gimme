@@ -1024,6 +1024,8 @@ def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, 
         "identity": observed["identity"] if observed is not None else None,
     }
     _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
+    # Retaining abandons a half-finished destruction, so a later Resource of this name is free.
+    _destroying_path(root, resource_name).unlink(missing_ok=True)
     return cast(dict[str, object], tombstone)
 
 
