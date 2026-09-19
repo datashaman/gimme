@@ -247,12 +247,30 @@ def recovery_point_creation_plan(
             "destination_policy": destination.model_dump(mode="json"),
             "request_id": request_id,
             "recovery_point_id": point_id,
-            "components": ["postgres"],
+            "components": [
+                "postgres", *(["valkey"] if deployment.recovery.valkey else [])
+            ],
+            "quiesce_wait_seconds": deployment.recovery.quiesce_wait_seconds,
             "effects": [
-                "run a transactionally consistent pg_dump of the deployment's isolated database",
+                *(
+                    [
+                        "place only this deployment route into request-owned maintenance",
+                        "drain and stop only this deployment's managed writers",
+                    ]
+                    if deployment.recovery.valkey else []
+                ),
+                "capture the deployment's isolated PostgreSQL database",
+                *(
+                    ["capture only this deployment's registered Valkey prefix"]
+                    if deployment.recovery.valkey else []
+                ),
                 "exclude roles, ownership, ACLs, and credential material from the dump",
-                "upload the checksummed component with server-side encryption",
-                "publish the immutable Recovery Manifest only after verification succeeds",
+                "upload every checksummed component with server-side encryption",
+                "publish one immutable Recovery Manifest only after all components verify",
+                *(
+                    ["restore managed processes and normal routing after capture"]
+                    if deployment.recovery.valkey else []
+                ),
                 "make no other remote or destination changes",
             ],
         }

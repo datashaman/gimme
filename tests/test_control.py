@@ -489,6 +489,19 @@ def test_deployment_recovery_binds_to_a_registered_destination() -> None:
     assert state.deployments["example-local"].recovery.destination == "primary"
 
 
+@pytest.mark.parametrize("wait", [0, 301, 1.5, "30"])
+def test_recovery_quiesce_wait_is_a_bounded_integer(wait) -> None:
+    with pytest.raises(ValidationError):
+        RecoveryPolicy(destination="primary", quiesce_wait_seconds=wait)
+
+
+def test_recovery_policy_defaults_to_postgres_without_valkey() -> None:
+    policy = RecoveryPolicy(destination="primary")
+
+    assert policy.valkey is False
+    assert policy.quiesce_wait_seconds == 30
+
+
 def _target_with_role(
     alias: str, role: Literal["deployment", "administration"] = "deployment"
 ) -> TargetConfig:

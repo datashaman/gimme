@@ -808,6 +808,32 @@ def test_create_recovery_point_requires_a_bound_recovery_policy(tmp_path, monkey
         server_module.plan_create_recovery_point("example-app", "req-1")
 
 
+def test_valkey_recovery_opt_in_and_drain_interval_are_content_addressed(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    postgres_only = server_module.plan_create_recovery_point("example-app", "req-1")
+    deployment = selected.deployment("example-app")
+    selected.save(
+        selected.load().model_copy(update={
+            "deployments": {
+                "example-app": deployment.model_copy(update={
+                    "recovery": RecoveryPolicy(
+                        destination="primary", valkey=True, quiesce_wait_seconds=45
+                    )
+                })
+            }
+        })
+    )
+
+    inclusive = server_module.plan_create_recovery_point("example-app", "req-1")
+
+    assert postgres_only["components"] == ["postgres"]
+    assert inclusive["components"] == ["postgres", "valkey"]
+    assert inclusive["quiesce_wait_seconds"] == 45
+    assert inclusive["plan_id"] != postgres_only["plan_id"]
+
+
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:
     use_recovery_store(tmp_path, monkeypatch)
     monkeypatch.setattr(server_module, "backup_s3", FakeS3())
