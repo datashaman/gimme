@@ -282,6 +282,59 @@ def recovery_point_creation_plan(
     )
 
 
+def deployment_restore_plan(
+    deployment_name: str, recovery_point_id: str, request_id: str,
+    source_components: list[dict[str, object]], destination_resource: str,
+    destination_version: str, destination_empty: bool,
+    policy_selects_valkey: bool,
+    restore_state: str | None = None, request_conflict: bool = False,
+) -> dict[str, Any]:
+    postgres = next(
+        (component for component in source_components if component.get("kind") == "postgres"),
+        None,
+    )
+    source_version = "" if postgres is None else str(postgres.get("resource_version", ""))
+    issues = [
+        *(
+            ["multi_component_restore_unsupported"]
+            if policy_selects_valkey or len(source_components) != 1 or postgres is None else []
+        ),
+        *(
+            ["source_version_incompatible"]
+            if source_version != destination_version else []
+        ),
+        *(["restore_request_conflict"] if request_conflict else []),
+    ]
+    return exact_plan({
+        "kind": "deployment_restore",
+        "deployment": deployment_name,
+        "request_id": request_id,
+        "source": {
+            "recovery_point_id": recovery_point_id,
+            "provider": "target_local", "kind": "postgres", "version": source_version,
+        },
+        "destination": {
+            "resource": destination_resource, "provider": "target_local",
+            "kind": "postgres", "version": destination_version,
+            "empty": destination_empty,
+        },
+        "ready": not issues,
+        "readiness_issues": issues,
+        "restore_state": restore_state,
+        "confirmation": f"RESTORE DEPLOYMENT {deployment_name} FROM {recovery_point_id}",
+        "effects": [
+            "enter request-owned maintenance and stop only managed writers",
+            *(
+                ["create and verify a protected Safety Recovery Point"]
+                if not destination_empty else []
+            ),
+            "verify the exact PostgreSQL artifact before loading a shadow database",
+            "swap only the deployment database after shadow and private health verification",
+            "restore processes and routing only after post-swap verification",
+        ],
+    })
+
+
 def recovery_point_deletion_plan(
     deployment_name: str,
     destination_name: str,

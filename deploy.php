@@ -1139,6 +1139,37 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
 });
 
+task('gimme:recovery:inspect-postgres', function (): void {
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)) {
+        throw new \RuntimeException('Unsafe PostgreSQL recovery identity');
+    }
+    $query = <<<'SQL'
+SELECT CASE WHEN
+    EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','v','m','S','f')
+    ) OR EXISTS (
+        SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%'
+    ) OR EXISTS (
+        SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND n.nspname NOT LIKE 'pg_toast%' AND t.typtype IN ('c','d','e','r')
+    ) OR EXISTS (
+        SELECT 1 FROM pg_extension WHERE extname <> 'plpgsql'
+    ) THEN 'nonempty' ELSE 'empty' END
+SQL;
+    $command = 'result=$(psql --no-psqlrc -Atq -d ' . escapeshellarg($database) .
+        ' -c ' . escapeshellarg($query) . ' 2>/dev/null) || ' .
+        '{ printf %s\\n GIMME_POSTGRES_RESTORE_PREFLIGHT_FAILED >&2; exit 1; }; ' .
+        'case "$result" in empty|nonempty) printf %s\\n ' .
+        '"GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" ;; *) exit 1 ;; esac';
+    run('bash -c ' . escapeshellarg($command), timeout: 60);
+});
+
 task('gimme:recovery:maintenance', function () use ($appsRoot, $instance): void {
     $action = required_env('GIMME_RECOVERY_ACTION');
     $request = required_env('GIMME_RECOVERY_REQUEST_ID');

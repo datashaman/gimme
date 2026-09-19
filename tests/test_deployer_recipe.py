@@ -703,6 +703,21 @@ def test_valkey_recovery_capture_is_binary_safe_prefix_bounded_and_non_global() 
     assert "rm -f " in task
 
 
+def test_postgres_restore_preflight_uses_only_fixed_catalog_inspection() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:inspect-postgres'", 1)[1].split(
+        "task('gimme:recovery:maintenance'", 1
+    )[0]
+
+    assert "pg_class" in task
+    assert "pg_proc" in task
+    assert "pg_type" in task
+    assert "pg_extension" in task
+    assert "GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" in task
+    assert "DROP " not in task
+    assert "ALTER " not in task
+
+
 def _fake_psql(tmp_path: Path, *, fail: bool = False, message: str | None = None) -> Path:
     """A stand-in psql that records argv and stdin. It cannot judge SQL semantics, so the
     statements it receives are additionally exercised against a real server by hand; these

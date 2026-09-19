@@ -349,6 +349,7 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
     adapter = FakeS3()
     identity = {
         "source_recovery_point_id": recovery_point_id("checkout", "primary", "source-1"),
+        "destination_resource": "checkout-postgres",
         "destination_provider": "target_local",
         "destination_kind": "postgres",
         "destination_version": "17.2",
@@ -381,6 +382,7 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
     append_restore_event(
         destination(), None, adapter, "checkout", "restore-1", "started",
         source_recovery_point_id=point, destination_provider="target_local",
+        destination_resource="checkout-postgres",
         destination_kind="postgres", destination_version="17.2",
     )
 
@@ -388,6 +390,7 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
         append_restore_event(
             destination(), None, adapter, "checkout", "restore-1", "maintenance_entered",
             source_recovery_point_id=point, destination_provider="target_local",
+            destination_resource="checkout-postgres",
             destination_kind="postgres", destination_version="16.6",
         )
 
@@ -399,6 +402,7 @@ def test_restore_event_rejects_invalid_transition_without_writing() -> None:
         append_restore_event(
             destination(), None, adapter, "checkout", "restore-1", "data_replaced",
             source_recovery_point_id=recovery_point_id("checkout", "primary", "source-1"),
+            destination_resource="checkout-postgres",
             destination_provider="target_local", destination_kind="postgres",
             destination_version="17.2",
         )
@@ -418,6 +422,7 @@ def test_completed_authoritative_restore_record_releases_its_safety_point(
     )
     identity = {
         "source_recovery_point_id": source_id,
+        "destination_resource": "checkout-postgres",
         "destination_provider": "target_local",
         "destination_kind": "postgres",
         "destination_version": "17.2",

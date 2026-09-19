@@ -353,7 +353,9 @@ def _validate_restore_event(document: object) -> dict[str, object]:
         or document.get("state") not in RESTORE_STATES
         or RECOVERY_POINT_ID.fullmatch(str(document.get("source_recovery_point_id"))) is None
         or not isinstance(destination, dict)
-        or set(destination) != {"provider", "kind", "version"}
+        or set(destination) != {"resource", "provider", "kind", "version"}
+        or not isinstance(destination.get("resource"), str)
+        or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", str(destination.get("resource"))) is None
         or destination.get("provider") != "target_local"
         or destination.get("kind") != "postgres"
         or RESOURCE_VERSION.fullmatch(str(destination.get("version"))) is None
@@ -420,7 +422,7 @@ def append_restore_event(
     destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
     deployment: str, request_id: str, state: str, *,
     source_recovery_point_id: str, destination_provider: str,
-    destination_kind: str, destination_version: str,
+    destination_resource: str, destination_kind: str, destination_version: str,
     safety_recovery_point_id: str | None = None,
 ) -> dict[str, object]:
     """Append and round-trip one immutable, secret-safe Restore transition."""
@@ -429,6 +431,7 @@ def append_restore_event(
     identity = {
         "source_recovery_point_id": source_recovery_point_id,
         "destination": {
+            "resource": destination_resource,
             "provider": destination_provider,
             "kind": destination_kind,
             "version": destination_version,
