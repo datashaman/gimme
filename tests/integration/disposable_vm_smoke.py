@@ -222,6 +222,16 @@ def ssh_python_output(program: str) -> str:
     ).stdout.strip()
 
 
+def deployment_route_status(*, tls: bool = False) -> str:
+    scheme = "https" if tls else "http"
+    port = 443 if tls else 80
+    host = f"{RECOVERY_DEPLOYMENT}.gimme-ci.local"
+    return ssh(
+        "curl", "-ksS" if tls else "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--resolve", f"{host}:{port}:127.0.0.1", f"{scheme}://{host}/",
+    )
+
+
 def seed_recovery_valkey_state() -> dict[str, object]:
     """Seed two Deployment prefixes with binary, persistent, expiring, and expired keys."""
     output = ssh_python_output(textwrap.dedent(
@@ -627,11 +637,7 @@ def verify_postgres_restore(gimme) -> None:
         RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
     )["state"] != "verification_failed":
         raise AssertionError("failed verification was not recorded")
-    maintenance_status = ssh(
-        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
-        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
-        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
-    )
+    maintenance_status = deployment_route_status(tls=True)
     if maintenance_status != "503":
         raise AssertionError("failed verification exposed restored data")
     ssh("rm", "-f", gate)
@@ -641,11 +647,7 @@ def verify_postgres_restore(gimme) -> None:
     )
     if completed["state"] != "completed":
         raise AssertionError(f"Restore retry did not complete: {completed}")
-    live_status = ssh(
-        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
-        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
-        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
-    )
+    live_status = deployment_route_status(tls=True)
     if live_status != "200":
         raise AssertionError(f"completed Restore did not recover the route: {live_status}")
     if gimme.plan_delete_recovery_point(
@@ -680,11 +682,7 @@ def verify_postgres_restore(gimme) -> None:
         raise AssertionError("empty replacement unexpectedly created a Safety point")
     if restore_probe_value() != "before":
         raise AssertionError("empty replacement Restore did not recover PostgreSQL")
-    replacement_status = ssh(
-        "curl", "-ksS", "-o", "/dev/null", "-w", "%{http_code}",
-        "--resolve", f"{RECOVERY_DEPLOYMENT}.gimme-ci.local:443:127.0.0.1",
-        f"https://{RECOVERY_DEPLOYMENT}.gimme-ci.local/",
-    )
+    replacement_status = deployment_route_status(tls=True)
     if replacement_status != "200":
         raise AssertionError("empty replacement Restore did not recover the application")
 
@@ -765,10 +763,7 @@ def verify_backup_destination() -> None:
     if seeded["expired"] in captured or seeded["unrelated"] in captured:
         raise AssertionError("expired or unrelated Valkey key appeared in the archive")
 
-    route_status = ssh(
-        "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-        f"http://{RECOVERY_DEPLOYMENT}.gimme-ci.local",
-    )
+    route_status = deployment_route_status()
     if route_status == "503":
         raise AssertionError("Recovery Point capture left the Deployment in maintenance")
     for service in ("postgresql", "valkey-server", "caddy"):
