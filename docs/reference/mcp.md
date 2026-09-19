@@ -267,6 +267,7 @@ On-demand Recovery Points are created and listed with:
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
 | `plan_restore_deployment` | Destination + remote read | Verify a PostgreSQL-only source, exact destination compatibility, and database emptiness; return exact effects and confirmation without mutation |
+| `apply_restore_deployment` | Remote + destination write | Enter request-owned maintenance, protect non-empty current data with a Safety Recovery Point, verify and prepare the exact source artifact in a shadow database, then atomically swap the database while remaining in maintenance for verification |
 
 `create_recovery_point` takes a caller-supplied `request_id`; the Recovery Point's
 identity is derived from `(deployment, destination, request_id)`, never from wall-clock
@@ -314,8 +315,12 @@ classify the current database as `empty` or `nonempty`. Tables, partitioned tabl
 materialized views, sequences, foreign tables, routines, user-defined composite/domain/enum/
 range types, and non-baseline extensions all make the database non-empty; an ambiguous or
 failed inspection fails closed. The plan contains no database name and returns the exact
-`RESTORE DEPLOYMENT <deployment> FROM <recovery-point>` confirmation. Apply and verification
-tools are added by the following restore-execution slice.
+`RESTORE DEPLOYMENT <deployment> FROM <recovery-point>` confirmation.
+`apply_restore_deployment` advances the destination-authoritative Restore record through
+maintenance, Safety Recovery Point protection (when the destination was non-empty), exact
+artifact verification, shadow verification, and atomic data replacement. A failed or successful
+data swap remains behind the fixed maintenance route; the separate verification apply is the only
+path back online.
 
 The request-owned maintenance helper also supports internal `resume` and `quiesce`
 transitions for Restore verification. `resume` starts only the managed units recorded as

@@ -305,6 +305,7 @@ async def test_hard_v4_tool_surface() -> None:
         "list_recovery_points",
         "list_restores",
         "plan_restore_deployment",
+        "apply_restore_deployment",
     }
     assert {str(resource.uri) for resource in resources} == {
         "gimme://state", "gimme://operations"
@@ -748,6 +749,176 @@ def test_restore_plan_reports_multi_component_and_version_incompatibility(
     assert plan["readiness_issues"] == [
         "multi_component_restore_unsupported", "source_version_incompatible",
     ]
+
+
+def test_restore_plan_rejects_a_changed_destination_after_request_start(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    append_restore_event(
+        selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", "restore-1", "started",
+        source_recovery_point_id=point,
+        destination_resource="devbox-postgres",
+        destination_provider="target_local", destination_kind="postgres",
+        destination_version="17.2", safety_recovery_point_id=None,
+    )
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *args, **kwargs: CommandResult(
+            ["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty"
+        ),
+    )
+
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-1"
+    )
+
+    assert plan["ready"] is False
+    assert plan["readiness_issues"] == ["restore_destination_changed"]
+
+
+def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source_bytes = b"source-postgres-dump"
+    source = tmp_path / "source.dump"
+    source.write_bytes(source_bytes)
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(source_bytes).hexdigest(),
+            bytes=len(source_bytes), resource_version="17.2",
+        ),
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs.get("postgres_restore_action")))
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+        if task == "gimme:backup:dump-postgres":
+            safety = b"safety-postgres-dump"
+            kwargs["backup_local_path"].write_bytes(safety)
+            digest = hashlib.sha256(safety).hexdigest()
+            return CommandResult(["dep"], 0, f"GIMME_BACKUP|{digest}|{len(safety)}")
+        if task == "gimme:recovery:postgres" and kwargs["postgres_restore_action"] == "prepare":
+            assert kwargs["backup_local_path"].read_bytes() == source_bytes
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
+
+    result = server_module.apply_restore_deployment(
+        "example-app", point, "restore-1", str(plan["plan_id"]),
+        str(plan["confirmation"]),
+    )
+
+    assert result == {
+        "changed": True,
+        "deployment": "example-app",
+        "request_id": "restore-1",
+        "state": "data_replaced",
+        "recovery_required": True,
+        "correlation_id": result["correlation_id"],
+    }
+    assert [item[0] for item in calls] == [
+        "gimme:recovery:inspect-postgres",
+        "gimme:recovery:inspect-postgres",
+        "gimme:recovery:maintenance",
+        "gimme:backup:dump-postgres",
+        "gimme:recovery:postgres",
+        "gimme:recovery:postgres",
+    ]
+    assert calls[-2:] == [
+        ("gimme:recovery:postgres", "prepare"),
+        ("gimme:recovery:postgres", "swap"),
+    ]
+    record = server_module.restore_record_resource("example-app", "restore-1")
+    assert record["state"] == "data_replaced"
+    assert record["events"] == 6
+    safety_id = record["safety_recovery_point_id"]
+    safety = recovery_module.find_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", str(safety_id),
+    )
+    assert safety is not None and safety["safety"] is True
+    assert "source-postgres-dump" not in str(result)
+    assert "safety-postgres-dump" not in str(result)
+
+
+def test_apply_restore_failure_stays_in_maintenance_and_retry_resumes_at_swap(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    fail_swap = True
+    maintenance_actions: list[str] = []
+
+    def fake_run(task, *args, **kwargs):
+        nonlocal fail_swap
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
+        if task == "gimme:recovery:maintenance":
+            maintenance_actions.append(kwargs["recovery_action"])
+        if task == "gimme:recovery:postgres" and kwargs["postgres_restore_action"] == "swap":
+            if fail_swap:
+                fail_swap = False
+                raise RuntimeError("private database failure")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
+    with pytest.raises(RecoveryError, match="^restore_swap_failed$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, "restore-1", str(plan["plan_id"]),
+            str(plan["confirmation"]),
+        )
+    assert server_module.restore_record_resource(
+        "example-app", "restore-1"
+    )["state"] == "shadow_verified"
+    assert maintenance_actions == ["enter"]
+
+    retry_plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-1"
+    )
+    result = server_module.apply_restore_deployment(
+        "example-app", point, "restore-1", str(retry_plan["plan_id"]),
+        str(retry_plan["confirmation"]),
+    )
+
+    assert result["state"] == "data_replaced"
+    assert maintenance_actions == ["enter"], "retry must preserve the existing maintenance owner"
 
 
 def test_delete_recovery_point_requires_both_confirmations_for_the_last_point(

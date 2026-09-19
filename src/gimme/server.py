@@ -9,7 +9,7 @@ import socket
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import datetime
 from functools import wraps
 from inspect import signature
 from pathlib import Path
@@ -361,6 +361,41 @@ def _recovery_maintenance_window(
         yield restore
     finally:
         restore()
+
+
+def _capture_postgres_dump(
+    name: str, local_path: Path, resource_version: str
+) -> ComponentDump:
+    try:
+        result = _run_deployment(
+            "gimme:backup:dump-postgres", name,
+            backup_local_path=local_path, timeout=1800,
+        )
+    except Exception:
+        raise RecoveryError("recovery_capture_failed") from None
+    sha256 = ""
+    size = -1
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        if line.startswith("GIMME_BACKUP|"):
+            parts = line.split("|", 2)
+            if len(parts) == 3 and parts[2].isdigit():
+                sha256, size = parts[1], int(parts[2])
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        or not 0 <= size <= recovery_module.MAX_COMPONENT_BYTES
+        or not local_path.is_file()
+        or local_path.is_symlink()
+        or local_path.stat().st_size != size
+    ):
+        raise RecoveryError("recovery_dump_metadata_invalid")
+    with local_path.open("rb") as source:
+        if hashlib.file_digest(source, "sha256").hexdigest() != sha256:
+            raise RecoveryError("recovery_dump_metadata_invalid")
+    return ComponentDump(
+        kind="postgres", local_path=local_path, sha256=sha256, bytes=size,
+        resource_version=resource_version,
+    )
 
 
 def _revision(name: str) -> str:
@@ -1110,6 +1145,10 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
                 "changed": False,
                 "recovery_point": recovery_module.public_recovery_point(existing),
             }
+        database_name = deployment.resources.database
+        database = state.resources[database_name] if database_name is not None else None
+        if not isinstance(database, ResourceConfig):
+            raise RecoveryError("recovery_database_provenance_invalid")
         with tempfile.TemporaryDirectory(prefix="gimme-recovery-") as directory:
             local_path = Path(directory) / "postgres.dump"
             valkey_path = Path(directory) / "valkey.archive"
@@ -1141,43 +1180,19 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
                 enabled=deployment.recovery.valkey,
             ) as restore_runtime:
                 with protected_secret_file(admin_credential) as valkey_secret:
-                    try:
-                        results["postgres"] = _run_deployment(
-                            "gimme:backup:dump-postgres", name,
-                            backup_local_path=local_path, timeout=1800,
-                        )
-                        if deployment.recovery.valkey:
+                    postgres_dump = _capture_postgres_dump(
+                        name, local_path, database.version
+                    )
+                    if deployment.recovery.valkey:
+                        try:
                             results["valkey"] = _run_deployment(
                                 "gimme:backup:capture-valkey", name,
                                 backup_local_path=valkey_path, secret_file=valkey_secret,
                                 timeout=1800,
                             )
-                    except Exception:
-                        raise RecoveryError("recovery_capture_failed") from None
-                result = results["postgres"]
-                sha256 = ""
-                size = -1
-                for raw in result.output.splitlines():
-                    line = raw.split("] ", 1)[-1].strip()
-                    if line.startswith("GIMME_BACKUP|"):
-                        parts = line.split("|", 2)
-                        if len(parts) == 3 and parts[2].isdigit():
-                            sha256, size = parts[1], int(parts[2])
-                if (
-                    re.fullmatch(r"[0-9a-f]{64}", sha256) is None
-                    or size < 0
-                    or not local_path.is_file()
-                    or local_path.stat().st_size != size
-                ):
-                    raise RecoveryError("recovery_dump_metadata_invalid")
-                database_name = deployment.resources.database
-                database = state.resources[database_name] if database_name is not None else None
-                if not isinstance(database, ResourceConfig):
-                    raise RecoveryError("recovery_database_provenance_invalid")
-                dumps = [ComponentDump(
-                    kind="postgres", local_path=local_path, sha256=sha256, bytes=size,
-                    resource_version=database.version, captured_at=datetime.now(UTC).isoformat(),
-                )]
+                        except Exception:
+                            raise RecoveryError("recovery_capture_failed") from None
+                dumps = [postgres_dump]
                 if deployment.recovery.valkey:
                     version = (
                         valkey_resource.version if isinstance(valkey_resource, ResourceConfig)
@@ -1266,12 +1281,9 @@ def restore_record_resource(name: str, request_id: str) -> dict[str, object]:
     )
 
 
-@mcp.tool(annotations=READ)
-@_journal_plan("restore_deployment", "name")
-def plan_restore_deployment(
-    name: Name, recovery_point_id: RecoveryPointId, request_id: RequestId,
+def _deployment_restore_plan(
+    name: str, recovery_point_id: str, request_id: str,
 ) -> dict[str, object]:
-    """Plan a confirmed PostgreSQL-only Restore without mutating target or destination."""
     state, deployment, destination_name, destination = _recovery_context(name)
     _, credentials = _backup_destination_credentials(state, destination)
     manifest = recovery_module.find_recovery_point(
@@ -1310,15 +1322,208 @@ def plan_restore_deployment(
     request_conflict = existing_restore is not None and (
         existing_restore["source_recovery_point_id"] != recovery_point_id
         or existing_restore["destination"] != expected_destination
+        or existing_restore["safety_recovery_point_id"] not in {
+            None,
+            recovery_module.safety_recovery_point_id(
+                name, destination_name, request_id
+            ),
+        }
+    )
+    observed_empty = states == {"empty"}
+    original_empty = (
+        observed_empty
+        if existing_restore is None
+        else existing_restore["safety_recovery_point_id"] is None
+    )
+    destination_changed = (
+        existing_restore is not None
+        and existing_restore["state"] in {"started", "maintenance_entered"}
+        and original_empty != observed_empty
     )
     return deployment_restore_plan(
         name, recovery_point_id, request_id,
         cast(list[dict[str, object]], manifest["components"]),
-        resource_name, resource.version, states == {"empty"},
+        resource_name, resource.version, original_empty,
         deployment.recovery.valkey,
         None if existing_restore is None else str(existing_restore["state"]),
         request_conflict,
+        destination_changed,
     )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("restore_deployment", "name")
+def plan_restore_deployment(
+    name: Name, recovery_point_id: RecoveryPointId, request_id: RequestId,
+) -> dict[str, object]:
+    """Plan a confirmed PostgreSQL-only Restore without mutating target or destination."""
+    return _deployment_restore_plan(name, recovery_point_id, request_id)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("restore_deployment", "name")
+def apply_restore_deployment(
+    name: Name,
+    recovery_point_id: RecoveryPointId,
+    request_id: RequestId,
+    plan_id: PlanId,
+    confirmation: str,
+) -> dict[str, object]:
+    """Prepare and atomically activate one reviewed PostgreSQL Restore.
+
+    The deployment remains in request-owned maintenance for a separate verified
+    completion step.
+    """
+    with _deployment_resource_lock(name):
+        expected = _deployment_restore_plan(name, recovery_point_id, request_id)
+        _assert_plan(expected, plan_id)
+        if not expected["ready"]:
+            raise RecoveryError("restore_not_ready")
+        if confirmation != expected["confirmation"]:
+            raise ValueError("restore confirmation is invalid")
+        state, deployment, destination_name, destination = _recovery_context(name)
+        _, credentials = _backup_destination_credentials(state, destination)
+        manifest = recovery_module.find_recovery_point(
+            destination_name, destination, credentials, backup_s3, name,
+            recovery_point_id,
+        )
+        if manifest is None:
+            raise RecoveryError("restore_source_missing")
+        component = next(
+            (
+                item for item in manifest["components"]  # type: ignore[union-attr]
+                if item["kind"] == "postgres"
+            ),
+            None,
+        )
+        if component is None:
+            raise RecoveryError("restore_component_missing")
+        resource_name = deployment.resources.database
+        resource = state.resources[resource_name] if resource_name is not None else None
+        if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
+            raise RecoveryError("restore_destination_incompatible")
+        existing = (
+            recovery_module.load_restore_record(
+                destination, credentials, backup_s3, name, request_id
+            )
+            if expected["restore_state"] is not None else None
+        )
+        safety_id = (
+            None
+            if cast(dict[str, object], expected["destination"])["empty"]
+            else recovery_module.safety_recovery_point_id(
+                name, destination_name, request_id
+            )
+        )
+        if existing is not None:
+            safety_id = cast(str | None, existing["safety_recovery_point_id"])
+        identity = {
+            "source_recovery_point_id": recovery_point_id,
+            "destination_provider": "target_local",
+            "destination_resource": resource_name,
+            "destination_kind": "postgres",
+            "destination_version": resource.version,
+            "safety_recovery_point_id": safety_id,
+        }
+        current = None if existing is None else str(existing["state"])
+        changed = False
+
+        def advance(next_state: str) -> None:
+            nonlocal changed, current
+            recovery_module.append_restore_event(
+                destination, credentials, backup_s3, name, request_id, next_state,
+                **identity,
+            )
+            current = next_state
+            changed = True
+
+        if current is None:
+            advance("started")
+        if current == "started":
+            try:
+                _run_deployment(
+                    "gimme:recovery:maintenance", name,
+                    recovery_action="enter", recovery_request_id=request_id,
+                    recovery_quiesce_wait=deployment.recovery.quiesce_wait_seconds,
+                    timeout=900,
+                )
+            except Exception:
+                raise RecoveryError("restore_maintenance_failed") from None
+            advance("maintenance_entered")
+        if current == "maintenance_entered":
+            if safety_id is None:
+                advance("safety_not_required")
+            else:
+                with tempfile.TemporaryDirectory(
+                    prefix="gimme-restore-safety-"
+                ) as directory:
+                    local_safety = Path(directory) / "postgres.dump"
+                    safety_dump = _capture_postgres_dump(
+                        name, local_safety, resource.version
+                    )
+                    safety = recovery_module.create_recovery_point(
+                        destination_name, destination, credentials, backup_s3,
+                        name, safety_id, safety_dump,
+                        safety_restore_request_id=request_id,
+                    )
+                if (
+                    safety["safety"] is not True
+                    or safety["restore_request_id"] != request_id
+                    or len(cast(list[object], safety["components"])) != 1
+                    or cast(list[dict[str, object]], safety["components"])[0][
+                        "kind"
+                    ] != "postgres"
+                    or cast(list[dict[str, object]], safety["components"])[0][
+                        "resource_version"
+                    ] != resource.version
+                ):
+                    raise RecoveryError("restore_safety_conflict")
+                advance("safety_verified")
+        with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
+            local_source = Path(directory) / "postgres.dump"
+            if current in {
+                "safety_verified", "safety_not_required", "artifact_verified"
+            }:
+                component = recovery_module.materialize_recovery_component(
+                    destination_name, destination, credentials, backup_s3, name,
+                    recovery_point_id, "postgres", local_source,
+                )
+            if current in {"safety_verified", "safety_not_required"}:
+                advance("artifact_verified")
+            if current == "artifact_verified":
+                try:
+                    _run_deployment(
+                        "gimme:recovery:postgres", name,
+                        backup_local_path=local_source,
+                        postgres_restore_action="prepare",
+                        postgres_restore_request_id=request_id,
+                        postgres_restore_sha256=str(component["sha256"]),
+                        postgres_restore_bytes=int(component["bytes"]),
+                        timeout=3600,
+                    )
+                except Exception:
+                    raise RecoveryError("restore_shadow_prepare_failed") from None
+                advance("shadow_verified")
+        if current == "shadow_verified":
+            try:
+                _run_deployment(
+                    "gimme:recovery:postgres", name,
+                    postgres_restore_action="swap",
+                    postgres_restore_request_id=request_id,
+                    postgres_restore_sha256=str(component["sha256"]),
+                    postgres_restore_bytes=int(component["bytes"]),
+                    timeout=300,
+                )
+            except Exception:
+                raise RecoveryError("restore_swap_failed") from None
+            advance("data_replaced")
+        return {
+            "changed": changed,
+            "deployment": name,
+            "request_id": request_id,
+            "state": current,
+            "recovery_required": current in {"data_replaced", "verification_failed"},
+        }
 
 
 def _recovery_point_deletion_plan(

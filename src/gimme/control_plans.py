@@ -288,12 +288,14 @@ def deployment_restore_plan(
     destination_version: str, destination_empty: bool,
     policy_selects_valkey: bool,
     restore_state: str | None = None, request_conflict: bool = False,
+    destination_changed: bool = False,
 ) -> dict[str, Any]:
     postgres = next(
         (component for component in source_components if component.get("kind") == "postgres"),
         None,
     )
     source_version = "" if postgres is None else str(postgres.get("resource_version", ""))
+    source_bytes = -1 if postgres is None else postgres.get("bytes", -1)
     issues = [
         *(
             ["multi_component_restore_unsupported"]
@@ -303,7 +305,15 @@ def deployment_restore_plan(
             ["source_version_incompatible"]
             if source_version != destination_version else []
         ),
+        *(
+            ["source_artifact_too_large"]
+            if not isinstance(source_bytes, int)
+            or isinstance(source_bytes, bool)
+            or not 0 <= source_bytes <= 512 * 1024 * 1024
+            else []
+        ),
         *(["restore_request_conflict"] if request_conflict else []),
+        *(["restore_destination_changed"] if destination_changed else []),
     ]
     return exact_plan({
         "kind": "deployment_restore",
