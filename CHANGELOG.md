@@ -5,6 +5,15 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the `aws_elasticache_valkey` Resource for ADR 0009, registration only (slice 1 of #14):
+  an exact Valkey 9 or later `engine_version`, `node_type`, one Valkey security group, a daily
+  UTC snapshot window, `snapshot_retention_days` (1-35, default 7), and a non-overlapping
+  60-minute weekly maintenance window, with the administration Target and AWS Secrets Manager
+  store checked like a managed RDS Resource. Registration makes no AWS call, nothing is
+  provisioned, and `inspect_resource` reports `phase: registered`. A Deployment binding to it
+  is refused when state is validated until typed Valkey bindings exist. Updates that need a
+  new Resource are refused locally with `aws_elasticache_update_forbidden_<field>`. No privilege
+  change.
 - Managed AWS RDS PostgreSQL Resources in `cn-*` regions are now refused with
   `aws_rds_tls_region_unsupported`, exactly like `us-gov-*`: the pinned trust bundle has no China
   roots, so an instance created there could never be bound.

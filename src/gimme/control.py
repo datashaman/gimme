@@ -50,6 +50,16 @@ AWS_VPC_ID = re.compile(r"^vpc-[0-9a-f]{8,17}$")
 AWS_SUBNET_ID = re.compile(r"^subnet-[0-9a-f]{8,17}$")
 AWS_SECURITY_GROUP_ID = re.compile(r"^sg-[0-9a-f]{8,17}$")
 AWS_DB_INSTANCE_CLASS = re.compile(r"^db\.[a-z0-9]+\.[a-z0-9]+$")
+AWS_CACHE_NODE_TYPE = re.compile(r"^cache\.[a-z0-9]+\.[a-z0-9]+$")
+AWS_VALKEY_VERSION = re.compile(r"^[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
+CLOCK = r"(?:[01][0-9]|2[0-3]):[0-5][0-9]"
+SNAPSHOT_WINDOW = re.compile(rf"^({CLOCK})-({CLOCK})$")
+MAINTENANCE_WINDOW = re.compile(
+    rf"^(mon|tue|wed|thu|fri|sat|sun):({CLOCK})-(mon|tue|wed|thu|fri|sat|sun):({CLOCK})$"
+)
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+MINUTES_PER_DAY = 24 * 60
+MINUTES_PER_WEEK = 7 * MINUTES_PER_DAY
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?$")
 COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 RELATIVE_PATH = re.compile(r"^[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)*$")
@@ -215,8 +225,93 @@ class AWSRDSPostgresResource(BaseModel):
         return value
 
 
+def _clock_minutes(clock: str) -> int:
+    hours, minutes = clock.split(":")
+    return int(hours) * 60 + int(minutes)
+
+
+def _snapshot_window_minutes(window: str) -> list[int]:
+    """Minutes of the week a daily UTC window covers, repeated on every day."""
+    match = SNAPSHOT_WINDOW.fullmatch(window)
+    if match is None:
+        raise ValueError("snapshot_window must be a UTC HH:MM-HH:MM window")
+    start, end = (_clock_minutes(part) for part in match.groups())
+    length = (end - start) % MINUTES_PER_DAY
+    if length < 60:
+        raise ValueError("snapshot_window must span at least 60 minutes")
+    return [
+        (day * MINUTES_PER_DAY + start + offset) % MINUTES_PER_WEEK
+        for day in range(7) for offset in range(length)
+    ]
+
+
+def _maintenance_window_minutes(window: str) -> list[int]:
+    """Minutes of the week a weekly UTC window covers."""
+    match = MAINTENANCE_WINDOW.fullmatch(window)
+    if match is None:
+        raise ValueError("maintenance_window must be a UTC ddd:HH:MM-ddd:HH:MM window")
+    first_day, first_clock, last_day, last_clock = match.groups()
+    start = WEEKDAYS.index(first_day) * MINUTES_PER_DAY + _clock_minutes(first_clock)
+    end = WEEKDAYS.index(last_day) * MINUTES_PER_DAY + _clock_minutes(last_clock)
+    if (end - start) % MINUTES_PER_WEEK != 60:
+        raise ValueError("maintenance_window must span exactly 60 minutes")
+    return [(start + offset) % MINUTES_PER_WEEK for offset in range(60)]
+
+
+class AWSElastiCacheValkeyResource(BaseModel):
+    """One managed AWS ElastiCache for Valkey replication group (ADR 0009): one shard, one
+    cross-AZ replica, cluster mode, TLS, and synchronous durability are fixed by Gimme and
+    are not fields. Registration makes no AWS call and a Deployment cannot bind it yet."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["valkey"] = "valkey"
+    provider: Literal["aws_elasticache_valkey"] = "aws_elasticache_valkey"
+    aws_network: str = Field(pattern=AWS_NETWORK_NAME.pattern)
+    administration_target: str = Field(pattern=TARGET_NAME.pattern)
+    engine_version: str
+    node_type: str = Field(pattern=AWS_CACHE_NODE_TYPE.pattern)
+    security_group_id: str = Field(pattern=AWS_SECURITY_GROUP_ID.pattern)
+    snapshot_window: str
+    snapshot_retention_days: int = Field(default=7, ge=1, le=35)
+    maintenance_window: str
+    workload_secret_store: str = Field(pattern=SECRET_STORE_NAME.pattern)
+    retain_on_removal: bool = Field(
+        default=True,
+        description="Lifecycle policy: ordinary Resource removal only deletes desired "
+        "registration and leaves the replication group and its data intact.",
+    )
+
+    @field_validator("engine_version")
+    @classmethod
+    def exact_valkey_version(cls, value: str) -> str:
+        if AWS_VALKEY_VERSION.fullmatch(value) is None or int(value.split(".")[0]) < 9:
+            raise ValueError("engine_version must be an exact Valkey version, 9.0 or later")
+        return value
+
+    @field_validator("snapshot_window")
+    @classmethod
+    def valid_snapshot_window(cls, value: str) -> str:
+        _snapshot_window_minutes(value)
+        return value
+
+    @field_validator("maintenance_window")
+    @classmethod
+    def valid_maintenance_window(cls, value: str) -> str:
+        _maintenance_window_minutes(value)
+        return value
+
+    @model_validator(mode="after")
+    def windows_do_not_overlap(self) -> "AWSElastiCacheValkeyResource":
+        if set(_snapshot_window_minutes(self.snapshot_window)) & set(
+            _maintenance_window_minutes(self.maintenance_window)
+        ):
+            raise ValueError("snapshot_window and maintenance_window must not overlap")
+        return self
+
+
 Resource = Annotated[
-    ResourceConfig | AWSRDSPostgresResource,
+    ResourceConfig | AWSRDSPostgresResource | AWSElastiCacheValkeyResource,
     Field(discriminator="provider"),
 ]
 
@@ -773,13 +868,14 @@ class ControlState(BaseModel):
                         f"resource {name} workload_secret_store must be a registered "
                         "AWS Secrets Manager store"
                     )
-                for target_name in resource.deployment_security_group_ids:
-                    deployment_target = self.targets.get(target_name)
-                    if deployment_target is None or deployment_target.role != "deployment":
-                        raise ValueError(
-                            f"resource {name} deployment_security_group_ids references "
-                            "an invalid target"
-                        )
+                if isinstance(resource, AWSRDSPostgresResource):
+                    for target_name in resource.deployment_security_group_ids:
+                        deployment_target = self.targets.get(target_name)
+                        if deployment_target is None or deployment_target.role != "deployment":
+                            raise ValueError(
+                                f"resource {name} deployment_security_group_ids references "
+                                "an invalid target"
+                            )
         for name, deployment in self.deployments.items():
             if DEPLOYMENT_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid deployment name: {name}")
@@ -815,6 +911,11 @@ class ControlState(BaseModel):
                     raise ValueError(f"deployment {name} references unknown resource {binding}")
                 if resource.kind != kind:
                     raise ValueError(f"deployment {name} has an incompatible {kind} binding")
+                if isinstance(resource, AWSElastiCacheValkeyResource):
+                    raise ValueError(
+                        f"deployment {name} cannot bind managed Valkey resource {binding}: "
+                        "managed Valkey bindings are not implemented yet"
+                    )
                 if isinstance(resource, ResourceConfig):
                     if resource.target != deployment.target:
                         raise ValueError(f"deployment {name} has an incompatible {kind} binding")
