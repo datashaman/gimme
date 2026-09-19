@@ -144,7 +144,7 @@ before any change, and the response lists `modified_fields` and `rebooted`. `bin
 already report `phase: ready`; it resolves the master credential through the account's
 distinct resolver role only at apply time, creates or reconciles the deployment's isolated
 database and role through the Administration Target over `psql` with `verify-full` TLS
-against a pinned AWS trust bundle (`us-gov-*` regions are refused when registering,
+against a pinned AWS trust bundle (`us-gov-*` and `cn-*` regions are refused when registering,
 planning or applying a managed Resource), and stores a
 generation-1 workload credential as a tagged Secrets Manager secret — the response
 contains only the `{store, secret}` reference. Workload credential rotation, Detached

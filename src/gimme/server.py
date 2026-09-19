@@ -1100,10 +1100,10 @@ def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[s
 
 
 def _refuse_unverifiable_tls_region(state: ControlState, resource: AWSRDSPostgresResource) -> None:
-    # Only the AWS commercial-region trust bundle is pinned, so a us-gov-* instance could be
+    # Only the AWS commercial-region trust bundle is pinned, so a us-gov-* or cn-* instance could be
     # created but never bound. Refuse before anything is created.
     network = state.aws_networks.get(resource.aws_network)
-    if network is not None and network.region.startswith("us-gov-"):
+    if network is not None and network.region.startswith(("us-gov-", "cn-")):
         raise ResourceError("aws_rds_tls_region_unsupported")
 
 

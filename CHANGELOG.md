@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Managed AWS RDS PostgreSQL Resources in `cn-*` regions are now refused with
+  `aws_rds_tls_region_unsupported`, exactly like `us-gov-*`: the pinned trust bundle has no China
+  roots, so an instance created there could never be bound.
 - `apply_resource` now converges an existing managed AWS RDS PostgreSQL instance onto desired
   state with one immediate `ModifyDBInstance` (`ApplyImmediately`, never a major-version
   upgrade) carrying only the fields that differ: same-major `engine_version`,
