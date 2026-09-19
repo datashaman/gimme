@@ -332,6 +332,12 @@ check re-quiesces those units and appends `verification_failed`; a retry is requ
 successful private checks around idempotent previous-database cleanup, it restores the saved route
 and appends `completed`.
 
+One reentrant, filesystem-backed Deployment operation lock covers Restore, Recovery Point capture,
+deploy, runtime and resource reconciliation, binding and credential rotation, promotion, rollback,
+removal, Deployment updates, and mutating Artisan work. Multi-Deployment and shared-Resource
+operations acquire Deployment names in sorted order, preventing both interleaving and lock-order
+deadlocks.
+
 The request-owned maintenance helper also supports internal `resume` and `quiesce`
 transitions for Restore verification. `resume` starts only the managed units recorded as
 active before maintenance while leaving the public route on the fixed 503 response;

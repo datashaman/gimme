@@ -1,8 +1,8 @@
 import dataclasses
 import hashlib
-from pathlib import Path
-
 import json
+import threading
+from pathlib import Path
 
 from fastmcp import Client
 import pytest
@@ -123,6 +123,30 @@ def use_recovery_store(tmp_path: Path, monkeypatch) -> StateStore:
     selected.save(recovery_state())
     monkeypatch.setattr(server_module, "store", selected)
     return selected
+
+
+def test_deployment_operation_lock_is_reentrant_and_excludes_other_threads(
+    tmp_path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    started = threading.Event()
+    acquired = threading.Event()
+
+    def contender() -> None:
+        started.set()
+        with server_module._deployment_resource_lock("example-app"):
+            acquired.set()
+
+    with server_module._deployment_resource_lock("example-app"):
+        with server_module._deployment_resource_lock("example-app"):
+            thread = threading.Thread(target=contender)
+            thread.start()
+            assert started.wait(1)
+            assert not acquired.wait(0.05)
+
+    assert acquired.wait(1)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
 
 
 class FakeS3:
