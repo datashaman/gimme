@@ -315,8 +315,10 @@ class BotoElastiCacheAdapter(AWSAdapter):
         # ElastiCache, never returned. An existing user keeps the credential already stored.
         if not self._user_exists(client, admin_id):
             password = secrets_module.token_urlsafe(36)
+            # Deployment names cannot start with an underscore, so a Deployment credential at
+            # <resource>/<deployment> can never collide with this one.
             self.create_workload_secret(
-                account, store, f"{resource_name}/admin",
+                account, store, f"{resource_name}/_admin",
                 {"gimme:secret-store": store_name, "gimme:resource": resource_name},
                 {"username": ADMIN_USER_NAME, "password": password},
             )

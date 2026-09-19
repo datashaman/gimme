@@ -699,7 +699,7 @@ def expect_create(
         )
         secrets_stub.add_response(
             "create_secret", {"ARN": "arn:aws:secretsmanager:eu-central-1:123456789012:secret:x"},
-            {"Name": f"gimme/workload/{NAME}/admin", "SecretString": ANY, "Tags": [
+            {"Name": f"gimme/workload/{NAME}/_admin", "SecretString": ANY, "Tags": [
                 {"Key": "gimme:resource", "Value": NAME},
                 {"Key": "gimme:secret-store", "Value": "workload-secrets"}]},
         )
@@ -707,7 +707,7 @@ def expect_create(
             "put_secret_value",
             {"ARN": "arn:aws:secretsmanager:eu-central-1:123456789012:secret:x",
              "VersionId": "v" * 32},
-            {"SecretId": f"gimme/workload/{NAME}/admin", "SecretString": ANY},
+            {"SecretId": f"gimme/workload/{NAME}/_admin", "SecretString": ANY},
         )
         admin_request = {
             "UserId": admin_id, "UserName": "gimme-admin", "Engine": "valkey",

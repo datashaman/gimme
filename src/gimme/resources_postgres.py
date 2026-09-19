@@ -191,7 +191,10 @@ class AWSAdapter:
         self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
         tags: dict[str, str], payload: dict[str, str],
     ) -> tuple[str, str]:
-        session = self._session(account, account.inspection_role_arn, "workload-secret")
+        session = self._session(
+            account, account.inspection_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret",
+        )
         client = session.client("secretsmanager", region_name=store.region)
         secret_id = f"{store.prefix}/{name}"
         secret_string = json.dumps(payload, sort_keys=True, separators=(",", ":"))

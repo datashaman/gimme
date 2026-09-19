@@ -114,7 +114,7 @@ existing group.
 parameter group `gimme-<name>-params` (`cluster-enabled yes`, `maxmemory-policy noeviction`),
 the default user with an access string that can never authenticate, an administrative user
 whose generated 48-character password is written to the Secret Store at
-`<prefix>/<resource>/admin` as `username` and `password`, a user group holding both, and the
+`<prefix>/<resource>/_admin` as `username` and `password`, a user group holding both, and the
 replication group. Every object is tagged `gimme:resource=<name>`. Gimme refuses a group or
 parameter group of the same name that it does not own, and never adopts one.
 
@@ -125,7 +125,8 @@ Creation takes several minutes. `apply_resource` polls for at most 30 seconds an
 `phase: pending`; plan and apply again to resume, which describes the group and never creates
 a second one. An existing group is never modified.
 
-Phases are `pending`, `ready`, `degraded`, and `failed`. An `available` group that does not
+Phases are `pending`, `ready`, `degraded`, and `failed`. A `failed` group (AWS reports
+`create-failed`) is never deleted or recreated by Gimme: delete it yourself, then apply again. An `available` group that does not
 meet the contract is `degraded` with fixed reason codes: `cluster_mode`, `topology`,
 `availability_zones`, `multi_az`, `automatic_failover`, `tls`, `encryption_at_rest`,
 `durability` (the effective durability is not `sync`), `authentication`, `snapshot_policy`,
