@@ -141,8 +141,11 @@ def shared(tmp_path_factory: pytest.TempPathFactory, certificates: Path):
     started.stop()
 
 
-def config(server: Server, uses: list[str], host: str = "localhost") -> dict[str, object]:
-    return probe_config(DEPLOYMENT, uses, host, server.port)  # type: ignore[arg-type]
+def config(
+    server: Server, uses: list[str], host: str = "localhost", horizon: bool | None = None
+) -> dict[str, object]:
+    horizon = "queue" in uses if horizon is None else horizon
+    return probe_config(DEPLOYMENT, uses, host, server.port, horizon)  # type: ignore[arg-type]
 
 
 def environment(server: Server, uses: list[str], host: str = "localhost") -> dict[str, str]:
@@ -165,11 +168,11 @@ def lockfile(tmp_path: Path, framework: str = "v13.5.0", horizon: str = "v5.46.0
 def run_probe(
     server: Server, tmp_path: Path, uses: list[str], *, host: str = "localhost",
     context: ssl.SSLContext | None = None, values: dict[str, str] | None = None,
-    lock: Path | None = None,
+    lock: Path | None = None, horizon: bool | None = None,
 ) -> tuple[int, list[str]]:
     lines: list[str] = []
     code = PROBE["probe"](  # type: ignore[operator]
-        config(server, uses, host), values or environment(server, uses, host),
+        config(server, uses, host, horizon), values or environment(server, uses, host),
         str(lock or lockfile(tmp_path)), context or server.context(), lines.append,
     )
     return code, lines
@@ -184,10 +187,27 @@ def test_probe_passes_every_declared_use_and_leaves_no_keys(tmp_path: Path, shar
     code, lines = run_probe(shared, tmp_path, ["cache", "session", "queue"])
 
     assert code == 0
-    expected = probe_names(["cache", "session", "queue"])  # type: ignore[arg-type]
+    expected = probe_names(["cache", "session", "queue"], True)  # type: ignore[arg-type]
     assert "use-horizon" in expected and len(expected) == 13
     assert lines == [f"GIMME_VALKEY_PROBE|{name}|ready" for name in expected]
     assert shared.cli("DBSIZE") == "0"
+
+
+@needs_server
+def test_a_queue_without_horizon_needs_no_horizon_package_or_check(
+    tmp_path: Path, shared: Server
+) -> None:
+    empty = tmp_path / "empty.lock"
+    empty.write_text(json.dumps({"packages": []}))
+
+    code, lines = run_probe(shared, tmp_path, ["queue"], lock=empty, horizon=False)
+
+    assert code == 0
+    assert lines == [
+        f"GIMME_VALKEY_PROBE|{name}|ready"
+        for name in probe_names(["queue"], False)  # type: ignore[arg-type]
+    ]
+    assert not any("horizon" in line for line in lines)
 
 
 @needs_server
@@ -353,6 +373,9 @@ def test_probe_requires_the_environment_file_to_match_the_planned_contract(
 def test_probe_follows_redirects_only_inside_the_endpoint_domain() -> None:
     session = PROBE["Session"]("clustercfg.shop.abc.cache.example.com", 6379, None, "u", "p")
     failure = PROBE["ProbeFailure"]
+    two_labels = PROBE["Session"]("cache.com", 6379, None, "u", "p")
+    with pytest.raises(failure):
+        two_labels._redirect("MOVED 1 attacker.com:6379")
 
     assert session._redirect("MOVED 3999 node-0001.shop.abc.cache.example.com:6380") == (
         "node-0001.shop.abc.cache.example.com", 6380,
@@ -360,6 +383,7 @@ def test_probe_follows_redirects_only_inside_the_endpoint_domain() -> None:
     for message in (
         "MOVED 1 attacker.example.net:6379",
         "MOVED 1 10.0.0.5:6379",
+        "MOVED 1 attacker.com:6379",
         "MOVED 1 evilshop.abc.cache.example.com.attacker.net:6379",
         "MOVED 1 node.shop.abc.cache.example.com:0",
         "MOVED 1 node.shop.abc.cache.example.com:notaport",

@@ -73,22 +73,22 @@ def credential_references(
 
 
 def probe_config(
-    deployment_name: str, uses: list[ValkeyUse], host: str, port: int
+    deployment_name: str, uses: list[ValkeyUse], host: str, port: int, horizon: bool
 ) -> dict[str, object]:
-    """The non-secret input of the fixed activation probe program."""
+    """The non-secret input of the fixed activation probe program. `horizon` is whether the
+    Deployment runs Horizon, not merely whether it declares `queue`."""
     return {
-        "contract": CONTRACT, "host": host, "port": port, "uses": list(uses),
+        "contract": CONTRACT, "host": host, "port": port, "uses": list(uses), "horizon": horizon,
         "prefixes": namespace_prefixes(deployment_name, list(uses)),
         "deployment": deployment_name,
     }
 
 
-def probe_names(uses: list[ValkeyUse]) -> list[str]:
+def probe_names(uses: list[ValkeyUse], horizon: bool) -> list[str]:
     """The fixed checks of the activation probe, in the order it runs them and stops at the
-    first failure. Horizon accompanies queue."""
-    queue = "queue" in uses
+    first failure."""
     return [
-        "environment", *(["horizon-compatibility"] if queue else []), "tls", "auth",
+        "environment", *(["horizon-compatibility"] if horizon else []), "tls", "auth",
         "default-user", "cluster", "read-after-write", "namespace",
-        *(f"use-{use}" for use in uses), *(["use-horizon"] if queue else []), "cleanup",
+        *(f"use-{use}" for use in uses), *(["use-horizon"] if horizon else []), "cleanup",
     ]

@@ -263,6 +263,11 @@ The application must read them in its own cluster-aware PhpRedis or Predis confi
 | `GIMME_VALKEY_CACHE_PREFIX`, `_SESSION_PREFIX`, `_QUEUE_PREFIX`, `_HORIZON_PREFIX` | the derived namespaces |
 | `GIMME_VALKEY_USERNAME`, `_PASSWORD` | the Resource Credential, resolved from Secrets Manager at apply time |
 
+The credential is read by the Provider Account's resolver role, so its `GetSecretValue`
+permission must cover `<prefix>/<resource>/<deployment>` in the workload Secret Store (see
+[AWS secret stores](use-aws-secret-stores.md)); a credential it cannot read fails
+`apply_deployment_resources` with a bounded secret error.
+
 `plan_deployment_resources` shows the contract (uses, namespaces, adapters, the fixed probe
 names, a digest of the injected values) but never the endpoint or a credential, and reports
 `valkey_resource_not_ready` or `valkey_binding_missing` until the Resource is ready and the
@@ -273,7 +278,7 @@ the candidate health check. It reads only the shared `.env` and the candidate's 
 takes no path or command from a caller, and stops at the first failure. The order is:
 
 1. `environment`: the `.env` matches the planned contract and holds a credential.
-2. `horizon-compatibility` (with `queue`): the locked `laravel/framework` is 13.5.0 or later and
+2. `horizon-compatibility` (only when the Deployment runs Horizon): the locked `laravel/framework` is 13.5.0 or later and
    `laravel/horizon` 5.46.0 or later.
 3. `tls`: the server certificate verifies against the Target's system trust store, with hostname
    checking. There is no way to disable it or to supply a certificate.
@@ -285,8 +290,8 @@ takes no path or command from a caller, and stops at the first failure. The orde
    closed.
 7. `namespace`: a key, a channel, and read-only administrative commands outside the namespace
    are all denied with `NOPERM`. No destructive command is ever sent to prove a denial.
-8. `use-cache`, `use-session`, `use-queue`, `use-horizon`: a bounded write, read, and delete per
-   declared use, including TTLs, counters, `SET NX`, lists, sorted sets, hashes, and a Lua script.
+8. `use-cache`, `use-session`, `use-queue`, and `use-horizon` (only with Horizon): a bounded
+   write, read, and delete per declared use, including TTLs, counters, `SET NX`, lists, sorted sets, hashes, and a Lua script.
 9. `cleanup`: the probe keys are removed.
 
 Probe keys live under `<namespace>_probe:<random>:` with a 30 to 60 second TTL and are also

@@ -328,8 +328,9 @@ class Session:
         except (IndexError, ValueError):
             raise ProbeFailure("redirect_unverified")
         domain = self.host.partition(".")[2]
+        # A shared domain of one label (".com") would match any host: require at least two.
         if not 0 < port < 65536 or not (
-            host == self.host or (domain and host.endswith("." + domain))
+            host == self.host or ("." in domain and host.endswith("." + domain))
         ):
             raise ProbeFailure("redirect_unverified")
         return host, port
@@ -518,8 +519,9 @@ USES = {
 def steps(config, values, lock_path, context, session, scope):
     prefixes = config["prefixes"]
     first = prefixes[config["uses"][0]]
+    horizon = config["horizon"] is True
     yield "environment", lambda: check_environment(config, values)
-    if "horizon" in prefixes:
+    if horizon:
         yield "horizon-compatibility", lambda: check_horizon(lock_path)
     yield "tls", session.open
     yield "auth", session.login
@@ -527,7 +529,7 @@ def steps(config, values, lock_path, context, session, scope):
     yield "cluster", lambda: check_cluster(session)
     yield "read-after-write", lambda: check_read_after_write(scope, first)
     yield "namespace", lambda: check_namespace(session, scope.token)
-    for use in config["uses"] + (["horizon"] if "horizon" in prefixes else []):
+    for use in config["uses"] + (["horizon"] if horizon else []):
         yield f"use-{use}", lambda use=use: USES[use](scope, prefixes[use])
     yield "cleanup", scope.remove
 
@@ -565,7 +567,7 @@ def main(arguments):
     config = json.loads(base64.b64decode(arguments[3]).decode())
     try:
         values = read_environment(arguments[1])
-    except (OSError, ProbeFailure):
+    except (OSError, ValueError, ProbeFailure):
         print("GIMME_VALKEY_PROBE|environment|failed|environment")
         return 1
     return probe(config, values, arguments[2], ssl.create_default_context())

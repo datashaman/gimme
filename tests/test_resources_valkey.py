@@ -21,6 +21,7 @@ from gimme.resources_valkey import (
     derive_group_id, derive_user_group_id, group_drift, laravel_access_string, load_observed,
     modification_for, namespace_prefixes, structural_issues,
 )
+from gimme.config import HorizonWorkerConfig
 from gimme.deployer import CommandResult
 from gimme.secrets import SecretMetadata
 from gimme.valkey_contract import (
@@ -2047,7 +2048,7 @@ def test_deployment_resources_name_the_contract_and_carry_no_endpoint_or_credent
     assert contract["adapters"] == {
         "CACHE_STORE": "redis", "SESSION_DRIVER": "file", "QUEUE_CONNECTION": "redis"
     }
-    assert contract["probes"] == probe_names(["cache", "queue"])
+    assert contract["probes"] == probe_names(["cache", "queue"], False)
     assert contract["credential_keys"] == ["GIMME_VALKEY_USERNAME", "GIMME_VALKEY_PASSWORD"]
     assert {item["environment_key"] for item in plan["secret_versions"]} >= {
         "GIMME_VALKEY_USERNAME", "GIMME_VALKEY_PASSWORD"
@@ -2117,6 +2118,7 @@ def test_a_deploy_carries_the_contract_and_probe_but_never_a_credential(
     assert variables["HORIZON_PREFIX"] == "{gimme:example-local}:horizon:"
     probe = cast(dict[str, object], render["valkey_probe"])
     assert probe["deployment"] == DEPLOYMENT and probe["uses"] == ["cache", "queue"]
+    assert probe["horizon"] is False, "queue alone does not run Horizon"
     assert probe["prefixes"] == namespace_prefixes(DEPLOYMENT, ["cache", "queue"])
     for call in calls:
         assert "PASSWORD" not in json.dumps(call, default=str).upper().replace(
@@ -2134,3 +2136,37 @@ def test_a_target_local_binding_gets_neither_contract_nor_probe(tmp_path, monkey
     render = next(call for call in calls if call.get("arguments") == ("--plan",))
     assert render["valkey_probe"] is None
     assert not any(key.startswith("GIMME_VALKEY_") for key in cast(dict, render["variables"]))
+
+
+def test_the_probe_checks_horizon_only_for_a_deployment_that_runs_it(
+    tmp_path, monkeypatch
+) -> None:
+    bound_and_ready(tmp_path, monkeypatch)
+    state = server_module.store.load()
+    running = state.deployments[DEPLOYMENT].model_copy(update={"workers": HorizonWorkerConfig()})
+    server_module.store.save(state.model_copy(update={
+        "deployments": {**state.deployments, DEPLOYMENT: running}
+    }))
+    calls = capture_runs(monkeypatch)
+
+    plan = server_module.plan_deployment_resources(DEPLOYMENT)
+    server_module.plan_deployment(DEPLOYMENT)
+
+    contract = cast(dict[str, object], plan["valkey_contract"])
+    assert contract["probes"] == probe_names(["cache", "queue"], True)
+    render = next(call for call in calls if call.get("arguments") == ("--plan",))
+    assert cast(dict[str, object], render["valkey_probe"])["horizon"] is True
+
+
+def test_a_corrupt_observation_makes_the_resource_unready_instead_of_breaking_tasks(
+    tmp_path, monkeypatch
+) -> None:
+    bound_and_ready(tmp_path, monkeypatch)
+    (server_module.store.root / "observed-resources" / f"{NAME}.json").write_text("{not json")
+    calls = capture_runs(monkeypatch)
+
+    plan = server_module.plan_deployment_resources(DEPLOYMENT)
+    server_module._run_deployment("gimme:inspect", DEPLOYMENT)
+
+    assert "valkey_resource_not_ready" in plan["readiness_issues"]
+    assert calls[-1]["valkey_probe"] is None

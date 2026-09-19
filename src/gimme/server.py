@@ -26,7 +26,7 @@ from gimme.control import (
     ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
     ResourceConfig, S3BackupDestination, SecretReference, SecretStore, StateStore, TargetConfig,
     ValkeyBinding,
-    legacy_app, legacy_server, new_placement, target_sites,
+    legacy_app, legacy_server, new_placement, runs_horizon, target_sites,
 )
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
@@ -331,7 +331,10 @@ def _valkey_runtime(
     resource = None if binding is None else state.resources.get(binding.resource)
     if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
         return {}, {}, None, []
-    observed = resources_valkey_module.load_observed(store.root, binding.resource)
+    try:
+        observed = resources_valkey_module.load_observed(store.root, binding.resource)
+    except ResourceError:
+        observed = None  # a corrupt cache must not break unrelated tasks; it is not ready
     if observed is None or observed["phase"] != "ready":
         return {}, {}, None, ["valkey_resource_not_ready"]
     if name not in cast(dict[str, object], observed["allocations"]):
@@ -344,7 +347,9 @@ def _valkey_runtime(
         valkey_contract.credential_references(
             resource.workload_secret_store, binding.resource, name
         ),
-        valkey_contract.probe_config(name, binding.uses, host, port),
+        valkey_contract.probe_config(
+            name, binding.uses, host, port, runs_horizon(deployment.workers)
+        ),
         [],
     )
 
@@ -381,7 +386,9 @@ def _contract_summary(
             for use, key in valkey_contract.ADAPTER_KEYS.items()
         },
         "credential_keys": [valkey_contract.USERNAME_KEY, valkey_contract.PASSWORD_KEY],
-        "probes": valkey_contract.probe_names(list(binding.uses)),
+        "probes": valkey_contract.probe_names(
+            list(binding.uses), runs_horizon(deployment.workers)
+        ),
     }
 
 
