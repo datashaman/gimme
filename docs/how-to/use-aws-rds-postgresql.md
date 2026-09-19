@@ -304,7 +304,7 @@ global RDS trust bundle (`deploy/aws-rds-global-bundle.pem`, provenance and refr
 are verified. The bundle is uploaded on every bind beside the secret file, into the same
 `0700` directory with `0600` permissions, checked against a sha256 digest supplied by Gimme
 before any connection, and removed afterwards even on failure. Failures are fixed and
-secret-free: `us-gov-*` regions are refused with `aws_rds_tls_region_unsupported`
+secret-free: `us-gov-*` and `cn-*` regions are refused with `aws_rds_tls_region_unsupported`
 at `register_resource`, `plan_apply_resource`, `apply_resource`, `plan_bind_resource` and
 `bind_resource`, before anything is created or any remote work happens (inspection and
 Retained Resource cleanup still work), the program stops with

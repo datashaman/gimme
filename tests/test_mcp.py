@@ -834,12 +834,13 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert adapter.secret_payloads["primary-rds/example-app"]["password"] == workload_password
 
 
-def test_govcloud_resources_are_refused_before_anything_is_created(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("region", ["us-gov-west-1", "cn-north-1"])
+def test_regions_without_a_pinned_trust_bundle_are_refused_before_anything_is_created(
+    tmp_path, monkeypatch, region
 ) -> None:
     adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
     state = server_module.store.load()
-    network = state.aws_networks["primary"].model_copy(update={"region": "us-gov-west-1"})
+    network = state.aws_networks["primary"].model_copy(update={"region": region})
     server_module.store.save(state.model_copy(update={"aws_networks": {"primary": network}}))
     monkeypatch.setattr(
         server_module.runner, "run", lambda *a, **k: pytest.fail("must not reach the target")
