@@ -30,8 +30,8 @@ runs plain `psql` instead of a root-owned helper, and secret-free observations a
 
 ## Prerequisites
 
-Gimme creates only the RDS instance, its DB subnet group, and workload secrets. Everything
-else must already exist and is never edited:
+Gimme creates only the RDS instance, its DB subnet group and DB parameter group, and
+workload secrets. Everything else must already exist and is never edited:
 
 - an AWS Network: one VPC and exactly two private subnets in different Availability Zones;
 - two security groups in that VPC, one for the Administration Target and one per eligible
@@ -44,8 +44,14 @@ else must already exist and is never edited:
   workload credentials (see [`use-aws-secret-stores.md`](use-aws-secret-stores.md)).
 
 The instance is never public and always uses gp3 storage, `StorageEncrypted`, seven-day
-backups, deletion protection, and no automatic minor upgrades. Multi-AZ doubles the
-instance cost; Gimme reports structure but does not price it.
+backups, deletion protection, and no automatic minor upgrades. Its Resource-owned parameter
+group (`gimme-<name>-params`, family `postgres<major>`) sets `rds.force_ssl` to `1`, so the
+server rejects unencrypted connections on every PostgreSQL version, not only 15 and later.
+Gimme reuses an existing group of that name only if it carries this Resource's
+`gimme:resource` tag and the expected family; otherwise it refuses with
+`aws_rds_parameter_group_ownership_mismatch` and changes nothing.
+The group is attached only when Gimme creates the instance; it does not change an existing one.
+Multi-AZ doubles the instance cost; Gimme reports structure but does not price it.
 
 ## IAM roles
 
@@ -73,9 +79,22 @@ secrets. It does not read secret values. Replace `<region>`, `<account>`, and
       "Resource": [
         "arn:aws:rds:<region>:<account>:db:gimme-*",
         "arn:aws:rds:<region>:<account>:subgrp:gimme-*",
+        "arn:aws:rds:<region>:<account>:pg:gimme-*",
         "arn:aws:rds:<region>:<account>:pg:default.*",
         "arn:aws:rds:<region>:<account>:og:default:*"
       ]
+    },
+    {
+      "Sid": "RdsParameterGroup",
+      "Effect": "Allow",
+      "Action": [
+        "rds:CreateDBParameterGroup",
+        "rds:ModifyDBParameterGroup",
+        "rds:DescribeDBParameterGroups",
+        "rds:ListTagsForResource",
+        "rds:AddTagsToResource"
+      ],
+      "Resource": "arn:aws:rds:<region>:<account>:pg:gimme-*"
     },
     {
       "Sid": "Ec2Describe",
@@ -152,7 +171,8 @@ The **resolver role** reads only the RDS-managed master credential, and only at 
 ```
 
 Both policies were exercised against a live account with the AWS-managed `aws/rds` and
-`aws/secretsmanager` keys. A customer-managed KMS key for storage, the master secret, or the
+`aws/secretsmanager` keys, except the `RdsParameterGroup` statement and the `pg:gimme-*`
+resource on `RdsCreateAndDescribe`, which have only been exercised against botocore stubs. A customer-managed KMS key for storage, the master secret, or the
 workload Secret Store needs a key policy that admits these roles and RDS; that has not been
 verified. Trust policies should name only the identity that runs Gimme.
 
@@ -198,10 +218,11 @@ Targets may bind Deployments to the Resource. Use `register_resource`, or
 
 ## Provision
 
-`plan_apply_resource` then `apply_resource` creates the DB subnet group and instance, or
-reconciles an existing one. The instance is tagged `gimme:resource=<name>` and its AWS
-identifier is derived from the Resource name (`gimme-<name>`). Gimme refuses an instance
-whose tag does not derive that identifier, and never adopts an unrelated instance.
+`plan_apply_resource` then `apply_resource` creates the DB subnet group, the DB parameter
+group (with `rds.force_ssl` set to `1`), and the instance, or reconciles an existing one.
+The instance is tagged `gimme:resource=<name>` and its AWS identifier is derived from the
+Resource name (`gimme-<name>`). Gimme refuses an instance whose tag does not derive that
+identifier, and never adopts an unrelated instance.
 
 Multi-AZ creation takes roughly 12 to 15 minutes. `apply_resource` polls for at most 30
 seconds and returns `phase: pending`. Request a new plan and apply again to resume; a
@@ -234,7 +255,8 @@ returns the last observed state with a bounded `refresh_error`.
 `plan_cleanup_resource` and `apply_cleanup_resource` require the exact confirmation
 `RETAIN <name>` and are refused while a Deployment references the Resource. They remove
 only the local registration and write a Retained Resource tombstone. The instance,
-its data, the master secret, and the workload secrets remain in AWS and keep costing money.
+its data, the master secret, and the workload secrets remain in AWS and keep costing money,
+as do its DB subnet group and DB parameter group, which are never deleted automatically.
 To delete them, disable deletion protection and delete the instance yourself, then delete
 the workload secrets, and expect RDS to remove automated backups and snapshots
 asynchronously afterwards.
@@ -244,10 +266,15 @@ asynchronously afterwards.
 Provider failures become fixed `aws_rds_<operation>_<reason>` codes, for example
 `aws_rds_create_access_denied`. Reasons are `access_denied`, `missing`, `already_exists`,
 `invalid_state`, `throttled`, `revoked`, and `unavailable`. AWS messages, ARNs, and values
-are never included.
+are never included. Instance creation reports `subnet_group`, `parameter_group` (create),
+`parameter_group_verify` (reading an existing group's tags and family), and
+`parameter_group_modify` (the `rds.force_ssl` setting) as operations before `create`.
+`aws_rds_parameter_group_ownership_mismatch` means a same-named group exists that this
+Resource does not own; rename or delete it yourself, since Gimme never deletes one.
 
 `unavailable` covers any error Gimme does not classify, such as a rejected parameter
 combination or a KMS access problem. To see the underlying error, call the same AWS API with
 the same role and read the error code and message in your own terminal. Fix the cause and
-plan again. A failed create can leave the Resource's DB subnet group (free of charge), which the
-next apply reuses; partial provider state is never deleted automatically.
+plan again. A failed create can leave the Resource's DB subnet group and DB parameter group
+(both free of charge), which the next apply reuses and, for the parameter group, re-converges
+onto `rds.force_ssl=1`. Partial provider state is never deleted automatically.
