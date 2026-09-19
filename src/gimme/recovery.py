@@ -22,8 +22,10 @@ RESTORE_PREFIX = "gimme/restores"
 PREFLIGHT_PREFIX = "gimme/preflight"
 RECOVERY_POINT_ID = re.compile(r"^rp_[0-9a-f]{20}$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
-COMPONENT_KIND = re.compile(r"^postgres$")
+COMPONENT_KIND = re.compile(r"^(?:postgres|valkey)$")
 VERSION_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
+FORMAT_ID = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
+RESOURCE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,63}$")
 MAX_MANIFEST_BYTES = 8 * 1024
 REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -326,7 +328,15 @@ def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
         "safety": manifest["safety"],
         "restore_request_id": manifest["restore_request_id"],
         "components": [
-            {"kind": item["kind"], "bytes": item["bytes"]}
+            {
+                "kind": item["kind"],
+                "bytes": item["bytes"],
+                "format": item["format"],
+                "records": item["records"],
+                "captured_at": item["captured_at"],
+                "resource_kind": item["resource_kind"],
+                "resource_version": item["resource_version"],
+            }
             for item in manifest["components"]  # type: ignore[union-attr]
         ],
         **{
@@ -394,6 +404,10 @@ class ComponentDump:
     local_path: Path
     sha256: str
     bytes: int
+    resource_version: str
+    format: str = "pg-custom-v1"
+    records: int | None = None
+    captured_at: str | None = None
 
 
 def find_recovery_point(
@@ -411,10 +425,11 @@ def find_recovery_point(
 
 def create_recovery_point(
     destination_name: str, destination: S3BackupDestination, credentials: Credentials,
-    adapter: S3Adapter, deployment: str, point_id: str, dump: ComponentDump, *,
+    adapter: S3Adapter, deployment: str, point_id: str,
+    dump: ComponentDump | list[ComponentDump], *,
     safety_restore_request_id: str | None = None,
 ) -> dict[str, object]:
-    """Upload one verified PostgreSQL component and publish its immutable manifest."""
+    """Upload every verified component and publish one immutable manifest last."""
     existing = find_recovery_point(
         destination_name, destination, credentials, adapter, deployment, point_id
     )
@@ -425,55 +440,83 @@ def create_recovery_point(
         and REQUEST_ID.fullmatch(safety_restore_request_id) is None
     ):
         raise RecoveryError("restore_request_identity_invalid")
-    if COMPONENT_KIND.fullmatch(dump.kind) is None:
+    dumps = [dump] if isinstance(dump, ComponentDump) else list(dump)
+    if (
+        not dumps or len(dumps) > 8
+        or len({item.kind for item in dumps}) != len(dumps)
+        or any(COMPONENT_KIND.fullmatch(item.kind) is None for item in dumps)
+    ):
         raise RecoveryError("recovery_component_kind_invalid")
-    key = component_key(deployment, point_id, dump.kind)
-    body = dump.local_path.read_bytes()
-    if len(body) != dump.bytes or hashlib.sha256(body).hexdigest() != dump.sha256:
-        raise RecoveryError("recovery_component_checksum_mismatch")
-    written: ObjectMetadata | None = None
+    uploaded: list[tuple[str, ObjectMetadata]] = []
+    components: list[dict[str, object]] = []
+
+    def cleanup_uploaded() -> None:
+        for uploaded_key, metadata in reversed(uploaded):
+            if metadata.version_id is not None:
+                with suppress(Exception):
+                    adapter.delete_object(
+                        destination, credentials, uploaded_key,
+                        version_id=metadata.version_id,
+                    )
+
     try:
-        written = adapter.put_object(destination, credentials, key, body, dump.sha256)
-        confirmed = adapter.head_object(destination, credentials, key)
-        if confirmed is None or confirmed.bytes != written.bytes:
-            raise RecoveryError("recovery_component_verification_failed")
-        # head_object's sha256 only echoes the metadata tag put_object wrote, which S3
-        # never validates against the stored bytes; download and hash to catch a
-        # same-length corruption a provider-side metadata check would miss.
-        if hashlib.sha256(adapter.get_object(destination, credentials, key)).hexdigest() != (
-            dump.sha256
-        ):
-            raise RecoveryError("recovery_component_verification_failed")
+        for item in sorted(dumps, key=lambda value: value.kind):
+            key = component_key(deployment, point_id, item.kind)
+            body = item.local_path.read_bytes()
+            if len(body) != item.bytes or hashlib.sha256(body).hexdigest() != item.sha256:
+                raise RecoveryError("recovery_component_checksum_mismatch")
+            written = adapter.put_object(
+                destination, credentials, key, body, item.sha256
+            )
+            uploaded.append((key, written))
+            if written.version_id is None or VERSION_ID.fullmatch(written.version_id) is None:
+                raise RecoveryError("recovery_component_version_missing")
+            confirmed = adapter.head_object(
+                destination, credentials, key, written.version_id
+            )
+            if confirmed is None or confirmed.bytes != written.bytes:
+                raise RecoveryError("recovery_component_verification_failed")
+            # Metadata is untrusted: hash the exact uploaded version's bytes as well.
+            if hashlib.sha256(
+                adapter.get_object(destination, credentials, key, written.version_id)
+            ).hexdigest() != item.sha256:
+                raise RecoveryError("recovery_component_verification_failed")
+            components.append({
+                "kind": item.kind,
+                "key": key,
+                "bytes": item.bytes,
+                "sha256": item.sha256,
+                "version_id": written.version_id,
+                "format": item.format,
+                "records": item.records,
+                "captured_at": item.captured_at or datetime.now(UTC).isoformat(),
+                "resource_kind": item.kind,
+                "resource_version": item.resource_version,
+            })
     except Exception:
-        adapter.delete_object(
-            destination, credentials, key,
-            version_id=written.version_id if written is not None else None,
-        )
+        cleanup_uploaded()
         raise
-    if written.version_id is None or VERSION_ID.fullmatch(written.version_id) is None:
-        adapter.delete_object(destination, credentials, key, version_id=written.version_id)
-        raise RecoveryError("recovery_component_version_missing")
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "recovery_point_id": point_id,
         "deployment": deployment,
         "destination": destination_name,
         "created_at": datetime.now(UTC).isoformat(),
         "safety": safety_restore_request_id is not None,
         "restore_request_id": safety_restore_request_id,
-        "components": [
-            {
-                "kind": dump.kind,
-                "key": key,
-                "bytes": dump.bytes,
-                "sha256": dump.sha256,
-                "version_id": written.version_id,
-            }
-        ],
+        "components": components,
     }
-    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    try:
+        _validate_manifest(manifest)
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    except Exception:
+        cleanup_uploaded()
+        raise
     if len(encoded) > MAX_MANIFEST_BYTES:
-        adapter.delete_object(destination, credentials, key, version_id=written.version_id)
+        for key, metadata in reversed(uploaded):
+            adapter.delete_object(
+                destination, credentials, key, version_id=metadata.version_id
+            )
         raise RecoveryError("recovery_manifest_too_large")
     try:
         adapter.put_object(
@@ -490,7 +533,7 @@ def create_recovery_point(
             destination, credentials, manifest_key(deployment, point_id)
         )
         if published is None:
-            adapter.delete_object(destination, credentials, key, version_id=written.version_id)
+            cleanup_uploaded()
         raise
     return manifest
 
@@ -501,9 +544,15 @@ def _validate_manifest(document: object) -> dict[str, object]:
         "created_at", "safety", "restore_request_id", "components",
     }:
         raise RecoveryError("recovery_manifest_invalid")
-    if document.get("schema_version") != 2:
+    if document.get("schema_version") != 3:
         raise RecoveryError("recovery_manifest_invalid")
     if RECOVERY_POINT_ID.fullmatch(str(document.get("recovery_point_id"))) is None:
+        raise RecoveryError("recovery_manifest_invalid")
+    try:
+        created_at = datetime.fromisoformat(str(document.get("created_at")))
+    except ValueError:
+        raise RecoveryError("recovery_manifest_invalid") from None
+    if created_at.tzinfo is None:
         raise RecoveryError("recovery_manifest_invalid")
     components = document.get("components")
     safety = document.get("safety")
@@ -519,17 +568,62 @@ def _validate_manifest(document: object) -> dict[str, object]:
         raise RecoveryError("recovery_manifest_invalid")
     if not isinstance(components, list) or not components or len(components) > 8:
         raise RecoveryError("recovery_manifest_invalid")
+    seen_kinds: set[str] = set()
     for component in components:
         if (
             not isinstance(component, dict)
-            or set(component) != {"kind", "key", "bytes", "sha256", "version_id"}
+            or set(component) != {
+                "kind", "key", "bytes", "sha256", "version_id", "format", "records",
+                "captured_at", "resource_kind", "resource_version",
+            }
             or COMPONENT_KIND.fullmatch(str(component.get("kind"))) is None
             or not isinstance(component.get("key"), str)
             or not isinstance(component.get("bytes"), int)
+            or isinstance(component.get("bytes"), bool)
             or component["bytes"] < 0
             or SHA256_HEX.fullmatch(str(component.get("sha256"))) is None
             or VERSION_ID.fullmatch(str(component.get("version_id"))) is None
+            or FORMAT_ID.fullmatch(str(component.get("format"))) is None
+            or (
+                component.get("records") is not None
+                and (
+                    not isinstance(component["records"], int)
+                    or isinstance(component["records"], bool)
+                    or component["records"] < 0
+                    or component["records"] > 100_000
+                )
+            )
+            or not isinstance(component.get("captured_at"), str)
+            or not 1 <= len(component["captured_at"]) <= 64
+            or component.get("resource_kind") not in {"postgres", "valkey"}
+            or RESOURCE_VERSION.fullmatch(str(component.get("resource_version"))) is None
         ):
+            raise RecoveryError("recovery_manifest_invalid")
+        kind = str(component["kind"])
+        if kind in seen_kinds:
+            raise RecoveryError("recovery_manifest_invalid")
+        seen_kinds.add(kind)
+        if (
+            component["kind"] == "postgres"
+            and (
+                component["format"] != "pg-custom-v1"
+                or component["records"] is not None
+                or component["resource_kind"] != "postgres"
+            )
+        ) or (
+            component["kind"] == "valkey"
+            and (
+                component["format"] != "gimme-valkey-v1"
+                or not isinstance(component["records"], int)
+                or component["resource_kind"] != "valkey"
+            )
+        ):
+            raise RecoveryError("recovery_manifest_invalid")
+        try:
+            captured_at = datetime.fromisoformat(component["captured_at"])
+        except ValueError:
+            raise RecoveryError("recovery_manifest_invalid") from None
+        if captured_at.tzinfo is None:
             raise RecoveryError("recovery_manifest_invalid")
     return document
 

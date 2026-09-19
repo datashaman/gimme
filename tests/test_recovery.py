@@ -9,6 +9,7 @@ from gimme.recovery import (
     ComponentDump,
     ObjectMetadata,
     RecoveryError,
+    component_key,
     create_recovery_point,
     delete_recovery_point_versions,
     find_recovery_point,
@@ -88,7 +89,18 @@ def dump(tmp_path: Path, *, content: bytes = b"pg-dump-bytes") -> ComponentDump:
     path.write_bytes(content)
     return ComponentDump(
         kind="postgres", local_path=path, sha256=hashlib.sha256(content).hexdigest(),
-        bytes=len(content),
+        bytes=len(content), resource_version="17.2",
+    )
+
+
+def valkey_dump(tmp_path: Path) -> ComponentDump:
+    content = b'{"format":"gimme-valkey-v1"}\n'
+    path = tmp_path / "valkey.archive"
+    path.write_bytes(content)
+    return ComponentDump(
+        kind="valkey", local_path=path, sha256=hashlib.sha256(content).hexdigest(),
+        bytes=len(content), format="gimme-valkey-v1", records=0,
+        resource_version="8.0.1",
     )
 
 
@@ -155,6 +167,36 @@ def test_create_recovery_point_publishes_manifest_after_verification(tmp_path: P
     assert manifest["components"][0]["kind"] == "postgres"
     assert manifest["components"][0]["version_id"] == "v1"
     assert adapter.puts == 2  # component, then manifest
+
+
+def test_postgres_and_valkey_publish_together_in_one_manifest(tmp_path: Path) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id,
+        [valkey_dump(tmp_path), dump(tmp_path)],
+    )
+
+    assert [item["kind"] for item in manifest["components"]] == ["postgres", "valkey"]
+    assert manifest["components"][1]["records"] == 0
+    assert adapter.puts == 3  # both components, then the sole manifest
+
+
+def test_second_component_failure_removes_every_uploaded_exact_version(
+    tmp_path: Path,
+) -> None:
+    adapter = FailingPutS3(fail_after=1)
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+
+    with pytest.raises(RuntimeError, match="simulated transport failure"):
+        create_recovery_point(
+            "primary", destination(), None, adapter, "checkout", point_id,
+            [dump(tmp_path), valkey_dump(tmp_path)],
+        )
+
+    assert adapter.objects == {}
+    assert adapter.deletes == [(component_key("checkout", point_id, "postgres"), "v1")]
 
 
 def test_deletion_targets_are_resolved_only_from_the_published_manifest(tmp_path: Path) -> None:
@@ -324,7 +366,8 @@ def test_component_checksum_mismatch_is_rejected_before_upload(tmp_path: Path) -
     adapter = FakeS3()
     original = dump(tmp_path)
     bad = ComponentDump(
-        kind="postgres", local_path=original.local_path, sha256="0" * 64, bytes=original.bytes
+        kind="postgres", local_path=original.local_path, sha256="0" * 64,
+        bytes=original.bytes, resource_version="17.2",
     )
     point_id = recovery_point_id("checkout", "primary", "req-1")
 
@@ -336,8 +379,10 @@ def test_component_checksum_mismatch_is_rejected_before_upload(tmp_path: Path) -
 
 def test_component_upload_confirmation_mismatch_is_cleaned_up(tmp_path: Path) -> None:
     class TruncatingS3(FakeS3):
-        def head_object(self, destination, credentials, key) -> ObjectMetadata | None:
-            real = super().head_object(destination, credentials, key)
+        def head_object(
+            self, destination, credentials, key, version_id=None
+        ) -> ObjectMetadata | None:
+            real = super().head_object(destination, credentials, key, version_id)
             if real is None:
                 return None
             return ObjectMetadata(
@@ -362,7 +407,7 @@ def test_component_upload_content_mismatch_is_cleaned_up_even_when_metadata_lies
     tmp_path: Path,
 ) -> None:
     class LyingContentS3(FakeS3):
-        def get_object(self, destination, credentials, key) -> bytes:
+        def get_object(self, destination, credentials, key, version_id=None) -> bytes:
             return b"different-bytes-same-length"
 
     adapter = LyingContentS3()
