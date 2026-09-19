@@ -22,6 +22,26 @@ Resource name derived from the run id. Confirm the expected pending phases (`cre
 `deleting`, and `waiting_for_user_group`) by repeating the same confirmed apply; never issue a
 second create or destroy plan while one is pending.
 
+## Validate Multi-AZ failover
+
+Create the replication group through Gimme, not `aws elasticache create-replication-group`, so
+the test covers Gimme's exact durability, encryption, authentication, and ownership contract.
+After `inspect_resource` reports `ready`, invoke AWS's bounded failover test for the derived group
+and its sole node group:
+
+```bash
+aws elasticache test-failover --region <region> \
+  --replication-group-id gimme-<resource-name> --node-group-id 0001
+```
+
+Poll `inspect_resource` until it returns `ready` again. Record the initial pending observation,
+the accepted failover request, the eventual recovery observation, and any bounded provider errors.
+ElastiCache's `TestFailover` response does not reliably expose a primary-member role, so do not
+infer role transitions from missing `CurrentRole` fields; use the accepted request and recovered
+Multi-AZ/automatic-failover readiness instead. The `Durability` create field is Gimme's provider
+contract and may not be exposed by every installed AWS CLI version, another reason the group must
+be created through Gimme.
+
 Teardown is complete only after all of the following tag-filtered checks return empty: replication
 groups, snapshots, users, user groups, cache subnet groups, cache parameter groups, Secrets
 Manager secrets, security groups, subnets, VPCs, IAM users, and IAM roles. Delete the
