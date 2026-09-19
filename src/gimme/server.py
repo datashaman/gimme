@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import tempfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
@@ -87,6 +87,9 @@ _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", d
 # Set only while a restored Resource is being verified against its Deployments, so the
 # still-'restoring' Resource yields its contract values to exactly that verification.
 _restoring_ok: ContextVar[bool] = ContextVar("restoring_ok", default=False)
+_held_deployment_locks: ContextVar[frozenset[str]] = ContextVar(
+    "held_deployment_locks", default=frozenset()
+)
 
 
 def _journal() -> OperationJournal:
@@ -95,6 +98,10 @@ def _journal() -> OperationJournal:
 
 @contextmanager
 def _deployment_resource_lock(name: str):
+    held = _held_deployment_locks.get()
+    if name in held:
+        yield
+        return
     directory = store.root / "deployment-locks"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(directory, 0o700)
@@ -102,6 +109,18 @@ def _deployment_resource_lock(name: str):
     with path.open("a+") as lock:
         os.chmod(path, 0o600)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        token = _held_deployment_locks.set(held | {name})
+        try:
+            yield
+        finally:
+            _held_deployment_locks.reset(token)
+
+
+@contextmanager
+def _deployment_resource_locks(*names: str):
+    with ExitStack() as stack:
+        for name in sorted(set(names)):
+            stack.enter_context(_deployment_resource_lock(name))
         yield
 
 
@@ -1930,10 +1949,11 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
 @_journal_apply("update_resource", "name")
 def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed resource update to local desired state."""
-    expected = plan_update_resource(name, definition)
-    _assert_plan(expected, plan_id)
-    store.save(_replace(store.load(), "resources", name, definition))
-    return {"changed": True, "resource": name}
+    with _deployment_resource_locks(*_resource_deployment_names(name)):
+        expected = plan_update_resource(name, definition)
+        _assert_plan(expected, plan_id)
+        store.save(_replace(store.load(), "resources", name, definition))
+        return {"changed": True, "resource": name}
 
 
 def _refuse_unverifiable_tls_region(state: ControlState, resource: AWSRDSPostgresResource) -> None:
@@ -1983,6 +2003,20 @@ def _resource_provision_plan(name: str) -> dict[str, object]:
     return resource_provision_plan(name, resource, observed)
 
 
+def _resource_deployment_names(name: str) -> list[str]:
+    return sorted(
+        deployment_name
+        for deployment_name, deployment in store.load().deployments.items()
+        if (
+            deployment.resources.database == name
+            or (
+                deployment.resources.valkey is not None
+                and deployment.resources.valkey.resource == name
+            )
+        )
+    )
+
+
 @mcp.tool(annotations=READ)
 @_journal_plan("apply_resource", "name")
 def plan_apply_resource(name: Name) -> dict[str, object]:
@@ -1997,25 +2031,27 @@ def apply_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Create the RDS instance, or converge an existing one onto desired state with one
     immediate modification, polling at most 30 seconds before returning a bounded pending
     phase. Never returns a decrypted credential."""
-    expected = _resource_provision_plan(name)
-    _assert_plan(expected, plan_id)
-    if (valkey := _managed_valkey(name)) is not None:
-        state, cache = valkey
-        network = state.aws_networks[cache.aws_network]
-        workload_store = cast(
-            AWSSecretsManagerStore, state.secret_stores[cache.workload_secret_store]
+    with _deployment_resource_locks(*_resource_deployment_names(name)):
+        expected = _resource_provision_plan(name)
+        _assert_plan(expected, plan_id)
+        if (valkey := _managed_valkey(name)) is not None:
+            state, cache = valkey
+            network = state.aws_networks[cache.aws_network]
+            workload_store = cast(
+                AWSSecretsManagerStore, state.secret_stores[cache.workload_secret_store]
+            )
+            return {"changed": True, **resources_valkey_module.apply_provision(
+                elasticache_valkey, store.root,
+                state.provider_accounts[network.provider_account],
+                network, cache, name, workload_store, cache.workload_secret_store,
+            )}
+        state, resource = _managed_resource(name)
+        network = state.aws_networks[resource.aws_network]
+        account = state.provider_accounts[network.provider_account]
+        result = resources_postgres_module.apply_provision(
+            rds_postgres, store.root, account, network, resource, name
         )
-        return {"changed": True, **resources_valkey_module.apply_provision(
-            elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
-            network, cache, name, workload_store, cache.workload_secret_store,
-        )}
-    state, resource = _managed_resource(name)
-    network = state.aws_networks[resource.aws_network]
-    account = state.provider_accounts[network.provider_account]
-    result = resources_postgres_module.apply_provision(
-        rds_postgres, store.root, account, network, resource, name
-    )
-    return {"changed": True, **result}
+        return {"changed": True, **result}
 
 
 @mcp.tool(annotations=READ)
@@ -2184,24 +2220,24 @@ def plan_bind_resource(name: Name) -> dict[str, object]:
 def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Create or reconcile the deployment's isolated database and Valkey ACL user, each with
     its Resource Credential. Never returns a workload username or password."""
-    expected = _resource_binding_plan(name)
-    _assert_plan(expected, plan_id)
-    valkey = _managed_valkey_binding(name)
-    if valkey is None:
-        return {"changed": True, **_bind_database(name, expected)}
-    state, deployment, resource_name, resource = valkey
-    ready = cast(dict[str, object], expected["valkey"])["resource_ready"]
-    database = cast(dict[str, object] | None, expected["database"])
-    if not ready or (database is not None and not database["resource_ready"]):
-        raise ValueError("managed resource is not ready; run apply_resource first")
-    result: dict[str, object] = {"changed": True}
-    if database is not None:
-        result.update(_bind_database(name, database))
-    network = state.aws_networks[resource.aws_network]
-    workload_store = cast(
-        AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]
-    )
     with _deployment_resource_lock(name):
+        expected = _resource_binding_plan(name)
+        _assert_plan(expected, plan_id)
+        valkey = _managed_valkey_binding(name)
+        if valkey is None:
+            return {"changed": True, **_bind_database(name, expected)}
+        state, deployment, resource_name, resource = valkey
+        ready = cast(dict[str, object], expected["valkey"])["resource_ready"]
+        database = cast(dict[str, object] | None, expected["database"])
+        if not ready or (database is not None and not database["resource_ready"]):
+            raise ValueError("managed resource is not ready; run apply_resource first")
+        result: dict[str, object] = {"changed": True}
+        if database is not None:
+            result.update(_bind_database(name, database))
+        network = state.aws_networks[resource.aws_network]
+        workload_store = cast(
+            AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]
+        )
         result["valkey"] = resources_valkey_module.apply_binding(
             elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
             network, resource, resource_name, workload_store, resource.workload_secret_store,
@@ -2556,8 +2592,9 @@ def apply_restore_resource(name: Name, snapshot: SnapshotName, plan_id: PlanId
     """Create the replication group from the snapshot only if it does not exist, restore each
     recorded Deployment credential, then verify every Deployment before the Resource is ready.
     Phase 'restoring' means repeat the same call to continue."""
-    _assert_plan(_restore_plan(name, snapshot), plan_id)
-    return _restore_valkey(name, snapshot)
+    with _deployment_resource_locks(*_resource_deployment_names(name)):
+        _assert_plan(_restore_plan(name, snapshot), plan_id)
+        return _restore_valkey(name, snapshot)
 
 
 @mcp.tool(annotations=READ)
@@ -2574,11 +2611,12 @@ def apply_recreate_empty_resource(name: Name, plan_id: PlanId, confirmation: str
                                   ) -> dict[str, object]:
     """Create an empty replication group in place of a lost one after exact confirmation, then
     verify every recorded Deployment as a restore does."""
-    expected = _restore_plan(name, None)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    return _restore_valkey(name, None)
+    with _deployment_resource_locks(*_resource_deployment_names(name)):
+        expected = _restore_plan(name, None)
+        _assert_plan(expected, plan_id)
+        if confirmation != expected["confirmation"]:
+            raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+        return _restore_valkey(name, None)
 
 
 def _rotation_plan(name: str, deployment: str) -> dict[str, object]:
@@ -2611,18 +2649,19 @@ def apply_rotate_resource_credential(name: Name, deployment: Name, plan_id: Plan
     """Rotate the Deployment's credential with a probed switch and automatic rollback. A
     leftover rotation is finished or rolled back by this same call, which then does nothing
     else. Never returns a username or password."""
-    _assert_plan(_rotation_plan(name, deployment), plan_id)
-    _state, resource, network, account, workload_store = _valkey_context(name)
+    with _deployment_resource_lock(deployment):
+        _assert_plan(_rotation_plan(name, deployment), plan_id)
+        _state, resource, network, account, workload_store = _valkey_context(name)
 
-    def switch(target: str) -> None:
-        _apply_resources(target, _resource_plan(target))
-        _run_deployment("gimme:probe:valkey:current", target, timeout=300)
-        _run_deployment("gimme:restart:workers", target, timeout=300)
+        def switch(target: str) -> None:
+            _apply_resources(target, _resource_plan(target))
+            _run_deployment("gimme:probe:valkey:current", target, timeout=300)
+            _run_deployment("gimme:restart:workers", target, timeout=300)
 
-    return {"changed": True, **valkey_recovery.apply_rotation(
-        elasticache_valkey, store.root, account, network, resource, name, workload_store,
-        resource.workload_secret_store, deployment, switch,
-    )}
+        return {"changed": True, **valkey_recovery.apply_rotation(
+            elasticache_valkey, store.root, account, network, resource, name, workload_store,
+            resource.workload_secret_store, deployment, switch,
+        )}
 
 
 def _resource_forget_plan(name: str) -> dict[str, object]:
@@ -2691,11 +2730,12 @@ def plan_update_deployment(name: Name,
 def update_deployment(name: Name, definition: DeploymentRegistration,
                       plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed deployment update to local desired state."""
-    expected = plan_update_deployment(name, definition)
-    _assert_plan(expected, plan_id)
-    proposed = DeploymentConfig.model_validate(expected["proposed"])
-    store.save(_replace(store.load(), "deployments", name, proposed))
-    return {"changed": True, "deployment": name}
+    with _deployment_resource_lock(name):
+        expected = plan_update_deployment(name, definition)
+        _assert_plan(expected, plan_id)
+        proposed = DeploymentConfig.model_validate(expected["proposed"])
+        store.save(_replace(store.load(), "deployments", name, proposed))
+        return {"changed": True, "deployment": name}
 
 
 @mcp.tool(annotations=READ)
@@ -2758,11 +2798,12 @@ def plan_deployment_runtimes(name: Name) -> dict[str, object]:
 @_journal_apply("deployment_runtimes", "name")
 def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Install mise pins and verify system runtimes for one deployment."""
-    expected = plan_deployment_runtimes(name)
-    _assert_plan(expected, plan_id)
-    result = _run_deployment("gimme:provision:runtimes", name, timeout=1800)
-    _run_deployment("gimme:preflight:runtimes", name, timeout=120)
-    return _result(result)
+    with _deployment_resource_lock(name):
+        expected = plan_deployment_runtimes(name)
+        _assert_plan(expected, plan_id)
+        result = _run_deployment("gimme:provision:runtimes", name, timeout=1800)
+        _run_deployment("gimme:preflight:runtimes", name, timeout=120)
+        return _result(result)
 
 
 @mcp.tool(annotations=READ)
@@ -2776,9 +2817,10 @@ def plan_deployment_resources(name: Name) -> dict[str, object]:
 @_journal_apply("deployment_resources", "name")
 def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile one deployment's route and target-local runtime resources."""
-    expected = _resource_plan(name)
-    _assert_plan(expected, plan_id)
-    return _apply_resources(name, expected)
+    with _deployment_resource_lock(name):
+        expected = _resource_plan(name)
+        _assert_plan(expected, plan_id)
+        return _apply_resources(name, expected)
 
 
 def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
@@ -2818,18 +2860,19 @@ def plan_deployment(name: Name) -> dict[str, object]:
 @_journal_apply("deployment", "name")
 def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Deploy an exact reviewed revision with health gates and worker refresh."""
-    expected = _release_plan(name)
-    _assert_plan(expected, plan_id)
-    if not expected["ready"]:
-        raise ValueError("deployment is not ready; inspect readiness_issues")
-    result = _run_deployment("deploy", name, revision=str(expected["revision"]),
-                             timeout=1800)
-    _, deployment, _, application = _context(name)
-    if application.framework == "laravel" and (
-        deployment.workers is not None or deployment.scheduler is not None
-    ):
-        _run_deployment("gimme:provision:processes", name, timeout=1800)
-    return _result(result)
+    with _deployment_resource_lock(name):
+        expected = _release_plan(name)
+        _assert_plan(expected, plan_id)
+        if not expected["ready"]:
+            raise ValueError("deployment is not ready; inspect readiness_issues")
+        result = _run_deployment("deploy", name, revision=str(expected["revision"]),
+                                 timeout=1800)
+        _, deployment, _, application = _context(name)
+        if application.framework == "laravel" and (
+            deployment.workers is not None or deployment.scheduler is not None
+        ):
+            _run_deployment("gimme:provision:processes", name, timeout=1800)
+        return _result(result)
 
 
 @mcp.tool(annotations=READ)
@@ -2845,7 +2888,8 @@ def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
     expected = f"ROLLBACK {name}"
     if confirmation != expected:
         raise ValueError(f"confirmation must exactly equal '{expected}'")
-    return _result(_run_deployment("rollback", name))
+    with _deployment_resource_lock(name):
+        return _result(_run_deployment("rollback", name))
 
 
 @mcp.tool(annotations=READ)
@@ -2872,23 +2916,26 @@ def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
 @_journal_apply("promotion", "source", "destination")
 def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict[str, object]:
     """Promote an exact reviewed live commit and pin the destination after success."""
-    expected = plan_promotion(source, destination)
-    _assert_plan(expected, plan_id)
-    release = cast(dict[str, object], expected["release"])
-    if not release["ready"]:
-        raise ValueError("destination deployment is not ready; inspect release readiness_issues")
-    revision = str(expected["revision"])
-    result = _run_deployment("deploy", destination, revision=revision, timeout=1800)
-    state = store.load()
-    deployment = state.deployments[destination].model_copy(
-        update={"source": DeploymentSource(kind="commit", ref=revision)})
-    application = state.applications[deployment.application]
-    if application.framework == "laravel" and (
-        deployment.workers is not None or deployment.scheduler is not None
-    ):
-        _run_deployment("gimme:provision:processes", destination, timeout=1800)
-    store.save(_replace(state, "deployments", destination, deployment))
-    return _result(result)
+    with _deployment_resource_locks(source, destination):
+        expected = plan_promotion(source, destination)
+        _assert_plan(expected, plan_id)
+        release = cast(dict[str, object], expected["release"])
+        if not release["ready"]:
+            raise ValueError(
+                "destination deployment is not ready; inspect release readiness_issues"
+            )
+        revision = str(expected["revision"])
+        result = _run_deployment("deploy", destination, revision=revision, timeout=1800)
+        state = store.load()
+        deployment = state.deployments[destination].model_copy(
+            update={"source": DeploymentSource(kind="commit", ref=revision)})
+        application = state.applications[deployment.application]
+        if application.framework == "laravel" and (
+            deployment.workers is not None or deployment.scheduler is not None
+        ):
+            _run_deployment("gimme:provision:processes", destination, timeout=1800)
+        store.save(_replace(state, "deployments", destination, deployment))
+        return _result(result)
 
 
 @mcp.tool(annotations=READ)
@@ -2903,20 +2950,21 @@ def plan_remove_deployment(name: Name) -> dict[str, object]:
 @_journal_apply("remove_deployment", "name")
 def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Remove a deployment after exact plan and confirmation checks."""
-    expected = plan_remove_deployment(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
-    state = _delete(store.load(), "deployments", name)
-    store.save(state)
-    (store.root / "applied-secrets" / f"{name}.json").unlink(missing_ok=True)
-    target = state.targets[expected["target"]]
-    runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
-               sites=target_sites(state, str(expected["target"])),
-               network_mode=target.network.mode,
-               mise_version=target.runtimes.mise_version, timeout=1800)
-    return _result(result)
+    with _deployment_resource_lock(name):
+        expected = plan_remove_deployment(name)
+        _assert_plan(expected, plan_id)
+        if confirmation != expected["confirmation"]:
+            raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+        result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
+        state = _delete(store.load(), "deployments", name)
+        store.save(state)
+        (store.root / "applied-secrets" / f"{name}.json").unlink(missing_ok=True)
+        target = state.targets[expected["target"]]
+        runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
+                   sites=target_sites(state, str(expected["target"])),
+                   network_mode=target.network.mode,
+                   mise_version=target.runtimes.mise_version, timeout=1800)
+        return _result(result)
 
 
 @mcp.tool(annotations=READ)
@@ -2939,10 +2987,13 @@ def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -
 def run_artisan(name: Name, command: str, plan_id: PlanId,
                 arguments: list[str] | None = None) -> dict[str, object]:
     """Run an exact reviewed allowlisted Artisan invocation."""
-    expected = plan_artisan(name, command, arguments)
-    _assert_plan(expected, plan_id)
-    return _result(_run_deployment("gimme:artisan", name, artisan_command=command,
-                                   artisan_arguments=arguments or []))
+    with _deployment_resource_lock(name):
+        expected = plan_artisan(name, command, arguments)
+        _assert_plan(expected, plan_id)
+        return _result(_run_deployment(
+            "gimme:artisan", name, artisan_command=command,
+            artisan_arguments=arguments or [],
+        ))
 
 
 @mcp.tool(annotations=READ)
