@@ -1,12 +1,23 @@
+import dataclasses
 import json
+import re
+import stat
 from pathlib import Path
 from typing import cast
 
 import pytest
+from botocore.exceptions import ClientError
+from botocore.stub import ANY
 from pydantic import ValidationError
 
-from gimme.control import AWSElastiCacheValkeyResource, ControlState, StateStore
+from gimme.control import (
+    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, StateStore,
+)
 from gimme.resources_postgres import ResourceError
+from gimme.resources_valkey import (
+    ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, apply_provision,
+    derive_group_id, derive_user_group_id, load_observed, structural_issues,
+)
 import gimme.server as server_module
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config/state.example.json"
@@ -18,7 +29,78 @@ def valkey(**updates) -> AWSElastiCacheValkeyResource:
     return AWSElastiCacheValkeyResource.model_validate(values)
 
 
-def use_state(tmp_path: Path, monkeypatch, *, registered: bool = True) -> ControlState:
+GROUP_ID = derive_group_id(NAME)
+ARN = f"arn:aws:elasticache:eu-central-1:123456789012:replicationgroup:{GROUP_ID}"
+PASSWORD = "p" * 48
+
+
+def observation(**updates) -> GroupObservation:
+    values: dict[str, object] = dict(
+        identity=ARN, status="available", engine_version="9.0", node_type="cache.m7g.large",
+        cluster_enabled=True, shards=1, members=2,
+        member_zones=("eu-central-1a", "eu-central-1b"), multi_az=True, automatic_failover=True,
+        transit_encryption=True, at_rest_encryption=True, effective_durability="sync",
+        user_group_ids=(derive_user_group_id(GROUP_ID),), snapshot_retention_days=7,
+        snapshot_window="03:00-04:00", maintenance_window="sun:05:00-sun:06:00",
+        automatic_minor_upgrade=False, endpoint="cfg.example.cache.amazonaws.com", port=6379,
+    )
+    values.update(updates)
+    return GroupObservation(**values)  # type: ignore[arg-type]
+
+
+class FakeValkey:
+    """An existing or absent group. A created group reports 'creating' for `settle_polls`
+    describes and then 'available'."""
+
+    def __init__(self, live: GroupObservation | None = None, *, settle_polls: int = 0) -> None:
+        self.live = live
+        self.settle_polls = settle_polls
+        self.create_calls = 0
+        self.describe_calls = 0
+        self._polls = 0
+
+    def describe_group(self, account, network, group_id):
+        self.describe_calls += 1
+        if self.live is not None and self.live.status == "creating":
+            self._polls += 1
+            if self._polls > self.settle_polls:
+                self.live = dataclasses.replace(self.live, status="available")
+        return self.live
+
+    def create_group(self, account, network, resource, name, group_id, store, store_name):
+        self.create_calls += 1
+        self._polls = 0
+        self.live = observation(status="creating" if self.settle_polls else "available")
+        return self.live
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def provision(adapter, tmp_path: Path, **updates):
+    state = ControlState.model_validate(json.loads(EXAMPLE.read_text()))
+    network = state.aws_networks["primary"]
+    clock = FakeClock()
+    return apply_provision(
+        adapter, tmp_path, state.provider_accounts[network.provider_account], network,
+        valkey(**updates), NAME,
+        cast(AWSSecretsManagerStore, state.secret_stores["workload-secrets"]), "workload-secrets",
+        sleep=clock.sleep, now=clock.monotonic,
+    )
+
+
+def use_state(
+    tmp_path: Path, monkeypatch, *, registered: bool = True, adapter: FakeValkey | None = None,
+) -> ControlState:
+    monkeypatch.setattr(server_module, "elasticache_valkey", adapter or FakeValkey())
     state = ControlState.model_validate(json.loads(EXAMPLE.read_text()))
     if not registered:
         state = state.model_copy(update={"resources": {
@@ -127,15 +209,6 @@ def test_registration_makes_no_aws_call_and_lists_the_resource(tmp_path, monkeyp
         server_module.register_resource(NAME, valkey())
 
 
-def test_inspect_reports_only_registration_until_provisioning_exists(tmp_path, monkeypatch) -> None:
-    use_state(tmp_path, monkeypatch)
-
-    assert server_module.inspect_resource(NAME) == {
-        "resource": NAME, "provider": "aws_elasticache_valkey", "kind": "valkey",
-        "engine_version": "9.0", "phase": "registered",
-    }
-
-
 def test_updates_inside_the_allowlist_are_applied(tmp_path, monkeypatch) -> None:
     use_state(tmp_path, monkeypatch)
     larger = valkey(
@@ -187,3 +260,571 @@ def test_removal_only_deletes_the_registration(tmp_path, monkeypatch) -> None:
     server_module.apply_cleanup_resource(NAME, str(plan["plan_id"]), str(plan["confirmation"]))
 
     assert NAME not in server_module.store.load().resources
+
+
+# --- identifiers -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a", "devbox-cache", "x" * 34, "x" * 35, "a" * 64, "a--b", "trailing-", "a" + "-" * 30 + "b",
+     "shared-valkey-with-a-rather-long-name-indeed"],
+)
+def test_derived_identifiers_fit_elasticache_rules(name) -> None:
+    group = derive_group_id(name)
+    for identifier in (group, derive_user_group_id(group)):
+        assert len(identifier) <= 40
+        assert re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", identifier), identifier
+    assert group.startswith("gimme-")
+
+
+def test_derived_identifiers_stay_distinct_for_long_or_irregular_names() -> None:
+    names = ["a" * 40, "a" * 41, "a" * 42, "a--b", "a-b", "a---b", "ab-", "ab"]
+    groups = {derive_group_id(name) for name in names}
+    users = {derive_user_group_id(group) for group in groups}
+
+    assert len(groups) == len(names) and len(users) == len(names)
+    assert derive_group_id("devbox-cache") == "gimme-devbox-cache"
+
+
+# --- plan, apply, resume ---------------------------------------------------------------
+
+
+def test_the_provision_plan_is_local_and_secret_free(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey()
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+
+    plan = server_module.plan_apply_resource(NAME)
+
+    assert adapter.describe_calls == 0 and adapter.create_calls == 0
+    assert plan["current_phase"] == "absent" and plan["kind"] == "resource_provision"
+    effects = " ".join(cast(list[str], plan["effects"]))
+    assert "synchronous durability" in effects
+    assert "never modify an existing replication group" in effects
+
+
+def test_apply_creates_once_and_a_second_apply_only_describes(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey()
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    first_plan = server_module.plan_apply_resource(NAME)
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_resource(NAME, "plan_" + "0" * 20)
+    assert adapter.create_calls == 0
+    first = server_module.apply_resource(NAME, str(first_plan["plan_id"]))
+    second_plan = server_module.plan_apply_resource(NAME)
+    second = server_module.apply_resource(NAME, str(second_plan["plan_id"]))
+
+    assert adapter.create_calls == 1
+    assert first["phase"] == second["phase"] == "ready" and first["issues"] == []
+    assert second_plan["plan_id"] != first_plan["plan_id"], "the plan follows the phase"
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_resource(NAME, str(first_plan["plan_id"]))
+
+
+def test_a_slow_group_is_pending_and_a_later_apply_resumes_without_recreating(
+    tmp_path,
+) -> None:
+    adapter = FakeValkey(settle_polls=1000)
+
+    first = provision(adapter, tmp_path)
+    resumed = provision(adapter, tmp_path)
+
+    assert first["phase"] == resumed["phase"] == "pending"
+    assert adapter.create_calls == 1
+    observed = load_observed(tmp_path, NAME)
+    assert observed is not None and observed["phase"] == "pending"
+
+
+def test_a_group_that_settles_within_the_poll_budget_is_ready(tmp_path) -> None:
+    adapter = FakeValkey(settle_polls=3)
+
+    assert provision(adapter, tmp_path)["phase"] == "ready"
+
+
+def test_a_failed_creation_is_recorded_as_failed(tmp_path) -> None:
+    result = provision(FakeValkey(observation(status="create-failed")), tmp_path)
+
+    assert result["phase"] == "failed"
+
+
+def test_an_existing_group_is_described_and_never_created_or_modified(tmp_path) -> None:
+    adapter = FakeValkey(observation(node_type="cache.m7g.xlarge", engine_version="9.1"))
+
+    result = provision(adapter, tmp_path)
+
+    assert adapter.create_calls == 0 and result["phase"] == "ready"
+    assert result["engine_version"] == "9.1"
+
+
+# --- readiness contract ----------------------------------------------------------------
+
+BROKEN = {
+    "cluster_mode": {"cluster_enabled": False},
+    "topology": {"shards": 2},
+    "availability_zones": {"member_zones": ("eu-central-1a", "eu-central-1a")},
+    "multi_az": {"multi_az": False},
+    "automatic_failover": {"automatic_failover": False},
+    "tls": {"transit_encryption": False},
+    "encryption_at_rest": {"at_rest_encryption": False},
+    "durability": {"effective_durability": "async"},
+    "authentication": {"user_group_ids": ()},
+    "snapshot_policy": {"snapshot_retention_days": 1},
+    "maintenance_policy": {"maintenance_window": "mon:01:00-mon:02:00"},
+    "automatic_minor_upgrade": {"automatic_minor_upgrade": True},
+}
+
+
+def test_every_readiness_code_has_a_case() -> None:
+    assert set(BROKEN) == set(ISSUES)
+
+
+@pytest.mark.parametrize("code", sorted(BROKEN))
+def test_an_available_group_missing_one_part_of_the_contract_is_degraded(
+    tmp_path, code
+) -> None:
+    observed = observation(**BROKEN[code])
+
+    assert structural_issues(valkey(), observed, GROUP_ID) == [code]
+    result = provision(FakeValkey(observed), tmp_path)
+    assert result["phase"] == "degraded" and result["issues"] == [code]
+
+
+def test_a_mismatched_snapshot_window_is_a_snapshot_policy_issue() -> None:
+    observed = observation(snapshot_window="05:00-06:00")
+
+    assert structural_issues(valkey(), observed, GROUP_ID) == ["snapshot_policy"]
+
+
+def test_a_group_that_is_not_available_is_pending_not_degraded(tmp_path) -> None:
+    result = provision(
+        FakeValkey(observation(status="modifying", effective_durability="async"), settle_polls=0),
+        tmp_path,
+    )
+
+    assert result["phase"] == "pending"
+
+
+# --- inspection ------------------------------------------------------------------------
+
+
+def test_inspect_before_provisioning_is_absent(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch)
+
+    assert server_module.inspect_resource(NAME) == {
+        "resource": NAME, "provider": "aws_elasticache_valkey", "kind": "valkey",
+        "phase": "absent", "source": "cache",
+    }
+
+
+def test_inspect_reports_live_state_without_endpoints_or_identifiers(
+    tmp_path, monkeypatch
+) -> None:
+    use_state(tmp_path, monkeypatch, adapter=FakeValkey(observation(effective_durability="async")))
+
+    result = server_module.inspect_resource(NAME)
+
+    assert result["phase"] == "degraded" and result["issues"] == ["durability"]
+    assert result["source"] == "live" and result["effective_durability"] == "async"
+    text = json.dumps(result)
+    for secret in ("cfg.example.cache.amazonaws.com", ARN, GROUP_ID, "6379"):
+        assert secret not in text
+
+
+def test_inspect_falls_back_to_the_cache_with_a_bounded_refresh_error(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = FakeValkey(observation())
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    plan = server_module.plan_apply_resource(NAME)
+    server_module.apply_resource(NAME, str(plan["plan_id"]))
+
+    def denied(*args, **kwargs):
+        raise ResourceError("aws_elasticache_describe_access_denied")
+
+    adapter.describe_group = denied  # type: ignore[method-assign]
+    result = server_module.inspect_resource(NAME)
+
+    assert result["source"] == "cache" and result["phase"] == "ready"
+    assert result["refresh_error"] == "aws_elasticache_describe_access_denied"
+
+
+def test_the_observation_cache_is_private_and_secret_free(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch, adapter=FakeValkey(observation()))
+    plan = server_module.plan_apply_resource(NAME)
+    server_module.apply_resource(NAME, str(plan["plan_id"]))
+
+    path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert set(json.loads(path.read_text())) == {
+        "schema_version", "resource", "replication_group_id", "identity", "status", "phase",
+        "engine_version", "effective_durability", "issues", "endpoint", "port",
+    }
+    path.write_text(json.dumps({"schema_version": 1}))
+    with pytest.raises(ResourceError, match="^observed_resource_invalid$"):
+        load_observed(server_module.store.root, NAME)
+
+
+# --- removal ---------------------------------------------------------------------------
+
+
+def test_removing_a_provisioned_resource_leaves_a_tombstone_and_touches_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = FakeValkey(observation())
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    plan = server_module.plan_apply_resource(NAME)
+    server_module.apply_resource(NAME, str(plan["plan_id"]))
+    calls = (adapter.create_calls, adapter.describe_calls)
+
+    cleanup = server_module.plan_cleanup_resource(NAME)
+    result = server_module.apply_cleanup_resource(
+        NAME, str(cleanup["plan_id"]), str(cleanup["confirmation"])
+    )
+
+    assert "ElastiCache replication group and its data intact" in " ".join(
+        cast(list[str], cleanup["effects"])
+    )
+    assert result["retained"] is True and NAME not in server_module.store.load().resources
+    assert (adapter.create_calls, adapter.describe_calls) == calls
+    tombstone = json.loads(
+        (server_module.store.root / "retained-resources" / f"{NAME}.json").read_text()
+    )
+    assert tombstone["replication_group_id"] == GROUP_ID and tombstone["aws_network"] == "primary"
+
+
+# --- the boto adapter ------------------------------------------------------------------
+
+
+class StubbedSession:
+    def __init__(self, clients: dict[str, object]) -> None:
+        self._clients = clients
+
+    def client(self, service: str, region_name: str | None = None) -> object:
+        return self._clients[service]
+
+
+def stubbed(service: str):
+    import boto3
+    from botocore.stub import Stubber
+
+    client = boto3.client(
+        service, region_name="eu-central-1", aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    return client, Stubber(client)
+
+
+def fault(code: str, operation: str, message: str = "boom") -> ClientError:
+    return ClientError({"Error": {"Code": code, "Message": message}}, operation)
+
+
+def adapter_with(monkeypatch, *pairs):
+    adapter = BotoElastiCacheAdapter()
+    clients = {service: client for service, (client, _stub) in pairs}
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: StubbedSession(clients))
+    monkeypatch.setattr(
+        "gimme.resources_valkey.secrets_module.token_urlsafe", lambda size: PASSWORD
+    )
+    return adapter
+
+
+def context():
+    state = ControlState.model_validate(json.loads(EXAMPLE.read_text()))
+    network = state.aws_networks["primary"]
+    return (
+        state.provider_accounts[network.provider_account], network,
+        cast(AWSSecretsManagerStore, state.secret_stores["workload-secrets"]),
+    )
+
+
+def group_response(**updates) -> dict[str, object]:
+    values: dict[str, object] = {
+        "ReplicationGroupId": GROUP_ID, "Status": "available", "ARN": ARN,
+        "ClusterEnabled": True, "MultiAZ": "enabled", "AutomaticFailover": "enabled",
+        "CacheNodeType": "cache.m7g.large", "TransitEncryptionEnabled": True,
+        "AtRestEncryptionEnabled": True, "Durability": "sync", "EffectiveDurability": "sync",
+        "SnapshotRetentionLimit": 7, "SnapshotWindow": "03:00-04:00",
+        "UserGroupIds": [derive_user_group_id(GROUP_ID)],
+        "MemberClusters": [f"{GROUP_ID}-0001-001", f"{GROUP_ID}-0001-002"],
+        "ConfigurationEndpoint": {"Address": "cfg.example.cache.amazonaws.com", "Port": 6379},
+        "NodeGroups": [{"NodeGroupId": "0001", "Status": "available", "NodeGroupMembers": [
+            {"CacheClusterId": f"{GROUP_ID}-0001-001",
+             "PreferredAvailabilityZone": "eu-central-1a"},
+            {"CacheClusterId": f"{GROUP_ID}-0001-002",
+             "PreferredAvailabilityZone": "eu-central-1b"},
+        ]}],
+    }
+    values.update(updates)
+    return values
+
+
+def expect_describe(stub, cache_client_stub, **updates) -> None:
+    stub.add_response(
+        "describe_replication_groups", {"ReplicationGroups": [group_response(**updates)]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    stub.add_response(
+        "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": NAME}]},
+        {"ResourceName": ARN},
+    )
+    stub.add_response(
+        "describe_cache_clusters",
+        {"CacheClusters": [{
+            "EngineVersion": "9.0", "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+            "AutoMinorVersionUpgrade": False,
+        }]},
+        {"CacheClusterId": f"{GROUP_ID}-0001-001"},
+    )
+
+
+TAG = [{"Key": "gimme:resource", "Value": NAME}]
+
+
+def test_describe_parses_a_live_group(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    expect_describe(stub, stub)
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed == observation()
+
+
+def test_describe_of_an_absent_group_is_none(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error("describe_replication_groups", "ReplicationGroupNotFoundFault")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        assert adapter.describe_group(account, network, GROUP_ID) is None
+
+
+def test_describe_refuses_a_group_this_resource_does_not_own(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "describe_replication_groups", {"ReplicationGroups": [group_response()]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    stub.add_response(
+        "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": "other"}]},
+        {"ResourceName": ARN},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError, match="^aws_elasticache_group_ownership_mismatch$"):
+        adapter.describe_group(account, network, GROUP_ID)
+
+
+def test_describe_tolerates_a_member_cluster_that_does_not_exist_yet(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "describe_replication_groups",
+        {"ReplicationGroups": [group_response(Status="creating")]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    stub.add_response(
+        "list_tags_for_resource", {"TagList": TAG}, {"ResourceName": ARN},
+    )
+    stub.add_client_error("describe_cache_clusters", "CacheClusterNotFound")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed is not None and observed.engine_version is None
+    assert observed.maintenance_window is None
+
+
+def test_describe_failures_are_bounded_and_never_carry_the_provider_message(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error(
+        "describe_replication_groups", "AccessDenied",
+        service_message="arn:aws:iam::123456789012:role/secret-role is not authorized",
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.describe_group(account, network, GROUP_ID)
+
+    assert str(raised.value) == "aws_elasticache_describe_access_denied"
+
+
+def expect_create(
+    elasticache_stub, secrets_stub, *, admin_exists: bool = False, admin_fault: bool = False
+) -> None:
+    subnet = f"{GROUP_ID}-subnets"
+    params = f"{GROUP_ID}-params"
+    users = derive_user_group_id(GROUP_ID)
+    default_id, admin_id = f"{GROUP_ID}-default", f"{GROUP_ID}-admin"
+    stub = elasticache_stub
+    stub.add_response(
+        "create_cache_subnet_group", {},
+        {"CacheSubnetGroupName": subnet,
+         "CacheSubnetGroupDescription": f"Gimme-managed subnet group for {NAME}",
+         "SubnetIds": ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"], "Tags": TAG},
+    )
+    stub.add_response(
+        "create_cache_parameter_group", {},
+        {"CacheParameterGroupName": params, "CacheParameterGroupFamily": "valkey9",
+         "Description": f"Gimme-managed parameter group for {NAME}", "Tags": TAG},
+    )
+    stub.add_response(
+        "modify_cache_parameter_group", {"CacheParameterGroupName": params},
+        {"CacheParameterGroupName": params, "ParameterNameValues": [
+            {"ParameterName": "cluster-enabled", "ParameterValue": "yes"},
+            {"ParameterName": "maxmemory-policy", "ParameterValue": "noeviction"},
+        ]},
+    )
+    stub.add_response(
+        "create_user", {},
+        {"UserId": default_id, "UserName": "default", "Engine": "valkey",
+         "AccessString": "off ~* -@all", "NoPasswordRequired": True, "Tags": TAG},
+    )
+    if admin_exists:
+        stub.add_response("describe_users", {"Users": [{"UserId": admin_id}]},
+                          {"UserId": admin_id})
+    else:
+        stub.add_client_error(
+            "describe_users", "UserNotFound", expected_params={"UserId": admin_id}
+        )
+        secrets_stub.add_response(
+            "create_secret", {"ARN": "arn:aws:secretsmanager:eu-central-1:123456789012:secret:x"},
+            {"Name": f"gimme/workload/{NAME}/_admin", "SecretString": ANY, "Tags": [
+                {"Key": "gimme:resource", "Value": NAME},
+                {"Key": "gimme:secret-store", "Value": "workload-secrets"}]},
+        )
+        secrets_stub.add_response(
+            "put_secret_value",
+            {"ARN": "arn:aws:secretsmanager:eu-central-1:123456789012:secret:x",
+             "VersionId": "v" * 32},
+            {"SecretId": f"gimme/workload/{NAME}/_admin", "SecretString": ANY},
+        )
+        admin_request = {
+            "UserId": admin_id, "UserName": "gimme-admin", "Engine": "valkey",
+            "AccessString": ADMIN_ACCESS_STRING, "Passwords": [PASSWORD], "Tags": TAG,
+        }
+        if admin_fault:
+            stub.add_client_error(
+                "create_user", "AccessDenied", service_message=f"denied for {PASSWORD}",
+                expected_params=admin_request,
+            )
+            return
+        stub.add_response("create_user", {}, admin_request)
+    stub.add_response(
+        "create_user_group", {},
+        {"UserGroupId": users, "Engine": "valkey", "UserIds": [default_id, admin_id],
+         "Tags": TAG},
+    )
+    stub.add_response(
+        "create_replication_group", {},
+        {
+            "ReplicationGroupId": GROUP_ID,
+            "ReplicationGroupDescription": f"Gimme-managed Valkey for {NAME}",
+            "Engine": "valkey", "EngineVersion": "9.0", "CacheNodeType": "cache.m7g.large",
+            "CacheParameterGroupName": params, "CacheSubnetGroupName": subnet,
+            "SecurityGroupIds": ["sg-0123456789abcdef2"], "ClusterMode": "enabled",
+            "NumNodeGroups": 1, "ReplicasPerNodeGroup": 1, "AutomaticFailoverEnabled": True,
+            "MultiAZEnabled": True, "TransitEncryptionEnabled": True,
+            "TransitEncryptionMode": "required", "AtRestEncryptionEnabled": True,
+            "UserGroupIds": [users], "Durability": "sync", "AutoMinorVersionUpgrade": False,
+            "SnapshotRetentionLimit": 7, "SnapshotWindow": "03:00-04:00",
+            "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
+        },
+    )
+    expect_describe(stub, stub, Status="creating")
+
+
+def test_create_sends_exactly_the_fixed_contract_and_writes_the_admin_secret(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    expect_create(stub, secrets_stub)
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub:
+        observed = adapter.create_group(
+            account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets"
+        )
+
+    assert observed.status == "creating"
+    stub.assert_no_pending_responses()
+    secrets_stub.assert_no_pending_responses()
+
+
+def test_an_existing_admin_user_keeps_its_stored_credential(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    expect_create(stub, secrets_stub, admin_exists=True)
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub:
+        adapter.create_group(account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets")
+
+    secrets_stub.assert_no_pending_responses()  # no secret write was expected or made
+
+
+def test_the_admin_password_never_leaks_into_errors(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    expect_create(stub, secrets_stub, admin_fault=True)
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub, pytest.raises(ResourceError) as raised:
+        adapter.create_group(account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets")
+
+    assert str(raised.value) == "aws_elasticache_user_create_access_denied"
+    assert PASSWORD not in repr(raised.value)
+
+
+def test_a_foreign_parameter_group_of_the_same_name_is_refused(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    params = f"{GROUP_ID}-params"
+    stub.add_response(
+        "create_cache_subnet_group", {}, {
+            "CacheSubnetGroupName": f"{GROUP_ID}-subnets",
+            "CacheSubnetGroupDescription": f"Gimme-managed subnet group for {NAME}",
+            "SubnetIds": ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"], "Tags": TAG},
+    )
+    stub.add_client_error("create_cache_parameter_group", "CacheParameterGroupAlreadyExists")
+    pg_arn = "arn:aws:elasticache:eu-central-1:123456789012:parametergroup:" + params
+    stub.add_response(
+        "describe_cache_parameter_groups",
+        {"CacheParameterGroups": [{"CacheParameterGroupName": params,
+                                   "CacheParameterGroupFamily": "valkey9", "ARN": pg_arn}]},
+        {"CacheParameterGroupName": params},
+    )
+    stub.add_response(
+        "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": "someone-else"}]},
+        {"ResourceName": pg_arn},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, store = context()
+
+    with stub, pytest.raises(
+        ResourceError, match="^aws_elasticache_parameter_group_ownership_mismatch$"
+    ):
+        adapter.create_group(account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets")
+    stub.assert_no_pending_responses()

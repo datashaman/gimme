@@ -123,11 +123,13 @@ Updates are validated locally against the ADR 0008 allowlist and refused with a 
 decreased storage, and the other changes listed in the how-to; a refused update changes nothing.
 
 The same tools accept an AWS ElastiCache Valkey resource (provider `aws_elasticache_valkey`,
-[`use-aws-elasticache-valkey.md`](../how-to/use-aws-elasticache-valkey.md)). It is registration
-only for now: nothing is provisioned, `inspect_resource` reports `phase: registered`, and a
-Deployment cannot bind it. Updates are refused locally with a fixed
-`aws_elasticache_update_forbidden_<field>` code for `aws_network`, an engine major version, or
-`security_group_id`.
+[`use-aws-elasticache-valkey.md`](../how-to/use-aws-elasticache-valkey.md)).
+`plan_apply_resource` and `apply_resource` create its replication group, and
+`inspect_resource` reports secret-free `phase`, `status`, `engine_version`,
+`effective_durability`, and fixed `issues` codes, never an endpoint or identifier. A
+Deployment cannot bind it yet and updates are not applied to an existing group. Updates are
+refused locally with a fixed `aws_elasticache_update_forbidden_<field>` code for `aws_network`,
+an engine major version, or `security_group_id`.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |

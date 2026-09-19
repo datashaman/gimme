@@ -103,7 +103,9 @@ class RDSAdapter(Protocol):
     ) -> tuple[str, str]: ...
 
 
-def _provider_error(exc: Exception, operation: str) -> ResourceError:
+def _provider_error(
+    exc: Exception, operation: str, prefix: str = "aws_rds"
+) -> ResourceError:
     code = "unavailable"
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
@@ -124,6 +126,21 @@ def _provider_error(exc: Exception, operation: str) -> ResourceError:
             "DBParameterGroupAlreadyExists": "already_exists",
             "DBParameterGroupAlreadyExistsFault": "already_exists",
             "ResourceExistsException": "already_exists",
+            # ElastiCache wire codes mostly omit the "Fault" suffix its shapes carry.
+            "ReplicationGroupNotFoundFault": "missing",
+            "UserNotFound": "missing",
+            "UserGroupNotFound": "missing",
+            "CacheParameterGroupNotFound": "missing",
+            "CacheClusterNotFound": "missing",
+            "CacheSubnetGroupNotFoundFault": "missing",
+            "ReplicationGroupAlreadyExists": "already_exists",
+            "UserAlreadyExists": "already_exists",
+            "UserGroupAlreadyExists": "already_exists",
+            "CacheSubnetGroupAlreadyExists": "already_exists",
+            "CacheParameterGroupAlreadyExists": "already_exists",
+            "InvalidReplicationGroupState": "invalid_state",
+            "InvalidUserGroupState": "invalid_state",
+            "InvalidCacheParameterGroupState": "invalid_state",
             "InvalidDBInstanceState": "invalid_state",
             "InvalidDBInstanceStateFault": "invalid_state",
             "DecryptionFailure": "revoked",
@@ -133,12 +150,14 @@ def _provider_error(exc: Exception, operation: str) -> ResourceError:
         }
         if isinstance(provider_code, str):
             code = mapping.get(provider_code, "unavailable")
-    return ResourceError(f"aws_rds_{operation}_{code}")
+    return ResourceError(f"{prefix}_{operation}_{code}")
 
 
-class BotoRDSAdapter:
-    """Narrow AWS boundary for one managed RDS PostgreSQL instance and its workload
-    secrets. Every call is bounded to one instance, one network, and one account."""
+class AWSAdapter:
+    """Shared AWS boundary: role assumption pinned to one account, and workload secret
+    writes. Subclasses set the prefix of the bounded error codes they raise."""
+
+    error_prefix = "aws_rds"
 
     @staticmethod
     def _boto3():
@@ -161,12 +180,49 @@ class BotoRDSAdapter:
                 aws_session_token=credentials["SessionToken"],
             )
             if session.client("sts").get_caller_identity().get("Account") != account.account_id:
-                raise ResourceError("aws_rds_role_account_mismatch")
+                raise ResourceError(f"{self.error_prefix}_role_account_mismatch")
             return session
         except ResourceError:
             raise
         except Exception as exc:
-            raise _provider_error(exc, "identity") from None
+            raise _provider_error(exc, "identity", self.error_prefix) from None
+
+    def create_workload_secret(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        tags: dict[str, str], payload: dict[str, str],
+    ) -> tuple[str, str]:
+        session = self._session(
+            account, account.inspection_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret",
+        )
+        client = session.client("secretsmanager", region_name=store.region)
+        secret_id = f"{store.prefix}/{name}"
+        secret_string = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        kms_kwargs = {"KmsKeyId": store.kms_key_arn} if store.kms_key_arn is not None else {}
+        tag_list = [{"Key": key, "Value": value} for key, value in sorted(tags.items())]
+        try:
+            client.create_secret(
+                Name=secret_id, SecretString=secret_string, Tags=tag_list, **kms_kwargs,
+            )
+        except Exception as exc:
+            error = _provider_error(exc, "workload_secret_create", self.error_prefix)
+            if "already_exists" not in str(error):
+                raise error from None
+        try:
+            response = client.put_secret_value(SecretId=secret_id, SecretString=secret_string)
+        except Exception as exc:
+            raise _provider_error(exc, "workload_secret_write", self.error_prefix) from None
+        arn = response.get("ARN")
+        version_id = response.get("VersionId")
+        if not isinstance(arn, str) or not isinstance(version_id, str):
+            raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
+        return arn, version_id
+
+
+
+class BotoRDSAdapter(AWSAdapter):
+    """Narrow AWS boundary for one managed RDS PostgreSQL instance and its workload
+    secrets. Every call is bounded to one instance, one network, and one account."""
 
     @staticmethod
     def _observation(
@@ -428,34 +484,6 @@ class BotoRDSAdapter:
             raise ResourceError("aws_rds_master_secret_invalid")
         return username, password
 
-    def create_workload_secret(
-        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
-        tags: dict[str, str], payload: dict[str, str],
-    ) -> tuple[str, str]:
-        session = self._session(account, account.inspection_role_arn, "rds-workload-secret")
-        client = session.client("secretsmanager", region_name=store.region)
-        secret_id = f"{store.prefix}/{name}"
-        secret_string = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        kms_kwargs = {"KmsKeyId": store.kms_key_arn} if store.kms_key_arn is not None else {}
-        tag_list = [{"Key": key, "Value": value} for key, value in sorted(tags.items())]
-        try:
-            client.create_secret(
-                Name=secret_id, SecretString=secret_string, Tags=tag_list, **kms_kwargs,
-            )
-        except Exception as exc:
-            error = _provider_error(exc, "workload_secret_create")
-            if "already_exists" not in str(error):
-                raise error from None
-        try:
-            response = client.put_secret_value(SecretId=secret_id, SecretString=secret_string)
-        except Exception as exc:
-            raise _provider_error(exc, "workload_secret_write") from None
-        arn = response.get("ARN")
-        version_id = response.get("VersionId")
-        if not isinstance(arn, str) or not isinstance(version_id, str):
-            raise ResourceError("aws_rds_workload_secret_invalid")
-        return arn, version_id
-
 
 def _parameter_group_family(engine_version: str) -> str:
     major = re.match(r"[0-9]+", engine_version)
@@ -543,9 +571,8 @@ def load_observed(root: Path, resource_name: str) -> dict[str, object] | None:
     return _validate_observed(document)
 
 
-def _save_observed(root: Path, resource_name: str, document: dict[str, object]) -> None:
-    _validate_observed(document)
-    path = _observed_path(root, resource_name)
+def _write_json(path: Path, document: dict[str, object], resource_name: str) -> None:
+    """Atomically write one secret-free JSON document into a 0700 directory as 0600."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path.parent, 0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{resource_name}.", dir=path.parent)
@@ -561,6 +588,11 @@ def _save_observed(root: Path, resource_name: str, document: dict[str, object]) 
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _save_observed(root: Path, resource_name: str, document: dict[str, object]) -> None:
+    _validate_observed(document)
+    _write_json(_observed_path(root, resource_name), document, resource_name)
 
 
 def _instance_document(
@@ -816,22 +848,7 @@ def retain_resource(root: Path, resource_name: str, aws_network: str) -> dict[st
         ),
         "identity": observed["identity"] if observed is not None else None,
     }
-    path = _tombstone_path(root, resource_name)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{resource_name}.", dir=path.parent)
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(descriptor, "w") as handle:
-            json.dump(tombstone, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-    except BaseException:
-        temporary_path.unlink(missing_ok=True)
-        raise
+    _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
     return tombstone
 
 

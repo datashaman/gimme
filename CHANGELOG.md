@@ -5,6 +5,19 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- `apply_resource` now provisions an `aws_elasticache_valkey` Resource (slice 2 of #14): a cache
+  subnet group, a parameter group (`cluster-enabled yes`, `maxmemory-policy noeviction`), a user
+  group with a default user that cannot authenticate, an administrative user whose generated
+  password is written to the workload Secret Store, and one replication group with one shard,
+  one cross-AZ replica, Multi-AZ automatic failover, TLS, encryption at rest, synchronous
+  durability, and no automatic minor upgrades. Apply polls for 30 seconds, resumes idempotently,
+  and never modifies an existing group. `inspect_resource` reports secret-free `phase`
+  (`pending`, `ready`, `degraded`, `failed`) and fixed `issues` codes, and `degraded` when the
+  effective durability is not `sync`; removal now writes a Retained Resource tombstone.
+  Privilege impact: the inspection role needs the new `ElastiCacheCreateAndDescribe` statement
+  (create and describe actions on `gimme-*` ElastiCache objects, no delete or modify-group
+  actions) and, once per account, the ElastiCache service-linked role; existing deployments of
+  the policy must add them (see the ElastiCache how-to). Not yet verified against a live account.
 - Added the `aws_elasticache_valkey` Resource for ADR 0009, registration only (slice 1 of #14):
   an exact Valkey 9 or later `engine_version`, `node_type`, one Valkey security group, a daily
   UTC snapshot window, `snapshot_retention_days` (1-35, default 7), and a non-overlapping
