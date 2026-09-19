@@ -10,7 +10,8 @@ may contain deliberate schema and MCP API breaks.
   (`deploy/aws-rds-global-bundle.pem`) uploaded per bind beside the secret file, checked by
   sha256 before connecting, and removed afterwards. Certificate and digest failures return
   distinct fixed errors without `psql` output; `us-gov-*` regions are refused with
-  `aws_rds_tls_region_unsupported` before any remote work. The bundle is part of the
+  `aws_rds_tls_region_unsupported` when a managed Resource is registered, planned, applied, or
+  bound, so an instance that could never be bound is not created. The bundle is part of the
   execution fingerprint, so earlier plans go stale.
 - Fixed managed AWS RDS PostgreSQL instances not forcing TLS below PostgreSQL 15: creation
   now also creates a Resource-owned `gimme-<name>-params` DB parameter group

@@ -1060,6 +1060,8 @@ def register_resource(name: Name, definition: Resource) -> dict[str, object]:
     state = store.load()
     if name in state.resources:
         raise ValueError("resource already exists; use plan_update_resource")
+    if isinstance(definition, AWSRDSPostgresResource):
+        _refuse_unverifiable_tls_region(state, definition)
     store.save(_replace(state, "resources", name, definition))
     return {"changed": True, "resource": name}
 
@@ -1083,6 +1085,14 @@ def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[s
     return {"changed": True, "resource": name}
 
 
+def _refuse_unverifiable_tls_region(state: ControlState, resource: AWSRDSPostgresResource) -> None:
+    # Only the AWS commercial-region trust bundle is pinned, so a us-gov-* instance could be
+    # created but never bound. Refuse before anything is created.
+    network = state.aws_networks.get(resource.aws_network)
+    if network is not None and network.region.startswith("us-gov-"):
+        raise ResourceError("aws_rds_tls_region_unsupported")
+
+
 def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
     state = store.load()
     resource = state.resources.get(name)
@@ -1090,6 +1100,7 @@ def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
         raise KeyError(f"resource '{name}' is not registered")
     if not isinstance(resource, AWSRDSPostgresResource):
         raise ValueError(f"resource '{name}' is not a managed AWS RDS PostgreSQL resource")
+    _refuse_unverifiable_tls_region(state, resource)
     return state, resource
 
 
@@ -1205,8 +1216,6 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     resource_name = str(expected["resource"])
     _state, resource = _managed_resource(resource_name)
     network = state.aws_networks[resource.aws_network]
-    if network.region.startswith("us-gov-"):
-        raise ResourceError("aws_rds_tls_region_unsupported")
     account = state.provider_accounts[network.provider_account]
     admin_target = state.targets[resource.administration_target]
     store_name = resource.workload_secret_store

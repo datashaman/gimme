@@ -812,23 +812,41 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert adapter.secret_payloads["primary-rds/example-app"]["password"] == workload_password
 
 
-def test_bind_resource_refuses_govcloud_regions_before_any_remote_work(
+def test_govcloud_resources_are_refused_before_anything_is_created(
     tmp_path, monkeypatch
 ) -> None:
-    use_rds_store(tmp_path, monkeypatch, bound=True)
-    server_module.apply_resource(
-        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
-    )
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
     state = server_module.store.load()
     network = state.aws_networks["primary"].model_copy(update={"region": "us-gov-west-1"})
     server_module.store.save(state.model_copy(update={"aws_networks": {"primary": network}}))
     monkeypatch.setattr(
         server_module.runner, "run", lambda *a, **k: pytest.fail("must not reach the target")
     )
-    plan = server_module.plan_bind_resource("example-app")
+    stale = "plan_" + "0" * 20
+    refused = pytest.raises(ResourceError, match="aws_rds_tls_region_unsupported")
 
-    with pytest.raises(ResourceError, match="aws_rds_tls_region_unsupported"):
-        server_module.bind_resource("example-app", str(plan["plan_id"]))
+    with refused:
+        server_module.plan_apply_resource("primary-rds")
+    with refused:
+        server_module.apply_resource("primary-rds", stale)
+    with refused:
+        server_module.plan_bind_resource("example-app")
+    with refused:
+        server_module.bind_resource("example-app", stale)
+    with refused:
+        server_module.register_resource("second-rds", rds_definition())
+    assert "second-rds" not in server_module.store.load().resources
+    assert adapter.create_calls == 0
+    # A stranded Resource must still be inspectable and retainable.
+    server_module.inspect_resource("primary-rds")
+    server_module.store.save(
+        server_module.store.load().model_copy(update={"deployments": {}})
+    )
+    cleanup = server_module.plan_cleanup_resource("primary-rds")
+    server_module.apply_cleanup_resource(
+        "primary-rds", str(cleanup["plan_id"]), str(cleanup["confirmation"])
+    )
+    assert "primary-rds" not in server_module.store.load().resources
 
 
 def test_bind_resource_rejects_stale_plans_and_unready_resources(tmp_path, monkeypatch) -> None:
