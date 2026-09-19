@@ -317,6 +317,13 @@ failed inspection fails closed. The plan contains no database name and returns t
 `RESTORE DEPLOYMENT <deployment> FROM <recovery-point>` confirmation. Apply and verification
 tools are added by the following restore-execution slice.
 
+The request-owned maintenance helper also supports internal `resume` and `quiesce`
+transitions for Restore verification. `resume` starts only the managed units recorded as
+active before maintenance while leaving the public route on the fixed 503 response;
+`quiesce` stops and verifies all registered managed units again after a failed private
+check. Neither transition is exposed as a general-purpose MCP maintenance switch. Final
+`exit` restores the normal route only after the appropriate processes are active.
+
 ## Application operation tools
 
 | Tool | Access | Purpose |

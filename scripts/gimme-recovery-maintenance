@@ -212,16 +212,35 @@ def enter(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
             fail("managed process did not stop")
 
 
-def exit_maintenance(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+def resume_processes(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
     authority = load_authority(instance, request_id, owner, sudo_user)
-    marker_path, backup_path = marker_paths(instance)
     marker = read_marker(instance)
     if marker is None or marker["request_id"] != request_id:
         fail("maintenance is owned by another request")
+    if not set(marker["active_units"]).issubset(authority["units"]):
+        fail("maintenance process policy changed")
     for unit in sorted(marker["active_units"]):
         run(["systemctl", "start", unit])
         if not succeeds(["systemctl", "is-active", "--quiet", unit]):
             fail("managed process did not restart")
+
+
+def quiesce_processes(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+    authority = load_authority(instance, request_id, owner, sudo_user)
+    marker = read_marker(instance)
+    if marker is None or marker["request_id"] != request_id:
+        fail("maintenance is owned by another request")
+    for unit in authority["units"]:
+        if succeeds(["systemctl", "is-active", "--quiet", unit]):
+            run(["systemctl", "stop", unit])
+        if succeeds(["systemctl", "is-active", "--quiet", unit]):
+            fail("managed process did not stop")
+
+
+def exit_maintenance(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+    resume_processes(instance, request_id, owner, sudo_user)
+    authority = load_authority(instance, request_id, owner, sudo_user)
+    marker_path, backup_path = marker_paths(instance)
     if backup_path.is_symlink() or not backup_path.is_file():
         fail("maintenance route backup is invalid")
     backup = backup_path.stat()
@@ -241,7 +260,9 @@ def main() -> None:
     if os.geteuid() != 0 or len(sys.argv) != 4:
         fail("maintenance helper requires fixed action, Deployment, and request identity")
     action, instance, request_id = sys.argv[1:]
-    if action not in {"enter", "exit"} or IDENTITY.fullmatch(instance) is None or (
+    if action not in {"enter", "resume", "quiesce", "exit"} or (
+        IDENTITY.fullmatch(instance) is None
+    ) or (
         REQUEST_ID.fullmatch(request_id) is None
     ):
         fail("invalid maintenance request")
@@ -249,9 +270,13 @@ def main() -> None:
     if not sudo_user:
         fail("missing sudo caller")
     owner = pwd.getpwnam(sudo_user).pw_uid
-    (enter if action == "enter" else exit_maintenance)(
-        instance, request_id, owner, sudo_user
-    )
+    actions = {
+        "enter": enter,
+        "resume": resume_processes,
+        "quiesce": quiesce_processes,
+        "exit": exit_maintenance,
+    }
+    actions[action](instance, request_id, owner, sudo_user)
 
 
 if __name__ == "__main__":
