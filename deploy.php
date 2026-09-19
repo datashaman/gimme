@@ -1174,7 +1174,7 @@ task('gimme:recovery:maintenance', function () use ($appsRoot, $instance): void 
     $action = required_env('GIMME_RECOVERY_ACTION');
     $request = required_env('GIMME_RECOVERY_REQUEST_ID');
     $wait = required_env('GIMME_RECOVERY_QUIESCE_WAIT');
-    if (!in_array($action, ['enter', 'exit'], true) ||
+    if (!in_array($action, ['enter', 'resume', 'quiesce', 'exit'], true) ||
         !preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $request) ||
         !preg_match('/^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|300)$/', $wait)) {
         throw new \RuntimeException('Unsafe recovery maintenance request');

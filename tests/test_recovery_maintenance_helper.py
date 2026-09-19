@@ -109,3 +109,64 @@ def test_exit_refuses_another_requests_marker(tmp_path, monkeypatch) -> None:
         helper["exit_maintenance"]("example-app", "request-2", 1000, "deployer")
 
     assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
+
+
+def test_restore_can_resume_then_requiesce_processes_without_restoring_route(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    commands: list[list[str]] = []
+    auth = authority(tmp_path)
+    monkeypatch.setitem(helper, "MARKER_ROOT", tmp_path / "markers")
+    monkeypatch.setitem(helper, "CADDYFILE", tmp_path / "Caddyfile")
+    monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
+    active = set(auth["units"])
+    monkeypatch.setitem(helper, "succeeds", lambda command: command[-1] in active)
+
+    def run(command):
+        commands.append(command)
+        if command[:2] == ["systemctl", "stop"]:
+            active.discard(command[-1])
+        elif command[:2] == ["systemctl", "start"]:
+            active.add(command[-1])
+
+    monkeypatch.setitem(helper, "run", run)
+    helper["enter"]("example-app", "request-1", 1000, "deployer")
+    commands.clear()
+
+    helper["resume_processes"]("example-app", "request-1", 1000, "deployer")
+
+    assert active == set(auth["units"])
+    assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
+    assert (tmp_path / "markers" / "example-app.json").exists()
+
+    helper["quiesce_processes"]("example-app", "request-1", 1000, "deployer")
+
+    assert active == set()
+    assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
+
+
+def test_resume_refuses_a_unit_removed_from_registered_process_policy(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    auth = authority(tmp_path)
+    monkeypatch.setitem(helper, "MARKER_ROOT", tmp_path / "markers")
+    monkeypatch.setitem(helper, "CADDYFILE", tmp_path / "Caddyfile")
+    monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
+    active = set(auth["units"])
+    monkeypatch.setitem(helper, "succeeds", lambda command: command[-1] in active)
+
+    def run(command):
+        if command[:2] == ["systemctl", "stop"]:
+            active.discard(command[-1])
+
+    monkeypatch.setitem(helper, "run", run)
+    helper["enter"]("example-app", "request-1", 1000, "deployer")
+    auth["units"] = ["gimme-scheduler-example-app.timer"]
+
+    with pytest.raises(RuntimeError, match="process policy changed"):
+        helper["resume_processes"]("example-app", "request-1", 1000, "deployer")
+
+    assert active == set()
+    assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"

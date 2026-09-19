@@ -218,7 +218,7 @@ class DeployerRunner:
             recovery_action, recovery_request_id, recovery_quiesce_wait
         )):
             if (
-                recovery_action not in {"enter", "exit"}
+                recovery_action not in {"enter", "resume", "quiesce", "exit"}
                 or recovery_request_id is None
                 or recovery_quiesce_wait is None
             ):

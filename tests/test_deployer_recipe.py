@@ -656,7 +656,7 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-processes" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *" in recipe
     assert "maintenance is owned by another request" in recovery_helper
-    assert 'action not in {"enter", "exit"}' in recovery_helper
+    assert 'action not in {"enter", "resume", "quiesce", "exit"}' in recovery_helper
     assert "shell_exec" not in helper
     assert "GIMME_HELPER|" in recipe
     assert "chown {$user}:{$user}" in recipe
