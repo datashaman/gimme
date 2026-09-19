@@ -5,6 +5,23 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- `apply_resource` now converges an existing `aws_elasticache_valkey` replication group (slice 3
+  of #14) with one immediate `ModifyReplicationGroup` carrying only the fields that differ:
+  same-major `engine_version`, `node_type`, snapshot retention and window, and maintenance
+  window. A major mismatch, version downgrade, node type outside AWS's allowed modifications
+  (`ListAllowedNodeTypeModifications`), or, when something needs changing, any other live
+  difference from the contract is refused before any call with
+  `aws_elasticache_modify_forbidden_<reason>`. Values AWS has pending count as applied and a
+  group that is still modifying is never sent a second change. `inspect_resource` adds `drift`,
+  and an unfinished service update past its apply-by date makes the Resource `degraded`
+  (`service_update_overdue`). New read-only MCP resource
+  `gimme://aws-networks/{name}/valkey-options` lists the exact Valkey versions and node types
+  the account offers, and registering or updating to a `node_type` it does not offer is refused
+  with `aws_elasticache_node_type_unavailable`, so Valkey registration now reads from AWS.
+  Privilege impact: the inspection role needs `elasticache:ModifyReplicationGroup` and
+  `ListAllowedNodeTypeModifications` on the group, plus `DescribeUpdateActions`,
+  `DescribeCacheEngineVersions`, and `DescribeReservedCacheNodesOfferings` on `*`, and every
+  describe now also reads update actions. Not yet verified against a live account.
 - `apply_resource` now provisions an `aws_elasticache_valkey` Resource (slice 2 of #14): a cache
   subnet group, a parameter group (`cluster-enabled yes`, `maxmemory-policy noeviction`), a user
   group with a default user that cannot authenticate, an administrative user whose generated
@@ -22,8 +39,8 @@ may contain deliberate schema and MCP API breaks.
   an exact Valkey 9 or later `engine_version`, `node_type`, one Valkey security group, a daily
   UTC snapshot window, `snapshot_retention_days` (1-35, default 7), and a non-overlapping
   60-minute weekly maintenance window, with the administration Target and AWS Secrets Manager
-  store checked like a managed RDS Resource. Registration makes no AWS call, nothing is
-  provisioned, and `inspect_resource` reports `phase: registered`. A Deployment binding to it
+  store checked like a managed RDS Resource. Nothing is provisioned, and `inspect_resource`
+  reports `phase: absent`. A Deployment binding to it
   is refused when state is validated until typed Valkey bindings exist. Updates that need a
   new Resource are refused locally with `aws_elasticache_update_forbidden_<field>`. No privilege
   change.

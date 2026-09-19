@@ -32,10 +32,11 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://secret-stores/{name}` | One bounded Secret Store policy and derived ownership tag |
 | `gimme://backup-destinations/{name}` | One bounded S3-compatible Backup Destination policy without credentials |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
+| `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The eight parameterized URIs are resource templates. `gimme://state` and
+The nine parameterized URIs are resource templates. `gimme://state` and
 `gimme://operations` are concrete resources.
 
 ## State and inventory tools
@@ -126,10 +127,14 @@ The same tools accept an AWS ElastiCache Valkey resource (provider `aws_elastica
 [`use-aws-elasticache-valkey.md`](../how-to/use-aws-elasticache-valkey.md)).
 `plan_apply_resource` and `apply_resource` create its replication group, and
 `inspect_resource` reports secret-free `phase`, `status`, `engine_version`,
-`effective_durability`, and fixed `issues` codes, never an endpoint or identifier. A
-Deployment cannot bind it yet and updates are not applied to an existing group. Updates are
-refused locally with a fixed `aws_elasticache_update_forbidden_<field>` code for `aws_network`,
-an engine major version, or `security_group_id`.
+`effective_durability`, fixed `issues` codes, and `drift`, never an endpoint or identifier.
+`apply_resource` on an existing group makes one modification of only the differing same-major
+`engine_version`, `node_type`, snapshot, and maintenance fields, and refuses anything else with
+a fixed `aws_elasticache_modify_forbidden_<reason>` code before any change. A Deployment cannot
+bind it yet. Updates are refused locally with a fixed
+`aws_elasticache_update_forbidden_<field>` code for `aws_network`, an engine major version, or
+`security_group_id`, and registering or updating to a `node_type` the account does not offer is
+refused with `aws_elasticache_node_type_unavailable`.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |

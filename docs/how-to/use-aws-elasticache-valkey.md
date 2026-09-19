@@ -37,8 +37,9 @@ never edited:
 
 ## IAM
 
-The inspection role gains one statement (replace `<region>` and `<account>`). It has no delete
-or modify-group actions. This is a privilege increase for roles already deployed:
+The inspection role gains two statements (replace `<region>` and `<account>`). Neither has a
+delete action. This is a privilege increase for roles already deployed, including the
+`ModifyReplicationGroup` and read-only statement added for updates:
 
 ```json
 {
@@ -46,6 +47,8 @@ or modify-group actions. This is a privilege increase for roles already deployed
   "Effect": "Allow",
   "Action": [
     "elasticache:CreateReplicationGroup",
+    "elasticache:ModifyReplicationGroup",
+    "elasticache:ListAllowedNodeTypeModifications",
     "elasticache:CreateCacheSubnetGroup",
     "elasticache:CreateCacheParameterGroup",
     "elasticache:ModifyCacheParameterGroup",
@@ -69,8 +72,24 @@ or modify-group actions. This is a privilege increase for roles already deployed
 }
 ```
 
+Three read-only calls do not support resource-level permissions, so they need `"Resource": "*"`:
+
+```json
+{
+  "Sid": "ElastiCacheReadOptions",
+  "Effect": "Allow",
+  "Action": [
+    "elasticache:DescribeUpdateActions",
+    "elasticache:DescribeCacheEngineVersions",
+    "elasticache:DescribeReservedCacheNodesOfferings"
+  ],
+  "Resource": "*"
+}
+```
+
 The administrative user's secret is written with the existing `WorkloadSecrets` statement from
-the RDS page, so the Secret Store prefix must match it.
+the RDS page, so the Secret Store prefix must match it. The IAM statements are not yet verified
+against a live account.
 
 ## Register the Resource
 
@@ -94,8 +113,13 @@ the RDS page, so the Secret Store prefix must match it.
 ```
 
 - `engine_version` is an exact Valkey version, 9.0 or later, in its canonical spelling.
-  `node_type` is `cache.<family>.<size>`; whether AWS offers it with synchronous durability is
-  not checked until creation, when AWS rejects an unsupported one with a bounded error.
+  `node_type` is `cache.<family>.<size>`. Registering, or updating to, a `node_type` the
+  account does not offer in the network's region is refused with
+  `aws_elasticache_node_type_unavailable`, so registration now reads from AWS through the
+  inspection role. AWS does not say which node types support synchronous durability, so one
+  that does not is only rejected at creation, with a bounded error. Read
+  `gimme://aws-networks/<network>/valkey-options` for the exact Valkey versions and node types
+  the account offers.
 - `snapshot_window` is a daily UTC `HH:MM-HH:MM` window of at least 60 minutes.
   `snapshot_retention_days` is 1 to 35. `maintenance_window` is a weekly UTC
   `ddd:HH:MM-ddd:HH:MM` window of exactly 60 minutes and must not overlap the snapshot window.
@@ -105,8 +129,8 @@ Use `register_resource`, or `plan_update_resource` and `update_resource` to chan
 are checked locally and refused with `aws_elasticache_update_forbidden_<field>` for a changed
 `aws_network`, an engine major version, or `security_group_id`, and
 `aws_elasticache_update_forbidden_provider` for a change between this provider and another.
-Same-major engine, `node_type`, windows, and retention register, but are not yet applied to an
-existing group.
+Same-major engine, `node_type`, windows, and retention are accepted and applied to an
+existing group by `apply_resource`.
 
 ## Provision
 
@@ -123,14 +147,40 @@ characters, so a long or irregular name gets a hash suffix.
 
 Creation takes several minutes. `apply_resource` polls for at most 30 seconds and returns
 `phase: pending`; plan and apply again to resume, which describes the group and never creates
-a second one. An existing group is never modified.
+a second one.
+
+## Update an existing group
+
+`apply_resource` on an existing `available` group makes one immediate
+`ModifyReplicationGroup` carrying only the fields that differ from the Resource: `engine_version`,
+`node_type`, `snapshot_retention_days`, `snapshot_window`, and `maintenance_window`. Before any
+change it refuses, with no modify call:
+
+- `aws_elasticache_modify_forbidden_engine_major` and
+  `aws_elasticache_modify_forbidden_engine_downgrade`: only newer versions of the same major
+  are applied. A desired `9.0` is satisfied by a running `9.0.3`;
+- `aws_elasticache_modify_forbidden_node_type`: AWS does not list the desired type among the
+  allowed modifications of this group;
+- `aws_elasticache_modify_forbidden_<reason>`, using the codes below, when there is something
+  to change but the group is also outside the contract (say TLS is off). Gimme never touches a
+  group it would have to repair beyond those five fields. With nothing to change, apply
+  returns the `degraded` phase instead.
+
+An engine version or node type change replaces nodes one at a time and may fail over the
+primary, briefly interrupting connections. Values AWS has accepted but not finished applying
+count as applied, and a group that is not yet `available` is polled and never sent a second
+modification, so re-running apply mid-change is safe. `inspect_resource` reports `drift`
+(`engine_version`, `node_type`, retention, and windows, desired against live) and whether a
+modification is pending. A pending engine version or node type keeps the phase `pending`.
 
 Phases are `pending`, `ready`, `degraded`, and `failed`. A `failed` group (AWS reports
 `create-failed`) is never deleted or recreated by Gimme: delete it yourself, then apply again. An `available` group that does not
 meet the contract is `degraded` with fixed reason codes: `cluster_mode`, `topology`,
 `availability_zones`, `multi_az`, `automatic_failover`, `tls`, `encryption_at_rest`,
 `durability` (the effective durability is not `sync`), `authentication`, `snapshot_policy`,
-`maintenance_policy`, `automatic_minor_upgrade`.
+`maintenance_policy`, `automatic_minor_upgrade`, `service_update_overdue` (AWS reports a
+service update that missed its recommended apply-by date and is not finished). Apply the update
+yourself; Gimme does not.
 
 If creating the administrative user fails after its secret was written, the next apply
 generates and stores a fresh password before trying again. If the user already exists, its
@@ -155,7 +205,8 @@ Provider failures become fixed `aws_elasticache_<operation>_<reason>` codes, for
 `invalid_state`, `throttled`, `revoked`, and `unavailable`, and AWS messages, ARNs, and values
 are never included. Operations include `subnet_group`, `parameter_group`,
 `parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
-`user_describe`, `tags`, `describe`, `describe_cluster`, and `create`.
+`user_describe`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
+`options`, `modify`, and `create`.
 `aws_elasticache_group_ownership_mismatch` and
 `aws_elasticache_parameter_group_ownership_mismatch` mean a same-named object exists that this
 Resource does not own; rename or delete it yourself. `unavailable` covers anything unclassified,

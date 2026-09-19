@@ -318,11 +318,16 @@ def valkey_provision_plan(
                 "encryption at rest, synchronous durability, and no automatic minor upgrades",
                 "write the administrative user's generated password to the workload Secret "
                 "Store; it is never returned, stored locally, or logged",
-                "never modify an existing replication group; applying updates and drift "
-                "reconciliation are not implemented yet",
+                "converge an existing replication group with one immediate modification of "
+                "only the fields that differ: same-major engine version, node type, snapshot "
+                "retention and window, and maintenance window; a major mismatch, version "
+                "downgrade, node type outside the modifications AWS allows, or any other live "
+                "difference from the contract is refused before any change",
+                "disruption: an engine version or node type change replaces nodes one at a "
+                "time and may fail over the primary, briefly interrupting connections",
                 "report the Resource degraded, with fixed reason codes, when an available "
                 "group does not meet the durability, topology, encryption, authentication, "
-                "snapshot, or maintenance contract",
+                "snapshot, or maintenance contract, or has an overdue required service update",
                 "poll for at most 30 seconds and return a bounded pending phase if not yet ready",
             ],
         }

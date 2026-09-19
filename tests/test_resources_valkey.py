@@ -15,8 +15,9 @@ from gimme.control import (
 )
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
-    ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, apply_provision,
-    derive_group_id, derive_user_group_id, load_observed, structural_issues,
+    ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, MODIFIABLE_FIELDS,
+    ValkeyOptions, apply_provision, derive_group_id, derive_user_group_id, group_drift,
+    load_observed, modification_for, structural_issues,
 )
 import gimme.server as server_module
 
@@ -32,6 +33,9 @@ def valkey(**updates) -> AWSElastiCacheValkeyResource:
 GROUP_ID = derive_group_id(NAME)
 ARN = f"arn:aws:elasticache:eu-central-1:123456789012:replicationgroup:{GROUP_ID}"
 PASSWORD = "p" * 48
+ANY_UPDATE_ACTIONS = {
+    "ReplicationGroupIds": [GROUP_ID], "ServiceUpdateStatus": ["available"], "MaxRecords": 100,
+}
 
 
 def observation(**updates) -> GroupObservation:
@@ -48,24 +52,54 @@ def observation(**updates) -> GroupObservation:
     return GroupObservation(**values)  # type: ignore[arg-type]
 
 
-class FakeValkey:
-    """An existing or absent group. A created group reports 'creating' for `settle_polls`
-    describes and then 'available'."""
+FIELDS = {
+    "EngineVersion": "engine_version", "CacheNodeType": "node_type",
+    "SnapshotRetentionLimit": "snapshot_retention_days", "SnapshotWindow": "snapshot_window",
+    "PreferredMaintenanceWindow": "maintenance_window",
+}
+OPTIONS = ValkeyOptions(("9.0", "9.1"), ("cache.m7g.large", "cache.m7g.xlarge"))
 
-    def __init__(self, live: GroupObservation | None = None, *, settle_polls: int = 0) -> None:
+
+class FakeValkey:
+    """An existing or absent group. A created or modified group reports 'creating' or
+    'modifying' for `settle_polls` describes and then 'available'."""
+
+    def __init__(
+        self, live: GroupObservation | None = None, *, settle_polls: int = 0,
+        allowed: frozenset[str] = frozenset({"cache.m7g.large", "cache.m7g.xlarge"}),
+    ) -> None:
         self.live = live
         self.settle_polls = settle_polls
+        self.allowed = allowed
         self.create_calls = 0
         self.describe_calls = 0
+        self.modify_calls: list[dict[str, object]] = []
+        self.options = OPTIONS
         self._polls = 0
 
     def describe_group(self, account, network, group_id):
         self.describe_calls += 1
-        if self.live is not None and self.live.status == "creating":
+        if self.live is not None and self.live.status in ("creating", "modifying"):
             self._polls += 1
             if self._polls > self.settle_polls:
                 self.live = dataclasses.replace(self.live, status="available")
         return self.live
+
+    def allowed_node_types(self, account, network, group_id):
+        return self.allowed
+
+    def modify_group(self, account, network, group_id, changes):
+        assert self.live is not None and set(changes) <= MODIFIABLE_FIELDS
+        self.modify_calls.append(dict(changes))
+        self._polls = 0
+        self.live = dataclasses.replace(
+            self.live, status="modifying" if self.settle_polls else "available",
+            **{FIELDS[key]: value for key, value in changes.items()},
+        )
+        return self.live
+
+    def live_options(self, account, network):
+        return self.options
 
     def create_group(self, account, network, resource, name, group_id, store, store_name):
         self.create_calls += 1
@@ -300,7 +334,7 @@ def test_the_provision_plan_is_local_and_secret_free(tmp_path, monkeypatch) -> N
     assert plan["current_phase"] == "absent" and plan["kind"] == "resource_provision"
     effects = " ".join(cast(list[str], plan["effects"]))
     assert "synchronous durability" in effects
-    assert "never modify an existing replication group" in effects
+    assert "converge an existing replication group" in effects
 
 
 def test_apply_creates_once_and_a_second_apply_only_describes(tmp_path, monkeypatch) -> None:
@@ -348,13 +382,14 @@ def test_a_failed_creation_is_recorded_as_failed(tmp_path) -> None:
     assert result["phase"] == "failed"
 
 
-def test_an_existing_group_is_described_and_never_created_or_modified(tmp_path) -> None:
-    adapter = FakeValkey(observation(node_type="cache.m7g.xlarge", engine_version="9.1"))
+def test_a_group_that_matches_is_described_and_never_created_or_modified(tmp_path) -> None:
+    adapter = FakeValkey(observation(engine_version="9.0.3"))  # a patch of the desired 9.0
 
     result = provision(adapter, tmp_path)
 
-    assert adapter.create_calls == 0 and result["phase"] == "ready"
-    assert result["engine_version"] == "9.1"
+    assert adapter.create_calls == 0 and adapter.modify_calls == []
+    assert result["phase"] == "ready" and result["modified_fields"] == []
+    assert result["engine_version"] == "9.0.3"
 
 
 # --- readiness contract ----------------------------------------------------------------
@@ -372,6 +407,7 @@ BROKEN = {
     "snapshot_policy": {"snapshot_retention_days": 1},
     "maintenance_policy": {"maintenance_window": "mon:01:00-mon:02:00"},
     "automatic_minor_upgrade": {"automatic_minor_upgrade": True},
+    "service_update_overdue": {"service_update_overdue": True},
 }
 
 
@@ -379,15 +415,24 @@ def test_every_readiness_code_has_a_case() -> None:
     assert set(BROKEN) == set(ISSUES)
 
 
+REPAIRED = {"snapshot_policy", "maintenance_policy"}  # the policy fields apply converges
+
+
 @pytest.mark.parametrize("code", sorted(BROKEN))
+def test_every_readiness_code_is_reported_by_structural_issues(code) -> None:
+    assert structural_issues(valkey(), observation(**BROKEN[code]), GROUP_ID) == [code]
+
+
+@pytest.mark.parametrize("code", sorted(set(BROKEN) - REPAIRED))
 def test_an_available_group_missing_one_part_of_the_contract_is_degraded(
     tmp_path, code
 ) -> None:
-    observed = observation(**BROKEN[code])
+    adapter = FakeValkey(observation(**BROKEN[code]))
 
-    assert structural_issues(valkey(), observed, GROUP_ID) == [code]
-    result = provision(FakeValkey(observed), tmp_path)
+    result = provision(adapter, tmp_path)
+
     assert result["phase"] == "degraded" and result["issues"] == [code]
+    assert adapter.modify_calls == []
 
 
 def test_a_mismatched_snapshot_window_is_a_snapshot_policy_issue() -> None:
@@ -398,7 +443,9 @@ def test_a_mismatched_snapshot_window_is_a_snapshot_policy_issue() -> None:
 
 def test_a_group_that_is_not_available_is_pending_not_degraded(tmp_path) -> None:
     result = provision(
-        FakeValkey(observation(status="modifying", effective_durability="async"), settle_polls=0),
+        FakeValkey(
+            observation(status="modifying", effective_durability="async"), settle_polls=1000
+        ),
         tmp_path,
     )
 
@@ -560,7 +607,9 @@ def group_response(**updates) -> dict[str, object]:
     return values
 
 
-def expect_describe(stub, cache_client_stub, **updates) -> None:
+def expect_describe(
+    stub, cache_client_stub, *, actions=None, pending=None, **updates
+) -> None:
     stub.add_response(
         "describe_replication_groups", {"ReplicationGroups": [group_response(**updates)]},
         {"ReplicationGroupId": GROUP_ID},
@@ -570,10 +619,13 @@ def expect_describe(stub, cache_client_stub, **updates) -> None:
         {"ResourceName": ARN},
     )
     stub.add_response(
+        "describe_update_actions", {"UpdateActions": actions or []}, ANY_UPDATE_ACTIONS
+    )
+    stub.add_response(
         "describe_cache_clusters",
         {"CacheClusters": [{
             "EngineVersion": "9.0", "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
-            "AutoMinorVersionUpgrade": False,
+            "AutoMinorVersionUpgrade": False, "PendingModifiedValues": pending or {},
         }]},
         {"CacheClusterId": f"{GROUP_ID}-0001-001"},
     )
@@ -631,6 +683,7 @@ def test_describe_tolerates_a_member_cluster_that_does_not_exist_yet(monkeypatch
     stub.add_response(
         "list_tags_for_resource", {"TagList": TAG}, {"ResourceName": ARN},
     )
+    stub.add_response("describe_update_actions", {"UpdateActions": []}, ANY_UPDATE_ACTIONS)
     stub.add_client_error("describe_cache_clusters", "CacheClusterNotFound")
     adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
     account, network, _ = context()
@@ -828,3 +881,400 @@ def test_a_foreign_parameter_group_of_the_same_name_is_refused(monkeypatch) -> N
     ):
         adapter.create_group(account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets")
     stub.assert_no_pending_responses()
+
+
+# --- reviewed updates ------------------------------------------------------------------
+
+ALLOWED_CHANGES = [
+    ({"engine_version": "9.1"}, {"EngineVersion": "9.1"}),
+    ({"node_type": "cache.m7g.xlarge"}, {"CacheNodeType": "cache.m7g.xlarge"}),
+    ({"snapshot_retention_days": 14}, {"SnapshotRetentionLimit": 14}),
+    ({"snapshot_window": "02:00-03:00"}, {"SnapshotWindow": "02:00-03:00"}),
+    ({"maintenance_window": "mon:05:00-mon:06:00"},
+     {"PreferredMaintenanceWindow": "mon:05:00-mon:06:00"}),
+    (
+        {"engine_version": "9.1", "node_type": "cache.m7g.xlarge", "snapshot_retention_days": 14,
+         "snapshot_window": "02:00-03:00", "maintenance_window": "mon:05:00-mon:06:00"},
+        {"EngineVersion": "9.1", "CacheNodeType": "cache.m7g.xlarge",
+         "SnapshotRetentionLimit": 14, "SnapshotWindow": "02:00-03:00",
+         "PreferredMaintenanceWindow": "mon:05:00-mon:06:00"},
+    ),
+]
+
+
+@pytest.mark.parametrize(("desired", "changes"), ALLOWED_CHANGES)
+def test_each_allowed_change_is_one_modification_of_only_the_differing_fields(
+    tmp_path, desired, changes
+) -> None:
+    adapter = FakeValkey(observation())
+
+    result = provision(adapter, tmp_path, **desired)
+
+    assert adapter.modify_calls == [changes] and adapter.create_calls == 0
+    assert result["modified_fields"] == sorted(changes) and result["phase"] == "ready"
+    assert modification_for(valkey(**desired), adapter.live, GROUP_ID) == {}
+    again = provision(adapter, tmp_path, **desired)
+    assert len(adapter.modify_calls) == 1 and again["modified_fields"] == []
+
+
+@pytest.mark.parametrize(
+    ("live", "desired", "code"),
+    [
+        ({"engine_version": "10.0"}, {}, "engine_major"),
+        ({"engine_version": "9.1"}, {"engine_version": "9.0"}, "engine_downgrade"),
+        ({"engine_version": "9.0.3"}, {"engine_version": "9.0.1"}, "engine_downgrade"),
+        ({}, {"node_type": "cache.m7g.4xlarge"}, "node_type"),
+        ({"transit_encryption": False}, {"snapshot_retention_days": 14}, "tls"),
+        ({"shards": 2}, {"node_type": "cache.m7g.xlarge"}, "topology"),
+        ({"user_group_ids": ()}, {"snapshot_window": "02:00-03:00"}, "authentication"),
+        ({"effective_durability": "async"}, {"engine_version": "9.1"}, "durability"),
+        ({"automatic_minor_upgrade": True}, {"snapshot_retention_days": 3},
+         "automatic_minor_upgrade"),
+    ],
+)
+def test_a_live_difference_outside_the_allowlist_fails_apply_with_no_modify_call(
+    tmp_path, live, desired, code
+) -> None:
+    adapter = FakeValkey(observation(**live))
+
+    with pytest.raises(ResourceError, match=f"^aws_elasticache_modify_forbidden_{code}$"):
+        provision(adapter, tmp_path, **desired)
+
+    assert adapter.modify_calls == [] and load_observed(tmp_path, NAME) is None
+
+
+def test_a_group_outside_the_contract_with_nothing_to_change_is_reported_not_refused(
+    tmp_path,
+) -> None:
+    adapter = FakeValkey(observation(transit_encryption=False))
+
+    result = provision(adapter, tmp_path)
+
+    assert result["phase"] == "degraded" and result["issues"] == ["tls"]
+    assert adapter.modify_calls == []
+
+
+def test_a_group_that_is_already_modifying_is_left_alone_and_a_resume_sends_nothing(
+    tmp_path,
+) -> None:
+    adapter = FakeValkey(observation(), settle_polls=1000)
+
+    first = provision(adapter, tmp_path, engine_version="9.1")
+    second = provision(adapter, tmp_path, engine_version="9.1")
+
+    assert first["phase"] == second["phase"] == "pending"
+    assert first["modified_fields"] == ["EngineVersion"] and second["modified_fields"] == []
+    assert len(adapter.modify_calls) == 1
+    adapter.settle_polls = 0
+    third = provision(adapter, tmp_path, engine_version="9.1")
+    assert third["phase"] == "ready" and len(adapter.modify_calls) == 1
+
+
+def test_a_group_that_settles_within_the_poll_is_diffed_once_it_is_available(tmp_path) -> None:
+    adapter = FakeValkey(observation(status="modifying"), settle_polls=2)
+
+    result = provision(adapter, tmp_path, snapshot_retention_days=14)
+
+    assert adapter.modify_calls == [{"SnapshotRetentionLimit": 14}]
+    assert result["modified_fields"] == ["SnapshotRetentionLimit"]
+
+
+def test_a_modification_that_settles_during_the_poll_is_ready_and_recorded(tmp_path) -> None:
+    adapter = FakeValkey(observation(), settle_polls=3)
+
+    result = provision(adapter, tmp_path, node_type="cache.m7g.xlarge")
+
+    assert result["phase"] == "ready"
+    observed = load_observed(tmp_path, NAME)
+    assert observed is not None and observed["phase"] == "ready"
+
+
+def test_values_already_pending_count_as_applied(tmp_path) -> None:
+    adapter = FakeValkey(
+        observation(pending_engine_version="9.1", pending_node_type="cache.m7g.xlarge")
+    )
+
+    result = provision(adapter, tmp_path, engine_version="9.1", node_type="cache.m7g.xlarge")
+
+    assert adapter.modify_calls == [] and result["phase"] == "pending"
+
+
+def test_a_pending_downgrade_is_judged_against_the_pending_version(tmp_path) -> None:
+    adapter = FakeValkey(observation(pending_engine_version="9.2"))
+
+    with pytest.raises(ResourceError, match="engine_downgrade$"):
+        provision(adapter, tmp_path, engine_version="9.1")
+
+    assert adapter.modify_calls == []
+
+
+def test_an_overdue_service_update_degrades_and_does_not_block_a_change(tmp_path) -> None:
+    overdue = FakeValkey(observation(service_update_overdue=True))
+
+    result = provision(overdue, tmp_path)
+
+    assert result["phase"] == "degraded" and result["issues"] == ["service_update_overdue"]
+    assert overdue.modify_calls == []
+    fixing = FakeValkey(observation(service_update_overdue=True))
+    result = provision(fixing, tmp_path, engine_version="9.1")
+    assert fixing.modify_calls == [{"EngineVersion": "9.1"}]
+    assert result["issues"] == ["service_update_overdue"]
+
+
+def test_unobserved_fields_are_never_sent() -> None:
+    live = observation(
+        engine_version=None, snapshot_retention_days=None, snapshot_window=None,
+        maintenance_window=None,
+    )
+
+    assert modification_for(valkey(), live, GROUP_ID) == {}
+    assert group_drift(valkey(), live)["fields"] == {}
+
+
+def test_inspect_reports_secret_free_drift(tmp_path, monkeypatch) -> None:
+    live = observation(
+        node_type="cache.m7g.xlarge", engine_version="9.1", status="modifying",
+    )
+    use_state(tmp_path, monkeypatch, adapter=FakeValkey(live, settle_polls=1000))
+
+    result = server_module.inspect_resource(NAME)
+
+    assert result["drift"] == {
+        "fields": {
+            "engine_version": {"desired": "9.0", "live": "9.1"},
+            "node_type": {"desired": "cache.m7g.large", "live": "cache.m7g.xlarge"},
+        },
+        "modification_pending": True,
+    }
+    assert "cfg.example.cache.amazonaws.com" not in json.dumps(result)
+
+
+def test_a_matching_group_has_no_drift() -> None:
+    assert group_drift(valkey(), observation(engine_version="9.0.4")) == {
+        "fields": {}, "modification_pending": False,
+    }
+
+
+def test_the_apply_plan_names_the_disruption_and_the_refusals(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch)
+
+    effects = " ".join(cast(list[str], server_module.plan_apply_resource(NAME)["effects"]))
+
+    assert "may fail over the primary" in effects
+    assert "outside the modifications AWS allows" in effects
+    assert "overdue required service update" in effects
+
+
+# --- live options and registration ------------------------------------------------------
+
+
+def test_registration_rejects_a_node_type_the_account_cannot_use(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch, registered=False)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_node_type_unavailable$"):
+        server_module.register_resource(NAME, valkey(node_type="cache.m7g.4xlarge"))
+    assert NAME not in server_module.store.load().resources
+    server_module.register_resource(NAME, valkey(node_type="cache.m7g.xlarge"))
+
+
+def test_an_update_checks_the_node_type_only_when_it_changes(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey()
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    adapter.options = ValkeyOptions((), ())
+
+    server_module.plan_update_resource(NAME, valkey(snapshot_retention_days=10))
+    with pytest.raises(ResourceError, match="^aws_elasticache_node_type_unavailable$"):
+        server_module.plan_update_resource(NAME, valkey(node_type="cache.m7g.xlarge"))
+
+
+def test_the_live_options_resource_lists_versions_and_node_types(
+    tmp_path, monkeypatch
+) -> None:
+    use_state(tmp_path, monkeypatch)
+
+    assert server_module.valkey_options("primary") == {
+        "aws_network": "primary", "engine_versions": ["9.0", "9.1"],
+        "node_types": ["cache.m7g.large", "cache.m7g.xlarge"],
+    }
+    with pytest.raises(KeyError):
+        server_module.valkey_options("missing")
+
+
+# --- the boto adapter: updates and options ----------------------------------------------
+
+
+def test_describe_reads_pending_values_and_overdue_service_updates(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    expect_describe(
+        stub, stub,
+        actions=[
+            {"SlaMet": "yes", "UpdateActionStatus": "not-applied"},
+            {"SlaMet": "no", "UpdateActionStatus": "complete"},
+            {"SlaMet": "no", "UpdateActionStatus": "not-applied"},
+        ],
+        pending={"EngineVersion": "9.1", "CacheNodeType": "cache.m7g.xlarge"},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed == observation(
+        pending_engine_version="9.1", pending_node_type="cache.m7g.xlarge",
+        service_update_overdue=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "action", [{"SlaMet": "n/a", "UpdateActionStatus": "not-applied"},
+               {"SlaMet": "no", "UpdateActionStatus": "not-applicable"}],
+)
+def test_only_an_unfinished_action_past_its_apply_by_date_is_overdue(monkeypatch, action) -> None:
+    client, stub = stubbed("elasticache")
+    expect_describe(stub, stub, actions=[action])
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        assert adapter.describe_group(account, network, GROUP_ID).service_update_overdue is False
+
+
+def test_a_service_update_read_failure_is_bounded_and_fails_the_describe(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "describe_replication_groups", {"ReplicationGroups": [group_response()]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    stub.add_response("list_tags_for_resource", {"TagList": TAG}, {"ResourceName": ARN})
+    stub.add_client_error("describe_update_actions", "AccessDenied", service_message="arn:secret")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.describe_group(account, network, GROUP_ID)
+
+    assert str(raised.value) == "aws_elasticache_update_actions_access_denied"
+
+
+def test_modify_sends_only_the_given_fields_immediately_then_describes(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "modify_replication_group", {"ReplicationGroup": group_response(Status="modifying")},
+        {"ReplicationGroupId": GROUP_ID, "ApplyImmediately": True, "EngineVersion": "9.1",
+         "SnapshotRetentionLimit": 14},
+    )
+    expect_describe(stub, stub, Status="modifying")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.modify_group(
+            account, network, GROUP_ID, {"EngineVersion": "9.1", "SnapshotRetentionLimit": 14}
+        )
+
+    assert observed.status == "modifying"
+    stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, {"AutomaticFailoverEnabled": False}, {"EngineVersion": "9.1", "Engine": "redis"},
+     {"UserGroupIdsToRemove": ["x"]}, {"TransitEncryptionEnabled": False}],
+)
+def test_modify_refuses_any_field_outside_the_allowlist_before_calling_aws(
+    monkeypatch, changes
+) -> None:
+    client, stub = stubbed("elasticache")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError, match="^aws_elasticache_modify_field_forbidden$"):
+        adapter.modify_group(account, network, GROUP_ID, changes)
+
+
+def test_modify_failures_are_bounded(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error(
+        "modify_replication_group", "InvalidReplicationGroupState",
+        service_message=f"{ARN} is busy",
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.modify_group(account, network, GROUP_ID, {"EngineVersion": "9.1"})
+
+    assert str(raised.value) == "aws_elasticache_modify_invalid_state"
+
+
+def test_allowed_node_types_join_scale_up_and_scale_down(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "list_allowed_node_type_modifications",
+        {"ScaleUpModifications": ["cache.m7g.xlarge"],
+         "ScaleDownModifications": ["cache.t4g.small"]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        allowed = adapter.allowed_node_types(account, network, GROUP_ID)
+
+    assert allowed == {"cache.m7g.xlarge", "cache.t4g.small"}
+
+
+def test_live_options_page_through_versions_and_offerings(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "describe_cache_engine_versions",
+        {"Marker": "next", "CacheEngineVersions": [
+            {"Engine": "valkey", "EngineVersion": "8.0"},
+            {"Engine": "valkey", "EngineVersion": "9.1"},
+        ]},
+        {"Engine": "valkey"},
+    )
+    stub.add_response(
+        "describe_cache_engine_versions",
+        {"CacheEngineVersions": [
+            {"Engine": "valkey", "EngineVersion": "9.0"},
+            {"Engine": "valkey", "EngineVersion": "10.0"},
+            {"Engine": "valkey", "EngineVersion": "9.0"},
+        ]},
+        {"Engine": "valkey", "Marker": "next"},
+    )
+    stub.add_response(
+        "describe_reserved_cache_nodes_offerings",
+        {"Marker": "more", "ReservedCacheNodesOfferings": [
+            {"CacheNodeType": "cache.m7g.xlarge"}, {"CacheNodeType": "cache.m7g.large"},
+        ]},
+        {},
+    )
+    stub.add_response(
+        "describe_reserved_cache_nodes_offerings",
+        {"ReservedCacheNodesOfferings": [
+            {"CacheNodeType": "cache.m7g.large"}, {"CacheNodeType": "not-a-cache-type"},
+        ]},
+        {"Marker": "more"},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        options = adapter.live_options(account, network)
+
+    assert options == ValkeyOptions(
+        ("9.0", "9.1", "10.0"), ("cache.m7g.large", "cache.m7g.xlarge")
+    )
+    stub.assert_no_pending_responses()
+
+
+def test_live_options_failures_are_bounded(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error("describe_cache_engine_versions", "AccessDenied")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError, match="^aws_elasticache_options_access_denied$"):
+        adapter.live_options(account, network)

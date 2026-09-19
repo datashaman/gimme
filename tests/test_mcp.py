@@ -276,6 +276,7 @@ async def test_hard_v4_tool_surface() -> None:
         "gimme://provider-accounts/{name}",
         "gimme://secret-stores/{name}",
         "gimme://backup-destinations/{name}",
+        "gimme://aws-networks/{name}/valkey-options",
     }
     assert all(tool.annotations is not None for tool in tools)
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
