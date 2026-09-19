@@ -567,14 +567,24 @@ def test_no_valkey_probe_runs_without_a_managed_binding() -> None:
 
 def test_valkey_probe_reads_only_fixed_paths_and_reports_the_current_release_stays_live() -> None:
     recipe = (ROOT / "deploy.php").read_text()
-    task = recipe.split("task('gimme:probe:valkey'", 1)[1].split(
+    task = recipe.split("function run_valkey_probe", 1)[1].split(
         "if ($health !== []) {", 1
     )[0]
 
     assert "get('deploy_path') . '/shared/.env'" in task
-    assert "'{{release_path}}/composer.lock'" in task
+    assert "run_valkey_probe('{{release_path}}/composer.lock')" in task
     assert "the current release stays live" in task
     assert "ssl" not in task and "cafile" not in task.lower()
+
+
+def test_current_release_probe_reads_only_the_live_lock_and_skips_a_never_deployed_one() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:probe:valkey:current'", 1)[1].split("});", 1)[0]
+
+    assert "get('deploy_path') . '/current/composer.lock'" in task
+    assert "valkey_probe=skipped_no_release" in task
+    assert "run_valkey_probe($lock)" in task
+    assert "release_path" not in task
 
 
 def test_horizon_prefix_follows_a_managed_valkey_contract_only() -> None:

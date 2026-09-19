@@ -1,4 +1,5 @@
 import dataclasses
+import datetime
 import json
 import re
 import stat
@@ -17,10 +18,10 @@ from gimme.control import (
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
     ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, LARAVEL_COMMANDS,
-    MODIFIABLE_FIELDS, ValkeyOptions, apply_binding, apply_destroy, apply_provision,
-    derive_binding_user_id,
-    derive_group_id, derive_user_group_id, group_drift, laravel_access_string, load_observed,
-    modification_for, namespace_prefixes, structural_issues,
+    MODIFIABLE_FIELDS, SnapshotInfo, ValkeyOptions, apply_binding, apply_destroy, apply_provision,
+    binding_username, derive_binding_user_id, derive_group_id, derive_user_group_id, group_drift,
+    laravel_access_string, load_observed, modification_for, namespace_prefixes,
+    structural_issues,
 )
 from gimme.config import HorizonWorkerConfig
 from gimme.deployer import CommandResult
@@ -29,6 +30,7 @@ from gimme.valkey_contract import (
     contract_variables, credential_references, probe_names,
 )
 import gimme.resources_valkey as resources_valkey_module
+import gimme.valkey_recovery as valkey_recovery_module
 import gimme.server as server_module
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config/state.example.json"
@@ -94,6 +96,13 @@ class FakeValkey:
         self.delete_calls: list[str] = []
         self.dependents_calls: list[tuple[str, list[str]]] = []
         self.dependents_error: ResourceError | None = None
+        self.snapshots: list[SnapshotInfo] = []
+        self.create_args: list[dict[str, object]] = []
+        # deployment -> credential versions, oldest first; the last one is current
+        self.credentials: dict[str, list[str]] = {}
+        self.removed_users: list[str] = []
+        self.remove_error: ResourceError | None = None
+        self.begin_error: ResourceError | None = None
         self._polls = 0
 
     def describe_group(self, account, network, group_id):
@@ -126,15 +135,52 @@ class FakeValkey:
 
     def ensure_binding(
         self, account, network, store, store_name, resource_name, group_id, deployment_name,
-        keep_credential,
+        keep_credential, generation=1,
     ):
         self.binding_calls.append((deployment_name, keep_credential))
-        user_id = derive_binding_user_id(group_id, deployment_name)
+        user_id = derive_binding_user_id(group_id, deployment_name, generation)
         if user_id in self.users and keep_credential:
             return None
         self.users.add(user_id)
+        self.credentials.setdefault(deployment_name, []).append(
+            binding_username(deployment_name, generation)
+        )
         arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{user_id}"
         return user_id, arn, "v" * 32
+
+    def list_snapshots(self, account, network, group_id):
+        return list(self.snapshots)
+
+    def _version(self, deployment_name):
+        return f"{len(self.credentials[deployment_name]):032d}"
+
+    def begin_rotation(
+        self, account, network, store, store_name, resource_name, group_id, deployment_name,
+        generation,
+    ):
+        if self.begin_error is not None:
+            raise self.begin_error
+        user_id = derive_binding_user_id(group_id, deployment_name, generation)
+        self.users.add(user_id)
+        self.credentials[deployment_name].append(binding_username(deployment_name, generation))
+        arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{deployment_name}"
+        return user_id, arn, self._version(deployment_name)
+
+    def restore_credential(self, account, store, resource_name, deployment_name, expected_username):
+        versions = self.credentials[deployment_name]
+        if versions[-1] != expected_username:
+            if len(versions) < 2 or versions[-2] != expected_username:
+                raise ResourceError("aws_elasticache_rotate_previous_credential_missing")
+            versions.append(expected_username)
+        arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{deployment_name}"
+        return arn, self._version(deployment_name)
+
+    def remove_user(self, account, network, resource_name, user_id):
+        assert account.destructive_role_arn is not None
+        self.removed_users.append(user_id)
+        if self.remove_error is not None:
+            raise self.remove_error
+        self.users.discard(user_id)
 
     def delete_group(self, account, network, group_id, final_snapshot):
         assert self.live is not None and account.destructive_role_arn is not None
@@ -148,7 +194,11 @@ class FakeValkey:
         if self.dependents_error is not None:
             raise self.dependents_error
 
-    def create_group(self, account, network, resource, name, group_id, store, store_name):
+    def create_group(
+        self, account, network, resource, name, group_id, store, store_name,
+        snapshot_name=None, restore_users=None,
+    ):
+        self.create_args.append({"snapshot_name": snapshot_name, "restore_users": restore_users})
         self.create_calls += 1
         self._polls = 0
         self.live = observation(status="creating" if self.settle_polls else "available")
@@ -1956,6 +2006,9 @@ class FakeSecrets:
     def describe(self, account, store_name, store, secret) -> SecretMetadata:
         return SecretMetadata(version_id="v1", identity=f"arn:{secret}")
 
+    def resolve(self, account, store_name, store, secret, version_id) -> str:
+        return json.dumps({"username": "gimme-u", "password": PASSWORD})
+
 
 def without_local_secrets(monkeypatch) -> None:
     """The example's own sops secret is not on disk; only the contract's are under test."""
@@ -2725,3 +2778,1023 @@ def test_a_corrupt_tombstone_can_still_be_forgotten(tmp_path, monkeypatch) -> No
     server_module.apply_forget_resource(NAME, str(plan["plan_id"]), f"FORGET {NAME}")
 
     assert not tombstone.exists()
+
+
+# --- recovery: restore, recreate empty, rotate ------------------------------------------
+
+SNAPSHOT = "gimme-final-0001"
+
+
+def marker_file(kind: str) -> Path:
+    return server_module.store.root / f"{kind}-resources" / f"{NAME}.json"
+
+
+def a_snapshot(**updates) -> SnapshotInfo:
+    values: dict[str, object] = dict(
+        name=SNAPSHOT, source="manual", status="available",
+        created="2026-09-01T00:00:00+00:00", engine_version="9.0", shards=1,
+    )
+    values.update(updates)
+    return SnapshotInfo(**values)  # type: ignore[arg-type]
+
+
+def lost(tmp_path, monkeypatch, instant) -> tuple[FakeValkey, list[dict[str, object]]]:
+    """A bound, ready Resource whose replication group has since vanished from AWS."""
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    adapter.live = None
+    adapter.snapshots = [a_snapshot()]
+    monkeypatch.setattr(valkey_recovery_module, "POLL_INTERVAL_SECONDS", 0)
+    return adapter, capture_runs(monkeypatch)
+
+
+def restore(snapshot: str = SNAPSHOT) -> dict[str, object]:
+    plan = server_module.plan_restore_resource(NAME, snapshot)
+    return server_module.apply_restore_resource(NAME, snapshot, str(plan["plan_id"]))
+
+
+def recreate_empty(confirmation: str = f"RECREATE EMPTY RESOURCE {NAME}") -> dict[str, object]:
+    plan = server_module.plan_recreate_empty_resource(NAME)
+    return server_module.apply_recreate_empty_resource(NAME, str(plan["plan_id"]), confirmation)
+
+
+def tasks(calls: list[dict[str, object]]) -> list[object]:
+    return [call["task"] for call in calls]
+
+
+def test_a_vanished_group_is_never_silently_recreated_empty(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    plan = server_module.plan_apply_resource(NAME)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_group_missing_replace_explicitly$"):
+        server_module.apply_resource(NAME, str(plan["plan_id"]))
+
+    assert adapter.create_calls == 0, "nothing recreated the vanished group"
+
+
+def test_a_restore_plan_is_local_and_the_same_before_during_and_after(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 0)
+    describes = adapter.describe_calls
+    plan = server_module.plan_restore_resource(NAME, SNAPSHOT)
+
+    assert adapter.describe_calls == describes, "planning reads nothing from AWS"
+    assert plan["kind"] == "resource_restore" and plan["snapshot"] == SNAPSHOT
+    assert plan["deployments"] == [DEPLOYMENT] and "confirmation" not in plan
+    assert "password" not in json.dumps(plan).lower()
+
+    assert server_module.apply_restore_resource(NAME, SNAPSHOT, str(plan["plan_id"]))["phase"] == (
+        "restoring"
+    )
+    assert server_module.plan_restore_resource(NAME, SNAPSHOT)["plan_id"] == plan["plan_id"]
+
+
+def test_a_restore_recreates_from_the_snapshot_keeping_every_credential_then_verifies(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    before = load_observed(server_module.store.root, NAME)
+    assert before is not None
+    allocation = cast(dict[str, dict[str, object]], before["allocations"])[DEPLOYMENT]
+
+    result = restore()
+
+    assert adapter.create_args[-1] == {
+        "snapshot_name": SNAPSHOT,
+        "restore_users": {DEPLOYMENT: (allocation["user_id"], 1)},
+    }
+    assert result["restored"] is True and result["phase"] == "ready"
+    assert result["verified"] == [DEPLOYMENT] and result["snapshot"] == SNAPSHOT
+    # the Deployment is pointed at the new group, proven against the live release, and restarted
+    assert tasks(calls)[-3:] == [
+        "gimme:provision:app", "gimme:probe:valkey:current", "gimme:restart:workers",
+    ]
+    assert not marker_file("restoring").exists()
+    after = load_observed(server_module.store.root, NAME)
+    assert after is not None and after["phase"] == "ready"
+    assert after["allocations"] == before["allocations"], "no credential was rotated"
+    assert adapter.binding_calls == [(DEPLOYMENT, False)], "restore never re-binds"
+    assert "password" not in json.dumps(result).lower()
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "code"),
+    [
+        (a_snapshot(name="other"), "aws_elasticache_restore_snapshot_missing"),
+        (a_snapshot(status="creating"), "aws_elasticache_restore_snapshot_unavailable"),
+        (a_snapshot(engine_version="9.1"), "aws_elasticache_restore_engine_older"),
+    ],
+)
+def test_a_restore_refuses_an_unusable_snapshot_before_creating_anything(
+    tmp_path, monkeypatch, instant, snapshot, code
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    adapter.snapshots = [snapshot]
+
+    with pytest.raises(ResourceError, match=f"^{code}$"):
+        restore()
+
+    assert adapter.create_calls == 0 and not marker_file("restoring").exists()
+
+
+def test_a_restore_never_replaces_a_group_that_exists(tmp_path, monkeypatch, instant) -> None:
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    adapter.snapshots = [a_snapshot()]
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_group_exists$"):
+        restore()
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_group_exists$"):
+        recreate_empty()
+
+    assert adapter.create_calls == 0
+
+
+def test_a_restoring_resource_refuses_every_other_operation_and_says_so(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 0)
+
+    first = restore()
+
+    assert first["restored"] is False and first["phase"] == "restoring"
+    assert first["pending"] == [DEPLOYMENT] and tasks(calls) == [], "nothing is verified early"
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["phase"] == "restoring" and inspected["operation"] == "restoring"
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_in_progress$"):
+        server_module.apply_resource(
+            NAME, str(server_module.plan_apply_resource(NAME)["plan_id"])
+        )
+    with pytest.raises(ValueError, match="managed resource is not ready"):
+        bind()
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_in_progress$"):
+        resources_valkey_module.apply_binding(
+            adapter, server_module.store.root, *destroy_context(), DEPLOYMENT, ["cache"]
+        )
+    assert server_module.plan_deployment_resources(DEPLOYMENT)["readiness_issues"] == [
+        "valkey_resource_not_ready"
+    ], "a Deployment is not handed a half-restored Resource"
+
+
+def test_a_pending_restore_resumes_without_creating_again(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 0)
+    restore()
+
+    adapter.settle_polls = 1
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 30)
+    second = restore()
+
+    assert second["restored"] is True and adapter.create_calls == 1
+    assert tasks(calls)[-1] == "gimme:restart:workers"
+
+
+def test_a_failed_verification_keeps_the_resource_restoring_and_a_repeat_finishes(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    real = server_module.runner.run
+
+    def failing(task, *args, **kwargs):
+        if task == "gimme:probe:valkey:current":
+            raise RuntimeError("Valkey activation probe failed: authentication")
+        return real(task, *args, **kwargs)
+
+    monkeypatch.setattr(server_module.runner, "run", failing)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_verification_failed$"):
+        restore()
+
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None and observed["phase"] == "restoring"
+    assert marker_file("restoring").is_file()
+
+    monkeypatch.setattr(server_module.runner, "run", real)
+    assert restore()["restored"] is True
+    assert adapter.create_calls == 1, "the repeat verified; it did not create again"
+    assert not marker_file("restoring").exists()
+
+
+def test_deployments_already_verified_are_not_verified_again_on_resume(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    root = server_module.store.root
+    observed = load_observed(root, NAME)
+    assert observed is not None
+    allocations = cast(dict[str, dict[str, object]], observed["allocations"])
+    allocations["aaa-first"] = {**allocations[DEPLOYMENT], "user_id": "gimme-u-other"}
+    (root / "observed-resources" / f"{NAME}.json").write_text(json.dumps(observed))
+    state = server_module.store.load()
+    seen: list[str] = []
+
+    def verify(deployment: str) -> None:
+        seen.append(deployment)
+        if deployment == DEPLOYMENT and seen.count(DEPLOYMENT) == 1:
+            raise RuntimeError("first attempt fails")
+
+    def call() -> dict[str, object]:
+        network = state.aws_networks["primary"]
+        return valkey_recovery_module.apply_restore(
+            adapter, root, state.provider_accounts[network.provider_account], network,
+            cast(AWSElastiCacheValkeyResource, state.resources[NAME]),
+            NAME, cast(AWSSecretsManagerStore, state.secret_stores["workload-secrets"]),
+            "workload-secrets", SNAPSHOT, verify,
+        )
+
+    with pytest.raises(ResourceError, match="verification_failed"):
+        call()
+    assert call()["restored"] is True
+
+    assert seen == ["aaa-first", DEPLOYMENT, DEPLOYMENT]
+
+
+def test_a_resumed_restore_must_name_the_snapshot_it_started_with(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 0)
+    restore()
+    adapter.snapshots.append(a_snapshot(name="another"))
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_snapshot_mismatch$"):
+        restore("another")
+
+
+def test_a_group_that_fails_to_create_ends_the_restore_and_frees_the_resource(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    real_create = adapter.create_group
+
+    def failing_group(*args, **kwargs):
+        real_create(*args, **kwargs)
+        adapter.live = dataclasses.replace(cast(GroupObservation, adapter.live),
+                                           status="create-failed")
+        return adapter.live
+
+    monkeypatch.setattr(adapter, "create_group", failing_group)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_restore_create_failed$"):
+        restore()
+
+    assert not marker_file("restoring").exists()
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None and observed["phase"] == "failed"
+
+
+def test_recreating_empty_needs_the_exact_confirmation_and_creates_no_snapshot_group(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, calls = lost(tmp_path, monkeypatch, instant)
+    plan = server_module.plan_recreate_empty_resource(NAME)
+    assert plan["kind"] == "resource_recreate_empty" and plan["irreversible"] is True
+
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        recreate_empty("yes")
+    assert adapter.create_calls == 0
+
+    result = recreate_empty()
+
+    assert adapter.create_args[-1]["snapshot_name"] is None
+    assert adapter.create_args[-1]["restore_users"] and result["restored"] is True
+    assert tasks(calls)[-1] == "gimme:restart:workers"
+
+
+def test_recreating_empty_needs_a_resource_that_was_once_observed(
+    tmp_path, monkeypatch
+) -> None:
+    use_bound(tmp_path, monkeypatch)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_recreate_not_needed$"):
+        server_module.plan_recreate_empty_resource(NAME)
+
+
+def test_a_restore_after_destroy_recreates_from_the_final_snapshot_with_fresh_bindings(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    adapter.snapshots = [a_snapshot()]
+    monkeypatch.setattr(valkey_recovery_module, "POLL_INTERVAL_SECONDS", 0)
+    destroy()
+    adapter.live = None
+    document = json.loads(EXAMPLE.read_text())
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={"resources": {
+        **state.resources,
+        NAME: AWSElastiCacheValkeyResource.model_validate(document["resources"][NAME]),
+    }}))
+
+    result = restore()
+
+    assert result["restored"] is True and result["verified"] == []
+    assert adapter.create_args[-1] == {"snapshot_name": SNAPSHOT, "restore_users": {}}
+
+
+def test_snapshots_are_listed_by_name_and_status_only(tmp_path, monkeypatch, instant) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+
+    result = server_module.list_resource_snapshots(NAME)
+
+    assert result == {"resource": NAME, "snapshots": [{
+        "name": SNAPSHOT, "source": "manual", "status": "available",
+        "created": "2026-09-01T00:00:00+00:00", "engine_version": "9.0", "shards": 1,
+    }]}
+
+
+def test_a_retained_resource_clears_a_half_finished_restore(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(valkey_recovery_module, "POLL_BUDGET_SECONDS", 0)
+    restore()
+    assert marker_file("restoring").is_file()
+
+    resources_valkey_module.retain_group(server_module.store.root, NAME, "primary")
+
+    assert not marker_file("restoring").exists()
+
+
+# rotation
+
+
+def destroy_context():
+    state = server_module.store.load()
+    resource = cast(AWSElastiCacheValkeyResource, state.resources[NAME])
+    network = state.aws_networks[resource.aws_network]
+    return (
+        state.provider_accounts[network.provider_account], network, resource, NAME,
+        cast(AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]),
+        resource.workload_secret_store,
+    )
+
+
+def rotatable(tmp_path, monkeypatch) -> tuple[FakeValkey, list[dict[str, object]]]:
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["provider_accounts"]["main"]["destructive_role_arn"] = DESTROYER
+    server_module.store.save(ControlState.model_validate(document))
+    return adapter, capture_runs(monkeypatch)
+
+
+def rotate() -> dict[str, object]:
+    plan = server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)
+    return server_module.apply_rotate_resource_credential(NAME, DEPLOYMENT, str(plan["plan_id"]))
+
+
+def allocation() -> dict[str, object]:
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None
+    return cast(dict[str, dict[str, object]], observed["allocations"])[DEPLOYMENT]
+
+
+def test_rotation_needs_the_destructive_role_and_a_bound_deployment(
+    tmp_path, monkeypatch
+) -> None:
+    bound_and_ready(tmp_path, monkeypatch)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)
+
+    rotatable(tmp_path, monkeypatch)
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_binding_missing$"):
+        server_module.plan_rotate_resource_credential(NAME, "nobody")
+    plan = server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)
+    assert plan["kind"] == "resource_credential_rotate" and plan["deployment"] == DEPLOYMENT
+    assert "password" not in json.dumps(plan).lower()
+
+
+def test_a_rotation_swaps_users_after_a_probed_switch_and_deletes_the_old_one_last(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, calls = rotatable(tmp_path, monkeypatch)
+    old = allocation()
+    old_user = str(old["user_id"])
+
+    result = rotate()
+
+    new = allocation()
+    assert result["rotated"] is True and result["generation"] == 2
+    assert new["generation"] == 2 and new["user_id"] == derive_binding_user_id(
+        GROUP_ID, DEPLOYMENT, 2
+    ) and new["user_id"] != old_user
+    assert adapter.credentials[DEPLOYMENT] == [
+        binding_username(DEPLOYMENT), binding_username(DEPLOYMENT, 2)
+    ]
+    assert adapter.removed_users == [old_user] and old_user not in adapter.users
+    assert tasks(calls)[-3:] == [
+        "gimme:provision:app", "gimme:probe:valkey:current", "gimme:restart:workers",
+    ]
+    assert not marker_file("rotating").exists()
+    text = json.dumps(result).lower()
+    assert "password" not in text and old_user not in text
+
+
+def test_a_failed_switch_restores_the_previous_credential_and_deletes_the_candidate(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    old = allocation()
+    real = server_module.runner.run
+    probes: list[str] = []
+
+    def failing(task, *args, **kwargs):
+        if task == "gimme:probe:valkey:current":
+            probes.append(task)
+            if len(probes) == 1:
+                raise RuntimeError("authentication failed")
+        return real(task, *args, **kwargs)
+
+    monkeypatch.setattr(server_module.runner, "run", failing)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_switch_failed$"):
+        rotate()
+
+    candidate = derive_binding_user_id(GROUP_ID, DEPLOYMENT, 2)
+    assert adapter.removed_users == [candidate]
+    assert adapter.credentials[DEPLOYMENT][-1] == binding_username(DEPLOYMENT)
+    restored = allocation()
+    assert restored["user_id"] == old["user_id"] and "generation" not in restored
+    assert restored["secret_version_id"] != old["secret_version_id"], (
+        "the restored credential is a new secret version"
+    )
+    assert len(probes) == 2, "the restored credential is proven against the release again"
+    assert not marker_file("rotating").exists()
+
+
+def test_a_rollback_that_cannot_finish_keeps_the_marker_and_a_repeat_completes_it(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    real = server_module.runner.run
+    monkeypatch.setattr(server_module.runner, "run", lambda task, *a, **k: (
+        (_ for _ in ()).throw(RuntimeError("down")) if task == "gimme:probe:valkey:current"
+        else real(task, *a, **k)
+    ))
+    adapter.remove_error = ResourceError("aws_elasticache_rotate_delete_access_denied")
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_rollback_failed$"):
+        rotate()
+
+    assert marker_file("rotating").is_file()
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_in_progress$"):
+        server_module.apply_resource(
+            NAME, str(server_module.plan_apply_resource(NAME)["plan_id"])
+        )
+
+    adapter.remove_error = None
+    monkeypatch.setattr(server_module.runner, "run", real)
+    repeat = rotate()
+
+    assert repeat["rotated"] is False and repeat["resumed"] is True
+    assert not marker_file("rotating").exists()
+    assert derive_binding_user_id(GROUP_ID, DEPLOYMENT, 2) not in adapter.users
+    assert adapter.credentials[DEPLOYMENT][-1] == binding_username(DEPLOYMENT)
+
+
+def test_a_failed_cleanup_keeps_the_new_credential_and_a_repeat_deletes_the_old_user(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    old_user = str(allocation()["user_id"])
+    adapter.remove_error = ResourceError("aws_elasticache_rotate_delete_unavailable")
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_delete_unavailable$"):
+        rotate()
+
+    assert allocation()["generation"] == 2, "the switch had succeeded, so it is recorded"
+    assert json.loads(marker_file("rotating").read_text())["phase"] == "cleanup"
+    adapter.remove_error = None
+    adapter.removed_users.clear()
+
+    repeat = rotate()
+
+    assert repeat["rotated"] is True and repeat["resumed"] is True
+    assert adapter.removed_users == [old_user] and not marker_file("rotating").exists()
+
+
+def test_a_leftover_candidate_user_is_neither_adopted_nor_deleted(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    adapter.begin_error = ResourceError("aws_elasticache_rotate_candidate_exists")
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_candidate_exists$"):
+        rotate()
+
+    assert adapter.removed_users == [] and not marker_file("rotating").exists()
+
+
+def test_another_deployments_unfinished_rotation_blocks_this_one(
+    tmp_path, monkeypatch
+) -> None:
+    _adapter, _calls = rotatable(tmp_path, monkeypatch)
+    resources_valkey_module.write_marker(
+        server_module.store.root, "rotating", NAME,
+        {"schema_version": 1, "resource": NAME, "deployment": "someone-else",
+         "phase": "switching"},
+    )
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_in_progress$"):
+        rotate()
+
+
+def test_rotation_needs_a_ready_group_and_starts_nothing_otherwise(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    adapter.settle_polls = 1000
+    adapter.live = dataclasses.replace(cast(GroupObservation, adapter.live), status="modifying")
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_resource_not_ready$"):
+        rotate()
+
+    assert not marker_file("rotating").exists() and adapter.removed_users == []
+
+
+def test_a_rotated_credential_survives_a_rebind_and_is_what_a_restore_recreates(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = rotatable(tmp_path, monkeypatch)
+    rotate()
+    monkeypatch.setattr(valkey_recovery_module, "POLL_INTERVAL_SECONDS", 0)
+
+    bind()
+    assert adapter.binding_calls[-1] == (DEPLOYMENT, True), "a rebind keeps the credential"
+    assert allocation()["generation"] == 2
+
+    adapter.live = None
+    adapter.snapshots = [a_snapshot()]
+    restore()
+
+    assert adapter.create_args[-1]["restore_users"] == {
+        DEPLOYMENT: (derive_binding_user_id(GROUP_ID, DEPLOYMENT, 2), 2)
+    }
+
+
+def test_the_recovery_tools_are_journaled_and_never_run_on_a_stale_plan(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_restore_resource(NAME, SNAPSHOT, "plan_" + "0" * 20)
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_restore_resource(
+            NAME, "another-snapshot",
+            str(server_module.plan_restore_resource(NAME, SNAPSHOT)["plan_id"]),
+        )
+
+    assert adapter.create_calls == 0
+
+
+# --- recovery adapter calls -------------------------------------------------------------
+
+USER_ID = derive_binding_user_id(GROUP_ID, "example-local", 1)
+SECRET_ARN = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:example"
+SECRET_ID = f"gimme/workload/{NAME}/example-local"
+
+
+def credential(username: str = "gimme-example-local", password: str = "old-" + "q" * 40):
+    return {"SecretString": json.dumps({"username": username, "password": password})}
+
+
+def test_a_snapshot_restore_sends_the_snapshot_omits_the_shard_count_and_never_writes_a_secret(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    subnet, params = f"{GROUP_ID}-subnets", f"{GROUP_ID}-params"
+    users = derive_user_group_id(GROUP_ID)
+    default_id, admin_id = f"{GROUP_ID}-default", f"{GROUP_ID}-admin"
+    stub.add_response(
+        "create_cache_subnet_group", {},
+        {"CacheSubnetGroupName": subnet,
+         "CacheSubnetGroupDescription": f"Gimme-managed subnet group for {NAME}",
+         "SubnetIds": ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"], "Tags": TAG},
+    )
+    stub.add_response(
+        "create_cache_parameter_group", {},
+        {"CacheParameterGroupName": params, "CacheParameterGroupFamily": "valkey9",
+         "Description": f"Gimme-managed parameter group for {NAME}", "Tags": TAG},
+    )
+    stub.add_response(
+        "modify_cache_parameter_group", {"CacheParameterGroupName": params},
+        {"CacheParameterGroupName": params, "ParameterNameValues": [
+            {"ParameterName": "cluster-enabled", "ParameterValue": "yes"},
+            {"ParameterName": "maxmemory-policy", "ParameterValue": "noeviction"},
+        ]},
+    )
+    stub.add_response(
+        "create_user", {},
+        {"UserId": default_id, "UserName": "default", "Engine": "valkey",
+         "AccessString": "off ~* -@all", "NoPasswordRequired": True, "Tags": TAG},
+    )
+    stub.add_response("describe_users", {"Users": [{"UserId": admin_id}]}, {"UserId": admin_id})
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": USER_ID})
+    secrets_stub.add_response(
+        "get_secret_value", credential(),
+        {"SecretId": SECRET_ID, "VersionStage": "AWSCURRENT"},
+    )
+    stub.add_response(
+        "create_user", {},
+        {"UserId": USER_ID, "UserName": "gimme-example-local", "Engine": "valkey",
+         "AccessString": laravel_access_string("example-local"),
+         "Passwords": ["old-" + "q" * 40],
+         "Tags": [*TAG, {"Key": "gimme:deployment", "Value": "example-local"}]},
+    )
+    stub.add_response(
+        "create_user_group", {},
+        {"UserGroupId": users, "Engine": "valkey", "UserIds": [default_id, admin_id],
+         "Tags": TAG},
+    )
+    stub.add_response(
+        "describe_user_groups", {"UserGroups": [{"UserIds": [default_id, admin_id]}]},
+        {"UserGroupId": users},
+    )
+    stub.add_response(
+        "modify_user_group", {}, {"UserGroupId": users, "UserIdsToAdd": [USER_ID]},
+    )
+    stub.add_response(
+        "create_replication_group", {},
+        {
+            "ReplicationGroupId": GROUP_ID,
+            "ReplicationGroupDescription": f"Gimme-managed Valkey for {NAME}",
+            "Engine": "valkey", "EngineVersion": "9.0", "CacheNodeType": "cache.m7g.large",
+            "CacheParameterGroupName": params, "CacheSubnetGroupName": subnet,
+            "SecurityGroupIds": ["sg-0123456789abcdef2"], "ClusterMode": "enabled",
+            "ReplicasPerNodeGroup": 1, "SnapshotName": SNAPSHOT,
+            "AutomaticFailoverEnabled": True,
+            "MultiAZEnabled": True, "TransitEncryptionEnabled": True,
+            "TransitEncryptionMode": "required", "AtRestEncryptionEnabled": True,
+            "UserGroupIds": [users], "Durability": "sync", "AutoMinorVersionUpgrade": False,
+            "SnapshotRetentionLimit": 7, "SnapshotWindow": "03:00-04:00",
+            "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
+        },
+    )
+    expect_describe(stub, None, Status="creating")
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub:
+        observed = adapter.create_group(
+            account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets",
+            snapshot_name=SNAPSHOT, restore_users={"example-local": (USER_ID, 1)},
+        )
+
+    assert observed.status == "creating"
+    stub.assert_no_pending_responses()
+    secrets_stub.assert_no_pending_responses()  # only the one read; a restore writes nothing
+
+
+def test_a_restored_user_whose_stored_username_is_another_generation_is_refused(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    stub.add_response(
+        "create_user", {}, {"UserId": f"{GROUP_ID}-default", "UserName": "default",
+                            "Engine": "valkey", "AccessString": "off ~* -@all",
+                            "NoPasswordRequired": True, "Tags": TAG},
+    )
+    stub.add_response(
+        "describe_users", {"Users": [{"UserId": f"{GROUP_ID}-admin"}]},
+        {"UserId": f"{GROUP_ID}-admin"},
+    )
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": USER_ID})
+    secrets_stub.add_response(
+        "get_secret_value", credential("gimme-example-local-g2"),
+        {"SecretId": SECRET_ID, "VersionStage": "AWSCURRENT"},
+    )
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, _network, store = context()
+
+    with stub, secrets_stub, pytest.raises(ResourceError) as raised:
+        adapter.restore_authentication(
+            account, client, store, NAME, GROUP_ID, {"example-local": (USER_ID, 1)}
+        )
+
+    assert str(raised.value) == "aws_elasticache_restore_credential_mismatch"
+    assert "q" * 10 not in repr(raised.value)
+
+
+def snapshot_page(names: list[str], marker: str | None = None, **updates):
+    return {
+        "Snapshots": [{
+            "SnapshotName": name, "ReplicationGroupId": GROUP_ID, "SnapshotStatus": "available",
+            "SnapshotSource": "manual", "EngineVersion": "9.0", "NumNodeGroups": 1,
+            "NodeSnapshots": [{"SnapshotCreateTime": datetime.datetime(
+                2026, 9, int(name[-2:]), tzinfo=datetime.timezone.utc)}],
+            **updates,
+        } for name in names],
+        **({"Marker": marker} if marker else {}),
+    }
+
+
+def test_snapshots_are_paged_filtered_to_this_group_and_listed_newest_first(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response(
+        "describe_snapshots", snapshot_page(["snap-01", "snap-03"], marker="m2"),
+        {"ReplicationGroupId": GROUP_ID, "MaxRecords": 50},
+    )
+    other = snapshot_page(["snap-09"], ReplicationGroupId="somebody-else")
+    other["Snapshots"] += snapshot_page(["snap-02"])["Snapshots"]
+    stub.add_response(
+        "describe_snapshots", other,
+        {"ReplicationGroupId": GROUP_ID, "MaxRecords": 50, "Marker": "m2"},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        found = adapter.list_snapshots(account, network, GROUP_ID)
+
+    assert [item.name for item in found] == ["snap-03", "snap-02", "snap-01"]
+    assert found[0].created == "2026-09-03T00:00:00+00:00" and found[0].shards == 1
+
+
+def test_snapshot_paging_is_bounded(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    for index in range(4):
+        stub.add_response(
+            "describe_snapshots", snapshot_page([f"snap-0{index + 1}"], marker="more"),
+            {"ReplicationGroupId": GROUP_ID, "MaxRecords": 50,
+             **({"Marker": "more"} if index else {})},
+        )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        found = adapter.list_snapshots(account, network, GROUP_ID)
+
+    assert len(found) == 4
+    stub.assert_no_pending_responses()
+
+
+def test_snapshot_listing_failures_are_bounded_codes(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error("describe_snapshots", "AccessDenied", "arn:aws:iam::1:role/secret")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.list_snapshots(account, network, GROUP_ID)
+
+    assert str(raised.value) == "aws_elasticache_snapshots_access_denied"
+
+
+CANDIDATE = derive_binding_user_id(GROUP_ID, "example-local", 2)
+
+
+def test_a_rotation_creates_the_user_and_joins_the_group_before_the_secret_points_at_it(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    calls: list[str] = []
+    for label, service in (("elasticache", client), ("secrets", secrets_client)):
+        service.meta.events.register(
+            "before-call.*.*", lambda model, label=label, **kw: calls.append(model.name)
+        )
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": CANDIDATE})
+    stub.add_response(
+        "create_user", {},
+        {"UserId": CANDIDATE, "UserName": "gimme-example-local-g2", "Engine": "valkey",
+         "AccessString": laravel_access_string("example-local"), "Passwords": [PASSWORD],
+         "Tags": [*TAG, {"Key": "gimme:deployment", "Value": "example-local"}]},
+    )
+    stub.add_response(
+        "modify_user_group", {},
+        {"UserGroupId": derive_user_group_id(GROUP_ID), "UserIdsToAdd": [CANDIDATE]},
+    )
+    secrets_stub.add_client_error(
+        "create_secret", "ResourceExistsException",
+        expected_params={"Name": SECRET_ID, "SecretString": ANY, "Tags": [
+            {"Key": "gimme:deployment", "Value": "example-local"},
+            {"Key": "gimme:resource", "Value": NAME},
+            {"Key": "gimme:secret-store", "Value": "workload-secrets"}]},
+    )
+    secrets_stub.add_response(
+        "put_secret_value", {"ARN": SECRET_ARN, "VersionId": "n" * 32},
+        {"SecretId": SECRET_ID, "SecretString": ANY},
+    )
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub:
+        result = adapter.begin_rotation(
+            account, network, store, "workload-secrets", NAME, GROUP_ID, "example-local", 2
+        )
+
+    assert result == (CANDIDATE, SECRET_ARN, "n" * 32)
+    assert calls == ["DescribeUsers", "CreateUser", "ModifyUserGroup", "CreateSecret",
+                     "PutSecretValue"]
+
+
+def test_a_rotation_never_adopts_a_candidate_user_that_already_exists(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    stub.add_response("describe_users", {"Users": [{"UserId": CANDIDATE}]}, {"UserId": CANDIDATE})
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, secrets_stub, pytest.raises(ResourceError, match="rotate_candidate_exists$"):
+        adapter.begin_rotation(
+            account, network, store, "workload-secrets", NAME, GROUP_ID, "example-local", 2
+        )
+
+    secrets_stub.assert_no_pending_responses()
+
+
+def test_a_rotation_failure_is_a_bounded_code_without_the_password(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": CANDIDATE})
+    stub.add_client_error("create_user", "AccessDenied", f"denied for {PASSWORD}")
+    adapter = adapter_with(
+        monkeypatch, ("elasticache", (client, stub)),
+        ("secretsmanager", (secrets_client, secrets_stub)),
+    )
+    account, network, store = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.begin_rotation(
+            account, network, store, "workload-secrets", NAME, GROUP_ID, "example-local", 2
+        )
+
+    assert str(raised.value) == "aws_elasticache_rotate_user_access_denied"
+    assert PASSWORD not in repr(raised.value)
+
+
+def test_restoring_a_credential_writes_nothing_when_it_is_already_current(monkeypatch) -> None:
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    secrets_stub.add_response(
+        "get_secret_value", credential(), {"SecretId": SECRET_ID, "VersionStage": "AWSCURRENT"}
+    )
+    secrets_stub.add_response(
+        "describe_secret",
+        {"ARN": SECRET_ARN, "VersionIdsToStages": {"a" * 32: ["AWSPREVIOUS"],
+                                                   "b" * 32: ["AWSCURRENT"]}},
+        {"SecretId": SECRET_ID},
+    )
+    adapter = adapter_with(monkeypatch, ("secretsmanager", (secrets_client, secrets_stub)))
+    account, _network, store = context()
+
+    with secrets_stub:
+        result = adapter.restore_credential(account, store, NAME, "example-local",
+                                            "gimme-example-local")
+
+    assert result == (SECRET_ARN, "b" * 32)
+
+
+def test_restoring_a_credential_puts_the_previous_version_back_as_current(monkeypatch) -> None:
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    secrets_stub.add_response(
+        "get_secret_value", credential("gimme-example-local-g2"),
+        {"SecretId": SECRET_ID, "VersionStage": "AWSCURRENT"},
+    )
+    secrets_stub.add_response(
+        "get_secret_value", credential(),
+        {"SecretId": SECRET_ID, "VersionStage": "AWSPREVIOUS"},
+    )
+    secrets_stub.add_client_error(
+        "create_secret", "ResourceExistsException",
+        expected_params={"Name": SECRET_ID, "SecretString": ANY, "Tags": [
+            {"Key": "gimme:deployment", "Value": "example-local"},
+            {"Key": "gimme:resource", "Value": NAME}]},
+    )
+    secrets_stub.add_response(
+        "put_secret_value", {"ARN": SECRET_ARN, "VersionId": "c" * 32},
+        {"SecretId": SECRET_ID, "SecretString": json.dumps(
+            {"password": "old-" + "q" * 40, "username": "gimme-example-local"},
+            sort_keys=True, separators=(",", ":"))},
+    )
+    adapter = adapter_with(monkeypatch, ("secretsmanager", (secrets_client, secrets_stub)))
+    account, _network, store = context()
+
+    with secrets_stub:
+        result = adapter.restore_credential(account, store, NAME, "example-local",
+                                            "gimme-example-local")
+
+    assert result == (SECRET_ARN, "c" * 32)
+
+
+def test_restoring_a_credential_that_is_in_neither_version_fails_closed(monkeypatch) -> None:
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    for stage in ("AWSCURRENT", "AWSPREVIOUS"):
+        secrets_stub.add_response(
+            "get_secret_value", credential("gimme-example-local-g9"),
+            {"SecretId": SECRET_ID, "VersionStage": stage},
+        )
+    adapter = adapter_with(monkeypatch, ("secretsmanager", (secrets_client, secrets_stub)))
+    account, _network, store = context()
+
+    with secrets_stub, pytest.raises(ResourceError) as raised:
+        adapter.restore_credential(account, store, NAME, "example-local", "gimme-example-local")
+
+    assert str(raised.value) == "aws_elasticache_rotate_previous_credential_missing"
+
+
+def test_a_credential_read_failure_is_a_bounded_code(monkeypatch) -> None:
+    secrets_client, secrets_stub = stubbed("secretsmanager")
+    secrets_stub.add_client_error("get_secret_value", "AccessDeniedException",
+                                  f"denied {PASSWORD}")
+    adapter = adapter_with(monkeypatch, ("secretsmanager", (secrets_client, secrets_stub)))
+    account, _network, store = context()
+
+    with secrets_stub, pytest.raises(ResourceError) as raised:
+        adapter.restore_credential(account, store, NAME, "example-local", "gimme-example-local")
+
+    assert str(raised.value) == "aws_elasticache_credential_read_access_denied"
+    assert PASSWORD not in repr(raised.value)
+
+
+def test_one_user_is_deleted_only_by_the_destructive_role_after_its_tag_is_read(
+    monkeypatch,
+) -> None:
+    adapter, account, network, (reader_stub, killer_stub), calls, assumed = destroyer(monkeypatch)
+    reader_stub.add_response(
+        "list_tags_for_resource", owned(), {"ResourceName": f"{ARN_PREFIX}:user:{USER_ID}"}
+    )
+    killer_stub.add_response("delete_user", {}, {"UserId": USER_ID})
+
+    with reader_stub, killer_stub:
+        adapter.remove_user(account, network, NAME, USER_ID)
+
+    assert calls == ["read:ListTagsForResource", "delete:DeleteUser"]
+    assert {role for role, _ in assumed} == {INSPECTOR, DESTROYER}
+
+
+def test_a_user_another_resource_owns_is_never_deleted(monkeypatch) -> None:
+    adapter, account, network, (reader_stub, killer_stub), calls, _assumed = destroyer(monkeypatch)
+    reader_stub.add_response(
+        "list_tags_for_resource", owned("someone-else"),
+        {"ResourceName": f"{ARN_PREFIX}:user:{USER_ID}"},
+    )
+
+    with reader_stub, killer_stub, pytest.raises(ResourceError) as raised:
+        adapter.remove_user(account, network, NAME, USER_ID)
+
+    assert str(raised.value) == "aws_elasticache_rotate_ownership_mismatch"
+    assert calls == ["read:ListTagsForResource"]
+
+
+def test_removing_a_user_needs_the_destructive_role(monkeypatch) -> None:
+    adapter, account, network, _stubs, _calls, assumed = destroyer(monkeypatch, with_role=False)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        adapter.remove_user(account, network, NAME, USER_ID)
+
+    assert assumed == []
+
+
+@pytest.mark.parametrize("kind", ["restoring", "rotating"])
+def test_a_resource_mid_recovery_cannot_be_destroyed(tmp_path, monkeypatch, kind) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    plan = server_module.plan_destroy_resource(NAME)
+    resources_valkey_module.write_marker(
+        server_module.store.root, kind, NAME, {"schema_version": 1, "resource": NAME}
+    )
+
+    with pytest.raises(ResourceError, match="_in_progress$"):
+        server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM)
+
+    assert adapter.delete_calls == []
+
+
+def test_a_rotation_without_the_destructive_role_starts_nothing(tmp_path, monkeypatch) -> None:
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    account, network, resource, name, workload_store, store_name = destroy_context()
+    assert account.destructive_role_arn is None
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        valkey_recovery_module.apply_rotation(
+            adapter, server_module.store.root, account, network, resource, name,
+            workload_store, store_name, DEPLOYMENT, lambda _deployment: None,
+        )
+
+    assert not marker_file("rotating").exists() and adapter.credentials[DEPLOYMENT] == [
+        binding_username(DEPLOYMENT)
+    ]

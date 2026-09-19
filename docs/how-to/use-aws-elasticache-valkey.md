@@ -11,10 +11,10 @@ Implemented: registering the Resource, provisioning one replication group (with 
 group, parameter group, user group, and administrative user), reviewed updates and drift,
 live inspection with fixed readiness codes, typed Deployment bindings with a per-Deployment ACL
 user, namespace, and credential, the `laravel-cluster-v1` application contract with its
-pre-switchover probes, retention-by-default removal, forgetting a retained tombstone, and
-destruction with a separate destructive role.
+pre-switchover probes, retention-by-default removal, forgetting a retained tombstone,
+destruction with a separate destructive role, snapshot inventory, restore from a snapshot (or
+recreation of an empty group) after a group is lost, and per-Deployment credential rotation.
 
-Not implemented yet (tracked in #14): snapshot inventory and restore, and credential rotation.
 The disposable Laravel test suite the ADR calls for (cache, session, queue, and
 Horizon driven through a real Laravel application, and ACL denials seen from it) does not
 exist yet; the probes below use the Redis protocol directly.
@@ -43,7 +43,7 @@ never edited:
 
 ## IAM
 
-The inspection role gains two statements (replace `<region>` and `<account>`). Neither has a
+The inspection role gains two statements, plus one more for snapshots and restore (below) (replace `<region>` and `<account>`). Neither has a
 delete action. This is a privilege increase for roles already deployed, including the
 `ModifyReplicationGroup` and read-only statement added for updates:
 
@@ -80,6 +80,25 @@ delete action. This is a privilege increase for roles already deployed, includin
   ]
 }
 ```
+
+Snapshot inventory and restore need the inspection role to read snapshots and to name one when it
+creates a group from it. `CreateReplicationGroup` with `SnapshotName` is authorized against the
+snapshot as well as the group, and the snapshot of a destroyed group is not named `gimme-*` unless
+it is Gimme's own final snapshot, so this statement covers snapshots of `gimme-*` groups only:
+
+```json
+{
+  "Sid": "ElastiCacheSnapshotsForRestore",
+  "Effect": "Allow",
+  "Action": ["elasticache:DescribeSnapshots", "elasticache:CreateReplicationGroup"],
+  "Resource": ["arn:aws:elasticache:<region>:<account>:snapshot:gimme-*"]
+}
+```
+
+`DescribeSnapshots` may not support resource-level permissions and then needs `"Resource": "*"`.
+The resolver role already reads the workload namespace, which a restore uses to recreate an ACL
+user from the credential already stored, and rotation reads the same secret. Whether these
+statements are sufficient is unverified.
 
 Four read-only calls do not support resource-level permissions, so they need `"Resource": "*"`:
 
@@ -134,7 +153,8 @@ assume it (for example behind an MFA condition):
 Privilege impact: this is the only Gimme role that can delete anything, and it can delete any
 `gimme-*` ElastiCache object in the account, so Gimme's own checks (below) are the second line of
 defense, not the only one. It has no Secrets Manager permission: destruction never deletes
-secrets. Whether the final snapshot needs `CreateSnapshot` on the snapshot resource, and whether
+secrets. Rotation deletes the previous ACL user with the same statement, so `DeleteUser` is used
+for more than destruction. Whether the final snapshot needs `CreateSnapshot` on the snapshot resource, and whether
 deleting a `default`-named user is allowed, are unverified.
 
 ## Register the Resource
@@ -381,6 +401,78 @@ delete it yourself. While a destruction is in progress the Resource cannot be pr
 progress marker in place, and the same call resumes. `apply_cleanup_resource` abandons a stuck
 destruction and retains what is left.
 
+## Recover a lost group
+
+If a replication group disappears from AWS (deleted by hand, or the account lost it) while Gimme's
+observation says it existed, `apply_resource` refuses with
+`aws_elasticache_group_missing_replace_explicitly` rather than quietly creating an empty group. Two
+explicit ways forward exist, and neither needs the destructive role. Both keep every Deployment's
+existing Resource Credential: the ElastiCache user group and any missing ACL user are created
+again from the credential already in the Secret Store, and no credential is generated or rotated.
+
+- `list_resource_snapshots` shows the snapshots of the group, by name and status. Then
+  `plan_restore_resource` and `apply_restore_resource` create the group from one of them. A
+  snapshot of a destroyed group also works (its final snapshot), in which case no allocations
+  remain and Deployments bind again.
+- `plan_recreate_empty_resource` and `apply_recreate_empty_resource` (confirmation
+  `RECREATE EMPTY RESOURCE <name>`) accept the loss of the data and create an empty group.
+
+Apply checks, before creating anything, that the group is absent (`aws_elasticache_restore_group_exists`),
+that the snapshot belongs to this group (`aws_elasticache_restore_snapshot_missing`), is `available`
+(`aws_elasticache_restore_snapshot_unavailable`), and was taken on an engine no newer than the
+Resource's `engine_version` (`aws_elasticache_restore_engine_older`). Plans read only local state and
+are identical before, during, and after an interrupted apply.
+
+Restoring takes minutes, so apply polls for 30 seconds and returns `phase: restoring`. The Resource
+then stays `restoring` (shown by `inspect_resource`, with `operation: restoring`) and refuses
+provisioning, binding, rotation, and destruction (`aws_elasticache_restore_in_progress`), and no
+Deployment is handed the new endpoint by a deploy, until each recorded Deployment has passed a
+verification: its environment is refreshed to the new endpoint, the activation probe runs against its
+current release (a Deployment that was never deployed skips the probe), and its workers restart.
+Repeat the same call to continue. A failed verification raises
+`aws_elasticache_restore_verification_failed` with the progress kept, so the repeat re-verifies only
+the Deployments that did not pass and never creates the group again. Only when every Deployment has
+passed does the Resource become `ready`. A group that fails to create
+(`aws_elasticache_restore_create_failed`) ends the restore. `apply_cleanup_resource` abandons a
+restore that cannot finish and retains what exists.
+
+Verification takes the same per-Deployment lock as `apply_deployment_resources`, but nothing stops
+a deploy of a bound Deployment from running alongside a restore or rotation. Do not deploy one
+while its Resource is `restoring` or being rotated.
+
+## Rotate a Deployment credential
+
+`plan_rotate_resource_credential` and `apply_rotate_resource_credential` replace one Deployment's
+ACL user and Resource Credential. The Provider Account needs the destructive role, because the
+previous user is deleted (`aws_elasticache_destroy_role_missing`). The plan reads only local state.
+
+Apply never leaves the credential in use invalid:
+
+1. It records a `rotating` marker, then creates the next generation's ACL user (a new user id and
+   username, with the same access string) and adds it to the group's user group. It never adopts a
+   user that already exists (`aws_elasticache_rotate_candidate_exists`, which touches nothing).
+2. It writes the new credential as the secret's current version, keeping the previous version.
+3. It refreshes the Deployment's environment, runs the activation probe against its current
+   release, and restarts its workers.
+4. Only then does it delete the previous ACL user, reading its ownership tag first.
+
+If step 1 to 3 fails, the previous credential is made the secret's current version again (from the
+`AWSPREVIOUS` version, and only if it is not already current), the environment is refreshed and
+probed again, and the new user is deleted: `aws_elasticache_rotate_switch_failed`. If that rollback
+cannot finish, `aws_elasticache_rotate_rollback_failed` keeps the marker. A failure after the
+switch, in step 4, keeps the new credential and the marker in phase `cleanup`. Either way, the same
+call resolves it: it finishes the cleanup or the rollback and then stops, so plan again to
+rotate. While a rotation is unfinished the Resource refuses provisioning, binding, restore, and
+destruction (`aws_elasticache_rotate_in_progress`), and a rotation of a different Deployment
+refuses the same way. The group must be `ready` to start one
+(`aws_elasticache_rotate_resource_not_ready`).
+
+Existing connections that authenticated as the deleted user are closed by ElastiCache, and PHP
+processes that cached configuration keep the old credential until they reload it. Whether
+`apply_deployment_resources` and a worker restart reach every such process is unverified; the probe
+proves the new credential from the Target, not from each running process. Whether ElastiCache lets
+a user be deleted while it is still a member of a user group is also unverified.
+
 ## Forget a retained tombstone
 
 `plan_cleanup_resource` and `apply_cleanup_resource` retain the infrastructure and write a
@@ -418,7 +510,8 @@ Provider failures become fixed `aws_elasticache_<operation>_<reason>` codes, for
 `invalid_state`, `throttled`, `revoked`, and `unavailable`, and AWS messages, ARNs, and values
 are never included. Operations include `subnet_group`, `parameter_group`,
 `parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
-`user_describe`, `user_bind`, `user_group_bind`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
+`user_describe`, `user_bind`, `user_group_bind`, `user_restore`, `user_group_restore`, `snapshots`,
+`credential_read`, `rotate_user`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
 `options`, `modify`, and `create`.
 `aws_elasticache_group_ownership_mismatch` and
 `aws_elasticache_parameter_group_ownership_mismatch` mean a same-named object exists that this

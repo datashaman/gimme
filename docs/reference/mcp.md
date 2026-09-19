@@ -148,6 +148,13 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
 | `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey Resource and its data; reads only local state and never assumes the destructive role |
 | `apply_destroy_resource` | Remote write (destructive) | Delete the replication group with a final snapshot and what Gimme created around it, through the Provider Account's destructive role, after exact confirmation `DESTROY RESOURCE <name>` |
+| `list_resource_snapshots` | Remote read | List a managed Valkey Resource's snapshots, including the final snapshot of a destroyed group, by name and status only |
+| `plan_restore_resource` | Read | Plan re-creating a lost managed Valkey replication group from one of its snapshots; reads only local state |
+| `apply_restore_resource` | Remote write | Create the group from the snapshot only if absent, restore each recorded Deployment credential unchanged, and verify every Deployment before the Resource is `ready`; repeat the same call while `restoring` |
+| `plan_recreate_empty_resource` | Read | Plan replacing a lost managed Valkey replication group with an empty one; reads only local state |
+| `apply_recreate_empty_resource` | Remote write (destructive) | Create an empty group in place of a lost one after exact confirmation `RECREATE EMPTY RESOURCE <name>`, then verify each Deployment as a restore does |
+| `plan_rotate_resource_credential` | Read | Plan replacing one Deployment's Valkey ACL user and Resource Credential; reads only local state |
+| `apply_rotate_resource_credential` | Remote write (destructive) | Rotate with a probed switch, rollback on failure, and deletion of the previous user through the destructive role; never returns a credential |
 | `plan_forget_resource` | Read | Plan deleting a Retained Resource tombstone |
 | `apply_forget_resource` | Local write | Delete the tombstone after exact confirmation `FORGET <name>`; the retained infrastructure is untouched |
 
