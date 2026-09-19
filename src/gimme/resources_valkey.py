@@ -31,7 +31,7 @@ from gimme.resources_postgres import (
 )
 
 ID_LIMIT = 40
-GROUP_PHASE = ("pending", "ready", "degraded", "failed")
+GROUP_PHASE = ("pending", "restoring", "ready", "degraded", "failed")
 # Fixed, secret-free reasons a group that AWS reports available is not ready.
 ISSUES = (
     "cluster_mode", "topology", "availability_zones", "multi_az", "automatic_failover", "tls",
@@ -131,13 +131,20 @@ def derive_user_group_id(group_id: str) -> str:
     return _derived(group_id, "users")
 
 
-def derive_binding_user_id(group_id: str, deployment_name: str) -> str:
-    """One opaque ElastiCache user id per (group, Deployment): letters, digits, and hyphens,
-    at most 40 characters, and never equal to the default or administrative user."""
-    digest = hashlib.sha256(
-        f"{group_id}/{_checked_name(deployment_name)}".encode()
-    ).hexdigest()[:24]
-    return f"gimme-u-{digest}"
+def derive_binding_user_id(group_id: str, deployment_name: str, generation: int = 1) -> str:
+    """One opaque ElastiCache user id per (group, Deployment, credential generation): letters,
+    digits, and hyphens, at most 40 characters, and never equal to the default or administrative
+    user. Generation 1 is the id every binding made before rotation existed already has."""
+    seed = f"{group_id}/{_checked_name(deployment_name)}"
+    if generation > 1:
+        seed += f"/g{generation}"
+    return f"gimme-u-{hashlib.sha256(seed.encode()).hexdigest()[:24]}"
+
+
+def binding_username(deployment_name: str, generation: int = 1) -> str:
+    """ACL user names are unique within a user group, so a candidate generation needs its own."""
+    suffix = "" if generation == 1 else f"-g{generation}"
+    return f"gimme-{_checked_name(deployment_name)}{suffix}"
 
 
 def _checked_name(deployment_name: str) -> str:
@@ -205,6 +212,16 @@ class ValkeyOptions:
     node_types: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SnapshotInfo:
+    name: str
+    source: str
+    status: str
+    created: str | None
+    engine_version: str | None
+    shards: int | None
+
+
 class ElastiCacheAdapter(Protocol):
     def describe_group(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
@@ -214,6 +231,8 @@ class ElastiCacheAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
         store: AWSSecretsManagerStore, store_name: str,
+        snapshot_name: str | None = None,
+        restore_users: dict[str, tuple[str, int]] | None = None,
     ) -> GroupObservation: ...
 
     def allowed_node_types(
@@ -228,8 +247,26 @@ class ElastiCacheAdapter(Protocol):
     def ensure_binding(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str, deployment_name: str,
-        keep_credential: bool,
+        keep_credential: bool, generation: int = 1,
     ) -> tuple[str, str, str] | None: ...
+
+    def list_snapshots(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
+    ) -> list["SnapshotInfo"]: ...
+
+    def begin_rotation(
+        self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
+        store_name: str, resource_name: str, group_id: str, deployment_name: str, generation: int,
+    ) -> tuple[str, str, str]: ...
+
+    def restore_credential(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, resource_name: str,
+        deployment_name: str, expected_username: str,
+    ) -> tuple[str, str]: ...
+
+    def remove_user(
+        self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str, user_id: str,
+    ) -> None: ...
 
     def delete_group(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
@@ -582,7 +619,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
     def ensure_binding(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str, deployment_name: str,
-        keep_credential: bool,
+        keep_credential: bool, generation: int = 1,
     ) -> tuple[str, str, str] | None:
         """Create or converge this Deployment's ACL user and add it to the group's user group.
         Returns (user id, secret ARN, secret version) when a credential was written, and None
@@ -593,8 +630,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
             {"Key": "gimme:resource", "Value": resource_name},
             {"Key": "gimme:deployment", "Value": deployment_name},
         ]
-        user_id = derive_binding_user_id(group_id, deployment_name)
-        username = f"gimme-{deployment_name}"
+        user_id = derive_binding_user_id(group_id, deployment_name, generation)
+        username = binding_username(deployment_name, generation)
         access = laravel_access_string(deployment_name)
         exists = self._user_exists(client, user_id)
         written: tuple[str, str, str] | None = None
@@ -659,7 +696,6 @@ class BotoElastiCacheAdapter(AWSAdapter):
         already-missing object counts as done, and any other doubt stops the sequence."""
         client = self._destructive_client(account, network)
         reader = self._client(account, network, "elasticache-destroy-verify")
-        prefix = f"arn:aws:elasticache:{network.region}:{account.account_id}"
         steps = [
             ("usergroup", derive_user_group_id(group_id), client.delete_user_group,
              "UserGroupId"),
@@ -670,26 +706,228 @@ class BotoElastiCacheAdapter(AWSAdapter):
              "CacheSubnetGroupName"),
         ]
         for kind, object_id, delete, argument in steps:
-            try:
-                tags = reader.list_tags_for_resource(ResourceName=f"{prefix}:{kind}:{object_id}")
-            except Exception as exc:
-                error = _provider_error(exc, "destroy_verify", self.error_prefix)
-                if "missing" in str(error):
-                    continue
+            self._delete_owned(
+                account, network, reader, resource_name, kind, object_id, delete, argument,
+                "destroy",
+            )
+
+    def _delete_owned(
+        self, account: AWSProviderAccount, network: AWSNetwork, reader, resource_name: str,
+        kind: str, object_id: str, delete: Callable[..., object], argument: str, operation: str,
+    ) -> None:
+        """Read the object's ownership tag with the inspection role, and only then delete it with
+        the destructive one. Already gone counts as done; anything else stops."""
+        arn = f"arn:aws:elasticache:{network.region}:{account.account_id}:{kind}:{object_id}"
+        try:
+            tags = reader.list_tags_for_resource(ResourceName=arn)
+        except Exception as exc:
+            error = _provider_error(exc, f"{operation}_verify", self.error_prefix)
+            if "missing" in str(error):
+                return
+            raise error from None
+        if _tags(tags).get("gimme:resource") != resource_name:
+            raise ResourceError(f"aws_elasticache_{operation}_ownership_mismatch")
+        try:
+            delete(**{argument: object_id})
+        except Exception as exc:
+            error = _provider_error(exc, f"{operation}_delete", self.error_prefix)
+            if "missing" not in str(error):
                 raise error from None
-            if _tags(tags).get("gimme:resource") != resource_name:
-                raise ResourceError("aws_elasticache_destroy_ownership_mismatch")
+
+    def remove_user(
+        self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str, user_id: str,
+    ) -> None:
+        """Delete one ACL user this Resource owns, with the destructive role."""
+        client = self._destructive_client(account, network)
+        reader = self._client(account, network, "elasticache-user-verify")
+        self._delete_owned(
+            account, network, reader, resource_name, "user", user_id, client.delete_user,
+            "UserId", "rotate",
+        )
+
+    def list_snapshots(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
+    ) -> list[SnapshotInfo]:
+        """Snapshots whose source group is this Resource's, including the final snapshot of a
+        destroyed group. At most 200, newest first."""
+        client = self._client(account, network, "elasticache-snapshots")
+        found: list[SnapshotInfo] = []
+        marker: str | None = None
+        for _ in range(4):
             try:
-                delete(**{argument: object_id})
+                response = client.describe_snapshots(
+                    ReplicationGroupId=group_id, MaxRecords=50,
+                    **({"Marker": marker} if marker else {}),
+                )
             except Exception as exc:
-                error = _provider_error(exc, "destroy_delete", self.error_prefix)
-                if "missing" not in str(error):
-                    raise error from None
+                raise _provider_error(exc, "snapshots", self.error_prefix) from None
+            for item in response.get("Snapshots") or []:
+                nodes = item.get("NodeSnapshots") or []
+                created = nodes[0].get("SnapshotCreateTime") if nodes else None
+                name = item.get("SnapshotName")
+                if item.get("ReplicationGroupId") != group_id or not isinstance(name, str):
+                    continue
+                shards = item.get("NumNodeGroups")
+                found.append(SnapshotInfo(
+                    name=name, source=str(item.get("SnapshotSource") or "unknown"),
+                    status=str(item.get("SnapshotStatus") or "unknown"),
+                    created=created.isoformat() if hasattr(created, "isoformat") else None,
+                    engine_version=_text(item.get("EngineVersion")),
+                    shards=shards if isinstance(shards, int) else None,
+                ))
+            marker = response.get("Marker")
+            if not marker:
+                break
+        return sorted(found, key=lambda info: (info.created or "", info.name), reverse=True)
+
+    def _read_secret(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        stage: str = "AWSCURRENT",
+    ) -> dict[str, str]:
+        """A workload credential, read with the resolver role. Held only in memory."""
+        session = self._session(account, account.resolver_role_arn, "elasticache-credential")
+        client = session.client("secretsmanager", region_name=store.region)
+        try:
+            response = client.get_secret_value(
+                SecretId=f"{store.prefix}/{name}", VersionStage=stage
+            )
+            payload = json.loads(response["SecretString"])
+        except Exception as exc:
+            raise _provider_error(exc, "credential_read", self.error_prefix) from None
+        if not isinstance(payload, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in payload.items()
+        ):
+            raise ResourceError("aws_elasticache_credential_read_invalid")
+        return payload
+
+    def begin_rotation(
+        self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
+        store_name: str, resource_name: str, group_id: str, deployment_name: str, generation: int,
+    ) -> tuple[str, str, str]:
+        """Create the candidate generation's ACL user and make its credential the secret's
+        current version, keeping the prior version and the prior user. The user exists before
+        the secret points at it. Returns (user id, secret ARN, secret version)."""
+        client = self._client(account, network, "elasticache-rotate")
+        user_id = derive_binding_user_id(group_id, deployment_name, generation)
+        if self._user_exists(client, user_id):
+            raise ResourceError("aws_elasticache_rotate_candidate_exists")
+        password = secrets_module.token_urlsafe(36)
+        username = binding_username(deployment_name, generation)
+        try:
+            client.create_user(
+                UserId=user_id, UserName=username, Engine="valkey",
+                AccessString=laravel_access_string(deployment_name), Passwords=[password],
+                Tags=[
+                    {"Key": "gimme:resource", "Value": resource_name},
+                    {"Key": "gimme:deployment", "Value": deployment_name},
+                ],
+            )
+            client.modify_user_group(
+                UserGroupId=derive_user_group_id(group_id), UserIdsToAdd=[user_id]
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "rotate_user", self.error_prefix) from None
+        arn, version = self.create_workload_secret(
+            account, store, f"{resource_name}/{deployment_name}",
+            {"gimme:secret-store": store_name, "gimme:resource": resource_name,
+             "gimme:deployment": deployment_name},
+            {"username": username, "password": password},
+        )
+        return user_id, arn, version
+
+    def restore_credential(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, resource_name: str,
+        deployment_name: str, expected_username: str,
+    ) -> tuple[str, str]:
+        """Make the credential for `expected_username` the secret's current version again,
+        idempotently: nothing is written when it already is. Returns (ARN, version)."""
+        name = f"{resource_name}/{deployment_name}"
+        if self._read_secret(account, store, name).get("username") == expected_username:
+            return self._current_secret(account, store, name)
+        previous = self._read_secret(account, store, name, "AWSPREVIOUS")
+        if previous.get("username") != expected_username:
+            raise ResourceError("aws_elasticache_rotate_previous_credential_missing")
+        return self.create_workload_secret(
+            account, store, name,
+            {"gimme:resource": resource_name, "gimme:deployment": deployment_name}, previous,
+        )
+
+    def _current_secret(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str
+    ) -> tuple[str, str]:
+        session = self._session(account, account.inspection_role_arn, "elasticache-secret-meta")
+        client = session.client("secretsmanager", region_name=store.region)
+        try:
+            described = client.describe_secret(SecretId=f"{store.prefix}/{name}")
+            versions = described.get("VersionIdsToStages") or {}
+            version = next(v for v, stages in versions.items() if "AWSCURRENT" in stages)
+            return str(described["ARN"]), str(version)
+        except Exception as exc:
+            raise _provider_error(exc, "credential_read", self.error_prefix) from None
+
+    def restore_authentication(
+        self, account: AWSProviderAccount, client, store: AWSSecretsManagerStore,
+        resource_name: str, group_id: str, users: dict[str, tuple[str, int]],
+    ) -> str:
+        """Recreate the user group and every ACL user that is missing, from the credentials
+        already in the Secret Store. Existing users keep their passwords, and nothing here
+        generates or writes a credential, so a restore never rotates one."""
+        tag = [{"Key": "gimme:resource", "Value": resource_name}]
+        default_id, admin_id = _derived(group_id, "default"), _derived(group_id, "admin")
+        self._tolerate_existing("user_create", lambda: client.create_user(
+            UserId=default_id, UserName="default", Engine="valkey",
+            AccessString=DEFAULT_ACCESS_STRING, NoPasswordRequired=True, Tags=tag,
+        ))
+        if not self._user_exists(client, admin_id):
+            password = self._read_secret(account, store, f"{resource_name}/_admin")["password"]
+            try:
+                client.create_user(
+                    UserId=admin_id, UserName=ADMIN_USER_NAME, Engine="valkey",
+                    AccessString=ADMIN_ACCESS_STRING, Passwords=[password], Tags=tag,
+                )
+            except Exception as exc:
+                raise _provider_error(exc, "user_create", self.error_prefix) from None
+        for deployment_name, (user_id, generation) in sorted(users.items()):
+            access = laravel_access_string(deployment_name)
+            try:
+                if self._user_exists(client, user_id):
+                    client.modify_user(UserId=user_id, AccessString=access)
+                    continue
+                credential = self._read_secret(
+                    account, store, f"{resource_name}/{deployment_name}"
+                )
+                if credential.get("username") != binding_username(deployment_name, generation):
+                    raise ResourceError("aws_elasticache_restore_credential_mismatch")
+                client.create_user(
+                    UserId=user_id, UserName=credential["username"], Engine="valkey",
+                    AccessString=access, Passwords=[credential["password"]],
+                    Tags=[*tag, {"Key": "gimme:deployment", "Value": deployment_name}],
+                )
+            except ResourceError:
+                raise
+            except Exception as exc:
+                raise _provider_error(exc, "user_restore", self.error_prefix) from None
+        user_group = derive_user_group_id(group_id)
+        members = [default_id, admin_id, *(user_id for user_id, _g in users.values())]
+        self._tolerate_existing("user_group_create", lambda: client.create_user_group(
+            UserGroupId=user_group, Engine="valkey", UserIds=[default_id, admin_id], Tags=tag,
+        ))
+        try:
+            groups = client.describe_user_groups(UserGroupId=user_group).get("UserGroups") or []
+            present = {user for group in groups for user in group.get("UserIds") or []}
+            missing = [user for user in members if user not in present]
+            if missing:
+                client.modify_user_group(UserGroupId=user_group, UserIdsToAdd=missing)
+        except Exception as exc:
+            raise _provider_error(exc, "user_group_restore", self.error_prefix) from None
+        return user_group
 
     def create_group(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
         store: AWSSecretsManagerStore, store_name: str,
+        snapshot_name: str | None = None,
+        restore_users: dict[str, tuple[str, int]] | None = None,
     ) -> GroupObservation:
         client = self._client(account, network, "elasticache-create")
         tag = [{"Key": "gimme:resource", "Value": resource_name}]
@@ -703,9 +941,16 @@ class BotoElastiCacheAdapter(AWSAdapter):
             client, parameter_group, _parameter_group_family(resource.engine_version),
             resource_name,
         )
-        user_group = self._ensure_authentication(
-            account, client, store, store_name, resource_name, group_id
-        )
+        if restore_users is None:
+            user_group = self._ensure_authentication(
+                account, client, store, store_name, resource_name, group_id
+            )
+        else:
+            user_group = self.restore_authentication(
+                account, client, store, resource_name, group_id, restore_users
+            )
+        # A snapshot fixes the shard count, so it is not sent; everything durable is.
+        restored = {"SnapshotName": snapshot_name} if snapshot_name else {}
         try:
             client.create_replication_group(
                 ReplicationGroupId=group_id,
@@ -713,7 +958,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
                 Engine="valkey", EngineVersion=resource.engine_version,
                 CacheNodeType=resource.node_type, CacheParameterGroupName=parameter_group,
                 CacheSubnetGroupName=subnet_group, SecurityGroupIds=[resource.security_group_id],
-                ClusterMode="enabled", NumNodeGroups=1, ReplicasPerNodeGroup=1,
+                ClusterMode="enabled", ReplicasPerNodeGroup=1,
+                **({} if snapshot_name else {"NumNodeGroups": 1}), **restored,
                 AutomaticFailoverEnabled=True, MultiAZEnabled=True,
                 TransitEncryptionEnabled=True, TransitEncryptionMode="required",
                 AtRestEncryptionEnabled=True, UserGroupIds=[user_group], Durability="sync",
@@ -873,8 +1119,11 @@ def _validate_observed(document: object) -> dict[str, object]:
         or (port is not None and not isinstance(port, int))
         or not isinstance(allocations, dict) or any(
             DEPLOYMENT_NAME.fullmatch(str(name)) is None or not isinstance(item, dict)
-            or set(item) != {"user_id", "secret_arn", "secret_version_id", "status"}
+            or set(item) - {"generation"} != {
+                "user_id", "secret_arn", "secret_version_id", "status"
+            }
             or item["status"] not in BINDING_STATUS
+            or not isinstance(item.get("generation", 1), int) or item.get("generation", 1) < 1
             for name, item in allocations.items()
         )
     ):
@@ -925,7 +1174,7 @@ def apply_provision(
     immediate modification of only the fields that differ, then poll up to a bounded 30
     seconds. A still-provisioning or still-modifying group is recorded as phase 'pending';
     a later call resumes by describing, so it re-creates and re-sends nothing."""
-    _refuse_while_destroying(root, resource_name)
+    refuse_while_busy(root, resource_name)
     group_id = derive_group_id(resource_name)
     previous = load_observed(root, resource_name)
     allocations = dict(cast(dict[str, object], previous["allocations"])) if previous else {}
@@ -943,6 +1192,9 @@ def apply_provision(
 
     observed = adapter.describe_group(account, network, group_id)
     if observed is None:
+        if previous is not None:
+            # The group existed and is gone. Provisioning would silently create an empty one.
+            raise ResourceError("aws_elasticache_group_missing_replace_explicitly")
         observed = adapter.create_group(
             account, network, resource, resource_name, group_id, store, store_name
         )
@@ -980,7 +1232,7 @@ def apply_binding(
     allocation keeps its credential; a user with no recorded allocation gets a new one.
     Never returns the username or password."""
     _checked_name(deployment_name)
-    _refuse_while_destroying(root, resource_name)
+    refuse_while_busy(root, resource_name)
     document = load_observed(root, resource_name)
     group_id = derive_group_id(resource_name)
     live = adapter.describe_group(account, network, group_id)
@@ -989,15 +1241,17 @@ def apply_binding(
     if group_phase(live, structural_issues(resource, live, group_id)) != "ready":
         raise ResourceError("aws_elasticache_binding_resource_not_ready")
     allocations = dict(cast(dict[str, object], document["allocations"]))
+    existing = cast(dict[str, dict[str, object]], allocations).get(deployment_name)
+    generation = int(cast(int, existing.get("generation", 1))) if existing else 1
     written = adapter.ensure_binding(
         account, network, store, store_name, resource_name, group_id, deployment_name,
-        keep_credential=deployment_name in allocations,
+        keep_credential=deployment_name in allocations, generation=generation,
     )
     if written is not None:
         user_id, secret_arn, version_id = written
         allocations[deployment_name] = {
             "user_id": user_id, "secret_arn": secret_arn, "secret_version_id": version_id,
-            "status": "active",
+            "status": "active", **({"generation": generation} if generation > 1 else {}),
         }
         _write_json(
             _observed_path(root, resource_name),
@@ -1024,20 +1278,73 @@ def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, 
         "identity": observed["identity"] if observed is not None else None,
     }
     _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
-    # Retaining abandons a half-finished destruction, so a later Resource of this name is free.
-    _destroying_path(root, resource_name).unlink(missing_ok=True)
+    # Retaining abandons anything half-finished, so a later Resource of this name is free.
+    for kind in MARKERS:
+        clear_marker(root, kind, resource_name)
     return cast(dict[str, object], tombstone)
 
 
-def _destroying_path(root: Path, resource_name: str) -> Path:
-    if RESOURCE_NAME.fullmatch(resource_name) is None:
+# One in-progress operation per Resource is recorded as a local marker, and every other
+# operation that could change the group refuses while any marker exists.
+MARKERS = {
+    "destroying": "aws_elasticache_destroy_in_progress",
+    "restoring": "aws_elasticache_restore_in_progress",
+    "rotating": "aws_elasticache_rotate_in_progress",
+}
+
+
+def _marker_path(root: Path, kind: str, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None or kind not in MARKERS:
         raise ResourceError("resource_name_invalid")
-    return root / "destroying-resources" / f"{resource_name}.json"
+    return root / f"{kind}-resources" / f"{resource_name}.json"
 
 
-def _refuse_while_destroying(root: Path, resource_name: str) -> None:
-    if _destroying_path(root, resource_name).is_file():
-        raise ResourceError("aws_elasticache_destroy_in_progress")
+def read_marker(root: Path, kind: str, resource_name: str) -> dict[str, object] | None:
+    path = _marker_path(root, kind, resource_name)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError(f"aws_elasticache_{kind}_marker_invalid") from None
+    if not isinstance(document, dict):
+        raise ResourceError(f"aws_elasticache_{kind}_marker_invalid")
+    return document
+
+
+def write_marker(
+    root: Path, kind: str, resource_name: str, document: dict[str, object]
+) -> None:
+    _write_json(_marker_path(root, kind, resource_name), document, resource_name)
+
+
+def clear_marker(root: Path, kind: str, resource_name: str) -> None:
+    _marker_path(root, kind, resource_name).unlink(missing_ok=True)
+
+
+def busy_operation(root: Path, resource_name: str) -> str | None:
+    """The operation a marker records as in progress on this Resource, if any."""
+    return next(
+        (kind for kind in MARKERS if _marker_path(root, kind, resource_name).is_file()), None
+    )
+
+
+def operation_progress(root: Path, resource_name: str, kind: str) -> dict[str, object]:
+    """Registered names only, for `inspect_resource`: which Deployments have been verified or
+    have failed, so a repeat can be aimed."""
+    try:
+        marker = read_marker(root, kind, resource_name) or {}
+    except ResourceError:
+        return {}
+    return {
+        key: marker[key] for key in ("verified", "failed", "deployment", "phase") if key in marker
+    }
+
+
+def refuse_while_busy(root: Path, resource_name: str, *, allow: str | None = None) -> None:
+    for kind, code in MARKERS.items():
+        if kind != allow and _marker_path(root, kind, resource_name).is_file():
+            raise ResourceError(code)
 
 
 def identity_fingerprint(identity: str) -> str:
@@ -1075,6 +1382,7 @@ def apply_destroy(
     'deleting', and a later call continues. The group must still be the one that was planned
     (identity and ownership tags); anything else fails closed before any deletion. Workload
     secrets and the final snapshot are retained."""
+    refuse_while_busy(root, resource_name, allow="destroying")
     fingerprint, user_ids = destruction_targets(root, resource_name)
     if fingerprint != expected_fingerprint:
         raise ResourceError("aws_elasticache_destroy_identity_changed")
@@ -1087,7 +1395,7 @@ def apply_destroy(
             raise ResourceError("aws_elasticache_destroy_identity_changed")
         if live.status not in ("available", "deleting"):
             raise ResourceError("aws_elasticache_destroy_invalid_state")
-        _write_json(_destroying_path(root, resource_name), marker, resource_name)
+        write_marker(root, "destroying", resource_name, marker)
         if live.status == "available":
             adapter.delete_group(account, network, group_id, snapshot)
         deadline = now() + POLL_BUDGET_SECONDS
@@ -1099,10 +1407,10 @@ def apply_destroy(
                 "resource": resource_name, "phase": "deleting", "destroyed": False,
                 "final_snapshot": snapshot,
             }
-    _write_json(_destroying_path(root, resource_name), marker, resource_name)
+    write_marker(root, "destroying", resource_name, marker)
     adapter.delete_dependents(account, network, resource_name, group_id, user_ids)
     _observed_path(root, resource_name).unlink(missing_ok=True)
-    _destroying_path(root, resource_name).unlink(missing_ok=True)
+    clear_marker(root, "destroying", resource_name)
     return {
         "resource": resource_name, "phase": "destroyed", "destroyed": True,
         "final_snapshot": snapshot,

@@ -448,6 +448,59 @@ def valkey_destroy_plan(
     )
 
 
+def valkey_restore_plan(
+    resource_name: str, snapshot: str | None, deployments: list[str], engine_version: str
+) -> dict[str, Any]:
+    """Restore from a named snapshot, or (no snapshot) recreate an empty group. Local state only,
+    so the plan is the same before, during, and after a resumed apply."""
+    empty = snapshot is None
+    return exact_plan(
+        {
+            "kind": "resource_recreate_empty" if empty else "resource_restore",
+            "resource": resource_name,
+            "snapshot": snapshot,
+            **({"confirmation": f"RECREATE EMPTY RESOURCE {resource_name}"} if empty else {}),
+            "engine_version": engine_version,
+            "deployments": deployments,
+            "effects": [
+                "create the replication group again only if it does not exist"
+                + (" and hold no data" if empty else " from the snapshot"),
+                "recreate the ElastiCache user group and any missing ACL user from the "
+                "credentials already in the Secret Store; no credential is rotated",
+                "for each recorded Deployment: refresh its environment to the new endpoint, "
+                "probe the current release, and restart its workers",
+                "the Resource is phase 'restoring' and takes no other operation until every "
+                "Deployment has passed; repeat the same call after a failure or a pending group",
+            ],
+            "authority": "the Provider Account's inspection and resolver roles",
+            "irreversible": empty,
+        }
+    )
+
+
+def valkey_rotation_plan(
+    resource_name: str, deployment: str, fingerprint: str
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_credential_rotate",
+            "resource": resource_name,
+            "deployment": deployment,
+            "identity_fingerprint": fingerprint,
+            "effects": [
+                "create a new ACL user for the Deployment and make its credential the secret's "
+                "current version, keeping the previous version",
+                "refresh the Deployment's environment, probe the current release, and restart "
+                "its workers",
+                "on success delete the previous ACL user; on any failure restore the previous "
+                "credential and delete the new user",
+                "a leftover rotation is finished or rolled back by repeating the same call",
+            ],
+            "authority": "the Provider Account's destructive role, to delete an ACL user",
+        }
+    )
+
+
 def resource_forget_plan(resource_name: str) -> dict[str, Any]:
     return exact_plan(
         {

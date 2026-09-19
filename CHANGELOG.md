@@ -5,6 +5,26 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added recovery of a managed `aws_elasticache_valkey` Resource: snapshot inventory, restore, and
+  credential rotation (slice 7 of #14, the last). `list_resource_snapshots` lists a group's
+  snapshots by name and status. `plan_restore_resource` / `apply_restore_resource` create a lost
+  group from one, and `plan_recreate_empty_resource` / `apply_recreate_empty_resource`
+  (`RECREATE EMPTY RESOURCE <name>`) create an empty one; both recreate the user group and any
+  missing ACL user from the credential already stored, so no credential is rotated, and the
+  Resource stays `restoring`, blocking every other operation, until each recorded Deployment has
+  its environment refreshed to the new endpoint, its current release probed, and its workers
+  restarted; a failed verification or a still-creating group is resumed by repeating the call.
+  `apply_resource` now refuses (`aws_elasticache_group_missing_replace_explicitly`) when a group
+  that was observed has vanished, instead of silently creating an empty one.
+  `plan_rotate_resource_credential` / `apply_rotate_resource_credential` create the next-generation
+  ACL user and secret version, prove them with the same refresh, probe, and restart, then delete
+  the previous user, and roll back on failure; an unfinished rotation or restore is a local marker
+  that makes every other operation refuse. Deployer gains `gimme:probe:valkey:current`. Privilege
+  impact: the inspection role needs `DescribeSnapshots` and `CreateReplicationGroup` on snapshots,
+  and the destructive role's `DeleteUser` is now also used by rotation, so a rotation needs a
+  destructive role; both are in the ElastiCache how-to. Not verified against a live account:
+  restoring with `SnapshotName` in cluster mode, snapshots of a destroyed group, deleting a user
+  that is still in a user group, and whether running PHP processes pick up a rotated credential.
 - Added destruction of a managed `aws_elasticache_valkey` Resource with separate authority (slice 6
   of #14). `AWSProviderAccount` gains an optional `destructive_role_arn` (same account, distinct
   from the inspection and resolver roles), assumed only while applying a destruction and never

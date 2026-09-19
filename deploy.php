@@ -470,7 +470,8 @@ task('gimme:diagnose:deployment', function () use (
     }
 });
 
-task('gimme:probe:valkey', function (): void {
+function run_valkey_probe(string $lockPath): void
+{
     $config = json_decode(getenv('GIMME_VALKEY_PROBE_JSON') ?: '', true, flags: JSON_THROW_ON_ERROR);
     if (!is_array($config) || !is_string($config['host'] ?? null) ||
         !preg_match('/^[a-zA-Z0-9.-]{1,255}$/', $config['host']) ||
@@ -482,7 +483,7 @@ task('gimme:probe:valkey', function (): void {
             'printf %s ' . escapeshellarg(base64_encode(valkey_probe_script())) .
             ' | base64 -d | python3 - ' .
             escapeshellarg(get('deploy_path') . '/shared/.env') . ' ' .
-            escapeshellarg('{{release_path}}/composer.lock') . ' ' .
+            escapeshellarg($lockPath) . ' ' .
             escapeshellarg(base64_encode(json_encode($config, JSON_THROW_ON_ERROR)))
         );
     } catch (\Throwable $failure) {
@@ -492,6 +493,21 @@ task('gimme:probe:valkey', function (): void {
         );
     }
     writeln($output);
+}
+
+task('gimme:probe:valkey', function (): void {
+    run_valkey_probe('{{release_path}}/composer.lock');
+});
+
+// The same probe against the live release, for recovery: a restored group has a new endpoint
+// and a rotated credential is a new secret version, and neither passes through a deploy.
+task('gimme:probe:valkey:current', function (): void {
+    $lock = get('deploy_path') . '/current/composer.lock';
+    if (!test('[ -f ' . escapeshellarg($lock) . ' ]')) {
+        writeln('valkey_probe=skipped_no_release');
+        return;
+    }
+    run_valkey_probe($lock);
 });
 
 if ($health !== []) {

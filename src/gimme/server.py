@@ -20,8 +20,9 @@ from gimme import recovery as recovery_module
 from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
 from gimme import valkey_contract
+from gimme import valkey_recovery
 from gimme.control import (
-    AWSElastiCacheValkeyResource, AWSProviderAccount, AWSRDSPostgresResource,
+    AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
     ResourceConfig, S3BackupDestination, SecretReference, SecretStore, StateStore, TargetConfig,
@@ -33,7 +34,7 @@ from gimme.control_plans import (
     exact_plan, migration_plan, recovery_point_creation_plan, registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
     resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
-    valkey_provision_plan,
+    valkey_provision_plan, valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
@@ -68,12 +69,18 @@ CHANGE = ToolAnnotations(title="Apply a non-idempotent Gimme change", readOnlyHi
                          destructiveHint=True, idempotentHint=False, openWorldHint=True)
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$", min_length=1, max_length=64)]
 PlanId = Annotated[str, Field(pattern=r"^plan_[a-f0-9]{20}$")]
+SnapshotName = Annotated[
+    str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$", min_length=1, max_length=255)
+]
 CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
 RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
 P = ParamSpec("P")
 R = TypeVar("R", bound=dict[str, object])
 _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", default=False)
+# Set only while a restored Resource is being verified against its Deployments, so the
+# still-'restoring' Resource yields its contract values to exactly that verification.
+_restoring_ok: ContextVar[bool] = ContextVar("restoring_ok", default=False)
 
 
 def _journal() -> OperationJournal:
@@ -335,7 +342,9 @@ def _valkey_runtime(
         observed = resources_valkey_module.load_observed(store.root, binding.resource)
     except ResourceError:
         observed = None  # a corrupt cache must not break unrelated tasks; it is not ready
-    if observed is None or observed["phase"] != "ready":
+    if observed is None or observed["phase"] not in (
+        ("ready", "restoring") if _restoring_ok.get() else ("ready",)
+    ):
         return {}, {}, None, ["valkey_resource_not_ready"]
     if name not in cast(dict[str, object], observed["allocations"]):
         return {}, {}, None, ["valkey_binding_missing"]
@@ -1363,10 +1372,17 @@ def _inspect_valkey(
     }
     if refresh_error is not None:
         result["refresh_error"] = refresh_error
+    operation = resources_valkey_module.busy_operation(store.root, name)
+    if operation is not None:
+        result["operation"] = operation
+        progress = resources_valkey_module.operation_progress(store.root, name, operation)
+        if progress:
+            result["progress"] = progress
     if live is not None:
         issues = resources_valkey_module.structural_issues(resource, live, group_id)
         result.update(
-            phase=resources_valkey_module.group_phase(live, issues), status=live.status,
+            phase="restoring" if operation == "restoring"
+            else resources_valkey_module.group_phase(live, issues), status=live.status,
             engine_version=live.engine_version,
             effective_durability=live.effective_durability, issues=issues,
             drift=resources_valkey_module.group_drift(resource, live),
@@ -1607,6 +1623,157 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
     return {"changed": True, **result}
 
 
+def _valkey_context(name: str) -> tuple[
+    ControlState, AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount,
+    AWSSecretsManagerStore,
+]:
+    state = store.load()
+    resource = state.resources.get(name)
+    if not isinstance(resource, AWSElastiCacheValkeyResource):
+        raise ValueError(f"resource {name} is not a managed ElastiCache Valkey resource")
+    network = state.aws_networks[resource.aws_network]
+    workload_store = cast(
+        AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]
+    )
+    return state, resource, network, state.provider_accounts[network.provider_account], (
+        workload_store
+    )
+
+
+@mcp.tool(annotations=READ)
+def list_resource_snapshots(name: Name) -> dict[str, object]:
+    """Read-only list of the snapshots of one managed Valkey Resource's replication group,
+    including the final snapshot of a destroyed group, newest first. Names and status only."""
+    _state, _resource, network, account, _store = _valkey_context(name)
+    snapshots = elasticache_valkey.list_snapshots(
+        account, network, resources_valkey_module.derive_group_id(name)
+    )
+    return {"resource": name, "snapshots": [vars(item) for item in snapshots]}
+
+
+def _binds(state: ControlState, deployment: str, name: str) -> bool:
+    bound = state.deployments.get(deployment)
+    return bound is not None and getattr(bound.resources.valkey, "resource", None) == name
+
+
+def _restore_plan(name: str, snapshot: str | None) -> dict[str, object]:
+    state, resource, _network, _account, _store = _valkey_context(name)
+    observed = resources_valkey_module.load_observed(store.root, name)
+    if snapshot is None and observed is None:
+        raise ResourceError("aws_elasticache_recreate_not_needed")
+    # An allocation whose Deployment is gone still has its user restored, but has nothing to verify.
+    return valkey_restore_plan(
+        name, snapshot,
+        sorted(d for d in valkey_recovery.restore_targets(store.root, name)
+               if _binds(state, d, name)),
+        resource.engine_version,
+    )
+
+
+def _restore_valkey(name: str, snapshot: str | None) -> dict[str, object]:
+    state, resource, network, account, workload_store = _valkey_context(name)
+
+    def verify(deployment: str) -> None:
+        if not _binds(store.load(), deployment, name):
+            return
+        token = _restoring_ok.set(True)
+        try:
+            _apply_resources(deployment, _resource_plan(deployment))
+            _run_deployment("gimme:probe:valkey:current", deployment, timeout=300)
+            _run_deployment("gimme:restart:workers", deployment, timeout=300)
+        finally:
+            _restoring_ok.reset(token)
+
+    return {"changed": True, **valkey_recovery.apply_restore(
+        elasticache_valkey, store.root, account, network, resource, name, workload_store,
+        resource.workload_secret_store, snapshot, verify,
+    )}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("restore_resource", "name")
+def plan_restore_resource(name: Name, snapshot: SnapshotName) -> dict[str, object]:
+    """Plan re-creating a lost managed Valkey replication group from one of its snapshots.
+    Reads only local state; apply checks the snapshot against AWS."""
+    return _restore_plan(name, snapshot)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("restore_resource", "name")
+def apply_restore_resource(name: Name, snapshot: SnapshotName, plan_id: PlanId
+                           ) -> dict[str, object]:
+    """Create the replication group from the snapshot only if it does not exist, restore each
+    recorded Deployment credential, then verify every Deployment before the Resource is ready.
+    Phase 'restoring' means repeat the same call to continue."""
+    _assert_plan(_restore_plan(name, snapshot), plan_id)
+    return _restore_valkey(name, snapshot)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("recreate_empty_resource", "name")
+def plan_recreate_empty_resource(name: Name) -> dict[str, object]:
+    """Plan replacing a lost managed Valkey replication group with an empty one, accepting the
+    loss of its data. Reads only local state."""
+    return _restore_plan(name, None)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("recreate_empty_resource", "name")
+def apply_recreate_empty_resource(name: Name, plan_id: PlanId, confirmation: str
+                                  ) -> dict[str, object]:
+    """Create an empty replication group in place of a lost one after exact confirmation, then
+    verify every recorded Deployment as a restore does."""
+    expected = _restore_plan(name, None)
+    _assert_plan(expected, plan_id)
+    if confirmation != expected["confirmation"]:
+        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+    return _restore_valkey(name, None)
+
+
+def _rotation_plan(name: str, deployment: str) -> dict[str, object]:
+    state, _resource, _network, account, _store = _valkey_context(name)
+    if account.destructive_role_arn is None:
+        raise ResourceError("aws_elasticache_destroy_role_missing")
+    observed = resources_valkey_module.load_observed(store.root, name)
+    if (
+        observed is None or deployment not in cast(dict[str, object], observed["allocations"])
+        or not _binds(state, deployment, name)
+    ):
+        raise ResourceError("aws_elasticache_rotate_binding_missing")
+    return valkey_rotation_plan(
+        name, deployment, resources_valkey_module.identity_fingerprint(str(observed["identity"]))
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("rotate_resource_credential", "name")
+def plan_rotate_resource_credential(name: Name, deployment: Name) -> dict[str, object]:
+    """Plan replacing one Deployment's Valkey ACL user and Resource Credential. Reads only
+    local state; the destructive role is never assumed while planning."""
+    return _rotation_plan(name, deployment)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("rotate_resource_credential", "name")
+def apply_rotate_resource_credential(name: Name, deployment: Name, plan_id: PlanId
+                                     ) -> dict[str, object]:
+    """Rotate the Deployment's credential with a probed switch and automatic rollback. A
+    leftover rotation is finished or rolled back by this same call, which then does nothing
+    else. Never returns a username or password."""
+    _assert_plan(_rotation_plan(name, deployment), plan_id)
+    _state, resource, network, account, workload_store = _valkey_context(name)
+
+    def switch(target: str) -> None:
+        _apply_resources(target, _resource_plan(target))
+        _run_deployment("gimme:probe:valkey:current", target, timeout=300)
+        _run_deployment("gimme:restart:workers", target, timeout=300)
+
+    return {"changed": True, **valkey_recovery.apply_rotation(
+        elasticache_valkey, store.root, account, network, resource, name, workload_store,
+        resource.workload_secret_store, deployment, switch,
+    )}
+
+
 def _resource_forget_plan(name: str) -> dict[str, object]:
     if name in store.load().resources:
         raise ValueError(f"resource {name} is still registered; only a retained one is forgotten")
@@ -1760,6 +1927,10 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
     """Reconcile one deployment's route and target-local runtime resources."""
     expected = _resource_plan(name)
     _assert_plan(expected, plan_id)
+    return _apply_resources(name, expected)
+
+
+def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
     if not expected["ready"]:
         raise ValueError("deployment resources are not ready; inspect readiness_issues")
     state, deployment, target, _ = _context(name)
