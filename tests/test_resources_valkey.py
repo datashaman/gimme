@@ -96,6 +96,7 @@ class FakeValkey:
         self.delete_calls: list[str] = []
         self.dependents_calls: list[tuple[str, list[str]]] = []
         self.dependents_error: ResourceError | None = None
+        self.dependents_pending = False
         self.snapshots: list[SnapshotInfo] = []
         self.create_args: list[dict[str, object]] = []
         # deployment -> credential versions, oldest first; the last one is current
@@ -193,6 +194,7 @@ class FakeValkey:
         self.dependents_calls.append((resource_name, list(user_ids)))
         if self.dependents_error is not None:
             raise self.dependents_error
+        return not self.dependents_pending
 
     def create_group(
         self, account, network, resource, name, group_id, store, store_name,
@@ -2441,6 +2443,10 @@ def test_a_group_still_deleting_returns_pending_and_a_repeat_continues(
     assert adapter.dependents_calls == [] and NAME in server_module.store.load().resources
     marker = server_module.store.root / "destroying-resources" / f"{NAME}.json"
     assert marker.is_file()
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["operation"] == "destroying"
+    assert inspected["phase"] == "deleting"
+    assert inspected["progress"] == {"phase": "deleting"}
     assert server_module.plan_destroy_resource(NAME)["plan_id"] == plan["plan_id"], (
         "the same plan resumes the destruction"
     )
@@ -2475,6 +2481,29 @@ def test_a_partly_destroyed_resource_cannot_be_provisioned_or_bound_again(
 
     adapter.dependents_error = None
     assert destroy()["destroyed"] is True, "a repeat resumes and finishes"
+
+
+def test_destroy_waits_for_an_asynchronously_deleting_user_group(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    adapter.dependents_pending = True
+
+    first = destroy()
+
+    assert first["phase"] == "waiting_for_user_group" and first["destroyed"] is False
+    marker = server_module.store.root / "destroying-resources" / f"{NAME}.json"
+    assert json.loads(marker.read_text())["phase"] == "waiting_for_user_group"
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["operation"] == "destroying"
+    assert inspected["phase"] == "waiting_for_user_group"
+    assert inspected["progress"] == {"phase": "waiting_for_user_group"}
+
+    adapter.dependents_pending = False
+    second = destroy()
+
+    assert second["phase"] == "destroyed" and second["destroyed"] is True
+    assert len(adapter.dependents_calls) == 2 and not marker.exists()
 
 
 def test_a_fingerprint_that_is_not_the_planned_one_deletes_nothing(
@@ -2680,6 +2709,27 @@ def test_dependents_are_verified_then_deleted_in_dependency_order(monkeypatch) -
     assert calls[:2] == ["read:ListTagsForResource", "delete:DeleteUserGroup"]
     assert calls.index("delete:DeleteCacheSubnetGroup") == len(calls) - 1
     assert calls.count("delete:DeleteUser") == 3
+
+
+def test_dependents_wait_until_the_deleted_user_group_releases_its_users(monkeypatch) -> None:
+    user_id = f"{GROUP_ID}-default"
+    run, (reader_stub, killer_stub), calls, _assumed = dependents(monkeypatch, [user_id])
+    reader_stub.add_response("list_tags_for_resource", owned(), {
+        "ResourceName": f"{ARN_PREFIX}:usergroup:{USER_GROUP}"})
+    killer_stub.add_response("delete_user_group", {}, {"UserGroupId": USER_GROUP})
+    reader_stub.add_response("list_tags_for_resource", owned(), {
+        "ResourceName": f"{ARN_PREFIX}:user:{user_id}"})
+    killer_stub.add_client_error("delete_user", "InvalidUserGroupState", "secret detail")
+
+    with reader_stub, killer_stub:
+        assert run() is False
+
+    reader_stub.assert_no_pending_responses()
+    killer_stub.assert_no_pending_responses()
+    assert calls == [
+        "read:ListTagsForResource", "delete:DeleteUserGroup",
+        "read:ListTagsForResource", "delete:DeleteUser",
+    ]
 
 
 def test_an_object_owned_by_someone_else_stops_the_sequence_before_it_is_deleted(

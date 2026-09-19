@@ -395,6 +395,9 @@ the same call, with the same plan, to continue: it deletes nothing twice, then r
 dependents in dependency order, reading each object's `gimme:resource` tag with the inspection role
 before deleting it with the destructive role (`aws_elasticache_destroy_ownership_mismatch` stops the
 sequence for an object that is not this Resource's). An object that is already gone counts as done.
+ElastiCache deletes the user group asynchronously; if it has not released its users yet, apply returns
+`phase: waiting_for_user_group`. `inspect_resource` reports the same phase under `progress`; repeat
+the same confirmed call once AWS has finished the user-group deletion.
 A user whose binding crashed before its allocation was recorded is not known to Gimme and is left;
 delete it yourself. While a destruction is in progress the Resource cannot be provisioned or bound again
 (`aws_elasticache_destroy_in_progress`). A failure part-way leaves the registration and the

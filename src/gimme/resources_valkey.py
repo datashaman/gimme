@@ -276,7 +276,7 @@ class ElastiCacheAdapter(Protocol):
     def delete_dependents(
         self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str,
         group_id: str, user_ids: list[str],
-    ) -> None: ...
+    ) -> bool: ...
 
 
 def _tags(response: dict[str, object]) -> dict[object, object]:
@@ -714,16 +714,31 @@ class BotoElastiCacheAdapter(AWSAdapter):
     def delete_dependents(
         self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str,
         group_id: str, user_ids: list[str],
-    ) -> None:
+    ) -> bool:
         """Delete what Gimme created around a group that is gone, in dependency order. Each
         object's ownership tag is read (with the inspection role) before it is deleted, an
-        already-missing object counts as done, and any other doubt stops the sequence."""
+        already-missing object counts as done, and any other doubt stops the sequence. Returns
+        False only while AWS is still deleting the user group that this call just removed."""
         client = self._destructive_client(account, network)
         reader = self._client(account, network, "elasticache-destroy-verify")
+        self._delete_owned(
+            account, network, reader, resource_name, "usergroup", derive_user_group_id(group_id),
+            client.delete_user_group, "UserGroupId", "destroy",
+        )
+        for user_id in user_ids:
+            try:
+                self._delete_owned(
+                    account, network, reader, resource_name, "user", user_id,
+                    client.delete_user, "UserId", "destroy",
+                )
+            except ResourceError as exc:
+                # A successful DeleteUserGroup is asynchronous. ElastiCache rejects user
+                # deletion until it has finished, so preserve the marker and let the same
+                # confirmed call resume after the group is gone.
+                if str(exc) == "aws_elasticache_destroy_delete_invalid_state":
+                    return False
+                raise
         steps = [
-            ("usergroup", derive_user_group_id(group_id), client.delete_user_group,
-             "UserGroupId"),
-            *(("user", user_id, client.delete_user, "UserId") for user_id in user_ids),
             ("parametergroup", f"{group_id}-params", client.delete_cache_parameter_group,
              "CacheParameterGroupName"),
             ("subnetgroup", f"{group_id}-subnets", client.delete_cache_subnet_group,
@@ -734,6 +749,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
                 account, network, reader, resource_name, kind, object_id, delete, argument,
                 "destroy",
             )
+        return True
 
     def _delete_owned(
         self, account: AWSProviderAccount, network: AWSNetwork, reader, resource_name: str,
@@ -1414,7 +1430,7 @@ def apply_destroy(
     group_id = derive_group_id(resource_name)
     snapshot = final_snapshot_id(group_id, fingerprint)
     live = adapter.describe_group(account, network, group_id)
-    marker = {"schema_version": 1, "resource": resource_name}
+    marker = {"schema_version": 1, "resource": resource_name, "phase": "deleting"}
     if live is not None:
         if identity_fingerprint(live.identity) != fingerprint:
             raise ResourceError("aws_elasticache_destroy_identity_changed")
@@ -1432,8 +1448,15 @@ def apply_destroy(
                 "resource": resource_name, "phase": "deleting", "destroyed": False,
                 "final_snapshot": snapshot,
             }
+    marker["phase"] = "cleaning"
     write_marker(root, "destroying", resource_name, marker)
-    adapter.delete_dependents(account, network, resource_name, group_id, user_ids)
+    if adapter.delete_dependents(account, network, resource_name, group_id, user_ids) is False:
+        marker["phase"] = "waiting_for_user_group"
+        write_marker(root, "destroying", resource_name, marker)
+        return {
+            "resource": resource_name, "phase": "waiting_for_user_group", "destroyed": False,
+            "final_snapshot": snapshot,
+        }
     _observed_path(root, resource_name).unlink(missing_ok=True)
     clear_marker(root, "destroying", resource_name)
     return {
