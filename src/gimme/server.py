@@ -1041,6 +1041,8 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
         name, deployment, destination_name, destination, request_id, point_id
     )
     _assert_plan(expected, plan_id)
+    if not expected["ready"]:
+        raise RecoveryError("valkey_recovery_capture_unavailable")
     _, credentials = _backup_destination_credentials(state, destination)
     with _deployment_resource_lock(name):
         existing = recovery_module.find_recovery_point(

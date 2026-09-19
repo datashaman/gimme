@@ -831,7 +831,13 @@ def test_valkey_recovery_opt_in_and_drain_interval_are_content_addressed(
     assert postgres_only["components"] == ["postgres"]
     assert inclusive["components"] == ["postgres", "valkey"]
     assert inclusive["quiesce_wait_seconds"] == 45
+    assert inclusive["ready"] is False
     assert inclusive["plan_id"] != postgres_only["plan_id"]
+
+    with pytest.raises(RecoveryError, match="^valkey_recovery_capture_unavailable$"):
+        server_module.create_recovery_point(
+            "example-app", "req-1", str(inclusive["plan_id"])
+        )
 
 
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:

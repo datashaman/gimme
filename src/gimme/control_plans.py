@@ -238,6 +238,9 @@ def recovery_point_creation_plan(
     request_id: str,
     point_id: str,
 ) -> dict[str, Any]:
+    policy = deployment.recovery
+    if policy is None:
+        raise ValueError("deployment has no Recovery Policy bound")
     return exact_plan(
         {
             "kind": "recovery_point_creation",
@@ -248,28 +251,32 @@ def recovery_point_creation_plan(
             "request_id": request_id,
             "recovery_point_id": point_id,
             "components": [
-                "postgres", *(["valkey"] if deployment.recovery.valkey else [])
+                "postgres", *(["valkey"] if policy.valkey else [])
             ],
-            "quiesce_wait_seconds": deployment.recovery.quiesce_wait_seconds,
+            "quiesce_wait_seconds": policy.quiesce_wait_seconds,
+            "ready": not policy.valkey,
+            "readiness_issues": (
+                [] if not policy.valkey else ["Valkey recovery capture is not installed"]
+            ),
             "effects": [
                 *(
                     [
                         "place only this deployment route into request-owned maintenance",
                         "drain and stop only this deployment's managed writers",
                     ]
-                    if deployment.recovery.valkey else []
+                    if policy.valkey else []
                 ),
                 "capture the deployment's isolated PostgreSQL database",
                 *(
                     ["capture only this deployment's registered Valkey prefix"]
-                    if deployment.recovery.valkey else []
+                    if policy.valkey else []
                 ),
                 "exclude roles, ownership, ACLs, and credential material from the dump",
                 "upload every checksummed component with server-side encryption",
                 "publish one immutable Recovery Manifest only after all components verify",
                 *(
                     ["restore managed processes and normal routing after capture"]
-                    if deployment.recovery.valkey else []
+                    if policy.valkey else []
                 ),
                 "make no other remote or destination changes",
             ],

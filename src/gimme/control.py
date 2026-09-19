@@ -584,6 +584,13 @@ class RecoveryPolicy(BaseModel):
             raise ValueError("quiesce_wait_seconds must be an integer")
         return value
 
+    @field_validator("valkey", mode="before")
+    @classmethod
+    def strict_valkey_selection(cls, value: object) -> object:
+        if not isinstance(value, bool):
+            raise ValueError("valkey must be a boolean")
+        return value
+
 
 def _looks_like_ip(value: str) -> bool:
     try:
