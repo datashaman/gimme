@@ -143,6 +143,8 @@ def _provider_error(
             "InvalidCacheParameterGroupState": "invalid_state",
             "InvalidDBInstanceState": "invalid_state",
             "InvalidDBInstanceStateFault": "invalid_state",
+            "SnapshotAlreadyExistsFault": "snapshot_exists",
+            "SnapshotAlreadyExists": "snapshot_exists",
             "DecryptionFailure": "revoked",
             "Throttling": "throttled",
             "ThrottlingException": "throttled",
@@ -850,6 +852,12 @@ def retain_resource(root: Path, resource_name: str, aws_network: str) -> dict[st
     }
     _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
     return tombstone
+
+
+def forget_retained(root: Path, resource_name: str) -> None:
+    """Delete only the local tombstone. The infrastructure it named is untouched and stays
+    unadoptable."""
+    _tombstone_path(root, resource_name).unlink(missing_ok=True)
 
 
 def load_retained(root: Path, resource_name: str) -> dict[str, object] | None:

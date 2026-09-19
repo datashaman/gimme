@@ -231,6 +231,16 @@ class ElastiCacheAdapter(Protocol):
         keep_credential: bool,
     ) -> tuple[str, str, str] | None: ...
 
+    def delete_group(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
+        final_snapshot: str,
+    ) -> None: ...
+
+    def delete_dependents(
+        self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str,
+        group_id: str, user_ids: list[str],
+    ) -> None: ...
+
 
 def _tags(response: dict[str, object]) -> dict[object, object]:
     tags = response.get("TagList") or []
@@ -621,6 +631,61 @@ class BotoElastiCacheAdapter(AWSAdapter):
             raise _provider_error(exc, "user_group_bind", self.error_prefix) from None
         return written
 
+    def _destructive_client(self, account: AWSProviderAccount, network: AWSNetwork):
+        """The only place the destructive role is assumed, and only while applying."""
+        if account.destructive_role_arn is None:
+            raise ResourceError(f"{self.error_prefix}_destroy_role_missing")
+        session = self._session(account, account.destructive_role_arn, "elasticache-destroy")
+        return session.client("elasticache", region_name=network.region)
+
+    def delete_group(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
+        final_snapshot: str,
+    ) -> None:
+        client = self._destructive_client(account, network)
+        try:
+            client.delete_replication_group(
+                ReplicationGroupId=group_id, FinalSnapshotIdentifier=final_snapshot,
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "destroy_group", self.error_prefix) from None
+
+    def delete_dependents(
+        self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str,
+        group_id: str, user_ids: list[str],
+    ) -> None:
+        """Delete what Gimme created around a group that is gone, in dependency order. Each
+        object's ownership tag is read (with the inspection role) before it is deleted, an
+        already-missing object counts as done, and any other doubt stops the sequence."""
+        client = self._destructive_client(account, network)
+        reader = self._client(account, network, "elasticache-destroy-verify")
+        prefix = f"arn:aws:elasticache:{network.region}:{account.account_id}"
+        steps = [
+            ("usergroup", derive_user_group_id(group_id), client.delete_user_group,
+             "UserGroupId"),
+            *(("user", user_id, client.delete_user, "UserId") for user_id in user_ids),
+            ("parametergroup", f"{group_id}-params", client.delete_cache_parameter_group,
+             "CacheParameterGroupName"),
+            ("subnetgroup", f"{group_id}-subnets", client.delete_cache_subnet_group,
+             "CacheSubnetGroupName"),
+        ]
+        for kind, object_id, delete, argument in steps:
+            try:
+                tags = reader.list_tags_for_resource(ResourceName=f"{prefix}:{kind}:{object_id}")
+            except Exception as exc:
+                error = _provider_error(exc, "destroy_verify", self.error_prefix)
+                if "missing" in str(error):
+                    continue
+                raise error from None
+            if _tags(tags).get("gimme:resource") != resource_name:
+                raise ResourceError("aws_elasticache_destroy_ownership_mismatch")
+            try:
+                delete(**{argument: object_id})
+            except Exception as exc:
+                error = _provider_error(exc, "destroy_delete", self.error_prefix)
+                if "missing" not in str(error):
+                    raise error from None
+
     def create_group(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
@@ -860,6 +925,7 @@ def apply_provision(
     immediate modification of only the fields that differ, then poll up to a bounded 30
     seconds. A still-provisioning or still-modifying group is recorded as phase 'pending';
     a later call resumes by describing, so it re-creates and re-sends nothing."""
+    _refuse_while_destroying(root, resource_name)
     group_id = derive_group_id(resource_name)
     previous = load_observed(root, resource_name)
     allocations = dict(cast(dict[str, object], previous["allocations"])) if previous else {}
@@ -914,6 +980,7 @@ def apply_binding(
     allocation keeps its credential; a user with no recorded allocation gets a new one.
     Never returns the username or password."""
     _checked_name(deployment_name)
+    _refuse_while_destroying(root, resource_name)
     document = load_observed(root, resource_name)
     group_id = derive_group_id(resource_name)
     live = adapter.describe_group(account, network, group_id)
@@ -958,3 +1025,83 @@ def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, 
     }
     _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
     return cast(dict[str, object], tombstone)
+
+
+def _destroying_path(root: Path, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None:
+        raise ResourceError("resource_name_invalid")
+    return root / "destroying-resources" / f"{resource_name}.json"
+
+
+def _refuse_while_destroying(root: Path, resource_name: str) -> None:
+    if _destroying_path(root, resource_name).is_file():
+        raise ResourceError("aws_elasticache_destroy_in_progress")
+
+
+def identity_fingerprint(identity: str) -> str:
+    return hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def final_snapshot_id(group_id: str, fingerprint: str) -> str:
+    """Deterministic per group incarnation, so a retried delete never makes a second snapshot
+    and a reused name fails closed as `snapshot_exists`."""
+    return f"{group_id}-final-{fingerprint[:8]}"
+
+
+def destruction_targets(root: Path, resource_name: str) -> tuple[str, list[str]]:
+    """The observed identity fingerprint and every ElastiCache user Gimme created: the default
+    and administrative users and one per recorded allocation."""
+    observed = load_observed(root, resource_name)
+    if observed is None:
+        raise ResourceError("aws_elasticache_destroy_not_observed")
+    group_id = derive_group_id(resource_name)
+    allocations = cast(dict[str, dict[str, str]], observed["allocations"])
+    users = [
+        _derived(group_id, "default"), _derived(group_id, "admin"),
+        *sorted(item["user_id"] for item in allocations.values()),
+    ]
+    return identity_fingerprint(str(observed["identity"])), users
+
+
+def apply_destroy(
+    adapter: ElastiCacheAdapter, root: Path, account: AWSProviderAccount, network: AWSNetwork,
+    resource_name: str, expected_fingerprint: str,
+    *, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Delete the replication group with a final snapshot, then what Gimme created around it.
+    Resumable: a group that is still deleting after a bounded 30 seconds returns phase
+    'deleting', and a later call continues. The group must still be the one that was planned
+    (identity and ownership tags); anything else fails closed before any deletion. Workload
+    secrets and the final snapshot are retained."""
+    fingerprint, user_ids = destruction_targets(root, resource_name)
+    if fingerprint != expected_fingerprint:
+        raise ResourceError("aws_elasticache_destroy_identity_changed")
+    group_id = derive_group_id(resource_name)
+    snapshot = final_snapshot_id(group_id, fingerprint)
+    live = adapter.describe_group(account, network, group_id)
+    marker = {"schema_version": 1, "resource": resource_name}
+    if live is not None:
+        if identity_fingerprint(live.identity) != fingerprint:
+            raise ResourceError("aws_elasticache_destroy_identity_changed")
+        if live.status not in ("available", "deleting"):
+            raise ResourceError("aws_elasticache_destroy_invalid_state")
+        _write_json(_destroying_path(root, resource_name), marker, resource_name)
+        if live.status == "available":
+            adapter.delete_group(account, network, group_id, snapshot)
+        deadline = now() + POLL_BUDGET_SECONDS
+        while live is not None and now() < deadline:
+            sleep(POLL_INTERVAL_SECONDS)
+            live = adapter.describe_group(account, network, group_id)
+        if live is not None:
+            return {
+                "resource": resource_name, "phase": "deleting", "destroyed": False,
+                "final_snapshot": snapshot,
+            }
+    _write_json(_destroying_path(root, resource_name), marker, resource_name)
+    adapter.delete_dependents(account, network, resource_name, group_id, user_ids)
+    _observed_path(root, resource_name).unlink(missing_ok=True)
+    _destroying_path(root, resource_name).unlink(missing_ok=True)
+    return {
+        "resource": resource_name, "phase": "destroyed", "destroyed": True,
+        "final_snapshot": snapshot,
+    }

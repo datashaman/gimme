@@ -419,6 +419,50 @@ def resource_cleanup_plan(
     )
 
 
+def valkey_destroy_plan(
+    resource_name: str, fingerprint: str, final_snapshot: str, users: int
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_destroy",
+            "resource": resource_name,
+            "confirmation": f"DESTROY RESOURCE {resource_name}",
+            "identity_fingerprint": fingerprint,
+            "final_snapshot": final_snapshot,
+            "destroys": [
+                "the ElastiCache replication group and all its data",
+                "its automatic snapshots",
+                "the ElastiCache user group",
+                f"{users} ElastiCache users created by Gimme",
+                "the cache parameter group and cache subnet group created by Gimme",
+                "the local Resource registration and observation",
+            ],
+            "retains": [
+                "a final snapshot of the group, which you must delete yourself when done",
+                "manual snapshots",
+                "the Resource Credential and administrative secrets in Secrets Manager",
+            ],
+            "authority": "the Provider Account's destructive role, assumed only during apply",
+            "irreversible": True,
+        }
+    )
+
+
+def resource_forget_plan(resource_name: str) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_forget",
+            "resource": resource_name,
+            "confirmation": f"FORGET {resource_name}",
+            "effects": [
+                "delete the local Retained Resource tombstone only",
+                "make no remote changes",
+                "the retained infrastructure stays in AWS and cannot be adopted again",
+            ],
+        }
+    )
+
+
 def deployment_removal_plan(
     name: str,
     deployment: DeploymentConfig,

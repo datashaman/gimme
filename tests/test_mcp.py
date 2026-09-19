@@ -228,6 +228,27 @@ def test_provider_account_and_secret_store_registration_are_planned_and_secret_s
     assert "arn:aws" not in journal
 
 
+def test_registering_an_account_never_assumes_its_destructive_role(
+    tmp_path: Path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    aws = FakeAWSIdentity()
+    monkeypatch.setattr(server_module, "aws_secrets", aws)
+    destructive = "arn:aws:iam::123456789012:role/gimme-destroy"
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+        destructive_role_arn=destructive,
+    )
+
+    plan = server_module.plan_register_provider_account("production", account)
+    server_module.register_provider_account("production", account, str(plan["plan_id"]))
+
+    assert selected.load().provider_accounts["production"].destructive_role_arn == destructive
+    assert destructive not in aws.roles and len(aws.roles) == 4
+
+
 async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()

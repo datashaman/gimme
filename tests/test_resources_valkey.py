@@ -11,13 +11,14 @@ from botocore.stub import ANY
 from pydantic import ValidationError
 
 from gimme.control import (
-    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, MANAGED_VALKEY_ENV_KEYS,
-    ResourceBindings, StateStore, ValkeyBinding,
+    AWSElastiCacheValkeyResource, AWSProviderAccount, AWSSecretsManagerStore, ControlState,
+    MANAGED_VALKEY_ENV_KEYS, ResourceBindings, StateStore, ValkeyBinding,
 )
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
     ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, LARAVEL_COMMANDS,
-    MODIFIABLE_FIELDS, ValkeyOptions, apply_binding, apply_provision, derive_binding_user_id,
+    MODIFIABLE_FIELDS, ValkeyOptions, apply_binding, apply_destroy, apply_provision,
+    derive_binding_user_id,
     derive_group_id, derive_user_group_id, group_drift, laravel_access_string, load_observed,
     modification_for, namespace_prefixes, structural_issues,
 )
@@ -27,6 +28,7 @@ from gimme.secrets import SecretMetadata
 from gimme.valkey_contract import (
     contract_variables, credential_references, probe_names,
 )
+import gimme.resources_valkey as resources_valkey_module
 import gimme.server as server_module
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config/state.example.json"
@@ -89,6 +91,9 @@ class FakeValkey:
         self.options = OPTIONS
         self.binding_calls: list[tuple[str, bool]] = []
         self.users: set[str] = set()
+        self.delete_calls: list[str] = []
+        self.dependents_calls: list[tuple[str, list[str]]] = []
+        self.dependents_error: ResourceError | None = None
         self._polls = 0
 
     def describe_group(self, account, network, group_id):
@@ -97,6 +102,10 @@ class FakeValkey:
             self._polls += 1
             if self._polls > self.settle_polls:
                 self.live = dataclasses.replace(self.live, status="available")
+        elif self.live is not None and self.live.status == "deleting":
+            self._polls += 1
+            if self._polls > self.settle_polls:
+                self.live = None
         return self.live
 
     def allowed_node_types(self, account, network, group_id):
@@ -126,6 +135,18 @@ class FakeValkey:
         self.users.add(user_id)
         arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{user_id}"
         return user_id, arn, "v" * 32
+
+    def delete_group(self, account, network, group_id, final_snapshot):
+        assert self.live is not None and account.destructive_role_arn is not None
+        self.delete_calls.append(final_snapshot)
+        self._polls = 0
+        self.live = dataclasses.replace(self.live, status="deleting")
+
+    def delete_dependents(self, account, network, resource_name, group_id, user_ids):
+        assert self.live is None, "dependents go only after the group is gone"
+        self.dependents_calls.append((resource_name, list(user_ids)))
+        if self.dependents_error is not None:
+            raise self.dependents_error
 
     def create_group(self, account, network, resource, name, group_id, store, store_name):
         self.create_calls += 1
@@ -2170,3 +2191,483 @@ def test_a_corrupt_observation_makes_the_resource_unready_instead_of_breaking_ta
 
     assert "valkey_resource_not_ready" in plan["readiness_issues"]
     assert calls[-1]["valkey_probe"] is None
+
+
+# --- retention, destruction, and forgetting -----------------------------------------------
+
+DESTROYER = "arn:aws:iam::123456789012:role/gimme-destroy"
+CONFIRM = f"DESTROY RESOURCE {NAME}"
+
+
+def unreferenced(tmp_path, monkeypatch, adapter: FakeValkey | None = None) -> FakeValkey:
+    """A provisioned Resource that no Deployment references."""
+    adapter = provisioned(tmp_path, monkeypatch, adapter)
+    document = server_module.store.load().model_dump(mode="json")
+    for deployment in document["deployments"].values():
+        if (deployment["resources"].get("valkey") or {}).get("resource") == NAME:
+            deployment["resources"]["valkey"] = {"resource": "devbox-valkey", "uses": ["cache"]}
+    server_module.store.save(ControlState.model_validate(document))
+    return adapter
+
+
+def destroyable(tmp_path, monkeypatch, adapter: FakeValkey | None = None) -> FakeValkey:
+    """The same, on an account with a destructive role."""
+    adapter = unreferenced(tmp_path, monkeypatch, adapter)
+    document = server_module.store.load().model_dump(mode="json")
+    document["provider_accounts"]["main"]["destructive_role_arn"] = DESTROYER
+    server_module.store.save(ControlState.model_validate(document))
+    return adapter
+
+
+def destroy(confirmation: str = CONFIRM) -> dict[str, object]:
+    plan = server_module.plan_destroy_resource(NAME)
+    return server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), confirmation)
+
+
+@pytest.fixture
+def instant(monkeypatch):
+    monkeypatch.setattr(resources_valkey_module, "POLL_INTERVAL_SECONDS", 0)
+
+
+def test_the_destructive_role_is_optional_and_must_be_a_third_distinct_role() -> None:
+    document = json.loads(EXAMPLE.read_text())["provider_accounts"]["main"]
+    assert AWSProviderAccount.model_validate(document).destructive_role_arn is None
+
+    valid = {**document, "destructive_role_arn": DESTROYER}
+    assert AWSProviderAccount.model_validate(valid).destructive_role_arn == DESTROYER
+    for role in (
+        document["inspection_role_arn"], document["resolver_role_arn"],
+        "arn:aws:iam::999999999999:role/gimme-destroy", "arn:aws:iam::123456789012:user/x",
+    ):
+        with pytest.raises(ValidationError):
+            AWSProviderAccount.model_validate({**document, "destructive_role_arn": role})
+
+
+def test_a_destruction_plan_is_local_secret_free_and_names_what_it_keeps(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    describes = adapter.describe_calls
+
+    plan = server_module.plan_destroy_resource(NAME)
+
+    assert adapter.describe_calls == describes, "planning makes no AWS call"
+    assert plan["confirmation"] == CONFIRM and plan["irreversible"] is True
+    assert str(plan["final_snapshot"]).startswith(f"{GROUP_ID}-final-")
+    assert any("final snapshot" in item for item in cast(list[str], plan["retains"]))
+    assert any("secrets" in item for item in cast(list[str], plan["retains"]))
+    text = json.dumps(plan)
+    assert ARN not in text and "gimme-u-" not in text and "password" not in text.lower()
+
+
+@pytest.mark.parametrize("problem", ["role", "reference", "allocation", "unobserved", "kind"])
+def test_a_destruction_plan_fails_closed_until_it_is_safe(
+    tmp_path, monkeypatch, problem
+) -> None:
+    destroyable(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    name = NAME
+    match problem:
+        case "role":
+            document["provider_accounts"]["main"]["destructive_role_arn"] = None
+            expected = "aws_elasticache_destroy_role_missing"
+        case "reference":
+            document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+                "resource": NAME, "uses": ["cache"]}
+            expected = "still referenced"
+        case "allocation":
+            expected = "aws_elasticache_destroy_bindings_remain"
+        case "unobserved":
+            (server_module.store.root / "observed-resources" / f"{NAME}.json").unlink()
+            expected = "aws_elasticache_destroy_not_observed"
+        case _:
+            name = "devbox-postgres"
+            expected = "not a managed ElastiCache Valkey resource"
+    if problem == "allocation":
+        observed_path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+        observed = json.loads(observed_path.read_text())
+        observed["allocations"] = {DEPLOYMENT: {
+            "user_id": "gimme-u-x", "secret_arn": "arn", "secret_version_id": "v",
+            "status": "active"}}
+        observed_path.write_text(json.dumps(observed))
+    server_module.store.save(ControlState.model_validate(document))
+
+    with pytest.raises((ValueError, ResourceError), match=expected):
+        server_module.plan_destroy_resource(name)
+
+
+def test_destruction_needs_the_exact_confirmation_and_a_current_plan(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    plan = server_module.plan_destroy_resource(NAME)
+
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), "DESTROY")
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM.lower())
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_destroy_resource(NAME, "plan_" + "0" * 20, CONFIRM)
+
+    assert adapter.delete_calls == [] and adapter.dependents_calls == []
+
+
+def test_destruction_deletes_the_group_then_what_gimme_created_and_forgets_the_resource(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    bind_state = load_observed(server_module.store.root, NAME)
+    assert bind_state is not None
+
+    result = destroy()
+
+    assert result["destroyed"] is True and result["phase"] == "destroyed"
+    assert adapter.delete_calls == [result["final_snapshot"]]
+    assert adapter.live is None
+    assert [call[0] for call in adapter.dependents_calls] == [NAME]
+    assert adapter.dependents_calls[0][1][:2] == [
+        f"{GROUP_ID}-default", f"{GROUP_ID}-admin",
+    ]
+    assert NAME not in server_module.store.load().resources
+    assert load_observed(server_module.store.root, NAME) is None
+    assert not (server_module.store.root / "destroying-resources" / f"{NAME}.json").exists()
+    assert not (server_module.store.root / "retained-resources" / f"{NAME}.json").exists()
+    assert bind_state["identity"] == ARN
+
+
+def test_a_group_still_deleting_returns_pending_and_a_repeat_continues(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    adapter.settle_polls = 1000
+    monkeypatch.setattr(resources_valkey_module, "POLL_BUDGET_SECONDS", 0)
+    plan = server_module.plan_destroy_resource(NAME)
+
+    first = server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM)
+
+    assert first["phase"] == "deleting" and first["destroyed"] is False
+    assert adapter.dependents_calls == [] and NAME in server_module.store.load().resources
+    marker = server_module.store.root / "destroying-resources" / f"{NAME}.json"
+    assert marker.is_file()
+    assert server_module.plan_destroy_resource(NAME)["plan_id"] == plan["plan_id"], (
+        "the same plan resumes the destruction"
+    )
+
+    adapter.settle_polls = 1  # the repeat first sees the group still 'deleting', then gone
+    monkeypatch.setattr(resources_valkey_module, "POLL_BUDGET_SECONDS", 30)
+    second = server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM)
+
+    assert second["destroyed"] is True
+    assert adapter.delete_calls == [first["final_snapshot"]], "the group is deleted only once"
+    assert not marker.exists()
+
+
+def test_a_partly_destroyed_resource_cannot_be_provisioned_or_bound_again(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    adapter.dependents_error = ResourceError("aws_elasticache_destroy_delete_invalid_state")
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_delete_invalid_state$"):
+        destroy()
+
+    assert NAME in server_module.store.load().resources
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_in_progress$"):
+        server_module.apply_resource(NAME, str(server_module.plan_apply_resource(NAME)["plan_id"]))
+    account, network, secret_store = context()
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_in_progress$"):
+        apply_binding(
+            adapter, server_module.store.root, account, network, valkey(), NAME, secret_store,
+            "workload-secrets", DEPLOYMENT, ["cache"],
+        )
+
+    adapter.dependents_error = None
+    assert destroy()["destroyed"] is True, "a repeat resumes and finishes"
+
+
+def test_a_fingerprint_that_is_not_the_planned_one_deletes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    account, network, _store = context()
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_identity_changed$"):
+        apply_destroy(
+            adapter, server_module.store.root,
+            account.model_copy(update={"destructive_role_arn": DESTROYER}), network, NAME,
+            "0" * 16,
+        )
+
+    assert adapter.delete_calls == [] and adapter.dependents_calls == []
+
+
+@pytest.mark.parametrize(
+    ("live", "code"),
+    [
+        ({"identity": ARN + "-other"}, "aws_elasticache_destroy_identity_changed"),
+        ({"status": "modifying"}, "aws_elasticache_destroy_invalid_state"),
+        ({"status": "creating"}, "aws_elasticache_destroy_invalid_state"),
+    ],
+)
+def test_a_group_that_is_not_the_planned_one_is_never_deleted(
+    tmp_path, monkeypatch, instant, live, code
+) -> None:
+    adapter = destroyable(tmp_path, monkeypatch)
+    plan = server_module.plan_destroy_resource(NAME)
+    adapter.settle_polls = 1000
+    adapter.live = dataclasses.replace(adapter.live, **live)
+
+    with pytest.raises(ResourceError, match=f"^{code}$"):
+        server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM)
+
+    assert adapter.delete_calls == [] and adapter.dependents_calls == []
+    assert not (server_module.store.root / "destroying-resources" / f"{NAME}.json").exists()
+
+
+def test_a_replanned_group_identity_makes_the_old_plan_stale(tmp_path, monkeypatch) -> None:
+    destroyable(tmp_path, monkeypatch)
+    plan = server_module.plan_destroy_resource(NAME)
+    observed_path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    observed = json.loads(observed_path.read_text())
+    observed["identity"] = ARN + "-recreated"
+    observed_path.write_text(json.dumps(observed))
+
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_destroy_resource(NAME, str(plan["plan_id"]), CONFIRM)
+
+
+def test_forgetting_deletes_only_a_local_tombstone(tmp_path, monkeypatch) -> None:
+    adapter = unreferenced(tmp_path, monkeypatch)
+    cleanup = server_module.plan_cleanup_resource(NAME)
+    server_module.apply_cleanup_resource(
+        NAME, str(cleanup["plan_id"]), str(cleanup["confirmation"])
+    )
+    tombstone = server_module.store.root / "retained-resources" / f"{NAME}.json"
+    assert tombstone.is_file()
+    calls = (adapter.describe_calls, adapter.delete_calls)
+
+    plan = server_module.plan_forget_resource(NAME)
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_forget_resource(NAME, str(plan["plan_id"]), "forget")
+    assert tombstone.is_file()
+    result = server_module.apply_forget_resource(NAME, str(plan["plan_id"]), f"FORGET {NAME}")
+
+    assert result["changed"] is True and result["resource"] == NAME
+    assert not tombstone.exists()
+    assert (adapter.describe_calls, adapter.delete_calls) == calls
+    with pytest.raises(KeyError):
+        server_module.plan_forget_resource(NAME)
+
+
+def test_only_retained_infrastructure_can_be_forgotten(tmp_path, monkeypatch) -> None:
+    provisioned(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="still registered"):
+        server_module.plan_forget_resource(NAME)
+    with pytest.raises(KeyError):
+        server_module.plan_forget_resource("never-existed")
+
+
+INSPECTOR = "arn:aws:iam::123456789012:role/gimme-inspect"
+ARN_PREFIX = "arn:aws:elasticache:us-east-1:123456789012"
+USER_GROUP = derive_user_group_id(GROUP_ID)
+
+
+def destroyer(monkeypatch, *, with_role: bool = True):
+    """Two stubbed ElastiCache clients: the inspection role reads, the destructive one deletes.
+    `calls` is the order in which the two were used."""
+    reader, reader_stub = stubbed("elasticache")
+    killer, killer_stub = stubbed("elasticache")
+    calls: list[str] = []
+    for label, client in (("read", reader), ("delete", killer)):
+        client.meta.events.register(
+            "before-call.*.*",
+            lambda model, label=label, **kwargs: calls.append(f"{label}:{model.name}"),
+        )
+    assumed: list[tuple[str, str]] = []
+    adapter = BotoElastiCacheAdapter()
+
+    def session(account, role_arn, purpose):
+        assumed.append((role_arn, purpose))
+        return StubbedSession({"elasticache": {INSPECTOR: reader, DESTROYER: killer}[role_arn]})
+
+    monkeypatch.setattr(adapter, "_session", session)
+    account, network, _store = context()
+    if with_role:
+        account = account.model_copy(update={"destructive_role_arn": DESTROYER})
+    return adapter, account, network, (reader_stub, killer_stub), calls, assumed
+
+
+def owned(resource: str = NAME) -> dict[str, object]:
+    return {"TagList": [{"Key": "gimme:resource", "Value": resource}]}
+
+
+def test_the_group_is_deleted_with_a_final_snapshot_by_the_destructive_role_only(
+    monkeypatch,
+) -> None:
+    adapter, account, network, (reader_stub, killer_stub), _calls, assumed = destroyer(monkeypatch)
+    killer_stub.add_response(
+        "delete_replication_group", {},
+        {"ReplicationGroupId": GROUP_ID, "FinalSnapshotIdentifier": f"{GROUP_ID}-final-abcd1234"},
+    )
+
+    with reader_stub, killer_stub:
+        adapter.delete_group(account, network, GROUP_ID, f"{GROUP_ID}-final-abcd1234")
+
+    assert assumed == [(DESTROYER, "elasticache-destroy")]
+    killer_stub.assert_no_pending_responses()
+
+
+def test_without_a_destructive_role_nothing_is_assumed_or_deleted(monkeypatch) -> None:
+    adapter, account, network, _stubs, _calls, assumed = destroyer(monkeypatch, with_role=False)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        adapter.delete_group(account, network, GROUP_ID, "snapshot")
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        adapter.delete_dependents(account, network, NAME, GROUP_ID, [])
+
+    assert assumed == []
+
+
+@pytest.mark.parametrize(
+    ("wire", "code"),
+    [
+        ("SnapshotAlreadyExistsFault", "snapshot_exists"),
+        ("InvalidReplicationGroupState", "invalid_state"),
+        ("AccessDenied", "access_denied"),
+        ("SomethingElse", "unavailable"),
+    ],
+)
+def test_group_deletion_failures_are_bounded_codes(monkeypatch, wire, code) -> None:
+    adapter, account, network, (reader_stub, killer_stub), _calls, _assumed = destroyer(monkeypatch)
+    killer_stub.add_client_error("delete_replication_group", wire, "secret detail")
+
+    with killer_stub, pytest.raises(ResourceError) as caught:
+        adapter.delete_group(account, network, GROUP_ID, "snapshot")
+
+    assert str(caught.value) == f"aws_elasticache_destroy_group_{code}"
+    assert "secret" not in str(caught.value)
+
+
+def dependents(monkeypatch, users: list[str]):
+    adapter, account, network, stubs, calls, assumed = destroyer(monkeypatch)
+    adapter_call = lambda: adapter.delete_dependents(  # noqa: E731
+        account, network, NAME, GROUP_ID, users
+    )
+    return adapter_call, stubs, calls, assumed
+
+
+def test_dependents_are_verified_then_deleted_in_dependency_order(monkeypatch) -> None:
+    users = [f"{GROUP_ID}-default", f"{GROUP_ID}-admin", "gimme-u-abc"]
+    run, (reader_stub, killer_stub), calls, assumed = dependents(monkeypatch, users)
+    for kind, object_id in (
+        ("usergroup", USER_GROUP), *(("user", user) for user in users),
+        ("parametergroup", f"{GROUP_ID}-params"), ("subnetgroup", f"{GROUP_ID}-subnets"),
+    ):
+        reader_stub.add_response(
+            "list_tags_for_resource", owned(),
+            {"ResourceName": f"{ARN_PREFIX}:{kind}:{object_id}"},
+        )
+    killer_stub.add_response("delete_user_group", {}, {"UserGroupId": USER_GROUP})
+    for user in users:
+        killer_stub.add_response("delete_user", {}, {"UserId": user})
+    killer_stub.add_response(
+        "delete_cache_parameter_group", {}, {"CacheParameterGroupName": f"{GROUP_ID}-params"}
+    )
+    killer_stub.add_response(
+        "delete_cache_subnet_group", {}, {"CacheSubnetGroupName": f"{GROUP_ID}-subnets"}
+    )
+
+    with reader_stub, killer_stub:
+        run()
+
+    reader_stub.assert_no_pending_responses()
+    killer_stub.assert_no_pending_responses()
+    assert {role for role, _ in assumed} == {INSPECTOR, DESTROYER}
+    # every object is read before it is deleted, and nothing is deleted out of order
+    assert calls[:2] == ["read:ListTagsForResource", "delete:DeleteUserGroup"]
+    assert calls.index("delete:DeleteCacheSubnetGroup") == len(calls) - 1
+    assert calls.count("delete:DeleteUser") == 3
+
+
+def test_an_object_owned_by_someone_else_stops_the_sequence_before_it_is_deleted(
+    monkeypatch,
+) -> None:
+    run, (reader_stub, killer_stub), calls, _assumed = dependents(
+        monkeypatch, [f"{GROUP_ID}-default"]
+    )
+    reader_stub.add_response("list_tags_for_resource", owned(), {
+        "ResourceName": f"{ARN_PREFIX}:usergroup:{USER_GROUP}"})
+    killer_stub.add_response("delete_user_group", {}, {"UserGroupId": USER_GROUP})
+    reader_stub.add_response("list_tags_for_resource", owned("another-resource"), {
+        "ResourceName": f"{ARN_PREFIX}:user:{GROUP_ID}-default"})
+
+    with reader_stub, killer_stub, pytest.raises(
+        ResourceError, match="^aws_elasticache_destroy_ownership_mismatch$"
+    ):
+        run()
+
+    assert "delete:DeleteUser" not in calls and "delete:DeleteCacheSubnetGroup" not in calls
+
+
+def test_an_untagged_object_is_not_ours_to_delete(monkeypatch) -> None:
+    run, (reader_stub, killer_stub), calls, _assumed = dependents(monkeypatch, [])
+    reader_stub.add_response("list_tags_for_resource", {"TagList": []}, {
+        "ResourceName": f"{ARN_PREFIX}:usergroup:{USER_GROUP}"})
+
+    with reader_stub, killer_stub, pytest.raises(
+        ResourceError, match="^aws_elasticache_destroy_ownership_mismatch$"
+    ):
+        run()
+
+    assert calls == ["read:ListTagsForResource"]
+
+
+def test_objects_that_are_already_gone_count_as_done(monkeypatch) -> None:
+    run, (reader_stub, killer_stub), calls, _assumed = dependents(monkeypatch, ["gimme-u-abc"])
+    reader_stub.add_client_error("list_tags_for_resource", "UserGroupNotFound")
+    reader_stub.add_client_error("list_tags_for_resource", "UserNotFound")
+    reader_stub.add_response("list_tags_for_resource", owned(), {
+        "ResourceName": f"{ARN_PREFIX}:parametergroup:{GROUP_ID}-params"})
+    killer_stub.add_client_error("delete_cache_parameter_group", "CacheParameterGroupNotFound")
+    reader_stub.add_client_error("list_tags_for_resource", "CacheSubnetGroupNotFoundFault")
+
+    with reader_stub, killer_stub:
+        run()
+
+    assert not any(call.startswith("delete:DeleteUser") for call in calls)
+    reader_stub.assert_no_pending_responses()
+    killer_stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    ("wire", "code"),
+    [
+        ("InvalidUserGroupState", "aws_elasticache_destroy_delete_invalid_state"),
+        ("AccessDenied", "aws_elasticache_destroy_delete_access_denied"),
+    ],
+)
+def test_a_deletion_that_cannot_proceed_fails_with_a_bounded_code(
+    monkeypatch, wire, code
+) -> None:
+    run, (reader_stub, killer_stub), _calls, _assumed = dependents(monkeypatch, [])
+    reader_stub.add_response("list_tags_for_resource", owned(), {
+        "ResourceName": f"{ARN_PREFIX}:usergroup:{USER_GROUP}"})
+    killer_stub.add_client_error("delete_user_group", wire, "secret detail")
+
+    with reader_stub, killer_stub, pytest.raises(ResourceError) as caught:
+        run()
+
+    assert str(caught.value) == code
+
+
+def test_a_verification_that_cannot_be_read_stops_before_any_deletion(monkeypatch) -> None:
+    run, (reader_stub, killer_stub), calls, _assumed = dependents(monkeypatch, [])
+    reader_stub.add_client_error("list_tags_for_resource", "AccessDenied")
+
+    with reader_stub, killer_stub, pytest.raises(
+        ResourceError, match="^aws_elasticache_destroy_verify_access_denied$"
+    ):
+        run()
+
+    assert not any(call.startswith("delete:") for call in calls)

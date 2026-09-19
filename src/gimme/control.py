@@ -378,19 +378,25 @@ class AWSProviderAccount(BaseModel):
     account_id: str = Field(pattern=AWS_ACCOUNT_ID.pattern)
     inspection_role_arn: str = Field(min_length=20, max_length=600)
     resolver_role_arn: str = Field(min_length=20, max_length=600)
+    # Optional. Assumed only while applying a confirmed destruction, never while planning,
+    # registering, or inspecting, so the day-to-day roles cannot delete anything.
+    destructive_role_arn: str | None = Field(default=None, min_length=20, max_length=600)
 
     @model_validator(mode="after")
     def exact_roles(self) -> "AWSProviderAccount":
+        roles = [self.inspection_role_arn, self.resolver_role_arn]
+        if self.destructive_role_arn is not None:
+            roles.append(self.destructive_role_arn)
         accounts: list[str] = []
-        for role in (self.inspection_role_arn, self.resolver_role_arn):
+        for role in roles:
             match = AWS_ROLE_ARN.fullmatch(role)
             if match is None:
                 raise ValueError("AWS roles must be exact commercial-partition IAM role ARNs")
             accounts.append(match.group(1))
         if any(account != self.account_id for account in accounts):
             raise ValueError("AWS roles must belong to the expected account")
-        if self.inspection_role_arn == self.resolver_role_arn:
-            raise ValueError("AWS inspection and resolver roles must be distinct")
+        if len(set(roles)) != len(roles):
+            raise ValueError("AWS inspection, resolver, and destructive roles must be distinct")
         return self
 
 
