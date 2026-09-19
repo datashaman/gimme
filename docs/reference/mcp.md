@@ -130,8 +130,9 @@ The same tools accept an AWS ElastiCache Valkey resource (provider `aws_elastica
 `effective_durability`, fixed `issues` codes, and `drift`, never an endpoint or identifier.
 `apply_resource` on an existing group makes one modification of only the differing same-major
 `engine_version`, `node_type`, snapshot, and maintenance fields, and refuses anything else with
-a fixed `aws_elasticache_modify_forbidden_<reason>` code before any change. A Deployment cannot
-bind it yet. Updates are refused locally with a fixed
+a fixed `aws_elasticache_modify_forbidden_<reason>` code before any change. A bound Deployment
+receives the fixed `laravel-cluster-v1` contract and is probed before its release switches
+(see the how-to). Updates are refused locally with a fixed
 `aws_elasticache_update_forbidden_<field>` code for `aws_network`, an engine major version, or
 `security_group_id`, and registering or updating to a `node_type` the account does not offer is
 refused with `aws_elasticache_node_type_unavailable`.
@@ -195,7 +196,7 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_deployment_resources` | Read | Plan routing, database/cache identities, environment, secrets, and processes |
+| `plan_deployment_resources` | Read | Plan routing, database/cache identities, environment, secrets, and processes, and for a managed Valkey binding the secret-free contract |
 | `apply_deployment_resources` | Remote write | Reconcile the exact resource plan |
 | `plan_deployment` | Remote read | Resolve one commit, verify pins, and render the Deployer graph |
 | `apply_deployment` | Remote change | Deploy the exact reviewed revision with health gates |

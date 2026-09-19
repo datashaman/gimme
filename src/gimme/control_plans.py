@@ -143,6 +143,7 @@ def deployment_resource_plan(
     *,
     missing_secrets: list[str] | None = None,
     secret_versions: list[dict[str, str]] | None = None,
+    valkey_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     deploy_path = f"{target.apps_root}/{deployment.placement.relative_path}"
     missing = sorted(missing_secrets or [])
@@ -167,6 +168,7 @@ def deployment_resource_plan(
                 },
             },
             "resource_bindings": deployment.resources.model_dump(mode="json"),
+            **({"valkey_contract": valkey_contract} if valkey_contract is not None else {}),
             "secret_versions": secret_versions or [],
             "secret_issues": missing,
             "ready": not missing,

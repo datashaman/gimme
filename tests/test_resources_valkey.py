@@ -11,8 +11,8 @@ from botocore.stub import ANY
 from pydantic import ValidationError
 
 from gimme.control import (
-    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, ResourceBindings,
-    StateStore, ValkeyBinding,
+    AWSElastiCacheValkeyResource, AWSSecretsManagerStore, ControlState, MANAGED_VALKEY_ENV_KEYS,
+    ResourceBindings, StateStore, ValkeyBinding,
 )
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
@@ -20,6 +20,11 @@ from gimme.resources_valkey import (
     MODIFIABLE_FIELDS, ValkeyOptions, apply_binding, apply_provision, derive_binding_user_id,
     derive_group_id, derive_user_group_id, group_drift, laravel_access_string, load_observed,
     modification_for, namespace_prefixes, structural_issues,
+)
+from gimme.deployer import CommandResult
+from gimme.secrets import SecretMetadata
+from gimme.valkey_contract import (
+    contract_variables, credential_references, probe_names,
 )
 import gimme.server as server_module
 
@@ -1919,3 +1924,213 @@ def test_an_unready_managed_database_stops_a_dual_binding_before_any_change(
         server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
 
     assert adapter.binding_calls == []
+
+
+# --- the laravel-cluster-v1 contract ----------------------------------------------------
+
+class FakeSecrets:
+    """Metadata only, like planning: the values are resolved at apply time."""
+
+    def describe(self, account, store_name, store, secret) -> SecretMetadata:
+        return SecretMetadata(version_id="v1", identity=f"arn:{secret}")
+
+
+def without_local_secrets(monkeypatch) -> None:
+    """The example's own sops secret is not on disk; only the contract's are under test."""
+    state = server_module.store.load()
+    stripped = state.deployments[DEPLOYMENT].model_copy(update={"secrets": {}})
+    server_module.store.save(state.model_copy(update={
+        "deployments": {**state.deployments, DEPLOYMENT: stripped}
+    }))
+    monkeypatch.setattr(server_module, "aws_secrets", FakeSecrets())
+
+
+def bound_and_ready(tmp_path, monkeypatch) -> FakeValkey:
+    adapter = provisioned(tmp_path, monkeypatch)
+    without_local_secrets(monkeypatch)
+    bind()
+    return adapter
+
+
+def capture_runs(monkeypatch) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append({"task": task, **kwargs})
+        return CommandResult(["dep"], 0, "GIMME_REVISION|" + "a" * 40)
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    return calls
+
+
+def test_the_contract_injects_fixed_values_and_pins_undeclared_uses_local() -> None:
+    values = contract_variables(DEPLOYMENT, ["cache", "queue"], "cfg.example.internal", 6379)
+
+    assert values["GIMME_VALKEY_CONTRACT"] == "laravel-cluster-v1"
+    assert values["GIMME_VALKEY_HOST"] == "cfg.example.internal"
+    assert values["GIMME_VALKEY_USES"] == "cache,queue"
+    assert values["GIMME_VALKEY_CACHE_PREFIX"] == "{gimme:example-local}:cache:"
+    assert values["GIMME_VALKEY_HORIZON_PREFIX"] == values["HORIZON_PREFIX"] == (
+        "{gimme:example-local}:horizon:"
+    )
+    assert (values["CACHE_STORE"], values["QUEUE_CONNECTION"]) == ("redis", "redis")
+    assert values["SESSION_DRIVER"] == "file", "an undeclared use never reaches Valkey"
+    assert values["GIMME_VALKEY_READ_REPLICAS"] == "false"
+    assert values["GIMME_VALKEY_VERIFY_PEER"] == "true"
+    assert values["GIMME_VALKEY_CLUSTER"] == "true" and values["GIMME_VALKEY_SCHEME"] == "tls"
+    assert "GIMME_VALKEY_PASSWORD" not in values and "GIMME_VALKEY_USERNAME" not in values
+
+
+def test_every_key_the_contract_sets_is_protected_from_deployment_environment() -> None:
+    values = contract_variables(DEPLOYMENT, ["cache", "session", "queue"], "h", 6379)
+
+    protected = {
+        key for key in values if key.startswith("GIMME_VALKEY_") or key in MANAGED_VALKEY_ENV_KEYS
+    }
+    assert protected == set(values)
+    assert MANAGED_VALKEY_ENV_KEYS <= set(values)
+
+
+def test_no_queue_means_no_horizon_prefix_and_a_local_queue() -> None:
+    values = contract_variables(DEPLOYMENT, ["cache", "session"], "h", 6379)
+
+    assert "HORIZON_PREFIX" not in values and "GIMME_VALKEY_HORIZON_PREFIX" not in values
+    assert values["QUEUE_CONNECTION"] == "sync" and values["SESSION_DRIVER"] == "redis"
+
+
+def test_the_credential_is_referenced_by_field_never_carried() -> None:
+    references = credential_references("workload-secrets", NAME, DEPLOYMENT)
+
+    assert {key: (ref.store, ref.secret, ref.field) for key, ref in references.items()} == {
+        "GIMME_VALKEY_USERNAME": ("workload-secrets", f"{NAME}/{DEPLOYMENT}", "username"),
+        "GIMME_VALKEY_PASSWORD": ("workload-secrets", f"{NAME}/{DEPLOYMENT}", "password"),
+    }
+
+
+@pytest.mark.parametrize("field", ["variables", "secrets"])
+@pytest.mark.parametrize("key", [
+    "GIMME_VALKEY_HOST", "GIMME_VALKEY_PASSWORD", "CACHE_STORE", "SESSION_DRIVER",
+    "QUEUE_CONNECTION", "HORIZON_PREFIX",
+])
+def test_deployment_environment_cannot_override_a_managed_contract(
+    tmp_path, monkeypatch, field, key
+) -> None:
+    use_bound(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    value = {"store": "local-sops", "secret": "x", "field": "F"} if field == "secrets" else "x"
+    document["deployments"][DEPLOYMENT][field][key] = value
+
+    with pytest.raises(ValueError, match="managed by the Valkey contract|reserved or unsafe"):
+        ControlState.model_validate(document)
+
+
+def test_a_target_local_binding_keeps_its_own_adapter_values(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["variables"]["SESSION_DRIVER"] = "array"
+    ControlState.model_validate(document)
+    document["deployments"][DEPLOYMENT]["variables"]["GIMME_VALKEY_HOST"] = "x"
+
+    with pytest.raises(ValueError, match="managed by the Valkey contract"):
+        ControlState.model_validate(document)
+
+
+def test_deployment_resources_name_the_contract_and_carry_no_endpoint_or_credential(
+    tmp_path, monkeypatch
+) -> None:
+    bound_and_ready(tmp_path, monkeypatch)
+
+    plan = server_module.plan_deployment_resources(DEPLOYMENT)
+
+    contract = cast(dict[str, object], plan["valkey_contract"])
+    assert contract["contract"] == "laravel-cluster-v1" and contract["uses"] == ["cache", "queue"]
+    assert contract["adapters"] == {
+        "CACHE_STORE": "redis", "SESSION_DRIVER": "file", "QUEUE_CONNECTION": "redis"
+    }
+    assert contract["probes"] == probe_names(["cache", "queue"])
+    assert contract["credential_keys"] == ["GIMME_VALKEY_USERNAME", "GIMME_VALKEY_PASSWORD"]
+    assert {item["environment_key"] for item in plan["secret_versions"]} >= {
+        "GIMME_VALKEY_USERNAME", "GIMME_VALKEY_PASSWORD"
+    }
+    assert "readiness_issues" not in plan
+    text = json.dumps(plan)
+    assert "cfg." not in text and ".cache.amazonaws.com" not in text and "password\"" not in text
+
+
+def test_the_plan_changes_when_the_endpoint_the_contract_injects_changes(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    before = server_module.plan_deployment_resources(DEPLOYMENT)
+
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None
+    observed["endpoint"] = "moved." + str(observed["endpoint"])
+    (server_module.store.root / "observed-resources" / f"{NAME}.json").write_text(
+        json.dumps(observed)
+    )
+
+    assert server_module.plan_deployment_resources(DEPLOYMENT)["plan_id"] != before["plan_id"]
+    assert adapter.users
+
+
+def test_deployment_resources_are_not_ready_until_the_resource_is_ready_and_bound(
+    tmp_path, monkeypatch
+) -> None:
+    use_bound(tmp_path, monkeypatch)
+    without_local_secrets(monkeypatch)
+
+    assert "valkey_resource_not_ready" in server_module.plan_deployment_resources(
+        DEPLOYMENT
+    )["readiness_issues"]
+
+    server_module.apply_resource(NAME, str(server_module.plan_apply_resource(NAME)["plan_id"]))
+    assert "valkey_binding_missing" in server_module.plan_deployment_resources(
+        DEPLOYMENT
+    )["readiness_issues"]
+
+    bind()
+    assert "readiness_issues" not in server_module.plan_deployment_resources(DEPLOYMENT)
+
+
+def test_a_release_is_blocked_until_the_binding_exists(tmp_path, monkeypatch) -> None:
+    provisioned(tmp_path, monkeypatch)
+    monkeypatch.setattr(server_module, "aws_secrets", FakeSecrets())
+    capture_runs(monkeypatch)
+
+    with pytest.raises(ValueError, match="valkey_binding_missing"):
+        server_module.plan_deployment(DEPLOYMENT)
+
+
+def test_a_deploy_carries_the_contract_and_probe_but_never_a_credential(
+    tmp_path, monkeypatch
+) -> None:
+    bound_and_ready(tmp_path, monkeypatch)
+    calls = capture_runs(monkeypatch)
+
+    server_module.plan_deployment(DEPLOYMENT)
+
+    render = next(call for call in calls if call.get("arguments") == ("--plan",))
+    variables = cast(dict[str, str], render["variables"])
+    assert variables["LOG_CHANNEL"] == "stack", "the Deployment's own values still flow"
+    assert variables["GIMME_VALKEY_CONTRACT"] == "laravel-cluster-v1"
+    assert variables["HORIZON_PREFIX"] == "{gimme:example-local}:horizon:"
+    probe = cast(dict[str, object], render["valkey_probe"])
+    assert probe["deployment"] == DEPLOYMENT and probe["uses"] == ["cache", "queue"]
+    assert probe["prefixes"] == namespace_prefixes(DEPLOYMENT, ["cache", "queue"])
+    for call in calls:
+        assert "PASSWORD" not in json.dumps(call, default=str).upper().replace(
+            "GIMME_VALKEY_PASSWORD", ""
+        )
+
+
+def test_a_target_local_binding_gets_neither_contract_nor_probe(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch)
+    without_local_secrets(monkeypatch)
+    calls = capture_runs(monkeypatch)
+
+    server_module.plan_deployment(DEPLOYMENT)
+
+    render = next(call for call in calls if call.get("arguments") == ("--plan",))
+    assert render["valkey_probe"] is None
+    assert not any(key.startswith("GIMME_VALKEY_") for key in cast(dict, render["variables"]))

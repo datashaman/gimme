@@ -281,3 +281,25 @@ def test_environment_context_crosses_runner_boundary(tmp_path: Path, monkeypatch
     assert captured["GIMME_APP_DEBUG"] == "true"
     assert captured["GIMME_REVISION"] == "a" * 40
     assert json.loads(captured["GIMME_HEALTH_JSON"]) == []
+
+
+def test_valkey_probe_crosses_the_runner_boundary_only_when_given(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.clear()
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("GIMME_VALKEY_PROBE_JSON", "must-not-be-inherited")
+    probe = {"host": "cache.example.internal", "port": 6379}
+
+    deployer = runner(tmp_path)
+    deployer.run("deploy", server())
+    assert "GIMME_VALKEY_PROBE_JSON" not in captured
+
+    deployer.run("deploy", server(), valkey_probe=probe)
+    assert json.loads(captured["GIMME_VALKEY_PROBE_JSON"]) == probe

@@ -19,11 +19,13 @@ from pydantic import Field
 from gimme import recovery as recovery_module
 from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
+from gimme import valkey_contract
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
-    ResourceConfig, S3BackupDestination, SecretStore, StateStore, TargetConfig, ValkeyBinding,
+    ResourceConfig, S3BackupDestination, SecretReference, SecretStore, StateStore, TargetConfig,
+    ValkeyBinding,
     legacy_app, legacy_server, new_placement, target_sites,
 )
 from gimme.control_plans import (
@@ -253,6 +255,7 @@ def _run_deployment(
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
     valkey = deployment.resources.valkey
+    contract_values, _credentials, probe, _issues = _valkey_runtime(name, state, deployment)
     bound_resources = {
         kind: resource.model_dump(mode="json")
         for kind, resource_name in (
@@ -276,7 +279,8 @@ def _run_deployment(
         runtimes={key: value.model_dump(mode="json") for key, value in deployment.runtimes.items()},
         resources=bound_resources, mise_version=target.runtimes.mise_version,
         php_extensions=application.php_extensions,
-        variables=deployment.variables, secret_file=secret_file,
+        variables={**deployment.variables, **contract_values}, valkey_probe=probe,
+        secret_file=secret_file,
         secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
@@ -317,17 +321,68 @@ def _dns_issues(deployment: DeploymentConfig, target: TargetConfig) -> list[str]
     ]
 
 
+def _valkey_runtime(
+    name: str, state: ControlState, deployment: DeploymentConfig
+) -> tuple[dict[str, str], dict[str, SecretReference], dict[str, object] | None, list[str]]:
+    """The laravel-cluster-v1 values, credential references, and probe input for a Deployment
+    bound to a managed Valkey, or why it is not ready to receive them. Nothing when the
+    binding is Target-local."""
+    binding = deployment.resources.valkey
+    resource = None if binding is None else state.resources.get(binding.resource)
+    if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
+        return {}, {}, None, []
+    observed = resources_valkey_module.load_observed(store.root, binding.resource)
+    if observed is None or observed["phase"] != "ready":
+        return {}, {}, None, ["valkey_resource_not_ready"]
+    if name not in cast(dict[str, object], observed["allocations"]):
+        return {}, {}, None, ["valkey_binding_missing"]
+    host, port = observed["endpoint"], observed["port"]
+    if not isinstance(host, str) or not isinstance(port, int):
+        return {}, {}, None, ["valkey_endpoint_missing"]
+    return (
+        valkey_contract.contract_variables(name, binding.uses, host, port),
+        valkey_contract.credential_references(
+            resource.workload_secret_store, binding.resource, name
+        ),
+        valkey_contract.probe_config(name, binding.uses, host, port),
+        [],
+    )
+
+
 def _secret_plan(name: str, state: ControlState, deployment: DeploymentConfig
                  ) -> tuple[list[dict[str, str]], list[str]]:
     try:
         planned = plan_secret_references(
-            state, store.secrets_path, deployment.secrets, aws_secrets,
+            state, store.secrets_path,
+            {**deployment.secrets, **_valkey_runtime(name, state, deployment)[1]}, aws_secrets,
             load_applied_secret_manifest(store.root, name),
         )
         issues = ["secret_reference_missing" for item in planned if item["status"] == "missing"]
         return planned, issues
     except SecretError as exc:
         return [], [str(exc)]
+
+
+def _contract_summary(
+    name: str, state: ControlState, deployment: DeploymentConfig
+) -> dict[str, object] | None:
+    """What the contract will inject, without the endpoint or any credential."""
+    binding = deployment.resources.valkey
+    resource = None if binding is None else state.resources.get(binding.resource)
+    if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
+        return None
+    return {
+        "contract": valkey_contract.CONTRACT, "resource": binding.resource,
+        "uses": list(binding.uses),
+        "variables_digest": StateStore.digest(_valkey_runtime(name, state, deployment)[0]),
+        "namespaces": resources_valkey_module.namespace_prefixes(name, list(binding.uses)),
+        "adapters": {
+            key: ("redis" if use in binding.uses else valkey_contract.LOCAL_DRIVERS[key])
+            for use, key in valkey_contract.ADAPTER_KEYS.items()
+        },
+        "credential_keys": [valkey_contract.USERNAME_KEY, valkey_contract.PASSWORD_KEY],
+        "probes": valkey_contract.probe_names(list(binding.uses)),
+    }
 
 
 def _resolved_stack_plan(name: str) -> dict[str, Any]:
@@ -371,9 +426,10 @@ def _resource_plan(name: str) -> dict[str, Any]:
     secret_versions, secret_issues = _secret_plan(name, state, deployment)
     issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
         state, deployment
-    )
+    ) + _valkey_runtime(name, state, deployment)[3]
     plan = deployment_resource_plan(name, deployment, target, application,
-                                    missing_secrets=issues, secret_versions=secret_versions)
+                                    missing_secrets=issues, secret_versions=secret_versions,
+                                    valkey_contract=_contract_summary(name, state, deployment))
     if issues:
         plan["readiness_issues"] = issues
         plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})
@@ -385,7 +441,7 @@ def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
     _, secret_issues = _secret_plan(name, state, deployment)
     issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
         state, deployment
-    )
+    ) + _valkey_runtime(name, state, deployment)[3]
     if issues:
         raise ValueError("deployment is not ready: " + "; ".join(issues))
     selected = revision or _revision(name)
@@ -1610,7 +1666,8 @@ def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]
         raise ValueError("deployment resources are not ready; inspect readiness_issues")
     state, deployment, target, _ = _context(name)
     resolved = resolve_planned_secret_references(
-        state, store.secrets_path, deployment.secrets,
+        state, store.secrets_path,
+        {**deployment.secrets, **_valkey_runtime(name, state, deployment)[1]},
         cast(list[dict[str, str]], expected["secret_versions"]), aws_secrets,
     )
     with _deployment_resource_lock(name):

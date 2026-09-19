@@ -48,7 +48,7 @@ def managed_postgres_bind_script() -> str:
     )[1].split("\nPYTHON;", 1)[0]
 
 
-def rendered_deploy_plan(health: dict[str, object]) -> str:
+def rendered_deploy_plan(health: dict[str, object], extra: dict[str, str] | None = None) -> str:
     environment = {
         **os.environ,
         "GIMME_HOSTNAME": "devbox.local",
@@ -72,6 +72,7 @@ def rendered_deploy_plan(health: dict[str, object]) -> str:
         }),
         "GIMME_RESOURCES_JSON": "{}",
         "GIMME_PHP_EXTENSIONS_JSON": "[]",
+        **(extra or {}),
     }
     result = subprocess.run(
         [
@@ -237,7 +238,8 @@ def test_laravel_resources_include_required_application_environment() -> None:
     assert "GIMME_APP_ENV" in task
     assert "GIMME_APP_DEBUG" in task
     assert "APP_URL=https://{$siteHost}" in task
-    assert "HORIZON_PREFIX={$cachePrefix}horizon:" in task
+    assert "HORIZON_PREFIX={$horizonPrefix}" in task
+    assert "'HORIZON_PREFIX' => horizon_prefix($cachePrefix)" in task
     assert "laravel_environment_reconcile_script" in task
     assert "GIMME_ENVIRONMENT_CHANGED|yes" in task
     assert "grep -q '^APP_KEY='" in task
@@ -543,6 +545,56 @@ def test_deployment_health_gates_candidate_before_live_activation() -> None:
     assert plan.index("gimme:health:candidate") < plan.index("deploy:symlink")
     assert plan.index("deploy:symlink") < plan.index("gimme:health:live")
     assert plan.index("gimme:health:live") < plan.index("gimme:restart:workers")
+
+
+VALKEY_PROBE = json.dumps({"host": "cache.example.internal", "port": 6379})
+CANDIDATE_HEALTH = {
+    "name": "primary", "phases": ["candidate"], "path": "/up", "expected_status": 200,
+    "attempts": 1, "delay_seconds": 0, "timeout_seconds": 3,
+}
+
+
+def test_valkey_probe_gates_the_switch_before_the_candidate_health_check() -> None:
+    plan = rendered_deploy_plan(CANDIDATE_HEALTH, {"GIMME_VALKEY_PROBE_JSON": VALKEY_PROBE})
+
+    assert plan.index("gimme:probe:valkey") < plan.index("gimme:health:candidate")
+    assert plan.index("gimme:probe:valkey") < plan.index("deploy:symlink")
+
+
+def test_no_valkey_probe_runs_without_a_managed_binding() -> None:
+    assert "gimme:probe:valkey" not in rendered_deploy_plan(CANDIDATE_HEALTH)
+
+
+def test_valkey_probe_reads_only_fixed_paths_and_reports_the_current_release_stays_live() -> None:
+    recipe = (ROOT / "deploy.php").read_text()
+    task = recipe.split("task('gimme:probe:valkey'", 1)[1].split(
+        "if ($health !== []) {", 1
+    )[0]
+
+    assert "get('deploy_path') . '/shared/.env'" in task
+    assert "'{{release_path}}/composer.lock'" in task
+    assert "the current release stays live" in task
+    assert "ssl" not in task and "cafile" not in task.lower()
+
+
+def test_horizon_prefix_follows_a_managed_valkey_contract_only() -> None:
+    script = (
+        "namespace Deployer; require 'deploy/configuration.php';"
+        "putenv('GIMME_VARIABLES_JSON=' . $argv[1]);"
+        "echo horizon_prefix('gimme:shop:');"
+    )
+
+    def prefix(variables: dict[str, str]) -> str:
+        return subprocess.run(
+            ["php", "-r", script, json.dumps(variables)],
+            cwd=ROOT, text=True, capture_output=True, check=True,
+        ).stdout
+
+    assert prefix({}) == "gimme:shop:horizon:"
+    assert prefix({"HORIZON_PREFIX": "{other}:"}) == "gimme:shop:horizon:"
+    assert prefix({
+        "GIMME_VALKEY_CONTRACT": "laravel-cluster-v1", "HORIZON_PREFIX": "{gimme:shop}:horizon:"
+    }) == "{gimme:shop}:horizon:"
 
 
 def test_health_gates_apply_each_probe_only_at_declared_phases() -> None:
