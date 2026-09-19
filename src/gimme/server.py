@@ -36,7 +36,7 @@ from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     deployment_restore_plan,
     exact_plan, migration_plan, recovery_point_creation_plan, recovery_point_deletion_plan,
-    registration_update_plan,
+    registration_update_plan, restore_verification_plan,
     resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
     resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
     valkey_provision_plan, valkey_restore_plan, valkey_rotation_plan,
@@ -1522,7 +1522,153 @@ def apply_restore_deployment(
             "deployment": name,
             "request_id": request_id,
             "state": current,
-            "recovery_required": current in {"data_replaced", "verification_failed"},
+            "recovery_required": current != "completed",
+        }
+
+
+def _restore_verification_plan(name: str, request_id: str) -> dict[str, object]:
+    state, _deployment, _destination_name, destination = _recovery_context(name)
+    _, credentials = _backup_destination_credentials(state, destination)
+    restore = recovery_module.load_restore_record(
+        destination, credentials, backup_s3, name, request_id
+    )
+    return restore_verification_plan(name, request_id, restore)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("verify_restore", "name")
+def plan_verify_restore(name: Name, request_id: RequestId) -> dict[str, object]:
+    """Plan private application verification and return from Restore maintenance."""
+    return _restore_verification_plan(name, request_id)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("verify_restore", "name")
+def apply_verify_restore(
+    name: Name, request_id: RequestId, plan_id: PlanId,
+) -> dict[str, object]:
+    """Verify restored data privately, clean up, and restore normal routing."""
+    with _deployment_resource_lock(name):
+        expected = _restore_verification_plan(name, request_id)
+        _assert_plan(expected, plan_id)
+        if not expected["ready"]:
+            raise RecoveryError("restore_verification_not_ready")
+        state, deployment, destination_name, destination = _recovery_context(name)
+        _, credentials = _backup_destination_credentials(state, destination)
+        restore = recovery_module.load_restore_record(
+            destination, credentials, backup_s3, name, request_id
+        )
+        restore_destination = cast(dict[str, object], restore["destination"])
+        identity = {
+            "source_recovery_point_id": str(restore["source_recovery_point_id"]),
+            "destination_provider": str(restore_destination["provider"]),
+            "destination_resource": str(restore_destination["resource"]),
+            "destination_kind": str(restore_destination["kind"]),
+            "destination_version": str(restore_destination["version"]),
+            "safety_recovery_point_id": cast(
+                str | None, restore["safety_recovery_point_id"]
+            ),
+        }
+        current = str(restore["state"])
+        changed = False
+
+        def advance(next_state: str) -> None:
+            nonlocal changed, current
+            recovery_module.append_restore_event(
+                destination, credentials, backup_s3, name, request_id, next_state,
+                **identity,
+            )
+            current = next_state
+            changed = True
+
+        def verify_runtime() -> None:
+            try:
+                _run_deployment(
+                    "gimme:recovery:maintenance", name,
+                    recovery_action="resume", recovery_request_id=request_id,
+                    recovery_quiesce_wait=deployment.recovery.quiesce_wait_seconds,
+                    timeout=900,
+                )
+                result = _run_deployment(
+                    "gimme:recovery:verify-application", name, timeout=900
+                )
+                markers = {
+                    line
+                    for raw in result.output.splitlines()
+                    if (line := raw.split("] ", 1)[-1].strip()).startswith(
+                        "GIMME_RESTORE_VERIFY|"
+                    )
+                }
+                if markers != {"GIMME_RESTORE_VERIFY|ready"}:
+                    raise RecoveryError("restore_verification_failed")
+            except Exception:
+                quiesce_failed = False
+                try:
+                    _run_deployment(
+                        "gimme:recovery:maintenance", name,
+                        recovery_action="quiesce", recovery_request_id=request_id,
+                        recovery_quiesce_wait=deployment.recovery.quiesce_wait_seconds,
+                        timeout=900,
+                    )
+                except Exception:
+                    quiesce_failed = True
+                advance("verification_failed")
+                raise RecoveryError(
+                    "restore_quiesce_failed"
+                    if quiesce_failed else "restore_verification_failed"
+                ) from None
+
+        if current in {"data_replaced", "verification_failed"}:
+            verify_runtime()
+            advance("verification_succeeded")
+        elif current == "verification_succeeded":
+            verify_runtime()
+        if current == "verification_succeeded":
+            manifest = recovery_module.find_recovery_point(
+                destination_name, destination, credentials, backup_s3, name,
+                str(restore["source_recovery_point_id"]),
+            )
+            if manifest is None:
+                raise RecoveryError("restore_source_missing")
+            component = next(
+                (
+                    item for item in manifest["components"]  # type: ignore[union-attr]
+                    if item["kind"] == "postgres"
+                ),
+                None,
+            )
+            if component is None:
+                raise RecoveryError("restore_component_missing")
+            try:
+                _run_deployment(
+                    "gimme:recovery:postgres", name,
+                    postgres_restore_action="cleanup",
+                    postgres_restore_request_id=request_id,
+                    postgres_restore_sha256=str(component["sha256"]),
+                    postgres_restore_bytes=int(component["bytes"]),
+                    timeout=300,
+                )
+            except Exception:
+                raise RecoveryError("restore_cleanup_failed") from None
+            advance("cleanup_completed")
+        if current == "cleanup_completed":
+            verify_runtime()
+            try:
+                _run_deployment(
+                    "gimme:recovery:maintenance", name,
+                    recovery_action="exit", recovery_request_id=request_id,
+                    recovery_quiesce_wait=deployment.recovery.quiesce_wait_seconds,
+                    timeout=900,
+                )
+            except Exception:
+                raise RecoveryError("restore_maintenance_exit_failed") from None
+            advance("completed")
+        return {
+            "changed": changed,
+            "deployment": name,
+            "request_id": request_id,
+            "state": current,
+            "recovery_required": current != "completed",
         }
 
 
@@ -1558,6 +1704,9 @@ def _recovery_point_deletion_plan(
     safety_protected = recovery_module.safety_recovery_point_protected(
         destination, credentials, backup_s3, name, targets["manifest"]  # type: ignore[arg-type]
     )
+    restore_protected = recovery_module.recovery_point_source_protected(
+        destination, credentials, backup_s3, name, point_id
+    )
     normalized_inventory = sorted(
         (
             str(item["recovery_point_id"]),
@@ -1588,6 +1737,7 @@ def _recovery_point_deletion_plan(
         bytes=int(targets["bytes"]),
         final_verified_point=effective_verified == 1,
         safety_protected=safety_protected,
+        restore_protected=restore_protected,
         inventory_fingerprint=inventory_fingerprint,
         manifest_fingerprint=manifest_fingerprint,
         state="verified",
@@ -1642,6 +1792,8 @@ def delete_recovery_point(
         _assert_plan(expected, plan_id)
         if expected["safety_protected"]:
             raise RecoveryError("recovery_point_safety_protected")
+        if expected["restore_protected"]:
+            raise RecoveryError("recovery_point_restore_protected")
         if confirmation != expected["confirmation"]:
             raise ValueError("recovery point deletion confirmation is invalid")
         required_last = expected["last_recovery_point_confirmation"]

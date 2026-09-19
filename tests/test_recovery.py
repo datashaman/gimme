@@ -481,7 +481,8 @@ def test_completed_authoritative_restore_record_releases_its_safety_point(
     }
     for state in (
         "started", "maintenance_entered", "safety_verified", "artifact_verified",
-        "shadow_verified", "data_replaced", "completed",
+        "shadow_verified", "data_replaced", "verification_succeeded",
+        "cleanup_completed", "completed",
     ):
         append_restore_event(
             destination(), None, adapter, "checkout", "restore-1", state, **identity,

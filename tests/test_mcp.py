@@ -306,6 +306,8 @@ async def test_hard_v4_tool_surface() -> None:
         "list_restores",
         "plan_restore_deployment",
         "apply_restore_deployment",
+        "plan_verify_restore",
+        "apply_verify_restore",
     }
     assert {str(resource.uri) for resource in resources} == {
         "gimme://state", "gimme://operations"
@@ -822,6 +824,8 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
             return CommandResult(["dep"], 0, f"GIMME_BACKUP|{digest}|{len(safety)}")
         if task == "gimme:recovery:postgres" and kwargs["postgres_restore_action"] == "prepare":
             assert kwargs["backup_local_path"].read_bytes() == source_bytes
+        if task == "gimme:recovery:verify-application":
+            return CommandResult(["dep"], 0, "GIMME_RESTORE_VERIFY|ready")
         return CommandResult(["dep"], 0, "ok")
 
     monkeypatch.setattr(server_module.runner, "run", fake_run)
@@ -863,6 +867,88 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
     assert safety is not None and safety["safety"] is True
     assert "source-postgres-dump" not in str(result)
     assert "safety-postgres-dump" not in str(result)
+
+    verification = server_module.plan_verify_restore("example-app", "restore-1")
+    completed = server_module.apply_verify_restore(
+        "example-app", "restore-1", str(verification["plan_id"])
+    )
+
+    assert completed["state"] == "completed"
+    assert completed["recovery_required"] is False
+    completed_record = server_module.restore_record_resource(
+        "example-app", "restore-1"
+    )
+    assert completed_record["state"] == "completed"
+    assert completed_record["events"] == 9
+    assert calls[-6:] == [
+        ("gimme:recovery:maintenance", None),
+        ("gimme:recovery:verify-application", None),
+        ("gimme:recovery:postgres", "cleanup"),
+        ("gimme:recovery:maintenance", None),
+        ("gimme:recovery:verify-application", None),
+        ("gimme:recovery:maintenance", None),
+    ]
+    assert recovery_module.safety_recovery_point_protected(
+        selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", safety,
+    ) is False
+
+
+def test_failed_restore_verification_requiesces_and_never_cleans_up_or_exits(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    identity = {
+        "source_recovery_point_id": point,
+        "destination_resource": "devbox-postgres",
+        "destination_provider": "target_local",
+        "destination_kind": "postgres",
+        "destination_version": "17.2",
+    }
+    for restore_state in (
+        "started", "maintenance_entered", "safety_not_required",
+        "artifact_verified", "shadow_verified", "data_replaced",
+    ):
+        append_restore_event(
+            selected.load().backup_destinations["primary"], None, adapter,
+            "example-app", "restore-1", restore_state, **identity,
+        )
+    actions = []
+
+    def fake_run(task, *args, **kwargs):
+        if task == "gimme:recovery:maintenance":
+            actions.append(kwargs["recovery_action"])
+            return CommandResult(["dep"], 0, "ok")
+        if task == "gimme:recovery:verify-application":
+            raise RuntimeError("secret application failure")
+        raise AssertionError(f"unexpected task {task}")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_verify_restore("example-app", "restore-1")
+
+    with pytest.raises(RecoveryError, match="^restore_verification_failed$") as raised:
+        server_module.apply_verify_restore(
+            "example-app", "restore-1", str(plan["plan_id"])
+        )
+
+    assert "secret" not in str(raised.value)
+    assert actions == ["resume", "quiesce"]
+    assert server_module.restore_record_resource(
+        "example-app", "restore-1"
+    )["state"] == "verification_failed"
 
 
 def test_apply_restore_failure_stays_in_maintenance_and_retry_resumes_at_swap(
@@ -1082,6 +1168,42 @@ def test_unresolved_safety_recovery_point_cannot_be_deleted(tmp_path, monkeypatc
     )
     completed_plan = server_module.plan_delete_recovery_point("example-app", point_id)
     assert completed_plan["safety_protected"] is False
+
+
+def test_source_recovery_point_is_protected_until_restore_completes(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "source-1")
+    recovery_module.create_recovery_point(
+        "primary", recovery_state().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    append_restore_event(
+        recovery_state().backup_destinations["primary"], None, adapter,
+        "example-app", "restore-1", "started",
+        source_recovery_point_id=point,
+        destination_resource="devbox-postgres",
+        destination_provider="target_local", destination_kind="postgres",
+        destination_version="17.2",
+    )
+
+    plan = server_module.plan_delete_recovery_point("example-app", point)
+
+    assert plan["restore_protected"] is True
+    with pytest.raises(RecoveryError, match="^recovery_point_restore_protected$"):
+        server_module.delete_recovery_point(
+            "example-app", point, str(plan["plan_id"]), str(plan["confirmation"]),
+            str(plan["last_recovery_point_confirmation"]),
+        )
 
 
 def test_create_recovery_point_requires_a_bound_recovery_policy(tmp_path, monkeypatch) -> None:
