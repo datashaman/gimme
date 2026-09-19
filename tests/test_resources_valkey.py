@@ -49,7 +49,7 @@ GROUP_SG = "sg-0123456789abcdef2"
 ADMIN_SG = "sg-0123456789abcdef0"
 DEVBOX_SG = "sg-0123456789abcdef1"
 ANY_UPDATE_ACTIONS = {
-    "ReplicationGroupIds": [GROUP_ID], "ServiceUpdateStatus": ["available"], "MaxRecords": 100,
+    "ReplicationGroupIds": [GROUP_ID], "ServiceUpdateStatus": ["available"], "MaxRecords": 50,
 }
 
 
@@ -721,11 +721,11 @@ def expect_describe(
         "describe_replication_groups", {"ReplicationGroups": [group_response(**updates)]},
         {"ReplicationGroupId": GROUP_ID},
     )
-    stub.add_response(
-        "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": NAME}]},
-        {"ResourceName": ARN},
-    )
     if updates.get("Status", "available") == "available":
+        stub.add_response(
+            "list_tags_for_resource", {"TagList": [{"Key": "gimme:resource", "Value": NAME}]},
+            {"ResourceName": ARN},
+        )
         stub.add_response(
             "describe_update_actions", {"UpdateActions": actions or []}, ANY_UPDATE_ACTIONS
         )
@@ -797,9 +797,6 @@ def test_describe_tolerates_a_member_cluster_that_does_not_exist_yet(monkeypatch
         {"ReplicationGroups": [group_response(Status="creating")]},
         {"ReplicationGroupId": GROUP_ID},
     )
-    stub.add_response(
-        "list_tags_for_resource", {"TagList": TAG}, {"ResourceName": ARN},
-    )
     stub.add_client_error("describe_cache_clusters", "CacheClusterNotFound")
     adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
     account, network, _ = context()
@@ -809,6 +806,48 @@ def test_describe_tolerates_a_member_cluster_that_does_not_exist_yet(monkeypatch
 
     assert observed is not None and observed.engine_version is None
     assert observed.maintenance_window is None
+
+
+def test_describe_tolerates_missing_node_groups_while_creating(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    response = group_response(Status="creating")
+    response.pop("NodeGroups")
+    stub.add_response(
+        "describe_replication_groups", {"ReplicationGroups": [response]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    stub.add_response(
+        "describe_cache_clusters", {"CacheClusters": [{
+            "EngineVersion": "9.0", "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+            "AutoMinorVersionUpgrade": False, "PendingModifiedValues": {},
+            "SecurityGroups": [{"SecurityGroupId": GROUP_SG, "Status": "active"}],
+        }]}, {"CacheClusterId": f"{GROUP_ID}-0001-001"},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed.status == "creating" and observed.shards == 0 and observed.members == 2
+
+
+def test_describe_tolerates_missing_members_and_node_groups_while_deleting(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    response = group_response(Status="deleting")
+    response.pop("MemberClusters")
+    response.pop("NodeGroups")
+    stub.add_response(
+        "describe_replication_groups", {"ReplicationGroups": [response]},
+        {"ReplicationGroupId": GROUP_ID},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed.status == "deleting" and observed.shards == observed.members == 0
 
 
 def test_describe_failures_are_bounded_and_never_carry_the_provider_message(
@@ -857,7 +896,7 @@ def expect_create(
     stub.add_response(
         "create_user", {},
         {"UserId": default_id, "UserName": "default", "Engine": "valkey",
-         "AccessString": "off ~* -@all", "NoPasswordRequired": True, "Tags": TAG},
+         "AccessString": "off ~* -@all", "Passwords": [ANY], "Tags": TAG},
     )
     if admin_exists:
         stub.add_response("describe_users", {"Users": [{"UserId": admin_id}]},
@@ -3398,7 +3437,7 @@ def test_a_snapshot_restore_sends_the_snapshot_omits_the_shard_count_and_never_w
     stub.add_response(
         "create_user", {},
         {"UserId": default_id, "UserName": "default", "Engine": "valkey",
-         "AccessString": "off ~* -@all", "NoPasswordRequired": True, "Tags": TAG},
+         "AccessString": "off ~* -@all", "Passwords": [ANY], "Tags": TAG},
     )
     stub.add_response("describe_users", {"Users": [{"UserId": admin_id}]}, {"UserId": admin_id})
     stub.add_client_error("describe_users", "UserNotFound", expected_params={"UserId": USER_ID})
@@ -3468,7 +3507,7 @@ def test_a_restored_user_whose_stored_username_is_another_generation_is_refused(
     stub.add_response(
         "create_user", {}, {"UserId": f"{GROUP_ID}-default", "UserName": "default",
                             "Engine": "valkey", "AccessString": "off ~* -@all",
-                            "NoPasswordRequired": True, "Tags": TAG},
+                            "Passwords": [ANY], "Tags": TAG},
     )
     stub.add_response(
         "describe_users", {"Users": [{"UserId": f"{GROUP_ID}-admin"}]},
