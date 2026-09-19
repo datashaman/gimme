@@ -233,7 +233,7 @@ class ElastiCacheAdapter(Protocol):
         store: AWSSecretsManagerStore, store_name: str,
         snapshot_name: str | None = None,
         restore_users: dict[str, tuple[str, int]] | None = None,
-    ) -> GroupObservation: ...
+    ) -> GroupObservation | None: ...
 
     def allowed_node_types(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str
@@ -1012,10 +1012,10 @@ class BotoElastiCacheAdapter(AWSAdapter):
             )
         except Exception as exc:
             raise _provider_error(exc, "create", self.error_prefix) from None
-        observed = self.describe_group(account, network, group_id)
-        if observed is None:
-            raise ResourceError("aws_elasticache_group_missing_after_create")
-        return observed
+        # A successful AWS response is the durable creation acknowledgement. Do not read the
+        # group here: that read can fail transiently (including before tags are available), and
+        # the caller records this acknowledgement before attempting a resumable observation.
+        return None
 
 
 def structural_issues(
@@ -1213,11 +1213,15 @@ def apply_provision(
 ) -> dict[str, object]:
     """Create the replication group if absent, otherwise converge an available one with one
     immediate modification of only the fields that differ, then poll up to a bounded 30
-    seconds. A still-provisioning or still-modifying group is recorded as phase 'pending';
-    a later call resumes by describing, so it re-creates and re-sends nothing."""
-    refuse_while_busy(root, resource_name)
+    seconds. AWS's creation acknowledgement is recorded before any following observation, so
+    a transient read failure cannot make a later call create a second group. A still-
+    provisioning or still-modifying group is recorded as phase 'pending'; a later call
+    resumes by describing, so it re-creates and re-sends nothing."""
+    refuse_while_busy(root, resource_name, allow="provisioning")
     group_id = derive_group_id(resource_name)
     previous = load_observed(root, resource_name)
+    provisioning = read_marker(root, "provisioning", resource_name)
+    creation_pending = provisioning is not None
     allocations = dict(cast(dict[str, object], previous["allocations"])) if previous else {}
     modified_fields: list[str] = []
     deadline = now() + POLL_BUDGET_SECONDS
@@ -1233,12 +1237,24 @@ def apply_provision(
 
     observed = adapter.describe_group(account, network, group_id)
     if observed is None:
+        if provisioning is not None:
+            raise ResourceError("aws_elasticache_group_missing_after_create")
         if previous is not None:
             # The group existed and is gone. Provisioning would silently create an empty one.
             raise ResourceError("aws_elasticache_group_missing_replace_explicitly")
-        observed = adapter.create_group(
+        created = adapter.create_group(
             account, network, resource, resource_name, group_id, store, store_name
         )
+        write_marker(
+            root, "provisioning", resource_name,
+            {"schema_version": 1, "resource": resource_name, "phase": "creating"},
+        )
+        creation_pending = True
+        observed = created
+        if observed is None:
+            observed = adapter.describe_group(account, network, group_id)
+            if observed is None:
+                raise ResourceError("aws_elasticache_group_missing_after_create")
     else:
         # Diff against the settled group, so a modification already under way is not repeated.
         observed = settle(observed)
@@ -1255,6 +1271,14 @@ def apply_provision(
     issues = structural_issues(resource, observed, group_id)
     document = _group_document(resource_name, group_id, observed, issues, allocations)
     _write_json(_observed_path(root, resource_name), _validate_observed(document), resource_name)
+    if creation_pending:
+        if document["phase"] == "pending":
+            write_marker(
+                root, "provisioning", resource_name,
+                {"schema_version": 1, "resource": resource_name, "phase": observed.status},
+            )
+        else:
+            clear_marker(root, "provisioning", resource_name)
     return {
         "resource": resource_name, "status": observed.status, "phase": document["phase"],
         "engine_version": observed.engine_version,
@@ -1328,6 +1352,7 @@ def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, 
 # One in-progress operation per Resource is recorded as a local marker, and every other
 # operation that could change the group refuses while any marker exists.
 MARKERS = {
+    "provisioning": "aws_elasticache_provision_in_progress",
     "destroying": "aws_elasticache_destroy_in_progress",
     "restoring": "aws_elasticache_restore_in_progress",
     "rotating": "aws_elasticache_rotate_in_progress",

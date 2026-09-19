@@ -1383,6 +1383,7 @@ def _inspect_valkey(
         result.update(
             phase="restoring" if operation == "restoring"
             else progress.get("phase", "destroying") if operation == "destroying"
+            else "pending" if operation == "provisioning"
             else resources_valkey_module.group_phase(live, issues), status=live.status,
             engine_version=live.engine_version,
             effective_durability=live.effective_durability, issues=issues,
@@ -1391,10 +1392,13 @@ def _inspect_valkey(
     elif observed is not None:
         result.update(
             phase=progress.get("phase", "destroying") if operation == "destroying"
+            else "pending" if operation == "provisioning"
             else result["phase"],
             status=observed["status"], engine_version=observed["engine_version"],
             effective_durability=observed["effective_durability"], issues=observed["issues"],
         )
+    elif operation == "provisioning":
+        result["phase"] = "pending"
     if observed is not None:
         result["allocations"] = {
             deployment_name: {"status": allocation["status"]}

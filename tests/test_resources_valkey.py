@@ -461,6 +461,43 @@ def test_a_slow_group_is_pending_and_a_later_apply_resumes_without_recreating(
     assert observed is not None and observed["phase"] == "pending"
 
 
+def test_a_create_acknowledgement_survives_a_transient_first_observation_failure(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = FakeValkey(settle_polls=1000)
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    original_describe = adapter.describe_group
+
+    def fail_after_create(*args, **kwargs):
+        if adapter.create_calls:
+            raise ResourceError("aws_elasticache_describe_unavailable")
+        return original_describe(*args, **kwargs)
+
+    adapter.describe_group = fail_after_create  # type: ignore[method-assign]
+    plan = server_module.plan_apply_resource(NAME)
+    with pytest.raises(ResourceError, match="^aws_elasticache_describe_unavailable$"):
+        server_module.apply_resource(NAME, str(plan["plan_id"]))
+
+    marker = server_module.store.root / "provisioning-resources" / f"{NAME}.json"
+    assert adapter.create_calls == 1 and json.loads(marker.read_text())["phase"] == "creating"
+    assert load_observed(server_module.store.root, NAME) is None
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["operation"] == "provisioning"
+    assert inspected["phase"] == "pending"
+    assert inspected["progress"] == {"phase": "creating"}
+
+    adapter.describe_group = original_describe  # type: ignore[method-assign]
+    adapter.settle_polls = 0
+    resumed = server_module.apply_resource(
+        NAME, str(server_module.plan_apply_resource(NAME)["plan_id"])
+    )
+
+    assert resumed["phase"] == "ready" and adapter.create_calls == 1
+    assert not marker.exists()
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None and observed["phase"] == "ready"
+
+
 def test_a_group_that_settles_within_the_poll_budget_is_ready(tmp_path) -> None:
     adapter = FakeValkey(settle_polls=3)
 
@@ -951,7 +988,6 @@ def expect_create(
             "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
         },
     )
-    expect_describe(stub, None, Status="creating")
 
 
 def test_create_sends_exactly_the_fixed_contract_and_writes_the_admin_secret(
@@ -967,11 +1003,11 @@ def test_create_sends_exactly_the_fixed_contract_and_writes_the_admin_secret(
     account, network, store = context()
 
     with stub, secrets_stub:
-        observed = adapter.create_group(
+        acknowledged = adapter.create_group(
             account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets"
         )
 
-    assert observed.status == "creating"
+    assert acknowledged is None
     stub.assert_no_pending_responses()
     secrets_stub.assert_no_pending_responses()
 
@@ -3531,7 +3567,6 @@ def test_a_snapshot_restore_sends_the_snapshot_omits_the_shard_count_and_never_w
             "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
         },
     )
-    expect_describe(stub, None, Status="creating")
     adapter = adapter_with(
         monkeypatch, ("elasticache", (client, stub)),
         ("secretsmanager", (secrets_client, secrets_stub)),
@@ -3539,12 +3574,12 @@ def test_a_snapshot_restore_sends_the_snapshot_omits_the_shard_count_and_never_w
     account, network, store = context()
 
     with stub, secrets_stub:
-        observed = adapter.create_group(
+        acknowledged = adapter.create_group(
             account, network, valkey(), NAME, GROUP_ID, store, "workload-secrets",
             snapshot_name=SNAPSHOT, restore_users={"example-local": (USER_ID, 1)},
         )
 
-    assert observed.status == "creating"
+    assert acknowledged is None
     stub.assert_no_pending_responses()
     secrets_stub.assert_no_pending_responses()  # only the one read; a restore writes nothing
 
