@@ -147,15 +147,16 @@ credentials use protected temporary files on both controller and Target and are 
 `finally` cleanup. Results contain only fixed status fields, SHA-256 values, and the opaque
 reader object version; provider errors and credentials are not returned.
 
-Backend-only `laravel_v1` publication is the first build implementation. Planning rejects
-Applications with frontend configuration or build secrets before remote work. It resolves an
-exact commit, inspects the bounded `composer.lock`, and binds repository fingerprint, commit,
-lock digest and size, normalized build policy, Deployment runtime pins, required extensions,
+`laravel_v1` publication supports Composer-only Applications and frontends using npm, pnpm,
+Yarn 1/2+, or Bun. Planning resolves an exact commit, requires exactly the configured frontend
+lockfile with no conflicting lockfile, and binds repository fingerprint, commit, dependency lock
+digests and sizes, normalized build policy, Deployment runtime pins, required extensions,
 observed platform capability, packaging version, and execution fingerprint into a versioned
 `build_id`.
 
 Apply repeats those checks, uses an owner-only derived workspace, and runs fixed frozen production
-Composer semantics without scripts. It rejects submodules, Git LFS pointers, alternate object
+Composer semantics without scripts, then the selected package manager's fixed frozen install and
+bounded configured build script. It rejects submodules, Git LFS pointers, alternate object
 databases, repository substitution, unsafe paths/links/modes/ownership, special files, oversized
 input, and insufficient space. The deterministic archive contains tracked immutable source and
 production `vendor` metadata while excluding Git data, frontend dependencies, environment and
@@ -167,8 +168,18 @@ An identical repeat returns `idempotent`; different verified bytes for an existi
 return `non_reproducible_build` without another authoritative manifest. Inventory never returns
 bucket keys, object versions, raw manifests, commands, paths, output, or credentials. It reports
 only bounded artifact identity, digest, publication time, and one of `ready`, `malformed`,
-`foreign`, `missing`, `unsupported`, or `checksum_invalid`. This slice does not build frontends,
-resolve build secrets, deploy artifacts, or delete store objects.
+`foreign`, `missing`, `unsupported`, or `checksum_invalid`. This path does not deploy artifacts
+or delete store objects.
+
+Optional build-only secrets are safe environment-name mappings to bounded local-SOPS references.
+They are resolved only after plan acceptance, transferred through protected temporary files, and
+available only to the fixed frontend install and build processes; Deployment secrets and Resource
+credentials never enter the build. Gimme removes credential material before packaging and scans
+the selected tree plus final archive for every exact non-empty secret value. A match fails with
+the fixed `secret_leak_detected` outcome before publication. Secret values and references never enter
+`build_id` or provenance; the manifest records only whether build secrets were used and their
+bounded count. A secret-induced output difference is therefore rejected by the existing
+`non_reproducible_build` rule.
 
 ## Managed AWS RDS PostgreSQL resources
 

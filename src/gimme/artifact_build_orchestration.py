@@ -72,10 +72,10 @@ class ArtifactBuildOrchestrator:
         build = application.build
         if build is None:
             raise ValueError("application has no artifact build policy")
-        if application.frontend is not None:
-            raise ValueError("artifact_frontend_not_supported")
-        if build.secrets:
-            raise ValueError("artifact_build_secrets_not_supported")
+        if application.frontend is not None and application.frontend.output_dir != "public/build":
+            raise ValueError("artifact_frontend_output_not_supported")
+        if build.secrets and application.frontend is None:
+            raise ValueError("artifact_build_secrets_require_frontend")
         target = state.targets[build.target]
         definition = state.artifact_stores[build.artifact_store]
         return state, deployment, application, build, target, definition
@@ -126,11 +126,15 @@ class ArtifactBuildOrchestrator:
                 for name, pin in deployment.runtimes.items()
             },
             "php_extensions": application.php_extensions,
+            "frontend": (
+                application.frontend.model_dump(mode="json")
+                if application.frontend is not None else None
+            ),
         }
         value = _result(self._run(target, request).output)
         if set(value) != {
             "status", "commit", "repository_fingerprint", "composer_lock_sha256",
-            "composer_lock_bytes", "capability",
+            "composer_lock_bytes", "frontend_lock", "capability",
         } or value.get("status") != "ready" or value.get("commit") != revision:
             raise RuntimeError("artifact_source_inspection_invalid")
         if (
@@ -145,11 +149,51 @@ class ArtifactBuildOrchestrator:
             raise RuntimeError("artifact_source_inspection_invalid")
         capability = value["capability"]
         if set(capability) != {
-            "php", "composer", "php_extensions", "system", "machine"
+            "php", "composer", "php_extensions", "system", "machine", "frontend"
         } or any(
             not isinstance(capability.get(name), str)
             or VERSION.fullmatch(capability[name]) is None
             for name in ("php", "composer")
+        ):
+            raise RuntimeError("artifact_source_inspection_invalid")
+        frontend_lock = value["frontend_lock"]
+        if frontend_lock is not None and (
+            not isinstance(frontend_lock, dict)
+            or set(frontend_lock) != {"filename", "sha256", "bytes"}
+            or frontend_lock["filename"] not in {
+                "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"
+            }
+            or not isinstance(frontend_lock["sha256"], str)
+            or SHA256.fullmatch(frontend_lock["sha256"]) is None
+            or not isinstance(frontend_lock["bytes"], int)
+            or not 0 < frontend_lock["bytes"] <= 4 * 1024 * 1024
+        ):
+            raise RuntimeError("artifact_source_inspection_invalid")
+        observed_frontend = capability["frontend"]
+        if observed_frontend is not None and (
+            not isinstance(observed_frontend, dict)
+            or set(observed_frontend) != {"manager", "manager_version", "node_version"}
+            or observed_frontend["manager"] not in {"npm", "pnpm", "yarn", "bun"}
+            or not isinstance(observed_frontend["manager_version"], str)
+            or VERSION.fullmatch(observed_frontend["manager_version"]) is None
+            or observed_frontend["node_version"] is not None
+            and (
+                not isinstance(observed_frontend["node_version"], str)
+                or VERSION.fullmatch(observed_frontend["node_version"]) is None
+            )
+        ):
+            raise RuntimeError("artifact_source_inspection_invalid")
+        configured_frontend = application.frontend
+        if (configured_frontend is None) != (frontend_lock is None) or (
+            configured_frontend is None
+        ) != (observed_frontend is None):
+            raise RuntimeError("artifact_source_inspection_invalid")
+        if configured_frontend is not None and (
+            observed_frontend["manager"] != configured_frontend.package_manager
+            or observed_frontend["node_version"] is None
+            and configured_frontend.package_manager != "bun"
+            or observed_frontend["node_version"] is not None
+            and configured_frontend.package_manager == "bun"
         ):
             raise RuntimeError("artifact_source_inspection_invalid")
         extensions = capability["php_extensions"]
@@ -190,7 +234,8 @@ class ArtifactBuildOrchestrator:
             "build_id": build_id,
             "store": _store_policy(definition),
         }
-        context = protected_secret_file(credentials) if credentials else nullcontext(None)
+        document = {"store": credentials, "build": {}}
+        context = protected_secret_file(document) if credentials else nullcontext(None)
         with context as credential_file:
             value = _result(self._run(target, request, credential_file).output)
         status = value.get("status")
@@ -229,17 +274,32 @@ class ArtifactBuildOrchestrator:
             "commit": revision,
             "composer_lock_sha256": inspection["composer_lock_sha256"],
             "composer_lock_bytes": inspection["composer_lock_bytes"],
-            "build_policy": build.model_dump(mode="json"),
+            "frontend_lock": inspection["frontend_lock"],
+            "build_policy": {
+                "target": build.target,
+                "artifact_store": build.artifact_store,
+                "packaging": build.packaging,
+                "build_secrets_used": bool(build.secrets),
+                "build_secret_count": len(build.secrets),
+                "build_secret_names": sorted(build.secrets),
+            },
             "runtimes": {
                 runtime: pin.model_dump(mode="json")
                 for runtime, pin in sorted(deployment.runtimes.items())
             },
             "php_extensions": application.php_extensions,
+            "frontend": (
+                application.frontend.model_dump(mode="json")
+                if application.frontend is not None else None
+            ),
             "capability": inspection["capability"],
             "packaging_version": "laravel_v1",
             "execution_fingerprint": execution_fingerprint(),
         }
         build_id = self._build_id(identity)
+        build_secret_versions = plan_secret_references(
+            state, self.store.secrets_path, build.secrets
+        )
         planned, credentials = self._publisher_credentials(state, definition)
         publication = self._publication(
             target, definition, deployment.application, build_id, credentials
@@ -251,10 +311,13 @@ class ArtifactBuildOrchestrator:
             "build_id": build_id,
             "identity": identity,
             "publisher_credential_versions": planned,
+            "build_secret_versions": build_secret_versions,
             "publication": publication,
             "effects": [
                 "fetch the exact reviewed commit into an isolated Build Target workspace",
                 "install frozen production Composer dependencies without scripts",
+                "run the configured frozen frontend build with protected build-only secrets",
+                "scan the workspace and final archive for exact secret values",
                 "create and verify one deterministic laravel_v1 archive",
                 "upload and read back encrypted archive bytes on the Build Target",
                 "publish the private authoritative manifest last when absent",
@@ -270,9 +333,15 @@ class ArtifactBuildOrchestrator:
 
     def build_artifact(self, name: str, plan_id: str) -> dict[str, object]:
         (
-            _state, deployment, application, _build, target, definition, credentials, expected
+            state, deployment, application, build, target, definition, credentials, expected
         ) = self._plan_context(name)
         self.assert_plan(expected, plan_id)
+        build_secrets = resolve_planned_secret_references(
+            state,
+            self.store.secrets_path,
+            build.secrets,
+            expected["build_secret_versions"],
+        )
         identity = expected["identity"]
         if not isinstance(identity, dict):
             raise RuntimeError("artifact_plan_invalid")
@@ -283,12 +352,22 @@ class ArtifactBuildOrchestrator:
             "commit": identity["commit"],
             "runtimes": identity["runtimes"],
             "php_extensions": identity["php_extensions"],
+            "frontend": (
+                application.frontend.model_dump(mode="json")
+                if application.frontend is not None else None
+            ),
             "composer_lock_sha256": identity["composer_lock_sha256"],
+            "frontend_lock": identity["frontend_lock"],
             "capability": identity["capability"],
+            "build_secret_names": identity["build_policy"]["build_secret_names"],
             "build_id": expected["build_id"],
             "store": _store_policy(definition),
         }
-        context = protected_secret_file(credentials) if credentials else nullcontext(None)
+        document = {"store": credentials, "build": build_secrets}
+        context = (
+            protected_secret_file(document)
+            if credentials or build_secrets else nullcontext(None)
+        )
         with context as credential_file:
             value = _result(self._run(target, request, credential_file).output)
         common = {"status", "application", "build_id"}
@@ -328,7 +407,8 @@ class ArtifactBuildOrchestrator:
             "application": application_name,
             "store": _store_policy(definition),
         }
-        context = protected_secret_file(credentials) if credentials else nullcontext(None)
+        document = {"store": credentials, "build": {}}
+        context = protected_secret_file(document) if credentials else nullcontext(None)
         with context as credential_file:
             value = _result(self._run(target, request, credential_file).output)
         artifacts = value.get("artifacts")

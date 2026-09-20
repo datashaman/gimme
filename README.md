@@ -253,10 +253,10 @@ catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
 ## Current scope
 
 Gimme provides the multi-target foundation, local SOPS, bounded AWS Secrets Manager stores,
-versioned S3-compatible Artifact Stores, and deterministic backend-only Laravel artifact
-publication. Frontend/build-secret artifact builds, artifact deployment, promotion, rollback,
-traffic splitting, and fleet scheduling remain future work rather than implied production
-guarantees.
+versioned S3-compatible Artifact Stores, and deterministic Laravel artifact publication with
+Composer plus npm, pnpm, Yarn, or Bun and protected build-only secrets. Artifact deployment,
+promotion, rollback, traffic splitting, and fleet scheduling remain future work rather than
+implied production guarantees.
 
 Resource provider coverage:
 

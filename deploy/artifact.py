@@ -41,6 +41,12 @@ MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_FILES = 100_000
 MAX_MANIFEST_BYTES = 64 * 1024
 MIN_FREE_BYTES = 1024 * 1024 * 1024
+LOCKFILES = {
+    "npm": ("package-lock.json",),
+    "pnpm": ("pnpm-lock.yaml",),
+    "yarn": ("yarn.lock",),
+    "bun": ("bun.lock", "bun.lockb"),
+}
 active_process: subprocess.Popen[bytes] | None = None
 
 
@@ -130,6 +136,9 @@ def command(
             fail("build_command_failed")
         return output
     finally:
+        if active_process is not None:
+            with suppress_os_error():
+                os.killpg(active_process.pid, signal.SIGTERM)
         active_process = None
 
 
@@ -273,7 +282,91 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def runtime_capability(request: dict[str, object]) -> dict[str, object]:
+def frontend_policy(request: dict[str, object], source: Path) -> dict[str, object] | None:
+    frontend = request.get("frontend")
+    if frontend is None:
+        return None
+    if (
+        not isinstance(frontend, dict)
+        or set(frontend) != {"package_manager", "build_script", "output_dir"}
+        or frontend.get("package_manager") not in LOCKFILES
+        or not isinstance(frontend.get("build_script"), str)
+        or re.fullmatch(r"[A-Za-z0-9:_-]{1,64}", frontend["build_script"]) is None
+        or frontend.get("output_dir") != "public/build"
+    ):
+        fail("frontend_policy_invalid")
+    supported = {name for names in LOCKFILES.values() for name in names}
+    present = sorted(name for name in supported if (source / name).is_file())
+    matching = [name for name in LOCKFILES[str(frontend["package_manager"])] if name in present]
+    if len(present) != 1 or len(matching) != 1:
+        fail("frontend_lockfile_invalid")
+    lock = source / matching[0]
+    if lock.is_symlink() or lock.stat().st_size > MAX_LOCK_BYTES:
+        fail("frontend_lockfile_invalid")
+    return {
+        "package_manager": frontend["package_manager"],
+        "build_script": frontend["build_script"],
+        "output_dir": frontend["output_dir"],
+        "lockfile": matching[0],
+        "lockfile_sha256": file_sha256(lock),
+        "lockfile_bytes": lock.stat().st_size,
+    }
+
+
+def runtime_vector(
+    runtimes: dict[str, object], names: list[str], arguments: list[str], workspace_root: Path
+) -> tuple[list[str], dict[str, str]]:
+    selected = []
+    for name in names:
+        pin = runtimes[name]
+        if isinstance(pin, dict) and pin["provider"] == "mise":
+            selected.append(f"{name}@{pin['version']}")
+    if not selected:
+        return arguments, {}
+    return ["mise", "exec", *selected, "--", *arguments], {
+        "MISE_DATA_DIR": str(workspace_root.parent / "mise")
+    }
+
+
+def frontend_capability(
+    request: dict[str, object], policy: dict[str, object] | None, workspace_root: Path
+) -> dict[str, object] | None:
+    if policy is None:
+        return None
+    runtimes = request["runtimes"]
+    manager = str(policy["package_manager"])
+    names = [manager] if manager == "bun" else ["node", manager]
+    if not isinstance(runtimes, dict) or any(name not in runtimes for name in names):
+        fail("build_runtime_policy_invalid")
+    manager_command, manager_environment = runtime_vector(
+        runtimes, names, [manager, "--version"], workspace_root
+    )
+    manager_version = command(
+        manager_command, environment=manager_environment, timeout=30
+    ).decode().strip().removeprefix("v")
+    node_version = None
+    if manager != "bun":
+        node_command, node_environment = runtime_vector(
+            runtimes, names, ["node", "--version"], workspace_root
+        )
+        node_version = command(
+            node_command, environment=node_environment, timeout=30
+        ).decode().strip().removeprefix("v")
+    if (
+        manager_version != runtimes[manager]["version"]
+        or manager != "bun" and node_version != runtimes["node"]["version"]
+    ):
+        fail("build_runtime_mismatch")
+    return {
+        "manager": manager,
+        "manager_version": manager_version,
+        "node_version": node_version,
+    }
+
+
+def runtime_capability(
+    request: dict[str, object], policy: dict[str, object] | None, workspace_root: Path
+) -> dict[str, object]:
     runtimes = request.get("runtimes")
     extensions = request.get("php_extensions")
     if not isinstance(runtimes, dict) or set(runtimes) < {"php", "composer"}:
@@ -283,9 +376,11 @@ def runtime_capability(request: dict[str, object]) -> dict[str, object]:
             not isinstance(name, str)
             or not isinstance(pin, dict)
             or set(pin) != {"provider", "version"}
-            or pin["provider"] != "system"
+            or pin["provider"] not in {"system", "mise", "bundled"}
             or not isinstance(pin["version"], str)
             or VERSION.fullmatch(pin["version"]) is None
+            or name in {"php", "composer"} and pin["provider"] != "system"
+            or pin["provider"] == "bundled" and name != "npm"
         ):
             fail("build_runtime_policy_invalid")
     if not isinstance(extensions, list) or any(
@@ -313,6 +408,7 @@ def runtime_capability(request: dict[str, object]) -> dict[str, object]:
         "php_extensions": available,
         "system": platform.system().lower(),
         "machine": platform.machine().lower(),
+        "frontend": frontend_capability(request, policy, workspace_root),
     }
 
 
@@ -326,7 +422,8 @@ def inspect_source(request: dict[str, object], workspace_root: Path) -> dict[str
         lock = source / "composer.lock"
         if not lock.is_file() or lock.is_symlink() or lock.stat().st_size > MAX_LOCK_BYTES:
             fail("composer_lock_invalid")
-        capability = runtime_capability(request)
+        frontend = frontend_policy(request, source)
+        capability = runtime_capability(request, frontend, workspace_root)
         return {
             "status": "ready",
             "commit": request["commit"],
@@ -335,6 +432,13 @@ def inspect_source(request: dict[str, object], workspace_root: Path) -> dict[str
             ).hexdigest(),
             "composer_lock_sha256": file_sha256(lock),
             "composer_lock_bytes": lock.stat().st_size,
+            "frontend_lock": (
+                None if frontend is None else {
+                    "filename": frontend["lockfile"],
+                    "sha256": frontend["lockfile_sha256"],
+                    "bytes": frontend["lockfile_bytes"],
+                }
+            ),
             "capability": capability,
         }
     finally:
@@ -342,25 +446,43 @@ def inspect_source(request: dict[str, object], workspace_root: Path) -> dict[str
             shutil.rmtree(workspace, ignore_errors=True)
 
 
-def credentials(argument: str) -> dict[str, str]:
+def credentials(argument: str) -> tuple[dict[str, str], dict[str, str]]:
     if argument == "-":
-        return {}
+        return {}, {}
     path = Path(argument)
-    details = path.lstat()
-    if path.is_symlink() or not stat.S_ISREG(details.st_mode):
-        fail("credential_document_invalid")
     try:
+        details = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(details.st_mode):
+            fail("credential_document_invalid")
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError, UnicodeError):
         fail("credential_document_invalid")
+    finally:
+        path.unlink(missing_ok=True)
+    if not isinstance(value, dict) or set(value) != {"store", "build"}:
+        fail("credential_document_invalid")
+    store, build_values = value["store"], value["build"]
     allowed = {"access_key_id", "secret_access_key", "session_token"}
-    if (
-        not isinstance(value, dict)
-        or not {"access_key_id", "secret_access_key"} <= set(value) <= allowed
-        or any(not isinstance(item, str) or not item or len(item) > 4096 for item in value.values())
+    if not isinstance(store, dict) or (
+        store and not {"access_key_id", "secret_access_key"} <= set(store) <= allowed
+    ) or any(
+        not isinstance(item, str) or not item or len(item) > 4096
+        for item in store.values()
     ):
         fail("credential_document_invalid")
-    return value
+    if (
+        not isinstance(build_values, dict)
+        or len(build_values) > 32
+        or any(
+            not isinstance(name, str)
+            or re.fullmatch(r"^[A-Z][A-Z0-9_]{0,63}$", name) is None
+            or not isinstance(item, str)
+            or len(item) > 4096
+            for name, item in build_values.items()
+        )
+    ):
+        fail("credential_document_invalid")
+    return store, build_values
 
 
 def s3_client(store: dict[str, object], values: dict[str, str]):
@@ -461,12 +583,13 @@ def read_manifest(client, bucket: str, key: str) -> dict[str, object] | None:
 
 
 def valid_manifest(value: dict[str, object], application: str, build_id: str) -> bool:
+    provenance = {"build_secrets_used", "build_secret_count"}
     return (
         set(value) == {
             "schema_version", "application", "build_id", "commit", "format",
             "artifact_digest", "tree_digest", "bytes", "package_version", "published_at",
-        }
-        and value.get("schema_version") == 1
+        } | provenance
+        and value.get("schema_version") == 2
         and value.get("application") == application
         and value.get("build_id") == build_id
         and value.get("format") == "laravel_v1"
@@ -482,6 +605,10 @@ def valid_manifest(value: dict[str, object], application: str, build_id: str) ->
         and VERSION_ID.fullmatch(value["package_version"]) is not None
         and isinstance(value.get("published_at"), str)
         and PUBLISHED_AT.fullmatch(value["published_at"]) is not None
+        and isinstance(value.get("build_secrets_used"), bool)
+        and isinstance(value.get("build_secret_count"), int)
+        and 0 <= value["build_secret_count"] <= 32
+        and value["build_secrets_used"] == (value["build_secret_count"] > 0)
     )
 
 
@@ -506,7 +633,10 @@ def publication_status(request: dict[str, object], credential_argument: str) -> 
     if not isinstance(build_id, str) or BUILD_ID.fullmatch(build_id) is None:
         fail("artifact_identity_invalid")
     store = store_request(request)
-    client = s3_client(store, credentials(credential_argument))
+    store_credentials, build_values = credentials(credential_argument)
+    if build_values:
+        fail("credential_document_invalid")
+    client = s3_client(store, store_credentials)
     _, manifest_key, _ = object_keys(application, build_id)
     try:
         manifest = read_manifest(client, str(store["bucket"]), manifest_key)
@@ -532,14 +662,163 @@ def included_source(relative: str) -> bool:
     path = PurePosixPath(relative)
     if relative == ".env" or relative.startswith(".env.") and relative != ".env.example":
         return False
-    if path.parts and path.parts[0] in {".git", "node_modules", "storage"}:
+    if path.parts and path.parts[0] in {
+        ".bun", ".git", ".npm", ".pnpm-store", ".yarn", "node_modules", "storage",
+    }:
         return False
     if len(path.parts) >= 2 and path.parts[:2] == ("bootstrap", "cache"):
         return False
     return True
 
 
-def collect_tree(source: Path, tracked: list[str]) -> list[tuple[str, Path]]:
+def source_record(path: Path) -> tuple[str, str, int]:
+    details = path.lstat()
+    if stat.S_ISLNK(details.st_mode):
+        return "symlink", os.readlink(path), normalized_mode(details)
+    if stat.S_ISREG(details.st_mode):
+        return "file", file_sha256(path), normalized_mode(details)
+    return "directory", "", normalized_mode(details)
+
+
+def frontend_commands(manager: str, version: str, script: str) -> tuple[list[str], list[str]]:
+    if manager == "npm":
+        install = ["npm", "ci", "--no-audit", "--no-fund"]
+    elif manager == "pnpm":
+        install = ["pnpm", "install", "--frozen-lockfile"]
+    elif manager == "yarn":
+        install = (
+            ["yarn", "install", "--frozen-lockfile", "--non-interactive"]
+            if int(version.split(".", 1)[0]) == 1
+            else ["yarn", "install", "--immutable"]
+        )
+    elif manager == "bun":
+        install = ["bun", "install", "--frozen-lockfile"]
+    else:
+        fail("frontend_policy_invalid")
+    return install, [manager, "run", script]
+
+
+def run_frontend(
+    request: dict[str, object], policy: dict[str, object], source: Path,
+    workspace_root: Path, tracked: list[str], build_secrets: dict[str, str]
+) -> None:
+    output = str(policy["output_dir"])
+    before = {
+        relative: source_record(source / relative)
+        for relative in tracked
+        if relative != output and not relative.startswith(output + "/")
+    }
+    manager = str(policy["package_manager"])
+    capability = request["capability"]
+    frontend = capability["frontend"]
+    install, build_command = frontend_commands(
+        manager, str(frontend["manager_version"]), str(policy["build_script"])
+    )
+    names = [manager] if manager == "bun" else ["node", manager]
+    install_vector, runtime_environment = runtime_vector(
+        request["runtimes"], names, install, workspace_root
+    )
+    command(
+        install_vector,
+        cwd=source,
+        environment={**runtime_environment, **build_secrets},
+        timeout=1800,
+    )
+    build_vector, runtime_environment = runtime_vector(
+        request["runtimes"], names, build_command, workspace_root
+    )
+    command(
+        build_vector,
+        cwd=source,
+        environment={**runtime_environment, **build_secrets},
+        timeout=1800,
+    )
+    try:
+        mutated = any(
+            source_record(source / relative) != record
+            for relative, record in before.items()
+        )
+    except OSError:
+        mutated = True
+    if mutated:
+        fail("frontend_source_mutation_detected")
+    output_path = source / output
+    if not output_path.is_dir() or output_path.is_symlink():
+        fail("frontend_output_missing")
+
+
+def contains_secret(handle, needles: list[bytes]) -> bool:
+    overlap = max(len(needle) for needle in needles) - 1
+    previous = b""
+    while chunk := handle.read(1024 * 1024):
+        combined = previous + chunk
+        if any(needle in combined for needle in needles):
+            return True
+        previous = combined[-overlap:] if overlap else b""
+    return False
+
+
+def scan_secret_values(entries: list[tuple[str, Path]], values: dict[str, str]) -> None:
+    needles = [value.encode() for value in values.values() if value]
+    if not needles:
+        return
+    for relative, path in entries:
+        if any(needle in relative.encode() for needle in needles):
+            fail("secret_leak_detected")
+        if path.is_symlink():
+            if any(needle in os.readlink(path).encode() for needle in needles):
+                fail("secret_leak_detected")
+        elif path.is_file():
+            with path.open("rb") as handle:
+                if contains_secret(handle, needles):
+                    fail("secret_leak_detected")
+
+
+def scan_workspace_secrets(root: Path, values: dict[str, str]) -> None:
+    needles = [value.encode() for value in values.values() if value]
+    if not needles:
+        return
+    count, total = 0, 0
+    for path in root.rglob("*"):
+        details = path.lstat()
+        if any(needle in path.relative_to(root).as_posix().encode() for needle in needles):
+            fail("secret_leak_detected")
+        if stat.S_ISLNK(details.st_mode) and any(
+            needle in os.readlink(path).encode() for needle in needles
+        ):
+            fail("secret_leak_detected")
+        if not stat.S_ISREG(details.st_mode):
+            continue
+        count += 1
+        total += details.st_size
+        if count > MAX_FILES or total > MAX_TREE_BYTES:
+            fail("secret_scan_bounds_exceeded")
+        with path.open("rb") as handle:
+            if contains_secret(handle, needles):
+                fail("secret_leak_detected")
+
+
+def scan_archive_secrets(archive_path: Path, values: dict[str, str]) -> None:
+    needles = [value.encode() for value in values.values() if value]
+    if not needles:
+        return
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            if any(needle in member.name.encode() for needle in needles) or (
+                member.issym()
+                and any(needle in member.linkname.encode() for needle in needles)
+            ):
+                fail("secret_leak_detected")
+            if not member.isfile():
+                continue
+            source = archive.extractfile(member)
+            if source is not None and contains_secret(source, needles):
+                fail("secret_leak_detected")
+
+
+def collect_tree(
+    source: Path, tracked: list[str], frontend: dict[str, object] | None = None
+) -> list[tuple[str, Path]]:
     selected = [(relative, source / relative) for relative in tracked if included_source(relative)]
     vendor = source / "vendor"
     if not vendor.is_dir() or vendor.is_symlink():
@@ -549,6 +828,20 @@ def collect_tree(source: Path, tracked: list[str]) -> list[tuple[str, Path]]:
         if "/.git/" in f"/{relative}/" or "/node_modules/" in f"/{relative}/":
             continue
         selected.append((relative, path))
+    if frontend is not None:
+        output = source / str(frontend["output_dir"])
+        selected.append((str(frontend["output_dir"]), output))
+        for path in output.rglob("*"):
+            relative_parts = path.relative_to(output).parts
+            if any(
+                part == "node_modules"
+                or part in {".bun", ".git", ".npm", ".pnpm-store", ".yarn"}
+                or part == ".env"
+                or part.startswith(".env.") and part != ".env.example"
+                for part in relative_parts
+            ):
+                fail("frontend_output_invalid")
+            selected.append((path.relative_to(source).as_posix(), path))
     unique = {name: path for name, path in selected}
     if len(unique) > MAX_FILES:
         fail("artifact_tree_too_many_files")
@@ -700,13 +993,33 @@ def build(request: dict[str, object], credential_argument: str, workspace_root: 
     if not isinstance(expected_lock, str) or SHA256.fullmatch(expected_lock) is None:
         fail("artifact_identity_invalid")
     store = store_request(request)
+    store_credentials, build_secrets = credentials(credential_argument)
+    expected_secret_names = request.get("build_secret_names")
+    if (
+        not isinstance(expected_secret_names, list)
+        or expected_secret_names != sorted(build_secrets)
+        or len(expected_secret_names) != len(set(expected_secret_names))
+    ):
+        fail("build_secret_policy_invalid")
     workspace = None
     try:
         workspace, tracked = clone_exact(request, workspace_root)
         source = workspace / "source"
         lock = source / "composer.lock"
-        capability = runtime_capability(request)
-        if file_sha256(lock) != expected_lock or capability != request.get("capability"):
+        frontend = frontend_policy(request, source)
+        frontend_lock = (
+            None if frontend is None else {
+                "filename": frontend["lockfile"],
+                "sha256": frontend["lockfile_sha256"],
+                "bytes": frontend["lockfile_bytes"],
+            }
+        )
+        capability = runtime_capability(request, frontend, workspace_root)
+        if (
+            file_sha256(lock) != expected_lock
+            or frontend_lock != request.get("frontend_lock")
+            or capability != request.get("capability")
+        ):
             fail("build_plan_stale")
         composer_home = workspace / "composer-home"
         composer_cache = workspace / "composer-cache"
@@ -732,16 +1045,25 @@ def build(request: dict[str, object], credential_argument: str, workspace_root: 
                 cwd=source, environment={"COMPOSER_HOME": str(composer_home)}, timeout=300)
         if not (source / "vendor" / "composer" / "autoload_real.php").is_file():
             fail("composer_runtime_metadata_missing")
-        entries = collect_tree(source, tracked)
+        if frontend is not None:
+            run_frontend(
+                request, frontend, source, workspace_root, tracked, build_secrets
+            )
+            refreshed = frontend_policy(request, source)
+            if refreshed != frontend:
+                fail("frontend_lockfile_changed")
+        scan_workspace_secrets(source, build_secrets)
+        entries = collect_tree(source, tracked, frontend)
         validate_tree(entries, source)
+        scan_secret_values(entries, build_secrets)
         immutable_digest = tree_digest(entries)
         archive_path = workspace / "artifact.tar.gz"
         create_archive(entries, archive_path)
         verify_archive(archive_path, immutable_digest, workspace)
+        scan_archive_secrets(archive_path, build_secrets)
         artifact_digest = file_sha256(archive_path)
         artifact_bytes = archive_path.stat().st_size
-        values = credentials(credential_argument)
-        client = s3_client(store, values)
+        client = s3_client(store, store_credentials)
         bucket = str(store["bucket"])
         package_key, manifest_key, _ = object_keys(application, build_id)
         existing = read_manifest(client, bucket, manifest_key)
@@ -779,7 +1101,7 @@ def build(request: dict[str, object], credential_argument: str, workspace_root: 
         if downloaded_digest != artifact_digest or downloaded_bytes != artifact_bytes:
             fail("artifact_upload_checksum_mismatch")
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "application": application,
             "build_id": build_id,
             "commit": request["commit"],
@@ -789,6 +1111,8 @@ def build(request: dict[str, object], credential_argument: str, workspace_root: 
             "bytes": artifact_bytes,
             "package_version": version,
             "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "build_secrets_used": bool(build_secrets),
+            "build_secret_count": len(build_secrets),
         }
         manifest_bytes = json.dumps(
             manifest, sort_keys=True, separators=(",", ":")
@@ -837,7 +1161,10 @@ def inventory(request: dict[str, object], credential_argument: str) -> dict[str,
     if not isinstance(application, str) or NAME.fullmatch(application) is None:
         fail("artifact_identity_invalid")
     store = store_request(request)
-    client = s3_client(store, credentials(credential_argument))
+    store_credentials, build_values = credentials(credential_argument)
+    if build_values:
+        fail("credential_document_invalid")
+    client = s3_client(store, store_credentials)
     bucket = str(store["bucket"])
     _, _, prefix = object_keys(application, "build_v1_" + "0" * 64)
     publications: list[dict[str, object]] = []
@@ -862,7 +1189,7 @@ def inventory(request: dict[str, object], credential_argument: str) -> dict[str,
                     status = "malformed"
                 elif manifest.get("application") != application:
                     status = "foreign"
-                elif manifest.get("schema_version") != 1 or manifest.get("format") != "laravel_v1":
+                elif manifest.get("schema_version") != 2 or manifest.get("format") != "laravel_v1":
                     status = "unsupported"
                 elif not valid_manifest(manifest, application, derived):
                     status = "malformed"
@@ -900,7 +1227,7 @@ def main(arguments: list[str]) -> int:
     workspace_root = checked_root(arguments[3])
     if operation == "inspect":
         validate_request(request, {
-            "operation", "repository", "commit", "runtimes", "php_extensions"
+            "operation", "repository", "commit", "runtimes", "php_extensions", "frontend",
         })
         result = inspect_source(request, workspace_root)
     elif operation == "publication":
@@ -909,7 +1236,8 @@ def main(arguments: list[str]) -> int:
     elif operation == "build":
         validate_request(request, {
             "operation", "application", "repository", "commit", "runtimes",
-            "php_extensions", "composer_lock_sha256", "capability", "build_id", "store",
+            "php_extensions", "frontend", "composer_lock_sha256", "frontend_lock",
+            "capability", "build_secret_names", "build_id", "store",
         })
         result = build(request, arguments[2], workspace_root)
     elif operation == "inventory":
