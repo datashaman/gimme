@@ -254,6 +254,8 @@ def recovery_point_creation_plan(
                 "postgres", *(["valkey"] if policy.valkey else [])
             ],
             "quiesce_wait_seconds": policy.quiesce_wait_seconds,
+            "cadence": policy.cadence.model_dump(mode="json"),
+            "retain_last": policy.retain_last,
             "ready": True,
             "readiness_issues": [],
             "effects": [

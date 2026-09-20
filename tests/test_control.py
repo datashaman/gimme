@@ -16,6 +16,9 @@ from gimme.control import (
     CredentialReferenceBackupAuth,
     DeploymentConfig,
     DeploymentSource,
+    DailyRecoveryCadence,
+    HourlyRecoveryCadence,
+    ManualRecoveryCadence,
     RecoveryPolicy,
     Resource,
     ResourceBindings,
@@ -30,6 +33,7 @@ from gimme.control import (
     TargetConfig,
     TargetNetwork,
     TargetRuntimePolicy,
+    WeeklyRecoveryCadence,
     new_placement,
 )
 
@@ -506,6 +510,64 @@ def test_recovery_policy_defaults_to_postgres_without_valkey() -> None:
 
     assert policy.valkey is False
     assert policy.quiesce_wait_seconds == 30
+    assert policy.cadence == ManualRecoveryCadence()
+    assert policy.retain_last == 7
+    assert policy.model_dump(mode="json")["cadence"] == {"kind": "manual"}
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        ({"kind": "manual"}, ManualRecoveryCadence()),
+        ({"kind": "hourly"}, HourlyRecoveryCadence(minute=0)),
+        ({"kind": "daily"}, DailyRecoveryCadence(hour=2, minute=0)),
+        (
+            {"kind": "weekly"},
+            WeeklyRecoveryCadence(weekday="sun", hour=2, minute=0),
+        ),
+        ({"kind": "hourly", "minute": 59}, HourlyRecoveryCadence(minute=59)),
+        (
+            {"kind": "weekly", "weekday": "mon", "hour": 23, "minute": 59},
+            WeeklyRecoveryCadence(weekday="mon", hour=23, minute=59),
+        ),
+    ],
+)
+def test_recovery_cadence_normalizes_exact_defaults(document, expected) -> None:
+    policy = RecoveryPolicy(destination="primary", cadence=document)
+
+    assert policy.cadence == expected
+
+
+@pytest.mark.parametrize(
+    "cadence",
+    [
+        {"kind": "manual", "minute": 0},
+        {"kind": "hourly", "minute": -1},
+        {"kind": "hourly", "minute": 60},
+        {"kind": "daily", "hour": 24},
+        {"kind": "daily", "minute": True},
+        {"kind": "weekly", "weekday": "monday"},
+        {"kind": "weekly", "timezone": "Africa/Johannesburg"},
+        {"kind": "weekly", "second": 0},
+        {"kind": "cron", "expression": "* * * * *"},
+    ],
+)
+def test_recovery_cadence_rejects_arbitrary_schedule_fields(cadence) -> None:
+    with pytest.raises(ValidationError):
+        RecoveryPolicy(destination="primary", cadence=cadence)
+
+
+@pytest.mark.parametrize("retain_last", [0, 366, True, 7.0, "7"])
+def test_recovery_retention_is_a_bounded_strict_integer(retain_last) -> None:
+    with pytest.raises(ValidationError):
+        RecoveryPolicy(destination="primary", retain_last=retain_last)
+
+
+@pytest.mark.parametrize("retain_last", [1, 365])
+def test_recovery_retention_accepts_inclusive_boundaries(retain_last) -> None:
+    assert RecoveryPolicy(
+        destination="primary", retain_last=retain_last
+    ).retain_last == retain_last
 
 
 def _target_with_role(
