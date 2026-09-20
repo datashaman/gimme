@@ -189,7 +189,7 @@ function privileged_helper_source_hashes(): array
     $hashes = [];
     foreach ([
         'gimme-provision-stack', 'gimme-provision-processes',
-        'gimme-recovery-maintenance',
+        'gimme-recovery-maintenance', 'gimme-postgres-restore-swap',
     ] as $name) {
         $source = file_get_contents(dirname(__DIR__) . "/scripts/{$name}");
         if ($source === false) {
@@ -207,6 +207,7 @@ function privileged_helper_policy(
     string $mdnsName,
     string $remoteUser,
     string $appsRoot,
+    array $sites,
 ): string {
     return hash('sha256', json_encode([
         'helper_source_sha256' => privileged_helper_source_hashes(),
@@ -216,5 +217,6 @@ function privileged_helper_policy(
         'mdns_name' => $mdnsName,
         'remote_user' => $remoteUser,
         'apps_root' => $appsRoot,
+        'sites' => $sites,
     ], JSON_THROW_ON_ERROR));
 }

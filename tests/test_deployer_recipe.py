@@ -291,6 +291,8 @@ def test_inspection_uses_content_bound_helper_readiness() -> None:
     assert "privileged_helper_policy(" in inspect
     assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack" in inspect
     assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes" in inspect
+    assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-postgres-restore-swap" in inspect
+    assert "sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap probe probe" in inspect
 
 
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
@@ -436,6 +438,8 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
     assert '"{$sudo} bash -c %bootstrap%"' in task
     assert "secrets: ['bootstrap' => escapeshellarg($bootstrap)]" in task
     assert "sudo -n /usr/local/sbin/gimme-provision-stack" in task
+    assert "/usr/local/sbin/gimme-postgres-restore-swap *" in task
+    assert r'mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap' in task
 
 
 def test_environment_removal_is_bounded_to_non_default_environment_root() -> None:

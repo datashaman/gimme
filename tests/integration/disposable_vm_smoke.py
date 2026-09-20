@@ -603,19 +603,6 @@ def verify_postgres_restore(gimme) -> None:
         RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
     )
     point_id = str(created["recovery_point"]["recovery_point_id"])
-    restore_state, _deployment, destination_name, destination = (
-        gimme._recovery_context(RECOVERY_DEPLOYMENT)
-    )
-    _, restore_credentials = gimme._backup_destination_credentials(
-        restore_state, destination
-    )
-    private_source = gimme.recovery_module.find_recovery_point(
-        destination_name, destination, restore_credentials, gimme.backup_s3,
-        RECOVERY_DEPLOYMENT, point_id,
-    )
-    if private_source is None:
-        raise AssertionError("private restore source disappeared after capture")
-    private_component = private_source["components"][0]
 
     set_restore_probe("after")
     restore = gimme.plan_restore_deployment(
@@ -623,29 +610,10 @@ def verify_postgres_restore(gimme) -> None:
     )
     if not restore["ready"] or restore["destination"]["empty"]:
         raise AssertionError(f"non-empty Restore did not require Safety capture: {restore}")
-    try:
-        applied = gimme.apply_restore_deployment(
-            RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
-            str(restore["plan_id"]), str(restore["confirmation"]),
-        )
-    except RecoveryError as exc:
-        if str(exc) == "restore_swap_failed":
-            try:
-                gimme._run_deployment(
-                    "gimme:recovery:postgres", RECOVERY_DEPLOYMENT,
-                    postgres_restore_action="swap",
-                    postgres_restore_request_id="ci-nonempty-restore",
-                    postgres_restore_sha256=str(private_component["sha256"]),
-                    postgres_restore_bytes=int(private_component["bytes"]),
-                    timeout=300,
-                )
-            except Exception as detail:
-                reasons = re.findall(
-                    r"GIMME_POSTGRES_RESTORE_FAILED\|([a-z_]{1,64})", str(detail)
-                )
-                reason = reasons[-1] if reasons else "restore stage unknown"
-                print(f"[DEBUG-restore-swap] {reason}", flush=True)
-        raise
+    applied = gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
+        str(restore["plan_id"]), str(restore["confirmation"]),
+    )
     if applied["state"] != "data_replaced" or restore_probe_value() != "before":
         raise AssertionError(f"PostgreSQL data was not replaced: {applied}")
     record = gimme.restore_record_resource(

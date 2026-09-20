@@ -624,18 +624,23 @@ BASH;
         $mdnsName,
         $remoteUser,
         $appsRoot,
+        configured_sites($appsRoot, $mdnsName),
     );
     $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
         '[ -x /usr/local/sbin/gimme-recovery-maintenance ] && ' .
+        '[ -x /usr/local/sbin/gimme-postgres-restore-swap ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-recovery-maintenance && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-postgres-restore-swap && " .
         'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-recovery-maintenance enter probe probe ' .
+        '>/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap probe probe ' .
         '>/dev/null 2>&1'
     );
     writeln('privileged_helper=' . ($helperReady ? 'ready' : 'bootstrap_required'));
@@ -818,6 +823,7 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
         $mdnsName,
         $remoteUser,
         $appsRoot,
+        configured_sites($appsRoot, $mdnsName),
     );
     $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
     $helperReady = test(
@@ -887,8 +893,11 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $recoveryHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-recovery-maintenance'
     );
+    $postgresSwapHelperTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-postgres-restore-swap'
+    );
     if ($helperTemplate === false || $processHelperTemplate === false ||
-        $recoveryHelperTemplate === false) {
+        $recoveryHelperTemplate === false || $postgresSwapHelperTemplate === false) {
         throw new \RuntimeException('Missing privileged helper source');
     }
     $policy = privileged_helper_policy(
@@ -898,6 +907,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         $mdnsName,
         $remoteUser,
         $appsRoot,
+        configured_sites($appsRoot, $mdnsName),
     );
     $helper = str_replace(
         '"__GIMME_STATE_PATH__"',
@@ -936,9 +946,27 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         $recoveryHelperTemplate,
     );
     $recoveryHelper = str_replace('__GIMME_POLICY_ID__', $policy, $recoveryHelper);
+    $allowedDatabases = [];
+    foreach (configured_sites($appsRoot, $mdnsName) as $instance => $site) {
+        $allowedDatabases[$instance] = $site['database_identifier'];
+    }
+    $postgresSwapHelper = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $postgresSwapHelperTemplate,
+    );
+    $postgresSwapHelper = str_replace(
+        '"__GIMME_ALLOWED_DATABASES_JSON__"',
+        json_encode(json_encode($allowedDatabases, JSON_THROW_ON_ERROR), JSON_THROW_ON_ERROR),
+        $postgresSwapHelper,
+    );
+    $postgresSwapHelper = str_replace(
+        '__GIMME_POLICY_ID__', $policy, $postgresSwapHelper
+    );
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
     $recoveryHelperEncoded = escapeshellarg(base64_encode($recoveryHelper));
+    $postgresSwapHelperEncoded = escapeshellarg(base64_encode($postgresSwapHelper));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
     $miseVersion = escapeshellarg(configured_mise_version() ?? '');
     $user = escapeshellarg($remoteUser);
@@ -946,6 +974,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *\n"
+        . "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-postgres-restore-swap *\n"
     );
     $rootWriteState = str_replace(
         'install -d -m 0700',
@@ -993,8 +1022,9 @@ printf 'GIMME_BOOTSTRAP|helpers|installing privileged helpers\n'
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
 process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
 recovery_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-recovery-maintenance.XXXXXX)
+postgres_swap_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-postgres-restore-swap.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$recovery_helper_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
@@ -1004,6 +1034,9 @@ chmod 0755 "\$process_helper_tmp"
 printf %s {$recoveryHelperEncoded} | base64 -d > "\$recovery_helper_tmp"
 chown root:root "\$recovery_helper_tmp"
 chmod 0755 "\$recovery_helper_tmp"
+printf %s {$postgresSwapHelperEncoded} | base64 -d > "\$postgres_swap_helper_tmp"
+chown root:root "\$postgres_swap_helper_tmp"
+chmod 0755 "\$postgres_swap_helper_tmp"
 printf %s {$sudoers} > "\$sudoers_tmp"
 chown root:root "\$sudoers_tmp"
 chmod 0440 "\$sudoers_tmp"
@@ -1012,6 +1045,7 @@ visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
 mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
 mv "\$recovery_helper_tmp" /usr/local/sbin/gimme-recovery-maintenance
+mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack
 trap - EXIT
 printf 'GIMME_BOOTSTRAP|reconcile|applying target desired state\n'
@@ -1415,6 +1449,7 @@ task('gimme:provision:app', function () use (
             $mdnsName,
             $remoteUser,
             $appsRoot,
+            configured_sites($appsRoot, $mdnsName),
         );
         $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
         $helperReady = test(
@@ -1679,6 +1714,7 @@ task('gimme:preflight:processes', function () use (
         $mdnsName,
         $remoteUser,
         $appsRoot,
+        configured_sites($appsRoot, $mdnsName),
     );
     $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
     $helperReady = test(

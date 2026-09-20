@@ -30,10 +30,7 @@ EXECUTABLES = {
     "psql": "/usr/bin/psql",
 }
 PUBLIC_FAILURE_CODES = {
-    "restore connection termination failed": "connection_termination_failed",
-    "restore live rename failed": "live_rename_failed",
-    "restore shadow rename failed": "shadow_rename_failed",
-    "restore compensation failed": "compensation_failed",
+    "restore privileged swap failed": "privileged_swap_failed",
     "restore invocation does not match state": "invocation_mismatch",
 }
 
@@ -185,14 +182,19 @@ def database_oid(name: str) -> int | None:
     return int(output)
 
 
-def rename_database(current: str, replacement: str, role: str) -> None:
-    query(
-        "postgres",
-        'SET ROLE :"role";\n'
-        "SELECT format('ALTER DATABASE %I RENAME TO %I', :'current', :'replacement') "
-        "\\gexec\n",
-        {"current": current, "replacement": replacement, "role": role},
-    )
+def privileged_swap(state: dict[str, Any]) -> None:
+    try:
+        subprocess.run(  # nosec B603
+            [
+                "/usr/bin/sudo", "-n",
+                "/usr/local/sbin/gimme-postgres-restore-swap",
+                state["deployment"], state["request_id"],
+            ],
+            check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RestoreFailure("restore privileged swap failed") from exc
 
 
 def prepare(state_path: Path, artifact: Path) -> None:
@@ -256,31 +258,12 @@ def swap(state_path: Path) -> None:
         state["phase"] = "data_replaced"
         atomic_write(state_path, state)
         return
-    if observed == {"live": live_oid, "shadow": shadow_oid, "previous": None}:
-        try:
-            query(
-                "postgres",
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
-                {"database": database},
-            )
-        except RestoreFailure as exc:
-            raise RestoreFailure("restore connection termination failed") from exc
-        try:
-            rename_database(database, previous, state["role"])
-        except RestoreFailure as exc:
-            raise RestoreFailure("restore live rename failed") from exc
-    elif observed != {"live": None, "shadow": shadow_oid, "previous": live_oid}:
+    if observed not in (
+        {"live": live_oid, "shadow": shadow_oid, "previous": None},
+        {"live": None, "shadow": shadow_oid, "previous": live_oid},
+    ):
         raise RestoreFailure("restore swap state ambiguous")
-    try:
-        rename_database(shadow, database, state["role"])
-    except RestoreFailure as exc:
-        if database_oid(database) is None and database_oid(previous) == live_oid:
-            try:
-                rename_database(previous, database, state["role"])
-            except RestoreFailure as compensation:
-                raise RestoreFailure("restore compensation failed") from compensation
-        raise RestoreFailure("restore shadow rename failed") from exc
+    privileged_swap(state)
     if database_oid(database) != shadow_oid or database_oid(previous) != live_oid:
         raise RestoreFailure("restore swap verification failed")
     state["phase"] = "data_replaced"

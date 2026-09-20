@@ -55,10 +55,7 @@ def test_public_failure_codes_are_fixed_and_do_not_include_request_data(tmp_path
     program = program_namespace(tmp_path)
 
     assert program["PUBLIC_FAILURE_CODES"] == {
-        "restore connection termination failed": "connection_termination_failed",
-        "restore live rename failed": "live_rename_failed",
-        "restore shadow rename failed": "shadow_rename_failed",
-        "restore compensation failed": "compensation_failed",
+        "restore privileged swap failed": "privileged_swap_failed",
         "restore invocation does not match state": "invocation_mismatch",
     }
 
@@ -166,32 +163,7 @@ def test_invocation_must_match_the_protected_request_state(tmp_path, monkeypatch
         program["main"]()
 
 
-def test_database_rename_assumes_only_the_validated_owner_role(
-    tmp_path, monkeypatch
-) -> None:
-    program = program_namespace(tmp_path)
-    observed = []
-    monkeypatch.setitem(
-        program, "query",
-        lambda database, statement, variables: observed.append(
-            (database, statement, variables)
-        ) or "",
-    )
-
-    program["rename_database"](
-        "gimme_example_app", "gimme_previous_example", "gimme_example_app"
-    )
-
-    assert observed[0][0] == "postgres"
-    assert 'SET ROLE :"role"' in observed[0][1]
-    assert observed[0][2] == {
-        "current": "gimme_example_app",
-        "replacement": "gimme_previous_example",
-        "role": "gimme_example_app",
-    }
-
-
-def test_failed_second_rename_compensates_the_original_database_name(
+def test_failed_privileged_swap_keeps_the_verified_shadow_state(
     tmp_path, monkeypatch
 ) -> None:
     program = program_namespace(tmp_path)
@@ -199,27 +171,17 @@ def test_failed_second_rename_compensates_the_original_database_name(
     database = "gimme_example_app"
     shadow, previous = program["derived_identities"](database, "restore-1")
     oids = {database: 101, shadow: 202}
-    renames = []
     monkeypatch.setitem(program, "database_oid", lambda name: oids.get(name))
-    monkeypatch.setitem(program, "query", lambda *_args: "")
+    monkeypatch.setitem(
+        program, "privileged_swap",
+        lambda _state: (_ for _ in ()).throw(
+            program["RestoreFailure"]("restore privileged swap failed")
+        ),
+    )
 
-    def rename(current, replacement, role):
-        renames.append((current, replacement, role))
-        if current == shadow:
-            raise program["RestoreFailure"]("simulated second rename failure")
-        oids[replacement] = oids.pop(current)
-
-    monkeypatch.setitem(program, "rename_database", rename)
-
-    with pytest.raises(program["RestoreFailure"], match="shadow rename failed"):
+    with pytest.raises(program["RestoreFailure"], match="privileged swap failed"):
         program["swap"](state_path)
 
-    assert renames == [
-        (database, previous, database),
-        (shadow, database, database),
-        (previous, database, database),
-    ]
-    assert oids == {database: 101, shadow: 202}
     assert json.loads(state_path.read_text())["phase"] == "shadow_verified"
 
 
@@ -231,23 +193,23 @@ def test_swap_retries_after_the_live_database_was_already_renamed(
     database = "gimme_example_app"
     shadow, previous = program["derived_identities"](database, "restore-1")
     oids = {previous: 101, shadow: 202}
-    renames = []
+    calls = []
     monkeypatch.setitem(program, "database_oid", lambda name: oids.get(name))
 
-    def rename(current, replacement, role):
-        renames.append((current, replacement, role))
-        oids[replacement] = oids.pop(current)
+    def privileged_swap(state):
+        calls.append((state["deployment"], state["request_id"]))
+        oids[database] = oids.pop(shadow)
 
-    monkeypatch.setitem(program, "rename_database", rename)
+    monkeypatch.setitem(program, "privileged_swap", privileged_swap)
 
     program["swap"](state_path)
 
-    assert renames == [(shadow, database, database)]
+    assert calls == [("example-app", "restore-1")]
     assert oids == {previous: 101, database: 202}
     assert json.loads(state_path.read_text())["phase"] == "data_replaced"
 
 
-def test_successful_swap_terminates_only_live_database_connections(
+def test_successful_swap_delegates_only_the_protected_request(
     tmp_path, monkeypatch
 ) -> None:
     program = program_namespace(tmp_path)
@@ -255,24 +217,19 @@ def test_successful_swap_terminates_only_live_database_connections(
     database = "gimme_example_app"
     shadow, previous = program["derived_identities"](database, "restore-1")
     oids = {database: 101, shadow: 202}
-    queries = []
+    calls = []
     monkeypatch.setitem(program, "database_oid", lambda name: oids.get(name))
 
-    def query(target, statement, variables):
-        queries.append((target, statement, variables))
-        return ""
+    def privileged_swap(state):
+        calls.append((state["deployment"], state["request_id"], state["database"]))
+        oids[previous] = oids.pop(database)
+        oids[database] = oids.pop(shadow)
 
-    def rename(current, replacement, _role):
-        oids[replacement] = oids.pop(current)
-
-    monkeypatch.setitem(program, "query", query)
-    monkeypatch.setitem(program, "rename_database", rename)
+    monkeypatch.setitem(program, "privileged_swap", privileged_swap)
 
     program["swap"](state_path)
 
-    assert len(queries) == 1
-    assert "pg_terminate_backend" in queries[0][1]
-    assert queries[0][2] == {"database": database}
+    assert calls == [("example-app", "restore-1", database)]
     assert oids == {previous: 101, database: 202}
     assert json.loads(state_path.read_text())["phase"] == "data_replaced"
 
