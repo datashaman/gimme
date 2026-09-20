@@ -10,7 +10,7 @@ import socket
 import tempfile
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import wraps
 from inspect import signature
 from pathlib import Path
@@ -21,6 +21,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from gimme import recovery as recovery_module
+from gimme import recovery_schedule as recovery_schedule_module
 from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
 from gimme import valkey_contract
@@ -332,6 +333,7 @@ def _run_deployment(
         task, legacy_server(target), stack=target.stack,
         app_name=deployment.application, app=legacy_app(application, deployment),
         revision=revision, arguments=arguments,
+        deployment_name=name,
         instance_name=deployment.placement.instance,
         deploy_path=f"{target.apps_root}/{deployment.placement.relative_path}",
         site_host=deployment.placement.site_host,
@@ -928,6 +930,82 @@ def valkey_options(name: str) -> dict[str, object]:
 @mcp.resource("gimme://deployments/{name}")
 def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
+
+
+def _recovery_schedule_status(
+    name: str, observed_at: datetime | None = None,
+) -> dict[str, object]:
+    _state, deployment, _target, _application = _context(name)
+    if deployment.recovery is None:
+        raise ValueError(f"deployment {name} has no Recovery Policy bound")
+    cadence = deployment.recovery.cadence
+    observed = (observed_at or datetime.now(UTC)).astimezone(UTC)
+    logical_next = recovery_schedule_module.next_logical_slot(cadence, observed)
+    effective_next = (
+        None if logical_next is None
+        else recovery_schedule_module.effective_execution(logical_next, name)
+    )
+    result: dict[str, object] = {
+        "deployment": name,
+        "cadence": cadence.model_dump(mode="json"),
+        "logical_next_utc": None if logical_next is None else logical_next.isoformat(),
+        "effective_next_utc": None if effective_next is None else effective_next.isoformat(),
+        "timer_state": "disabled" if logical_next is None else "unavailable",
+        "timer_enabled": False if logical_next is None else None,
+        "timer_active": False if logical_next is None else None,
+        "last_logical_slot": None,
+        "started_at": None,
+        "finished_at": None,
+        "outcome": None if logical_next is None else "status_unavailable",
+        "error_code": None if logical_next is None else "status_unavailable",
+        "recovery_point_id": None,
+        "last_verified_recovery_point_id": None,
+        "retention_outcome": None,
+        "retention_deleted": 0,
+        "retention_remaining": 0,
+    }
+    if logical_next is None:
+        return result
+    try:
+        observation = _run_deployment(
+            "gimme:recovery:schedule-status", name, timeout=60
+        )
+        markers = []
+        for raw in observation.output.splitlines():
+            line = raw.split("] ", 1)[-1].strip()
+            if line.startswith("GIMME_RECOVERY_TIMER|"):
+                markers.append(line.split("|"))
+        if (
+            len(markers) != 1 or len(markers[0]) != 3
+            or markers[0][1] not in {"missing", "enabled", "disabled"}
+            or markers[0][2] not in {"active", "inactive"}
+        ):
+            return result
+        configured, activity = markers[0][1:]
+        result.update({
+            "timer_state": (
+                "missing" if configured == "missing" else activity
+            ),
+            "timer_enabled": configured == "enabled",
+            "timer_active": activity == "active",
+            "outcome": None,
+            "error_code": None,
+        })
+    except Exception:
+        return result
+    return result
+
+
+@mcp.tool(annotations=READ)
+def get_recovery_schedule_status(name: Name) -> dict[str, object]:
+    """Read bounded, secret-safe observed Recovery Schedule status."""
+    return _recovery_schedule_status(name)
+
+
+@mcp.resource("gimme://deployments/{name}/recovery-schedule")
+def recovery_schedule_resource(name: str) -> dict[str, object]:
+    """Read bounded Recovery Schedule status without raw target output."""
+    return _recovery_schedule_status(name)
 
 
 @mcp.resource("gimme://operations")

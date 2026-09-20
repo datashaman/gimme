@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -330,6 +331,7 @@ async def test_hard_v4_tool_surface() -> None:
         "plan_create_recovery_point",
         "create_recovery_point",
         "list_recovery_points",
+        "get_recovery_schedule_status",
         "list_restores",
         "plan_restore_deployment",
         "apply_restore_deployment",
@@ -350,6 +352,7 @@ async def test_hard_v4_tool_surface() -> None:
         "gimme://backup-destinations/{name}",
         "gimme://aws-networks/{name}/valkey-options",
         "gimme://deployments/{name}/restores/{request_id}",
+        "gimme://deployments/{name}/recovery-schedule",
     }
     assert all(tool.annotations is not None for tool in tools)
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
@@ -841,6 +844,91 @@ def test_on_demand_recovery_plan_preserves_normalized_scheduled_policy(
     }
     assert plan["retain_last"] == 30
     assert plan["ready"] is True
+
+
+def test_manual_recovery_schedule_status_is_local_and_disabled(
+    tmp_path, monkeypatch
+) -> None:
+    use_recovery_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *args, **kwargs: pytest.fail("manual cadence must not contact the Target"),
+    )
+
+    status = server_module._recovery_schedule_status(
+        "example-app", datetime(2026, 9, 20, 10, tzinfo=UTC)
+    )
+
+    assert status["cadence"] == {"kind": "manual"}
+    assert status["timer_state"] == "disabled"
+    assert status["timer_enabled"] is False
+    assert status["logical_next_utc"] is None
+    assert status["outcome"] is None
+
+
+def test_scheduled_recovery_status_exposes_only_bounded_observation(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    deployment = selected.deployment("example-app")
+    selected.save(selected.load().model_copy(update={
+        "deployments": {
+            "example-app": deployment.model_copy(update={
+                "recovery": RecoveryPolicy.model_validate({
+                    **deployment.recovery.model_dump(mode="json"),
+                    "cadence": {"kind": "daily", "hour": 2, "minute": 0},
+                })
+            })
+        }
+    }))
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *args, **kwargs: CommandResult(
+            ["dep", "private-command"], 0,
+            "private output\nGIMME_RECOVERY_TIMER|enabled|active\n",
+        ),
+    )
+
+    status = server_module._recovery_schedule_status(
+        "example-app", datetime(2026, 9, 20, 1, tzinfo=UTC)
+    )
+
+    assert status["logical_next_utc"] == "2026-09-20T02:00:00+00:00"
+    assert status["timer_state"] == "active"
+    assert status["timer_enabled"] is True
+    assert status["timer_active"] is True
+    assert status["outcome"] is None
+    assert "private" not in json.dumps(status)
+
+
+def test_scheduled_recovery_status_fails_closed_without_target_output(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    deployment = selected.deployment("example-app")
+    selected.save(selected.load().model_copy(update={
+        "deployments": {
+            "example-app": deployment.model_copy(update={
+                "recovery": RecoveryPolicy.model_validate({
+                    **deployment.recovery.model_dump(mode="json"),
+                    "cadence": {"kind": "hourly"},
+                })
+            })
+        }
+    }))
+    monkeypatch.setattr(
+        server_module.runner, "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("private target failure")
+        ),
+    )
+
+    status = server_module.get_recovery_schedule_status("example-app")
+
+    assert status["timer_state"] == "unavailable"
+    assert status["outcome"] == "status_unavailable"
+    assert status["error_code"] == "status_unavailable"
+    assert "private target failure" not in json.dumps(status)
 
 
 def test_restore_record_tool_and_resource_are_destination_authoritative(

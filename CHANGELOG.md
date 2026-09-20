@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added a bounded Recovery Schedule Status tool/resource projection. Manual cadence reports
+  disabled locally; scheduled cadence observes only the exact Deployment-derived timer and
+  collapses missing, malformed, or unavailable target observations to fixed secret-safe fields.
+  Latest-attempt persistence will arrive with the standalone runner layer.
 - Enforced `retain_last` after every newly published or idempotently verified on-demand
   Recovery Point. Automatic retention selects verified, unprotected points oldest-first,
   uses the sole exact-version deletion primitive, never deletes the successful replacement,
