@@ -184,6 +184,40 @@ trap - EXIT
 BASH;
 }
 
+function recovery_schedule_state_write_command(
+    string $statePath,
+    string $deployment,
+): string {
+    if (!preg_match('/^[a-z][a-z0-9-]{0,63}$/', $deployment)) {
+        throw new \RuntimeException('Unsafe Recovery Schedule Deployment identity');
+    }
+    $raw = getenv('GIMME_RECOVERY_SCHEDULE_JSON');
+    if ($raw === false || strlen($raw) > 65536) {
+        throw new \RuntimeException('Missing or oversized Recovery Schedule authority');
+    }
+    $state = json_decode($raw, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($state) || array_is_list($state) ||
+        ($state['deployment'] ?? null) !== $deployment) {
+        throw new \RuntimeException('Invalid Recovery Schedule authority');
+    }
+    $encoded = escapeshellarg(base64_encode(json_encode(
+        $state,
+        JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+    )));
+    $directory = escapeshellarg(dirname($statePath));
+    $path = escapeshellarg($statePath);
+    return <<<BASH
+set -eu
+install -d -m 0700 {$directory}
+temporary={$path}.tmp.\$\$
+trap 'rm -f "\$temporary"' EXIT
+printf %s {$encoded} | base64 -d > "\$temporary"
+chmod 0600 "\$temporary"
+mv "\$temporary" {$path}
+trap - EXIT
+BASH;
+}
+
 function privileged_helper_source_hashes(): array
 {
     $hashes = [];

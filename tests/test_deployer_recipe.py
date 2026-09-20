@@ -310,6 +310,40 @@ def test_recovery_schedule_status_queries_only_the_derived_timer() -> None:
     assert "GIMME_RECOVERY_TIMER|" in task
 
 
+def test_recovery_schedule_reconciliation_uses_fixed_protected_transfer() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:schedule-reconcile'", 1)[1].split(
+        "task('gimme:restart:workers'", 1
+    )[0]
+
+    assert "recovery_schedule_state_write_command(" in task
+    assert '"{$appsRoot}/.gimme/recovery-schedules"' in task
+    assert '"{$directory}/{$deployment}.json"' in task
+    assert '"{$directory}/{$deployment}.credentials"' in task
+    assert "upload($localCredential, $remoteCredential)" in task
+    assert "chmod 0600" in task
+    assert "sudo -n /usr/local/sbin/gimme-provision-recovery-schedule" in task
+    assert "finally" in task
+    assert "rm -f" in task
+    assert task.index("recovery_schedule_state_write_command(") < task.index("try {")
+    assert task.index("try {") < task.index("upload($localCredential") < task.index(
+        "sudo -n /usr/local/sbin/gimme-provision-recovery-schedule"
+    ) < task.index("finally")
+
+
+def test_recovery_schedule_state_writer_is_bounded_and_secret_free() -> None:
+    state = (ROOT / "deploy/state.php").read_text().split(
+        "function recovery_schedule_state_write_command", 1
+    )[1].split("function privileged_helper_source_hashes", 1)[0]
+
+    assert "GIMME_RECOVERY_SCHEDULE_JSON" in state
+    assert "strlen($raw) > 65536" in state
+    assert "($state['deployment'] ?? null) !== $deployment" in state
+    assert "GIMME_SECRET_FILE" not in state
+    assert "credentials" not in state
+    assert "chmod 0600" in state
+
+
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

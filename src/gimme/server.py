@@ -314,6 +314,7 @@ def _run_deployment(
     valkey_restore_sha256: str | None = None,
     valkey_restore_bytes: int | None = None,
     valkey_restore_records: int | None = None,
+    recovery_schedule_authority: dict[str, object] | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -371,6 +372,7 @@ def _run_deployment(
         valkey_restore_sha256=valkey_restore_sha256,
         valkey_restore_bytes=valkey_restore_bytes,
         valkey_restore_records=valkey_restore_records,
+        recovery_schedule_authority=recovery_schedule_authority,
         timeout=timeout,
     )
 

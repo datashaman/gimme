@@ -143,6 +143,7 @@ class DeployerRunner:
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
         resource_trust_bundle_sha256: str | None = None,
+        recovery_schedule_authority: dict[str, object] | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -278,6 +279,10 @@ class DeployerRunner:
             environment["GIMME_RESOURCE_TRUST_BUNDLE_SHA256"] = resource_trust_bundle_sha256
         if resource_database is not None:
             environment["GIMME_DATABASE_IDENTIFIER"] = resource_database
+        if recovery_schedule_authority is not None:
+            environment["GIMME_RECOVERY_SCHEDULE_JSON"] = json.dumps(
+                recovery_schedule_authority, sort_keys=True, separators=(",", ":")
+            )
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if deployment_name is not None:
