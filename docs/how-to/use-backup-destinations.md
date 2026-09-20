@@ -123,13 +123,11 @@ manifest whose referenced component object no longer
 matches its declared checksum is rejected and excluded from `recovery_points`, but does
 not fail the rest of the listing; its ID is reported under `rejected`.
 
-`create_recovery_point` serializes concurrent applies against the same Deployment through
-a local, per-control-plane lock. That lock does not extend across two independent
-control-plane processes (different state directories) targeting the same real
-destination bucket — Gimme assumes a single operator per Deployment, the same
-trusted-operator model the plan/apply split already relies on elsewhere. Running more
-than one control plane against the same Deployment's recovery destination at once is
-unsupported and can race.
+`create_recovery_point` transfers only reviewed policy and protected credentials to the
+registered Target, then invokes the same fixed runner used by scheduled captures. The runner
+serializes scheduled and on-demand work with the Deployment operation lock, so independent
+control-plane processes cannot capture the same Deployment concurrently. Different Deployments
+use independent locks and may capture concurrently.
 
 ## Delete a Recovery Point manually
 
@@ -152,23 +150,41 @@ versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destin
 
 For the full or partial Deployment Restore procedure, Target-loss replacement, and
 failed-verification recovery, see [Restore a Deployment](restore-a-postgresql-deployment.md).
-Scheduled/systemd-timer execution remains separate work described in
-[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md). Successful on-demand capture now
-enforces `retain_last`: verified, unprotected points are removed oldest-first after the
-replacement verifies. A pruning failure preserves the new point, stops further deletion, and
-returns `backup_succeeded_retention_failed`; retry retention with a later successful capture or
-use the explicit manual deletion workflow.
+Both scheduled and on-demand success enforce `retain_last`: verified, unprotected points are
+removed oldest-first after the replacement verifies. A pruning failure preserves the new point,
+stops further deletion, and returns `backup_succeeded_retention_failed`; retry retention with a
+later successful capture or use the explicit manual deletion workflow.
 
 The policy model accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence shapes and
-a bounded `retain_last` value from 1 through 365. A non-manual schedule requires the registered
-Target APT stack to include `python3-boto3`; planning reports
-`recovery_schedule_runtime_missing` and apply remains unavailable otherwise. Until the shared
-Target capture executable lands, leave `cadence` as `{kind: manual}`; the default is manual and
-the default retained count is 7.
+a bounded `retain_last` value from 1 through 365. The defaults are manual cadence and seven
+retained points. A non-manual schedule requires the registered Target APT stack to include
+`python3-boto3`; planning reports `recovery_schedule_runtime_missing` and apply remains
+unavailable otherwise. Applying Deployment resources installs or updates one persistent UTC
+systemd timer and its content-bound runner policy. Switching to manual cadence or removing the
+Deployment disables and removes the units, scheduled authority, status, and stored credentials.
+
+The timer computes only the latest missed logical slot after downtime. A stable
+Deployment-derived delay of 0–300 seconds spreads load without changing that slot or its
+deterministic request identity, so restart and catch-up retries converge on the same Recovery
+Point. The runner waits at most five minutes for the Deployment lock. `deployment_busy` means it
+performed no capture or retention and will wait for a later timer activation or on-demand call.
+
+Ambient Target identity writes no credential file. A destination using `secret_refs` resolves
+credentials only during apply, transfers them through owner-only files, and installs them as a
+root-owned systemd credential. Reapply Deployment resources to rotate stored or session
+credentials; the runner does not refresh expiring sessions. `credentials_expired` therefore
+requires reapplication. Switching to ambient authentication or manual cadence removes the
+persisted scheduled credential.
 Inspect `get_recovery_schedule_status(deployment)` or
 `gimme://deployments/{name}/recovery-schedule` for bounded timer state and logical/effective next
 UTC times. `status_unavailable` means the Target observation could not be obtained; destination
 manifests remain the authoritative Recovery Point inventory.
+The status reports only the latest scheduled attempt. `backup_succeeded_retention_failed` means
+the new point is valid but pruning stopped at its first failed oldest candidate; a later
+successful capture retries retention. `policy_stale`, `credentials_unavailable`,
+`credentials_expired`, `destination_unavailable`, `capture_failed`, and `verification_failed`
+are fixed safe outcomes; reapply policy or credentials after correcting the indicated class of
+failure. Raw target, systemd, provider, and credential errors are never returned.
 Before apply, inspect the `recovery_schedule` section of `plan_deployment_resources`. Its
 authority fingerprint changes with policy, placement, selected Resource provenance, destination
 execution policy, or auth mode, while the plan exposes no secret reference or credential path.

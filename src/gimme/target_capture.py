@@ -75,14 +75,14 @@ def _provider_failure(error: Exception, operation: str) -> CaptureFailure:
     provider_code = None
     if isinstance(response, dict) and isinstance(response.get("Error"), dict):
         provider_code = response["Error"].get("Code")
-    codes = {
-        "AccessDenied": "access_denied", "NoSuchBucket": "missing",
-        "NoSuchKey": "missing", "404": "missing", "SlowDown": "throttled",
-        "Throttling": "throttled",
-    }
-    return CaptureFailure(
-        f"backup_destination_{operation}_{codes.get(provider_code, 'unavailable')}"
-    )
+    if provider_code in {"ExpiredToken", "ExpiredTokenException", "RequestExpired"}:
+        return CaptureFailure("credentials_expired")
+    if provider_code in {
+        "InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken",
+        "UnrecognizedClientException",
+    }:
+        return CaptureFailure("credentials_unavailable")
+    return CaptureFailure("destination_unavailable")
 
 
 class BotoObjectStore:
@@ -98,10 +98,10 @@ class BotoObjectStore:
         if destination.get("addressing") not in {"virtual_hosted", "path"}:
             raise CaptureFailure("backup_destination_policy_invalid")
         encryption = destination.get("encryption")
-        if not isinstance(encryption, dict) or encryption.get("method") not in {"AES256", "kms"}:
+        if not isinstance(encryption, dict) or encryption.get("method") not in {"aes256", "kms"}:
             raise CaptureFailure("backup_destination_policy_invalid")
         if (
-            (encryption["method"] == "AES256" and set(encryption) != {"method"})
+            (encryption["method"] == "aes256" and set(encryption) != {"method"})
             or (
                 encryption["method"] == "kms"
                 and (
@@ -123,7 +123,10 @@ class BotoObjectStore:
             raise CaptureFailure("credentials_unavailable")
         if auth_mode == "stored" and (
             not isinstance(credentials, dict)
-            or set(credentials) != {"access_key_id", "secret_access_key"}
+            or set(credentials) not in (
+                {"access_key_id", "secret_access_key"},
+                {"access_key_id", "secret_access_key", "session_token"},
+            )
             or not all(
                 isinstance(value, str) and value and "\n" not in value and "\0" not in value
                 for value in credentials.values()
@@ -151,6 +154,8 @@ class BotoObjectStore:
             if credentials is not None:
                 kwargs["aws_access_key_id"] = credentials["access_key_id"]
                 kwargs["aws_secret_access_key"] = credentials["secret_access_key"]
+                if "session_token" in credentials:
+                    kwargs["aws_session_token"] = credentials["session_token"]
             self.client = boto_module.client("s3", **kwargs)
         except CaptureFailure:
             raise

@@ -277,13 +277,10 @@ identity is derived from `(deployment, destination, request_id)`, never from wal
 time. Re-applying the same `plan_id`/`request_id` after a prior success is a deterministic
 no-op that returns the already-published manifest without re-running `pg_dump` or
 re-uploading. `pg_dump` runs on the Deployment's Target with `--no-owner --no-privileges
---no-acl` (roles, ownership, and ACLs are never captured); the dump is pulled back to the
-control plane over the same transport already used for deployment secret files, then
-uploaded from there with server-side encryption, because on-demand capture runs while the
-MCP server is live. (Scheduled, systemd-timer-driven capture is separate, future work and
-may instead use the Target's own ambient or credential-referenced identity, per
-[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).) The component upload is
-verified against its declared SHA-256 before the immutable Recovery Manifest is published.
+--no-acl` (roles, ownership, and ACLs are never captured). On-demand and scheduled capture
+both invoke the installed content-bound Target runner and the same capture, upload,
+verification, idempotency, and retention implementation. The component upload is verified
+against its declared SHA-256 before the immutable Recovery Manifest is published.
 For a Valkey-inclusive point, only the selected Deployment route and registered managed
 writers are quiesced; a binary-safe bounded scan captures only its registered prefix with
 absolute expiry timestamps. Normal runtime is restored after every component upload is
@@ -307,8 +304,11 @@ and accepts exactly one UTC cadence shape: `{kind: manual}`, `{kind: hourly, min
 `{kind: daily, hour: 2, minute: 0}`, or
 `{kind: weekly, weekday: sun, hour: 2, minute: 0}`. The shown clock fields are defaults;
 hour is 0–23 and minute is 0–59. Arbitrary time zones, seconds, cron expressions, and extra
-calendar fields are rejected. Scheduled runner, timer reconciliation, and schedule status are
-separate follow-on slices; scheduled execution will invoke the same retention path.
+calendar fields are rejected. Non-manual resource apply reconciles one persistent UTC systemd
+timer with a stable 0–300 second Deployment-derived delay. Each activation selects only the
+latest missed logical slot and derives its request identity from the normalized policy and slot.
+Manual cadence and Deployment removal delete the timer, authority, status, and scheduled
+credentials.
 
 `plan_deployment_resources` includes a content-addressed `recovery_schedule` projection when a
 Recovery Policy is bound. It shows enabled/manual state, normalized cadence and UTC calendar,
@@ -323,8 +323,21 @@ contacting the Target. A scheduled cadence queries only its Deployment-derived t
 fixed `status_unavailable` fields when the Target or observation is unavailable. The projection
 contains normalized cadence, logical/effective next UTC time, bounded timer state, the latest
 attempt fields, Recovery Point identities, and retention counts; it never includes raw systemd
-properties, unit contents, commands, paths, provider responses, or logs. Until the runner layer
-lands, latest-attempt fields remain empty and a missing timer is reported explicitly.
+properties, unit contents, commands, paths, provider responses, or logs. A missing timer is
+reported explicitly. Scheduled status is observed evidence; S3 manifests remain authoritative.
+
+The runner waits at most five minutes for the Deployment operation lock. A busy attempt records
+`deployment_busy` and performs no capture or pruning. Fixed attempt outcomes are `succeeded`,
+`backup_succeeded_retention_failed`, `deployment_busy`, `policy_stale`,
+`credentials_unavailable`, `credentials_expired`, `destination_unavailable`, `capture_failed`,
+`verification_failed`, `retention_failed`, and `status_unavailable`. A successful point remains
+valid when retention fails, and a later successful capture retries pruning.
+
+Ambient Backup Destination authentication persists no credential. `secret_refs` are resolved
+only during resource apply, transferred through protected temporary files, installed root-owned,
+and delivered with systemd `LoadCredential`. Reapply resources to rotate stored or session
+credentials. Switching to ambient auth or manual cadence removes the stored scheduled
+credential. The runner never refreshes session credentials itself.
 
 Deletion accepts only a registered Deployment and Recovery Point ID. The private manifest
 supplies every object key and exact S3 version; callers cannot provide a key, prefix, path,

@@ -271,6 +271,35 @@ def test_recovery_schedule_valkey_credential_crosses_as_protected_file_path(
     assert captured["GIMME_RECOVERY_SCHEDULE_VALKEY_FILE"] == str(credential)
 
 
+def test_on_demand_recovery_request_crosses_as_bounded_fixed_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner(tmp_path).run(
+        "gimme:recovery:on-demand", server(),
+        recovery_on_demand_request_id="manual-request-1",
+    )
+
+    assert captured["GIMME_RECOVERY_ON_DEMAND_REQUEST_ID"] == "manual-request-1"
+
+
+@pytest.mark.parametrize("request_id", ["UPPER", "bad/path", "", "a" * 65])
+def test_on_demand_recovery_request_rejects_arbitrary_input(
+    tmp_path: Path, request_id: str
+) -> None:
+    with pytest.raises(ValueError, match="recovery_on_demand_request_id is invalid"):
+        runner(tmp_path).run(
+            "gimme:recovery:on-demand", server(),
+            recovery_on_demand_request_id=request_id,
+        )
+
+
 def test_multiple_health_probes_cross_runner_boundary_with_phase_policy(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -503,6 +503,7 @@ class CredentialReferenceBackupAuth(BaseModel):
     mode: Literal["credential_reference"] = "credential_reference"
     access_key_id: SecretReference
     secret_access_key: SecretReference
+    session_token: SecretReference | None = None
 
 
 BackupDestinationAuth = Annotated[
@@ -946,7 +947,10 @@ class ControlState(BaseModel):
                 for reference in (
                     destination.auth.access_key_id,
                     destination.auth.secret_access_key,
+                    destination.auth.session_token,
                 ):
+                    if reference is None:
+                        continue
                     if reference.store not in self.secret_stores:
                         raise ValueError(
                             f"backup destination {name} references an unknown secret store"

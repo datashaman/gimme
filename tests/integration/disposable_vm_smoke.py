@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import re
 import subprocess
@@ -1539,6 +1540,8 @@ def verify_backup_destination() -> None:
     update_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
     gimme.update_deployment(RECOVERY_DEPLOYMENT, proposed, str(update_plan["plan_id"]))
 
+    verify_recovery_schedule_matrix(gimme, definition)
+
     seeded = seed_recovery_valkey_state()
     plan = gimme.plan_create_recovery_point(RECOVERY_DEPLOYMENT, "ci-smoke-1")
     result = gimme.create_recovery_point(
@@ -1629,6 +1632,149 @@ def verify_backup_destination() -> None:
     for path in (STATE_PATH, STATE_DIRECTORY / "operations.jsonl"):
         if path.exists() and "gimme-ci-secret" in path.read_text():
             raise AssertionError(f"MinIO credential leaked into {path}")
+
+
+def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
+    """Exercise real unit lifecycle, stored credentials, catch-up, status, and cleanup."""
+    from gimme.control import (
+        CredentialReferenceBackupAuth, DeploymentRegistration, RecoveryPolicy,
+        SecretReference,
+    )
+
+    credentials = ("gimme-ci", "gimme-ci-secret")
+    stored = ambient_definition.model_copy(update={
+        "auth": CredentialReferenceBackupAuth(
+            access_key_id=SecretReference(
+                store="local-sops", secret="minio", field="access_key_id"
+            ),
+            secret_access_key=SecretReference(
+                store="local-sops", secret="minio", field="secret_access_key"
+            ),
+        )
+    })
+
+    def update_destination(definition) -> None:
+        plan = gimme.plan_update_backup_destination(BACKUP_DESTINATION, definition)
+        with patch.object(
+            gimme, "_backup_destination_credentials", return_value=(None, credentials)
+        ):
+            gimme.update_backup_destination(
+                BACKUP_DESTINATION, definition, str(plan["plan_id"])
+            )
+
+    def apply_policy(cadence) -> dict[str, object]:
+        current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+        proposed = DeploymentRegistration.from_deployment(current).model_copy(update={
+            "recovery": RecoveryPolicy(
+                destination=BACKUP_DESTINATION, valkey=True,
+                quiesce_wait_seconds=1, cadence=cadence, retain_last=2,
+            )
+        })
+        update = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
+        gimme.update_deployment(
+            RECOVERY_DEPLOYMENT, proposed, str(update["plan_id"])
+        )
+        resources = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
+        with patch.object(
+            gimme, "_backup_destination_credentials", return_value=(None, credentials)
+        ):
+            try:
+                gimme.apply_deployment_resources(
+                    RECOVERY_DEPLOYMENT, str(resources["plan_id"])
+                )
+            except Exception as apply_error:
+                # The public boundary intentionally redacts remote activation output. On this
+                # isolated disposable host only, retry the exact fixed reconciliation task so a
+                # regression leaves actionable evidence, while still proving credentials absent.
+                from gimme.secrets import protected_secret_file
+
+                state = gimme.store.load()
+                active = state.deployments[RECOVERY_DEPLOYMENT]
+                authority = gimme._recovery_schedule_authority(
+                    RECOVERY_DEPLOYMENT, state, active,
+                    cleanup=active.recovery.cadence.kind == "manual",
+                )
+                try:
+                    with protected_secret_file({
+                        "access_key_id": credentials[0],
+                        "secret_access_key": credentials[1],
+                    }) as secret_file:
+                        gimme._run_deployment(
+                            "gimme:recovery:schedule-reconcile", RECOVERY_DEPLOYMENT,
+                            secret_file=secret_file,
+                            recovery_schedule_authority=authority, timeout=1800,
+                        )
+                except Exception as diagnostic:
+                    message = str(diagnostic)
+                    if any(value in message for value in credentials):
+                        raise AssertionError(
+                            "Recovery Schedule diagnostic exposed stored credentials"
+                        ) from None
+                    raise AssertionError(
+                        f"Recovery Schedule activation failed safely: {message}"
+                    ) from apply_error
+                raise
+        return resources
+
+    update_destination(stored)
+    calendars = (
+        ({"kind": "hourly", "minute": 17}, "*-*-* *:17:00 UTC"),
+        ({"kind": "daily", "hour": 3, "minute": 19}, "*-*-* 03:19:00 UTC"),
+        (
+            {"kind": "weekly", "weekday": "wed", "hour": 4, "minute": 23},
+            "Wed *-*-* 04:23:00 UTC",
+        ),
+    )
+    unit = f"gimme-recovery-{RECOVERY_DEPLOYMENT}"
+    for cadence, calendar in calendars:
+        apply_policy(cadence)
+        timer = ssh("sudo", "systemctl", "cat", f"{unit}.timer")
+        service = ssh("sudo", "systemctl", "cat", f"{unit}.service")
+        if f"OnCalendar={calendar}" not in timer or "Persistent=true" not in timer:
+            raise AssertionError(f"Recovery timer did not normalize {cadence}: {timer}")
+        if "LoadCredential=aws:" not in service:
+            raise AssertionError("stored Backup Destination did not use LoadCredential")
+        if credentials[0] in service or credentials[1] in service:
+            raise AssertionError("Recovery service unit exposed stored credentials")
+        if ssh("sudo", "systemctl", "is-enabled", f"{unit}.timer") != "enabled":
+            raise AssertionError("Recovery timer was not enabled")
+
+    # A daily slot one hour in the past avoids the stable jitter wait and exercises the
+    # latest-slot catch-up through the real installed runner. A newly created persistent
+    # timer has no prior activation timestamp, so explicitly start its fixed service to model
+    # the activation systemd would coalesce after an established timer's downtime.
+    past = datetime.now(UTC) - timedelta(hours=1)
+    apply_policy({"kind": "daily", "hour": past.hour, "minute": past.minute})
+    try:
+        ssh("sudo", "systemctl", "start", f"{unit}.service")
+    except subprocess.CalledProcessError:
+        # The runner's bounded status below is the supported diagnostic surface; never
+        # scrape journal output, unit environment, or provider errors here.
+        pass
+    deadline = time.monotonic() + 90
+    while True:
+        status = gimme.get_recovery_schedule_status(RECOVERY_DEPLOYMENT)
+        if status.get("outcome") == "succeeded":
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"scheduled catch-up did not succeed: {status}")
+        time.sleep(2)
+    if status["last_logical_slot"] is None or status["recovery_point_id"] is None:
+        raise AssertionError(f"scheduled status omitted verified identities: {status}")
+
+    # Switching both auth and cadence removes persisted scheduled authority and secrets.
+    update_destination(ambient_definition)
+    apply_policy({"kind": "manual"})
+    if ssh("sudo", "systemctl", "show", f"{unit}.timer", "-p", "LoadState", "--value") != (
+        "not-found"
+    ):
+        raise AssertionError("manual cadence retained the Recovery timer")
+    authority = ssh(
+        "sudo", "find", "/etc/gimme/recovery-schedules", "-maxdepth", "1",
+        "-name", f"{RECOVERY_DEPLOYMENT}*", "-print",
+    )
+    if authority:
+        raise AssertionError(f"manual cadence retained scheduled authority: {authority}")
 
 
 def supersede_component(key: str) -> str:

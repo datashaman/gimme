@@ -61,7 +61,7 @@ def authority(cadence: dict[str, object] | None = None) -> dict[str, object]:
             "region": "us-east-1",
             "endpoint": None,
             "addressing": "virtual_hosted",
-            "encryption": {"method": "AES256"},
+            "encryption": {"method": "aes256"},
             "auth_mode": "ambient",
         },
         "status_identity": "example-app",
@@ -362,6 +362,35 @@ def test_stored_credentials_are_validated_installed_and_transfer_removed(
     assert "LoadCredential=aws:" in unit
     assert "access-canary" not in unit
     assert "secret-canary" not in unit
+
+
+def test_session_credentials_are_installed_without_entering_the_unit(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    selected = authority()
+    selected["destination"]["auth_mode"] = "stored"
+    configure_filesystem(helper, tmp_path, selected)
+    transfer = helper["TRANSFER_ROOT"] / "example-app.credentials"
+    transfer.write_text(json.dumps({
+        "access_key_id": "access-canary", "secret_access_key": "secret-canary",
+        "session_token": "session-canary",
+    }))
+    transfer.chmod(0o600)
+    monkeypatch.setitem(helper, "run", lambda _command: None)
+    monkeypatch.setitem(helper, "succeeds", lambda _command: False)
+    monkeypatch.setattr(helper["os"], "chown", lambda *_args: None)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    helper["reconcile"]()
+
+    installed = helper["AUTHORITY_ROOT"] / "example-app.credentials"
+    assert json.loads(installed.read_text())["session_token"] == "session-canary"
+    unit = (helper["SYSTEMD_ROOT"] / "gimme-recovery-example-app.service").read_text()
+    assert "LoadCredential=aws:" in unit
+    assert "session-canary" not in unit
 
 
 @pytest.mark.parametrize(

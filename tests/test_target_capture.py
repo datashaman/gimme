@@ -10,6 +10,7 @@ from gimme.target_capture import (
     delete_recovery_point_versions, enforce_retention, recovery_point_id, retention_candidates,
     restore_protected_points, verified_inventory,
 )
+from gimme.target_capture import CaptureFailure
 
 
 class Store:
@@ -41,6 +42,41 @@ class Store:
 
     def list(self, prefix):
         return sorted({key for key, _version in self.objects if key.startswith(prefix)})
+
+
+def test_boto_store_passes_session_token_and_maps_expiry() -> None:
+    observed = {}
+
+    class Client:
+        def put_object(self, **_kwargs):
+            error = RuntimeError("secret provider message")
+            error.response = {"Error": {"Code": "ExpiredToken"}}
+            raise error
+
+    class Boto:
+        @staticmethod
+        def client(service, **kwargs):
+            observed.update(kwargs)
+            return Client()
+
+    destination = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "backups",
+        "region": "us-east-1", "endpoint": None, "addressing": "virtual_hosted",
+        "encryption": {"method": "aes256"}, "auth_mode": "stored",
+    }
+    store = BotoObjectStore(destination, {
+        "access_key_id": "access", "secret_access_key": "secret",
+        "session_token": "session",
+    }, boto_module=Boto)
+
+    assert observed["aws_session_token"] == "session"
+    try:
+        store.put("key", b"body", hashlib.sha256(b"body").hexdigest())
+    except CaptureFailure as error:
+        assert str(error) == "credentials_expired"
+        assert "secret provider message" not in str(error)
+    else:
+        raise AssertionError("expired session credential was accepted")
 
 
 def test_identity_matches_existing_recovery_contract() -> None:
@@ -251,7 +287,7 @@ def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() ->
     destination = {
         "name": "primary", "provider": "s3_compatible", "bucket": "gimme-backups",
         "region": "us-east-1", "endpoint": "minio.example.test:9000",
-        "addressing": "path", "encryption": {"method": "AES256"},
+        "addressing": "path", "encryption": {"method": "aes256"},
         "auth_mode": "stored",
     }
     store = BotoObjectStore(

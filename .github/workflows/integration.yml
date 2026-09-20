@@ -71,6 +71,9 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -keyout "$RUNNER_TEMP/minio-certs/private.key" \
             -out "$RUNNER_TEMP/minio-certs/public.crt" -days 1 -nodes \
             -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1"
+          sudo install -m 0644 "$RUNNER_TEMP/minio-certs/public.crt" \
+            /usr/local/share/ca-certificates/gimme-ci-minio.crt
+          sudo update-ca-certificates
           docker run -d --name gimme-ci-minio -p 9000:9000 \
             -e MINIO_ROOT_USER=gimme-ci -e MINIO_ROOT_PASSWORD=gimme-ci-secret \
             -e MINIO_KMS_SECRET_KEY="gimme-ci-key:$(openssl rand -base64 32)" \
