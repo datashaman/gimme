@@ -560,7 +560,21 @@ def test_environment_removal_is_bounded_to_non_default_environment_root() -> Non
     assert "Refusing to remove an environment through a symlinked parent" in task
     assert 'rm -rf -- "\\$path"' in task
     assert "dropdb --if-exists --force" in task
+    assert 'PGOPTIONS=' in task
+    assert '"-c role={$database}"' in task
     assert 'redis.call("SCAN"' in task
+
+
+def test_deployment_removal_assumes_only_its_derived_database_owner() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:remove:deployment'", 1)[1].split(
+        "task('gimme:service:status'", 1
+    )[0]
+
+    assert "dropdb --if-exists --force" in task
+    assert 'PGOPTIONS=' in task
+    assert '"-c role={$database}"' in task
+    assert "sudo -u postgres" not in task
 
 
 def test_frontend_build_runs_after_composer_dependencies() -> None:
