@@ -49,6 +49,7 @@ import gimme.control_plans as control_plans_module
 import gimme.recovery as recovery_module
 import gimme.recovery_schedule as recovery_schedule_module
 from gimme.recovery_orchestration import RecoveryOrchestrator
+from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.server import mcp
 
 
@@ -519,6 +520,66 @@ def test_recovery_mcp_adapter_delegates_to_current_orchestrator(monkeypatch) -> 
         "restores": [],
     }
     assert seen == ["example-app"]
+
+
+async def test_managed_resource_tool_schemas_remain_stable_across_module_extraction() -> None:
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    expected = {
+        "plan_apply_resource": ({"name"}, {"name"}, True),
+        "apply_resource": ({"name", "plan_id"}, {"name", "plan_id"}, False),
+        "inspect_resource": ({"name"}, {"name"}, True),
+    }
+    for name, (properties, required, read_only) in expected.items():
+        tool = tools[name]
+        assert set(tool.inputSchema["properties"]) == properties
+        assert set(tool.inputSchema["required"]) == required
+        assert tool.inputSchema["additionalProperties"] is False
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is read_only
+
+
+def test_managed_resource_orchestrator_owns_local_inspection() -> None:
+    state = sample_state()
+    orchestrator = ManagedResourceOrchestrator(
+        store=SimpleNamespace(load=lambda: state),
+        rds_postgres=None,
+        elasticache_valkey=None,
+        deployment_resource_locks=None,
+        assert_plan=None,
+    )
+
+    assert orchestrator.inspect_resource("devbox-postgres") == {
+        "resource": "devbox-postgres",
+        "provider": "target_local",
+        "target": "devbox",
+        "kind": "postgres",
+        "version": "17.2",
+    }
+
+
+def test_managed_resource_mcp_adapter_delegates_to_current_orchestrator(
+    monkeypatch,
+) -> None:
+    seen = []
+
+    class FakeManagedResourceOrchestrator:
+        def inspect_resource(self, name):
+            seen.append(name)
+            return {"resource": name, "provider": "target_local"}
+
+    monkeypatch.setattr(
+        server_module,
+        "_managed_resource_orchestrator",
+        FakeManagedResourceOrchestrator,
+    )
+
+    assert server_module.inspect_resource("devbox-postgres") == {
+        "resource": "devbox-postgres",
+        "provider": "target_local",
+    }
+    assert seen == ["devbox-postgres"]
 
 
 def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch) -> None:
