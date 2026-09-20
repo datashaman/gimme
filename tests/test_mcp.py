@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ from gimme.control import (
     TargetNetwork,
 )
 from gimme.deployer import CommandResult
+from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.recovery import ObjectMetadata, RecoveryError
 from gimme.recovery import append_restore_event, recovery_point_id, restore_event_key
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
@@ -106,6 +108,43 @@ def sample_state() -> ControlState:
 def use_store(tmp_path: Path, monkeypatch) -> StateStore:
     selected = StateStore(tmp_path / "state")
     selected.save(sample_state())
+    monkeypatch.setattr(server_module, "store", selected)
+    return selected
+
+
+def use_promotion_store(tmp_path: Path, monkeypatch, *, managed: bool = False) -> StateStore:
+    state = sample_state()
+    original = state.deployments["example-app"]
+    source = original.model_copy(update={
+        "source": DeploymentSource(kind="commit", ref="a" * 40),
+        "placement": Placement(
+            instance="source-app",
+            relative_path="deployments/source-app",
+            database_identifier="gimme_source_app",
+            cache_prefix="gimme:source-app:",
+            site_host="source-app.devbox.local",
+        ),
+    })
+    destination_update: dict[str, object] = {
+        "placement": Placement(
+            instance="destination-app",
+            relative_path="deployments/destination-app",
+            database_identifier="gimme_destination_app",
+            cache_prefix="gimme:destination-app:",
+            site_host="destination-app.devbox.local",
+        ),
+    }
+    if managed:
+        destination_update["workers"] = HorizonWorkerConfig()
+        destination_update["resources"] = ResourceBindings(
+            database="devbox-postgres",
+            valkey=ValkeyBinding(resource="devbox-valkey", uses=["cache", "queue"]),
+        )
+    destination = original.model_copy(update=destination_update)
+    selected = StateStore(tmp_path / "state")
+    selected.save(state.model_copy(update={
+        "deployments": {"source-app": source, "destination-app": destination}
+    }))
     monkeypatch.setattr(server_module, "store", selected)
     return selected
 
@@ -540,6 +579,92 @@ async def test_managed_resource_tool_schemas_remain_stable_across_module_extract
         assert tool.annotations.readOnlyHint is read_only
 
 
+async def test_deployment_release_tool_schemas_remain_stable_across_module_extraction() -> None:
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    expected = {
+        "plan_deployment": ({"name"}, {"name"}, True),
+        "apply_deployment": ({"name", "plan_id"}, {"name", "plan_id"}, False),
+        "list_releases": ({"name"}, {"name"}, True),
+        "rollback_deployment": ({"name", "confirmation"}, {"name", "confirmation"}, False),
+        "plan_promotion": ({"source", "destination"}, {"source", "destination"}, True),
+        "promote_deployment": (
+            {"source", "destination", "plan_id"},
+            {"source", "destination", "plan_id"},
+            False,
+        ),
+    }
+    for name, (properties, required, read_only) in expected.items():
+        tool = tools[name]
+        assert set(tool.inputSchema["properties"]) == properties
+        assert set(tool.inputSchema["required"]) == required
+        assert tool.inputSchema["additionalProperties"] is False
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is read_only
+
+
+def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> None:
+    calls: list[str] = []
+
+    @contextmanager
+    def lock(name):
+        calls.append(f"lock:{name}")
+        yield
+
+    def run(task, name, **_kwargs):
+        calls.append(f"{task}:{name}")
+        return CommandResult([name], 0, task)
+
+    orchestrator = DeploymentReleaseOrchestrator(
+        store=None,
+        context=None,
+        run_deployment=run,
+        secret_plan=None,
+        dns_issues=None,
+        managed_database_issues=None,
+        valkey_runtime=None,
+        deployment_resource_lock=lock,
+        deployment_resource_locks=None,
+        assert_plan=None,
+        replace=None,
+        result=lambda value: value.as_dict(),
+    )
+
+    assert orchestrator.list_releases("example-app")["output"] == "releases"
+    with pytest.raises(ValueError, match="ROLLBACK example-app"):
+        orchestrator.rollback_deployment("example-app", "wrong")
+    assert orchestrator.rollback_deployment(
+        "example-app", "ROLLBACK example-app"
+    )["output"] == "rollback"
+    assert calls == [
+        "releases:example-app",
+        "lock:example-app",
+        "rollback:example-app",
+    ]
+
+
+def test_deployment_release_mcp_adapter_uses_current_orchestrator(monkeypatch) -> None:
+    seen = []
+
+    class FakeDeploymentReleaseOrchestrator:
+        def list_releases(self, name):
+            seen.append(name)
+            return {"deployment": name, "releases": []}
+
+    monkeypatch.setattr(
+        server_module,
+        "_deployment_release_orchestrator",
+        FakeDeploymentReleaseOrchestrator,
+    )
+
+    assert server_module.list_releases("example-app") == {
+        "deployment": "example-app",
+        "releases": [],
+    }
+    assert seen == ["example-app"]
+
+
 def test_managed_resource_orchestrator_owns_local_inspection() -> None:
     state = sample_state()
     orchestrator = ManagedResourceOrchestrator(
@@ -785,6 +910,7 @@ def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> No
 
     assert result["output"] == "deployed"
     assert calls[-1] == ("deploy", ())
+    assert calls.count(("deploy", ("--plan",))) == 2
 
 
 def test_deploy_blocks_before_activation_when_process_helper_is_stale(
@@ -828,6 +954,89 @@ def test_deploy_blocks_before_activation_when_process_helper_is_stale(
     with pytest.raises(ValueError, match="deployment is not ready"):
         server_module.apply_deployment("example-app", str(plan["plan_id"]))
     assert ("deploy", ()) not in calls
+
+
+def test_promotion_pins_exact_live_revision_only_after_success(tmp_path, monkeypatch) -> None:
+    selected = use_promotion_store(tmp_path, monkeypatch)
+    revision = "b" * 40
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def fake_run(task, *args, **kwargs):
+        name = kwargs["deployment_name"]
+        arguments = tuple(kwargs.get("arguments", ()))
+        calls.append((task, name, arguments))
+        if task == "gimme:current-revision":
+            return CommandResult([name], 0, f"GIMME_CURRENT_REVISION|{revision}")
+        if task == "gimme:preflight:runtimes":
+            return CommandResult([name], 0, "runtime-ready")
+        if task == "deploy" and arguments == ("--plan",):
+            return CommandResult([name], 0, "candidate -> health -> symlink -> live")
+        return CommandResult([name], 0, "deployed")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_promotion("source-app", "destination-app")
+    result = server_module.promote_deployment(
+        "source-app", "destination-app", str(plan["plan_id"])
+    )
+
+    assert result["output"] == "deployed"
+    assert selected.deployment("destination-app").source == DeploymentSource(
+        kind="commit", ref=revision
+    )
+    assert calls.count(("deploy", "destination-app", ("--plan",))) == 2
+    assert calls[-1] == ("deploy", "destination-app", ())
+
+
+def test_promotion_rejects_an_unbounded_live_revision_marker(tmp_path, monkeypatch) -> None:
+    use_promotion_store(tmp_path, monkeypatch)
+
+    def fake_run(task, *args, **kwargs):
+        assert task == "gimme:current-revision"
+        return CommandResult([kwargs["deployment_name"]], 0, "GIMME_CURRENT_REVISION|main")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="no exact current revision"):
+        server_module.plan_promotion("source-app", "destination-app")
+
+
+@pytest.mark.parametrize("failure", ["deploy", "processes"])
+def test_failed_promotion_does_not_pin_destination_source(
+    tmp_path, monkeypatch, failure
+) -> None:
+    selected = use_promotion_store(
+        tmp_path, monkeypatch, managed=failure == "processes"
+    )
+    before = selected.deployment("destination-app").source
+    revision = "c" * 40
+
+    def fake_run(task, *args, **kwargs):
+        name = kwargs["deployment_name"]
+        arguments = tuple(kwargs.get("arguments", ()))
+        if task == "gimme:current-revision":
+            return CommandResult([name], 0, f"GIMME_CURRENT_REVISION|{revision}")
+        if task == "gimme:preflight:runtimes":
+            return CommandResult([name], 0, "runtime-ready")
+        if task == "gimme:preflight:processes":
+            return CommandResult(
+                [name],
+                0,
+                "GIMME_PROCESS_HELPER|ready\nGIMME_PCNTL|ready\nGIMME_POSIX|ready",
+            )
+        if task == "deploy" and arguments == ("--plan",):
+            return CommandResult([name], 0, "candidate -> health -> symlink -> live")
+        if task == failure or (failure == "processes" and task == "gimme:provision:processes"):
+            raise RuntimeError(f"{failure} failed")
+        return CommandResult([name], 0, "deployed")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_promotion("source-app", "destination-app")
+
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        server_module.promote_deployment(
+            "source-app", "destination-app", str(plan["plan_id"])
+        )
+    assert selected.deployment("destination-app").source == before
 
 
 def test_artisan_is_deployment_scoped_and_plan_gated(tmp_path, monkeypatch) -> None:
