@@ -45,7 +45,10 @@ OUTCOMES = {
     "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
 }
 ERROR_CODES = OUTCOMES | {
-    "maintenance_failed", "postgres_capture_failed", "valkey_capture_failed",
+    "maintenance_failed", "maintenance_route_validation_failed",
+    "maintenance_route_reload_failed", "maintenance_quiesce_wait_failed",
+    "maintenance_process_control_failed", "postgres_capture_failed",
+    "valkey_capture_failed",
     "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
     "provider_configuration_invalid", "provider_client_unavailable",
 }
@@ -363,10 +366,15 @@ def maintenance(
         result = execute(
             [SUDO, "-n", MAINTENANCE_HELPER, action, instance, request],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=900, check=False,
+            stderr=subprocess.PIPE, timeout=900, check=False, text=True,
         )
         if result.returncode != 0:
-            raise RunnerFailure("maintenance_failed")
+            marker = "GIMME_RECOVERY_MAINTENANCE_FAILED|"
+            reported = result.stderr.strip() if isinstance(result.stderr, str) else ""
+            code = reported.removeprefix(marker) if reported.startswith(marker) else ""
+            if code not in ERROR_CODES or not code.startswith("maintenance_"):
+                code = "maintenance_failed"
+            raise RunnerFailure(code)
         succeeded = True
     except RunnerFailure:
         raise

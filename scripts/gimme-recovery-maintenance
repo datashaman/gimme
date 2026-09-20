@@ -48,10 +48,19 @@ def fail(message: str) -> None:
 def run(command: list[str]) -> None:
     if not command or command[0] not in EXECUTABLES:
         fail("maintenance helper attempted an unexpected executable")
-    subprocess.run(  # nosec B603
-        [EXECUTABLES[command[0]], *command[1:]], check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(  # nosec B603
+            [EXECUTABLES[command[0]], *command[1:]], check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        if command[:2] == ["caddy", "validate"]:
+            fail("maintenance_route_validation_failed")
+        if command[:3] == ["systemctl", "reload", "caddy"]:
+            fail("maintenance_route_reload_failed")
+        if command[0] == "sleep":
+            fail("maintenance_quiesce_wait_failed")
+        fail("maintenance_process_control_failed")
 
 
 def succeeds(command: list[str]) -> bool:
@@ -319,6 +328,12 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
-        print("GIMME_RECOVERY_MAINTENANCE_FAILED|maintenance_failed", file=sys.stderr)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        code = str(error)
+        if code not in {
+            "maintenance_route_validation_failed", "maintenance_route_reload_failed",
+            "maintenance_quiesce_wait_failed", "maintenance_process_control_failed",
+        }:
+            code = "maintenance_failed"
+        print(f"GIMME_RECOVERY_MAINTENANCE_FAILED|{code}", file=sys.stderr)
         raise SystemExit(1) from None

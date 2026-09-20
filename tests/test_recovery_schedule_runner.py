@@ -288,6 +288,36 @@ def test_runner_maintenance_uses_only_fixed_helper_and_protected_request(
     assert request.exists(), "failed runtime restoration must preserve retry authority"
 
 
+def test_runner_maintenance_accepts_only_fixed_helper_failure_codes(
+    tmp_path, monkeypatch
+) -> None:
+    runner = runner_namespace()
+    runner["EXPECTED_APPS_ROOT"] = tmp_path
+    authority = runner_authority()
+
+    def fixed_failure(_argv, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stderr=("GIMME_RECOVERY_MAINTENANCE_FAILED|"
+                    "maintenance_route_validation_failed\n"),
+        )
+
+    with pytest.raises(
+        runner["RunnerFailure"], match="^maintenance_route_validation_failed$"
+    ):
+        runner["maintenance"](
+            "enter", authority, "scheduled-abc", execute=fixed_failure
+        )
+
+    def unsafe_failure(_argv, **_kwargs):
+        return SimpleNamespace(returncode=1, stderr="secret provider output\n")
+
+    with pytest.raises(runner["RunnerFailure"], match="^maintenance_failed$"):
+        runner["maintenance"](
+            "enter", authority, "scheduled-abc", execute=unsafe_failure
+        )
+
+
 def test_scheduled_execution_records_busy_without_capture(tmp_path) -> None:
     runner = runner_namespace()
     runner["acquire_lock"] = lambda _path: None

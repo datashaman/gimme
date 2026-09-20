@@ -1049,7 +1049,10 @@ def _valid_recovery_attempt_status(status: object, name: str) -> bool:
         "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
     }
     error_codes = outcomes | {
-        "maintenance_failed", "postgres_capture_failed", "valkey_capture_failed",
+        "maintenance_failed", "maintenance_route_validation_failed",
+        "maintenance_route_reload_failed", "maintenance_quiesce_wait_failed",
+        "maintenance_process_control_failed", "postgres_capture_failed",
+        "valkey_capture_failed",
         "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
         "provider_configuration_invalid", "provider_client_unavailable",
     }

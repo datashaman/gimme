@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import pytest
 
 
@@ -228,3 +229,27 @@ def test_resume_refuses_a_unit_removed_from_registered_process_policy(
 
     assert active == set()
     assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
+
+
+@pytest.mark.parametrize(
+    ("command", "code"),
+    [
+        (["caddy", "validate", "--config", "/etc/caddy/Caddyfile"],
+         "maintenance_route_validation_failed"),
+        (["systemctl", "reload", "caddy"], "maintenance_route_reload_failed"),
+        (["sleep", "1"], "maintenance_quiesce_wait_failed"),
+        (["systemctl", "stop", "gimme-worker-example-app@1.service"],
+         "maintenance_process_control_failed"),
+    ],
+)
+def test_run_maps_subprocess_failures_to_fixed_phase_codes(
+    monkeypatch, command, code
+) -> None:
+    helper = helper_namespace()
+
+    def failed(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(subprocess, "run", failed)
+    with pytest.raises(RuntimeError, match=f"^{code}$"):
+        helper["run"](command)
