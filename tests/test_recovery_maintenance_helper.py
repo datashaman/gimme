@@ -84,8 +84,10 @@ def test_exit_restores_only_previously_active_units_then_normal_route(
     helper["exit_maintenance"]("example-app", "request-1", 1000, "deployer")
 
     assert auth["site_path"].read_text() == "example.test {\n\trespond 200\n}\n"
-    assert commands[:2] == [
+    assert commands[:4] == [
+        ["systemctl", "reset-failed", "gimme-scheduler-example-app.timer"],
         ["systemctl", "start", "gimme-scheduler-example-app.timer"],
+        ["systemctl", "reset-failed", "gimme-worker-example-app@1.service"],
         ["systemctl", "start", "gimme-worker-example-app@1.service"],
     ]
     assert not (tmp_path / "markers" / "example-app.json").exists()
@@ -120,13 +122,17 @@ def test_exit_retry_is_a_no_op_after_route_was_already_restored(
     monkeypatch.setitem(helper, "CADDYFILE", tmp_path / "Caddyfile")
     monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
     active = set(auth["units"])
+    failed: set[str] = set()
     monkeypatch.setitem(helper, "succeeds", lambda command: command[-1] in active)
 
     def run(command):
         if command[:2] == ["systemctl", "stop"]:
             active.discard(command[-1])
+        elif command[:2] == ["systemctl", "reset-failed"]:
+            failed.discard(command[-1])
         elif command[:2] == ["systemctl", "start"]:
-            active.add(command[-1])
+            if command[-1] not in failed:
+                active.add(command[-1])
 
     monkeypatch.setitem(helper, "run", run)
     helper["enter"]("example-app", "request-1", 1000, "deployer")
@@ -163,22 +169,32 @@ def test_restore_can_resume_then_requiesce_processes_without_restoring_route(
     monkeypatch.setitem(helper, "CADDYFILE", tmp_path / "Caddyfile")
     monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
     active = set(auth["units"])
+    failed: set[str] = set()
     monkeypatch.setitem(helper, "succeeds", lambda command: command[-1] in active)
 
     def run(command):
         commands.append(command)
         if command[:2] == ["systemctl", "stop"]:
             active.discard(command[-1])
+        elif command[:2] == ["systemctl", "reset-failed"]:
+            failed.discard(command[-1])
         elif command[:2] == ["systemctl", "start"]:
-            active.add(command[-1])
+            if command[-1] not in failed:
+                active.add(command[-1])
 
     monkeypatch.setitem(helper, "run", run)
     helper["enter"]("example-app", "request-1", 1000, "deployer")
     commands.clear()
+    failed.update(auth["units"])
 
     helper["resume_processes"]("example-app", "request-1", 1000, "deployer")
 
     assert active == set(auth["units"])
+    assert failed == set()
+    assert [command[:2] for command in commands[:4]] == [
+        ["systemctl", "reset-failed"], ["systemctl", "start"],
+        ["systemctl", "reset-failed"], ["systemctl", "start"],
+    ]
     assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
     assert (tmp_path / "markers" / "example-app.json").exists()
 
