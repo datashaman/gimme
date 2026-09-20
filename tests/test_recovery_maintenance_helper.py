@@ -253,3 +253,25 @@ def test_run_maps_subprocess_failures_to_fixed_phase_codes(
     monkeypatch.setattr(subprocess, "run", failed)
     with pytest.raises(RuntimeError, match=f"^{code}$"):
         helper["run"](command)
+
+
+def test_caddy_validation_uses_only_fixed_writable_runtime_environment(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    monkeypatch.setitem(helper, "MARKER_ROOT", tmp_path / "recovery")
+    observed = {}
+
+    def execute(argv, **kwargs):
+        observed.update({"argv": argv, **kwargs})
+
+    monkeypatch.setattr(subprocess, "run", execute)
+    helper["run"](["caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+
+    assert observed["env"] == {
+        "HOME": str(tmp_path / "recovery"),
+        "XDG_CONFIG_HOME": str(tmp_path / "recovery/caddy-config"),
+        "XDG_DATA_HOME": str(tmp_path / "recovery/caddy-data"),
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+    assert "AWS_SECRET_ACCESS_KEY" not in observed["env"]
