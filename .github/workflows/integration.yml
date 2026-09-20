@@ -86,4 +86,6 @@ jobs:
         if: always()
         run: |
           docker rm -f gimme-ci-minio >/dev/null 2>&1 || true
+          sudo systemctl stop 'gimme-worker-*' 'gimme-horizon-*' \
+            'gimme-scheduler-*.timer' 'gimme-scheduler-*.service' || true
           sudo systemctl stop caddy postgresql valkey-server ssh || true
