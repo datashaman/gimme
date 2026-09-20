@@ -86,7 +86,7 @@ class ArtifactBuildOrchestrator:
             self.legacy_server(target),
             stack=target.stack,
             artifact_request=request,
-            secret_file=credential_file,
+            artifact_secret_file=credential_file,
             timeout=3600,
         )
 
@@ -264,7 +264,7 @@ class ArtifactBuildOrchestrator:
         encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
         return "build_v1_" + hashlib.sha256(b"gimme-build-v1\0" + encoded).hexdigest()
 
-    def _plan_context(self, name: str):
+    def expected_build(self, name: str):
         state, deployment, application, build, target, definition = self._context(name)
         revision = self._revision(deployment, application, target)
         inspection = self._source_inspection(deployment, application, target, revision)
@@ -300,6 +300,29 @@ class ArtifactBuildOrchestrator:
         build_secret_versions = plan_secret_references(
             state, self.store.secrets_path, build.secrets
         )
+        return {
+            "state": state,
+            "deployment": deployment,
+            "application": application,
+            "build": build,
+            "target": target,
+            "definition": definition,
+            "identity": identity,
+            "build_id": build_id,
+            "build_secret_versions": build_secret_versions,
+        }
+
+    def _plan_context(self, name: str):
+        context = self.expected_build(name)
+        state = context["state"]
+        deployment = context["deployment"]
+        application = context["application"]
+        build = context["build"]
+        target = context["target"]
+        definition = context["definition"]
+        identity = context["identity"]
+        build_id = context["build_id"]
+        build_secret_versions = context["build_secret_versions"]
         planned, credentials = self._publisher_credentials(state, definition)
         publication = self._publication(
             target, definition, deployment.application, build_id, credentials

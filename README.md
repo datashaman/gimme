@@ -208,8 +208,10 @@ Example stdio client configuration:
 3. `plan_deployment_runtimes` / `apply_deployment_runtimes` to install and verify pins.
 4. `plan_deployment_resources` / `apply_deployment_resources` to reconcile routing,
    PostgreSQL, Valkey, runtime values, workers, Horizon, and the scheduler.
-5. `plan_deployment` to review the resolved commit and Deployer task graph, then
-   `apply_deployment` with the exact plan.
+5. For artifact mode, `plan_build_artifact` / `build_artifact` on the Build Target. Then use
+   `plan_deployment` to review the exact publication (or inspect `artifact_missing`) and Deployer
+   task graph, followed by `apply_deployment` with the exact plan. Source mode resolves and
+   deploys its reviewed commit directly.
 6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools,
    `deployment_process_status`, and `diagnose_deployment` for operations.
 7. Use `plan_promotion` / `promote_deployment` to deploy the exact current commit from
@@ -253,10 +255,11 @@ catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
 ## Current scope
 
 Gimme provides the multi-target foundation, local SOPS, bounded AWS Secrets Manager stores,
-versioned S3-compatible Artifact Stores, and deterministic Laravel artifact publication with
-Composer plus npm, pnpm, Yarn, or Bun and protected build-only secrets. Artifact deployment,
-promotion, rollback, traffic splitting, and fleet scheduling remain future work rather than
-implied production guarantees.
+versioned S3-compatible Artifact Stores, deterministic Laravel artifact publication with Composer
+plus npm, pnpm, Yarn, or Bun and protected build-only secrets, and single-Target artifact
+deployment with existing health-gated activation and automatic live rollback. Artifact promotion,
+explicit rollback, traffic splitting, and fleet scheduling remain future work rather than implied
+production guarantees.
 
 Resource provider coverage:
 

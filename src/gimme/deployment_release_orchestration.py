@@ -28,6 +28,7 @@ class DeploymentReleaseOrchestrator:
     assert_plan: Callable[..., Any]
     replace: Callable[..., Any]
     result: Callable[..., Any]
+    artifact_deployment: Any = None
 
     @staticmethod
     def _require_source_release(deployment: DeploymentConfig) -> None:
@@ -78,6 +79,10 @@ class DeploymentReleaseOrchestrator:
 
     def _release_plan(self, name: str, revision: str | None = None) -> dict[str, Any]:
         state, deployment, target, application = self.context(name)
+        if deployment.release_mode == "artifact":
+            return self._artifact_release_plan(
+                name, state, deployment, target, application
+            )
         self._require_source_release(deployment)
         _, secret_issues = self.secret_plan(name, state, deployment)
         issues = (
@@ -116,6 +121,66 @@ class DeploymentReleaseOrchestrator:
             process_issues,
         )
 
+    def _artifact_release_plan(
+        self, name: str, state, deployment, target, application
+    ) -> dict[str, Any]:
+        _, secret_issues = self.secret_plan(name, state, deployment)
+        issues = (
+            secret_issues
+            + self.dns_issues(deployment, target)
+            + self.managed_database_issues(state, deployment)
+            + self.valkey_runtime(name, state, deployment)[3]
+        )
+        artifact_context = self.artifact_deployment.context(name)
+        artifact = artifact_context["artifact"]
+        if artifact["status"] == "missing":
+            issues.append("artifact_missing")
+            processes = {"required": False, "observed": {}}
+            process_issues: list[str] = []
+            runtime = None
+            rendered = ""
+        else:
+            preflight = self.run_deployment(
+                "gimme:preflight:artifact-runtimes", name, timeout=60
+            )
+            runtime = {
+                "declared": {
+                    "php": deployment.runtimes["php"].model_dump(mode="json"),
+                    "php_extensions": application.php_extensions,
+                },
+                "preflight": preflight.output,
+            }
+            processes, process_issues = self._process_preflight(
+                name, deployment, application
+            )
+            request = self.artifact_deployment.materialize_request(artifact_context)
+            rendered = self.run_deployment(
+                "deploy",
+                name,
+                revision=str(artifact["commit"]),
+                artifact_request=request,
+                arguments=("--plan",),
+                timeout=60,
+            ).output
+        return deployment_release_plan(
+            name,
+            deployment,
+            target,
+            application,
+            str(artifact.get("commit", artifact_context["identity"]["commit"])),
+            rendered,
+            runtime,
+            processes,
+            issues + process_issues,
+            artifact={
+                "expected_build_id": artifact_context["build_id"],
+                "reader_credential_versions": artifact_context[
+                    "reader_credential_versions"
+                ],
+                "publication": artifact,
+            },
+        )
+
     @staticmethod
     def _manages_processes(
         deployment: DeploymentConfig, application: ApplicationConfig
@@ -133,16 +198,38 @@ class DeploymentReleaseOrchestrator:
             self.assert_plan(expected, plan_id)
             if not expected["ready"]:
                 raise ValueError("deployment is not ready; inspect readiness_issues")
-            applied = self.run_deployment(
-                "deploy", name, revision=str(expected["revision"]), timeout=1800
-            )
             _, deployment, _, application = self.context(name)
+            if deployment.release_mode == "artifact":
+                artifact_context = self.artifact_deployment.context(name)
+                artifact_plan = expected.get("artifact")
+                if (
+                    not isinstance(artifact_plan, dict)
+                    or artifact_context["artifact"] != artifact_plan["publication"]
+                    or artifact_context["reader_credential_versions"]
+                    != artifact_plan["reader_credential_versions"]
+                ):
+                    raise ValueError("artifact deployment plan is stale")
+                request, secret_context = self.artifact_deployment.apply_arguments(
+                    artifact_context
+                )
+                with secret_context as credential_file:
+                    applied = self.run_deployment(
+                        "deploy",
+                        name,
+                        revision=str(expected["revision"]),
+                        artifact_request=request,
+                        artifact_secret_file=credential_file,
+                        timeout=1800,
+                    )
+            else:
+                applied = self.run_deployment(
+                    "deploy", name, revision=str(expected["revision"]), timeout=1800
+                )
             if self._manages_processes(deployment, application):
                 self.run_deployment("gimme:provision:processes", name, timeout=1800)
             return self.result(applied)
 
     def list_releases(self, name: str) -> dict[str, object]:
-        self._require_source_release(self.store.deployment(name))
         return self.result(self.run_deployment("releases", name))
 
     def rollback_deployment(self, name: str, confirmation: str) -> dict[str, object]:

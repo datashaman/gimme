@@ -203,6 +203,7 @@ def deployment_release_plan(
     toolchain: dict[str, Any] | None = None,
     processes: dict[str, Any] | None = None,
     readiness_issues: list[str] | None = None,
+    artifact: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     primary = application.default_health if deployment.health == "inherit" else deployment.health
     health = [*([primary] if primary is not None else []), *application.health_probes,
@@ -215,6 +216,7 @@ def deployment_release_plan(
             "application": deployment.application,
             "target": deployment.target,
             "stage": deployment.stage,
+            "release_mode": deployment.release_mode,
             "source": deployment.source.model_dump(mode="json"),
             "revision": revision,
             "site_url": f"https://{deployment.placement.site_host}",
@@ -225,13 +227,25 @@ def deployment_release_plan(
                 if application.frontend is not None
                 else None
             ),
+            "artifact": artifact,
             "runtimes": toolchain,
             "processes": processes,
             "ready": not issues,
             "readiness_issues": issues,
             "deployer_plan": rendered_tasks,
             "effects": [
-                "deploy the exact resolved revision",
+                (
+                    "download and verify the exact reviewed artifact versions on the Target"
+                    if deployment.release_mode == "artifact"
+                    else "deploy the exact resolved revision"
+                ),
+                *(
+                    [
+                        "safely extract and verify the immutable tree before mutable release work",
+                        "perform no Git checkout or dependency/frontend build on the Target",
+                    ]
+                    if deployment.release_mode == "artifact" else []
+                ),
                 "gate activation on the candidate health check when configured",
                 "switch the current symlink only after the candidate succeeds",
                 "roll back automatically if the live health check fails",

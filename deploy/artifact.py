@@ -565,12 +565,15 @@ def client_error_missing(error: ClientError) -> bool:
     return status == 404 or code in {"NoSuchKey", "NoSuchVersion", "NotFound"}
 
 
-def read_manifest(client, bucket: str, key: str) -> dict[str, object] | None:
+def read_manifest_record(client, bucket: str, key: str, version: str | None = None):
     try:
-        response = client.get_object(Bucket=bucket, Key=key)
+        arguments = {"Bucket": bucket, "Key": key}
+        if version is not None:
+            arguments["VersionId"] = version
+        response = client.get_object(**arguments)
     except ClientError as error:
         if client_error_missing(error):
-            return None
+            return None, None
         raise
     raw = read_bounded_body(response["Body"], MAX_MANIFEST_BYTES)
     try:
@@ -579,6 +582,11 @@ def read_manifest(client, bucket: str, key: str) -> dict[str, object] | None:
         fail("artifact_manifest_malformed")
     if not isinstance(value, dict):
         fail("artifact_manifest_malformed")
+    return value, response
+
+
+def read_manifest(client, bucket: str, key: str) -> dict[str, object] | None:
+    value, _ = read_manifest_record(client, bucket, key)
     return value
 
 
@@ -968,8 +976,7 @@ def verify_archive(archive_path: Path, expected_digest: str, root: Path) -> None
         fail("artifact_tree_digest_mismatch")
 
 
-def stream_digest(client, bucket: str, key: str, version: str) -> tuple[str, int]:
-    response = client.get_object(Bucket=bucket, Key=key, VersionId=version)
+def stream_response_digest(response) -> tuple[str, int]:
     digest, size = hashlib.sha256(), 0
     body = response["Body"]
     try:
@@ -981,6 +988,247 @@ def stream_digest(client, bucket: str, key: str, version: str) -> tuple[str, int
     finally:
         body.close()
     return digest.hexdigest(), size
+
+
+def stream_digest(client, bucket: str, key: str, version: str) -> tuple[str, int]:
+    return stream_response_digest(
+        client.get_object(Bucket=bucket, Key=key, VersionId=version)
+    )
+
+
+def resolve_artifact(request: dict[str, object], credential_argument: str) -> dict[str, object]:
+    application, build_id = request.get("application"), request.get("build_id")
+    if not isinstance(application, str) or NAME.fullmatch(application) is None:
+        fail("artifact_identity_invalid")
+    if not isinstance(build_id, str) or BUILD_ID.fullmatch(build_id) is None:
+        fail("artifact_identity_invalid")
+    store = store_request(request)
+    store_credentials, build_values = credentials(credential_argument)
+    if build_values:
+        fail("credential_document_invalid")
+    client = s3_client(store, store_credentials)
+    bucket = str(store["bucket"])
+    package_key, manifest_key, _ = object_keys(application, build_id)
+    manifest, response = read_manifest_record(client, bucket, manifest_key)
+    if manifest is None:
+        return {"status": "missing", "application": application, "build_id": build_id}
+    if not valid_manifest(manifest, application, build_id):
+        fail("artifact_manifest_malformed")
+    manifest_version = response.get("VersionId")
+    _, expected_encryption = encryption(store)
+    if (
+        not isinstance(manifest_version, str)
+        or VERSION_ID.fullmatch(manifest_version) is None
+        or not encryption_confirmed(response, store, expected_encryption)
+    ):
+        fail("artifact_manifest_unverified")
+    package_response = client.get_object(
+        Bucket=bucket, Key=package_key, VersionId=manifest["package_version"]
+    )
+    if not encryption_confirmed(package_response, store, expected_encryption):
+        fail("artifact_package_unverified")
+    digest, size = stream_response_digest(package_response)
+    if digest != manifest["artifact_digest"] or size != manifest["bytes"]:
+        fail("artifact_checksum_invalid")
+    return {
+        "status": "ready",
+        "application": application,
+        "build_id": build_id,
+        "commit": manifest["commit"],
+        "schema_version": manifest["schema_version"],
+        "format": manifest["format"],
+        "artifact_digest": manifest["artifact_digest"],
+        "tree_digest": manifest["tree_digest"],
+        "bytes": manifest["bytes"],
+        "package_version": manifest["package_version"],
+        "manifest_version": manifest_version,
+        "build_secrets_used": manifest["build_secrets_used"],
+        "build_secret_count": manifest["build_secret_count"],
+    }
+
+
+def checked_release(apps_root: Path, argument: str) -> Path:
+    release = Path(argument)
+    try:
+        resolved = release.resolve(strict=True)
+        details = release.lstat()
+    except OSError:
+        fail("artifact_release_invalid")
+    if (
+        not release.is_absolute()
+        or release != resolved
+        or not resolved.is_relative_to(apps_root)
+        or "releases" not in resolved.relative_to(apps_root).parts
+        or release.is_symlink()
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or any(release.iterdir())
+    ):
+        fail("artifact_release_invalid")
+    return resolved
+
+
+def extract_release(archive_path: Path, release: Path, expected_digest: str) -> None:
+    entries: list[tuple[str, Path]] = []
+    total, names, folded = 0, set(), set()
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+            if len(members) > MAX_FILES:
+                fail("artifact_archive_too_many_files")
+            for member in members:
+                pure = PurePosixPath(member.name)
+                normalized = pure.as_posix()
+                canonical = normalized.casefold()
+                if (
+                    pure.is_absolute()
+                    or not pure.parts
+                    or ".." in pure.parts
+                    or member.name != normalized
+                    or normalized in names
+                    or canonical in folded
+                    or canonical == ".gimme-artifact.json"
+                    or not (member.isfile() or member.isdir() or member.issym())
+                ):
+                    fail("artifact_archive_unsafe")
+                names.add(normalized)
+                folded.add(canonical)
+                if member.issym():
+                    safe_link(member.name, member.linkname)
+                    if member.mode != 0o777:
+                        fail("artifact_archive_unsafe")
+                elif member.isdir() and member.mode != 0o755:
+                    fail("artifact_archive_unsafe")
+                elif member.isfile() and member.mode not in {0o644, 0o755}:
+                    fail("artifact_archive_unsafe")
+                total += member.size
+                if member.size > MAX_FILE_BYTES or total > MAX_TREE_BYTES:
+                    fail("artifact_archive_too_large")
+            ordered = sorted(
+                members,
+                key=lambda item: (
+                    2 if item.issym() else 0 if item.isdir() else 1,
+                    len(PurePosixPath(item.name).parts),
+                    item.name,
+                ),
+            )
+            for member in ordered:
+                destination = release / member.name
+                if not destination.is_relative_to(release):
+                    fail("artifact_archive_unsafe")
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                if member.isdir():
+                    destination.mkdir(exist_ok=True, mode=0o755)
+                elif member.issym():
+                    destination.symlink_to(member.linkname)
+                else:
+                    source = archive.extractfile(member)
+                    if source is None:
+                        fail("artifact_archive_unsafe")
+                    with destination.open("xb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+                    os.chmod(destination, member.mode)
+                entries.append((member.name, destination))
+        if tree_digest(sorted(entries)) != expected_digest:
+            fail("artifact_tree_digest_mismatch")
+    except BaseException:
+        shutil.rmtree(release, ignore_errors=True)
+        raise
+
+
+def materialize_artifact(
+    request: dict[str, object], credential_argument: str, workspace_root: Path,
+    apps_root: Path, release_argument: str,
+) -> dict[str, object]:
+    artifact = request.get("artifact")
+    if not isinstance(artifact, dict) or artifact.get("status") != "ready":
+        fail("artifact_materialization_invalid")
+    application, build_id = artifact.get("application"), artifact.get("build_id")
+    if (
+        not isinstance(application, str)
+        or NAME.fullmatch(application) is None
+        or not isinstance(build_id, str)
+        or BUILD_ID.fullmatch(build_id) is None
+    ):
+        fail("artifact_materialization_invalid")
+    store = store_request(request)
+    store_credentials, build_values = credentials(credential_argument)
+    if build_values:
+        fail("credential_document_invalid")
+    release = checked_release(apps_root, release_argument)
+    workspace = None
+    try:
+        workspace = Path(tempfile.mkdtemp(prefix="materialize-", dir=workspace_root))
+        os.chmod(workspace, 0o700)
+        client = s3_client(store, store_credentials)
+        bucket = str(store["bucket"])
+        package_key, manifest_key, _ = object_keys(application, build_id)
+        manifest_version = artifact.get("manifest_version")
+        if not isinstance(manifest_version, str) or VERSION_ID.fullmatch(manifest_version) is None:
+            fail("artifact_materialization_invalid")
+        manifest, manifest_response = read_manifest_record(
+            client, bucket, manifest_key, manifest_version
+        )
+        _, expected_encryption = encryption(store)
+        if (
+            manifest is None
+            or not valid_manifest(manifest, application, build_id)
+            or not encryption_confirmed(manifest_response, store, expected_encryption)
+        ):
+            fail("artifact_manifest_unverified")
+        expected = {
+            "status": "ready", "application": application, "build_id": build_id,
+            "commit": manifest["commit"], "schema_version": manifest["schema_version"],
+            "format": manifest["format"], "artifact_digest": manifest["artifact_digest"],
+            "tree_digest": manifest["tree_digest"], "bytes": manifest["bytes"],
+            "package_version": manifest["package_version"],
+            "manifest_version": manifest_version,
+            "build_secrets_used": manifest["build_secrets_used"],
+            "build_secret_count": manifest["build_secret_count"],
+        }
+        if artifact != expected:
+            fail("artifact_plan_stale")
+        package_response = client.get_object(
+            Bucket=bucket, Key=package_key, VersionId=manifest["package_version"]
+        )
+        if not encryption_confirmed(package_response, store, expected_encryption):
+            fail("artifact_package_unverified")
+        archive_path = workspace / "artifact.tar.gz"
+        digest, size = hashlib.sha256(), 0
+        body = package_response["Body"]
+        try:
+            with archive_path.open("xb") as output:
+                for chunk in iter(lambda: body.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    if size > MAX_ARCHIVE_BYTES:
+                        fail("artifact_archive_too_large")
+                    digest.update(chunk)
+                    output.write(chunk)
+        finally:
+            body.close()
+        if digest.hexdigest() != manifest["artifact_digest"] or size != manifest["bytes"]:
+            fail("artifact_checksum_invalid")
+        extract_release(archive_path, release, str(manifest["tree_digest"]))
+        metadata = {
+            "application": application,
+            "commit": manifest["commit"],
+            "build_id": build_id,
+            "artifact_digest": manifest["artifact_digest"],
+            "tree_digest": manifest["tree_digest"],
+            "manifest_version": manifest_version,
+            "packaging_schema": manifest["format"],
+            "release_mode": "artifact",
+        }
+        metadata_path = release / ".gimme-artifact.json"
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+        os.chmod(metadata_path, 0o444)
+        return {"status": "materialized", "application": application, "build_id": build_id}
+    except BaseException:
+        shutil.rmtree(release, ignore_errors=True)
+        raise
+    finally:
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def build(request: dict[str, object], credential_argument: str, workspace_root: Path):
@@ -1218,12 +1466,14 @@ def inventory(request: dict[str, object], credential_argument: str) -> dict[str,
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 4:
+    if len(arguments) not in {4, 5}:
         fail("artifact_invocation_invalid")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     request = parse_request(arguments[1])
     operation = request.get("operation")
+    if operation != "materialize" and len(arguments) != 4:
+        fail("artifact_invocation_invalid")
     workspace_root = checked_root(arguments[3])
     if operation == "inspect":
         validate_request(request, {
@@ -1243,6 +1493,16 @@ def main(arguments: list[str]) -> int:
     elif operation == "inventory":
         validate_request(request, {"operation", "application", "store"})
         result = inventory(request, arguments[2])
+    elif operation == "resolve":
+        validate_request(request, {"operation", "application", "build_id", "store"})
+        result = resolve_artifact(request, arguments[2])
+    elif operation == "materialize":
+        if len(arguments) != 5:
+            fail("artifact_invocation_invalid")
+        validate_request(request, {"operation", "artifact", "store"})
+        result = materialize_artifact(
+            request, arguments[2], workspace_root, Path(arguments[3]), arguments[4]
+        )
     else:
         fail("artifact_operation_invalid")
     emit(result)

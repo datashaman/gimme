@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the first artifact-mode Deployment path. Planning recomputes the expected build,
+  resolves and verifies one exact private publication from the destination Target, checks its
+  execution-time PHP capability, and binds object versions plus archive/tree digests. Apply
+  downloads those exact versions directly on the Target, safely extracts and re-hashes the
+  immutable tree, records readonly secret-free release metadata, and then uses the existing
+  environment, Laravel, health-gate, activation, process-refresh, rollback, and retention graph
+  without Git, Composer, or frontend build tooling on the destination.
 - Extended Application Artifact publication to npm, pnpm, Yarn 1/2+, and Bun frontends with
   exact lock/runtime identity, fixed frozen commands, protected build-only SOPS secrets,
   exact-value leak scanning, and secret-independent reproducibility enforcement.

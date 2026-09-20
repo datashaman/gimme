@@ -43,6 +43,10 @@ $instance = getenv('GIMME_INSTANCE') ?: $app;
 $deployPath = getenv('GIMME_DEPLOY_PATH') ?: ($app === '' ? $appsRoot : "{$appsRoot}/{$app}");
 $siteHost = getenv('GIMME_SITE_HOST') ?: ($app === '' ? '' : "{$app}.{$mdnsName}.local");
 $health = $app === '' ? [] : configured_health();
+$releaseMode = getenv('GIMME_RELEASE_MODE') ?: 'source';
+if (!in_array($releaseMode, ['source', 'artifact'], true)) {
+    throw new \RuntimeException('Unsupported release mode');
+}
 
 if (!valid_endpoint($hostname) || !valid_endpoint($bootstrapHostname) || !valid_endpoint($sshHostname)) {
     throw new \RuntimeException('Unsafe host endpoint');
@@ -142,19 +146,21 @@ if ($app !== '') {
         $php = $runtimes['php'] ?? null;
         $composer = $runtimes['composer'] ?? null;
         if (!is_array($php) || $php['provider'] !== 'system' ||
-            !preg_match('/^(\d+)\.(\d+)\./', $php['version'], $phpParts) ||
-            !is_array($composer)) {
-            throw new \RuntimeException('PHP applications require exact PHP and Composer pins');
+            !preg_match('/^(\d+)\.(\d+)\./', $php['version'], $phpParts)) {
+            throw new \RuntimeException('PHP applications require an exact system PHP pin');
         }
         set('php_version', "{$phpParts[1]}.{$phpParts[2]}");
-        if ($composer['provider'] !== 'system') {
+        if ($releaseMode === 'source' &&
+            (!is_array($composer) || $composer['provider'] !== 'system')) {
             throw new \RuntimeException('Composer currently requires the system provider');
         }
-        set('composer_version', $composer['version']);
+        if (is_array($composer)) {
+            set('composer_version', $composer['version']);
+        }
     }
 }
 
-$hasFrontend = getenv('GIMME_FRONTEND') === '1';
+$hasFrontend = $releaseMode === 'source' && getenv('GIMME_FRONTEND') === '1';
 if ($hasFrontend) {
     $packageManager = required_env('GIMME_FRONTEND_PACKAGE_MANAGER');
     $buildScript = required_env('GIMME_FRONTEND_BUILD_SCRIPT');
@@ -333,6 +339,29 @@ task('gimme:preflight:runtimes', function () use ($appsRoot): void {
             throw new \RuntimeException("{$kind} version does not match desired state");
         }
         writeln("GIMME_RESOURCE|{$kind}|{$match[1]}");
+    }
+});
+
+task('gimme:preflight:artifact-runtimes', function (): void {
+    $runtimes = configured_runtimes();
+    $php = $runtimes['php'] ?? null;
+    if (!is_array($php) || $php['provider'] !== 'system') {
+        throw new \RuntimeException('Artifact deployments require an exact system PHP pin');
+    }
+    $phpBinary = '/usr/bin/php' . implode(
+        '.',
+        array_slice(explode('.', $php['version']), 0, 2),
+    );
+    $actual = trim(run($phpBinary . ' -r ' . escapeshellarg('echo PHP_VERSION;')));
+    if ($actual !== $php['version']) {
+        throw new \RuntimeException('PHP version does not match desired state');
+    }
+    writeln("GIMME_RUNTIME|php|{$actual}");
+    foreach (configured_php_extensions() as $extension) {
+        run($phpBinary . ' -r ' . escapeshellarg(
+            "exit(extension_loaded('{$extension}') ? 0 : 1);",
+        ));
+        writeln("GIMME_PHP_EXTENSION|{$extension}|ready");
     }
 });
 
@@ -863,7 +892,7 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
     $request = json_decode($requestJson, true, flags: JSON_THROW_ON_ERROR);
     if (!is_array($request) || !in_array(
         $request['operation'] ?? null,
-        ['inspect', 'publication', 'build', 'inventory'],
+        ['inspect', 'publication', 'build', 'inventory', 'resolve', 'materialize'],
         true,
     )) {
         throw new \RuntimeException('Artifact request has an unexpected shape');
@@ -871,7 +900,7 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
     $directory = "{$appsRoot}/.gimme/artifact-operations";
     $remoteProgram = "{$directory}/program-" . bin2hex(random_bytes(8)) . '.py';
     $remoteCredential = "{$directory}/credentials-" . bin2hex(random_bytes(8)) . '.json';
-    $localCredential = getenv('GIMME_SECRET_FILE') ?: '';
+    $localCredential = getenv('GIMME_ARTIFACT_SECRET_FILE') ?: '';
     $credentialArgument = '-';
     run('install -d -m 0700 ' . escapeshellarg($directory));
     try {
@@ -885,10 +914,14 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
             run('chmod 0600 ' . escapeshellarg($remoteCredential));
             $credentialArgument = $remoteCredential;
         }
+        $releaseArgument = $request['operation'] === 'materialize'
+            ? ' ' . escapeshellarg('{{release_path}}')
+            : '';
         $output = run(
             'python3 ' . escapeshellarg($remoteProgram) . ' ' .
             escapeshellarg(base64_encode($requestJson)) . ' ' .
-            escapeshellarg($credentialArgument) . ' ' . escapeshellarg($appsRoot),
+            escapeshellarg($credentialArgument) . ' ' . escapeshellarg($appsRoot) .
+            $releaseArgument,
             timeout: 3600,
         );
         if (!preg_match('/^GIMME_ARTIFACT_RESULT\|[A-Za-z0-9+\/=]{1,22000}$/', $output)) {
@@ -901,6 +934,14 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
         run('rmdir ' . escapeshellarg($directory) . ' 2>/dev/null || true');
     }
 });
+
+if ($app !== '' && $releaseMode === 'artifact') {
+    task('deploy:update_code', static function (): void {
+        invoke('gimme:artifact:run');
+    });
+    task('deploy:vendors', static function (): void {
+    });
+}
 
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
     if (configured_package_manager() !== 'apt') {

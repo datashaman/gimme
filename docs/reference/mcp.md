@@ -168,8 +168,25 @@ An identical repeat returns `idempotent`; different verified bytes for an existi
 return `non_reproducible_build` without another authoritative manifest. Inventory never returns
 bucket keys, object versions, raw manifests, commands, paths, output, or credentials. It reports
 only bounded artifact identity, digest, publication time, and one of `ready`, `malformed`,
-`foreign`, `missing`, `unsupported`, or `checksum_invalid`. This path does not deploy artifacts
-or delete store objects.
+`foreign`, `missing`, `unsupported`, or `checksum_invalid`. Inventory does not deploy artifacts or
+delete store objects.
+
+For an artifact-mode Deployment, `plan_deployment` recomputes the expected `build_id` and asks the
+destination Target's reader identity to resolve the authoritative manifest and exact package
+version. The content-addressed plan binds those opaque versions, archive and immutable-tree
+digests, source commit, provenance summary, reader credential versions, destination PHP and
+extension evidence, and the existing release effects. Absence is an inspectable `ready: false`
+plan with `artifact_missing`; it never starts a build.
+
+`apply_deployment` repeats that resolution and runtime preflight, rejects a stale plan, and sends
+only the reviewed versions to the Target. The Target verifies store encryption, manifest schema
+and ownership, provenance, size, and archive digest; extracts with fixed path, link, type, count,
+and size rules; recomputes the canonical tree digest; and writes readonly secret-free release
+metadata before mutable release tasks. The normal shared paths, environment activation, Laravel
+optimization and migrations, candidate/live health gates, symlink activation, automatic live
+rollback, worker refresh, and retained-release cleanup then apply. Artifact destinations execute
+no Git checkout, Composer install, Node/package-manager install, or frontend build. Explicit
+rollback and promotion remain source-mode-only.
 
 Optional build-only secrets are safe environment-name mappings to bounded local-SOPS references.
 They are resolved only after plan acceptance, transferred through protected temporary files, and
@@ -288,8 +305,8 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 | --- | --- | --- |
 | `plan_deployment_resources` | Read | Plan routing, database/cache identities, environment, secrets, and processes, and for a managed Valkey binding the secret-free contract |
 | `apply_deployment_resources` | Remote write | Reconcile the exact resource plan and return only a bounded outcome after secret resolution |
-| `plan_deployment` | Remote read | Resolve one commit, verify pins, and render the Deployer graph |
-| `apply_deployment` | Remote change | Deploy the exact reviewed revision with health gates |
+| `plan_deployment` | Remote read | For source mode, resolve one commit; for artifact mode, resolve exact reviewed object versions and digests or report `artifact_missing`; verify runtime compatibility and render the Deployer graph |
+| `apply_deployment` | Remote change | Deploy the exact reviewed source revision or materialize the exact reviewed artifact with health gates |
 | `list_releases` | Remote read | List retained releases and the current release |
 | `rollback_deployment` | Remote change | Restore the previous release after exact confirmation |
 | `plan_promotion` | Remote read | Pin the live commit from one deployment for another |

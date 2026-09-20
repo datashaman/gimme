@@ -223,6 +223,44 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
     }]
 
 
+def test_artifact_release_context_and_reader_file_use_separate_boundaries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    reader = tmp_path / "reader.json"
+    reader.write_text("{}")
+    runtime = tmp_path / "runtime.json"
+    runtime.write_text("{}")
+    app = AppConfig(repository="https://example.test/app.git", framework="laravel")
+    request = {
+        "operation": "materialize",
+        "artifact": {"status": "ready"},
+        "store": {"bucket": "example"},
+    }
+
+    runner(tmp_path).run(
+        "deploy",
+        server(),
+        app_name="example-app",
+        app=app,
+        release_mode="artifact",
+        secret_file=runtime,
+        artifact_secret_file=reader,
+        artifact_request=request,
+    )
+
+    assert captured["GIMME_RELEASE_MODE"] == "artifact"
+    assert captured["GIMME_SECRET_FILE"] == str(runtime)
+    assert captured["GIMME_ARTIFACT_SECRET_FILE"] == str(reader)
+    assert json.loads(captured["GIMME_ARTIFACT_REQUEST_JSON"]) == request
+
+
 def test_recovery_schedule_authority_crosses_as_canonical_json(
     tmp_path: Path, monkeypatch
 ) -> None:
