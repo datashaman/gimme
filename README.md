@@ -60,7 +60,7 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v5 desired state, provider accounts, stores, and pins
+state.json          # schema-v6 desired state, provider accounts, stores, and pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence
@@ -75,9 +75,10 @@ reveal private inventory. To make state Git-backed, point `GIMME_STATE_DIR` at a
 separate private repository. Legacy 0.4 manifests remain ignored for the same reason.
 Copy the example for a new installation, or use the migration tools for an older installation:
 
-1. call `plan_state_migration`;
+1. call `plan_state_migration` with an explicit release mode for every Deployment and any
+   Artifact Store/Application build policy required by artifact-mode Deployments;
 2. review its preserved placements and effects;
-3. pass its exact `plan_id` to `apply_state_migration`;
+3. pass the same explicit policy and exact `plan_id` to `apply_state_migration`;
 4. commit the resulting desired state only if that repository is intended to hold
    your operational inventory.
 

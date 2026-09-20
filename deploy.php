@@ -812,6 +812,52 @@ BASH;
     writeln(run('bash -c ' . escapeshellarg($script)));
 });
 
+task('gimme:artifact-store:verify', function () use ($appsRoot): void {
+    $policyJson = required_env('GIMME_ARTIFACT_STORE_JSON');
+    $policy = json_decode($policyJson, true, flags: JSON_THROW_ON_ERROR);
+    $role = required_env('GIMME_ARTIFACT_PROBE_ROLE');
+    $version = getenv('GIMME_ARTIFACT_READER_VERSION') ?: '-';
+    if (!is_array($policy) || array_keys($policy) !== [
+        'addressing', 'bucket', 'encryption', 'endpoint', 'name', 'region',
+    ]) {
+        throw new \RuntimeException('Artifact Store policy has an unexpected shape');
+    }
+    if (!in_array($role, ['publisher', 'reader'], true) ||
+        ($role === 'reader' && !preg_match('/^[A-Za-z0-9._+=\/-]{1,1024}$/', $version))) {
+        throw new \RuntimeException('Artifact Store verification input is invalid');
+    }
+    $localCredential = getenv('GIMME_SECRET_FILE') ?: '';
+    $directory = "{$appsRoot}/.gimme/artifact-store-probes";
+    $remoteCredential = "{$directory}/credentials-" . bin2hex(random_bytes(8)) . '.json';
+    $credentialArgument = '-';
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    try {
+        if ($localCredential !== '') {
+            if (!is_file($localCredential) || is_link($localCredential)) {
+                throw new \RuntimeException('Unsafe Artifact Store credential transfer');
+            }
+            upload($localCredential, $remoteCredential);
+            run('chmod 0600 ' . escapeshellarg($remoteCredential));
+            $credentialArgument = $remoteCredential;
+        }
+        $program = escapeshellarg(base64_encode(artifact_store_probe_script()));
+        $policyArgument = escapeshellarg(base64_encode($policyJson));
+        $output = run(
+            'printf %s ' . $program . ' | base64 -d | python3 - ' .
+            $policyArgument . ' ' . escapeshellarg($role) . ' ' .
+            escapeshellarg($version) . ' ' . escapeshellarg($credentialArgument),
+            timeout: 180,
+        );
+        if (!preg_match('/^GIMME_ARTIFACT_STORE_RESULT\|[A-Za-z0-9+\/=]{1,8192}$/', $output)) {
+            throw new \RuntimeException('Invalid Artifact Store verification result');
+        }
+        writeln($output);
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteCredential));
+        run('rmdir ' . escapeshellarg($directory) . ' 2>/dev/null || true');
+    }
+});
+
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
     if (configured_package_manager() !== 'apt') {
         throw new \RuntimeException('Configured package manager is not supported');

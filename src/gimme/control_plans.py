@@ -34,18 +34,20 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "state_migration",
-            "schema_version": 5,
+            "schema_version": 6,
             "state_directory": state_directory,
             "provider_accounts": sorted(state.provider_accounts),
             "secret_stores": state.model_dump(mode="json")["secret_stores"],
+            "artifact_stores": state.model_dump(mode="json")["artifact_stores"],
             "targets": state.model_dump(mode="json")["targets"],
-            "applications": sorted(state.applications),
+            "applications": state.model_dump(mode="json")["applications"],
             "resources": state.model_dump(mode="json")["resources"],
             "deployments": {
                 name: {
                     "application": deployment.application,
                     "target": deployment.target,
                     "stage": deployment.stage,
+                    "release_mode": deployment.release_mode,
                     "source": deployment.source.model_dump(mode="json"),
                     "site_host": deployment.placement.site_host,
                     "relative_path": deployment.placement.relative_path,
@@ -58,7 +60,8 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
                 for name, deployment in sorted(state.deployments.items())
             },
             "effects": [
-                "write one atomic schema-v5 desired-state document",
+                "write one atomic schema-v6 desired-state document",
+                "record every operator-selected release mode without inference",
                 "migrate local secret references to the fixed local-sops store",
                 "pin observed runtime and target-local resource versions explicitly",
                 "preserve existing remote paths, identities, databases, cache prefixes, and URLs",

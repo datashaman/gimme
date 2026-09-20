@@ -1,7 +1,7 @@
 # MCP reference
 
 Gimme is a local stdio MCP server built with FastMCP. Its desired state is stored in
-schema-v5 JSON; decrypted secrets are never returned by resources or tools.
+schema-v6 JSON; decrypted secrets are never returned by resources or tools.
 
 Runtime schemas returned by MCP discovery are authoritative. This page documents the
 stable intent, mutation boundary, and pairing of each primitive.
@@ -31,19 +31,20 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://provider-accounts/{name}` | One credential-free provider identity policy |
 | `gimme://secret-stores/{name}` | One bounded Secret Store policy and derived ownership tag |
 | `gimme://backup-destinations/{name}` | One bounded S3-compatible Backup Destination policy without credentials |
+| `gimme://artifact-stores/{name}` | One bounded versioned S3-compatible Artifact Store policy with credential references, never values |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The nine parameterized URIs are resource templates. `gimme://state` and
+The parameterized URIs are resource templates. `gimme://state` and
 `gimme://operations` are concrete resources.
 
 ## State and inventory tools
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_state_migration` | Read | Inspect installed versions and plan migration to schema v5 |
+| `plan_state_migration` | Read | Inspect installed versions and plan schema-v6 migration from explicit per-Deployment release modes, Artifact Stores, and Application build policies |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
 | `list_applications` | Read | List application source/build definitions |
@@ -52,6 +53,7 @@ The nine parameterized URIs are resource templates. `gimme://state` and
 | `list_resources` | Read | List named resources, optionally filtered by target |
 | `list_deployments` | Read | List deployments, optionally filtered by target |
 | `list_backup_destinations` | Read | List registered S3-compatible Backup Destinations without credentials |
+| `list_artifact_stores` | Read | List bounded Artifact Store policies without resolving credentials |
 | `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
 
@@ -95,6 +97,12 @@ bounded to 200 records per call.
 | `update_backup_destination` | Destination write | Preflight-verify and apply one reviewed Backup Destination policy update |
 | `plan_remove_backup_destination` | Read | Plan local removal when no Deployment references the destination |
 | `remove_backup_destination` | Local write | Remove only the local destination registration |
+| `plan_register_artifact_store` | Read | Plan local Artifact Store registration without a Target or store call |
+| `register_artifact_store` | Local write | Apply the exact local-only registration plan |
+| `plan_update_artifact_store` | Read | Plan a local Artifact Store policy replacement |
+| `update_artifact_store` | Local write | Apply the exact local-only policy replacement |
+| `plan_remove_artifact_store` | Read | Plan removal when no Application build policy references the store |
+| `remove_artifact_store` | Local write | Remove only the local Artifact Store registration |
 | `register_target` | Local write | Register a target |
 | `plan_update_target` | Read | Diff a proposed target update |
 | `update_target` | Local write | Apply an exact target update plan |
@@ -107,6 +115,34 @@ bounded to 200 records per call.
 | `register_deployment` | Local write | Register a deployment and allocate immutable placement identities |
 | `plan_update_deployment` | Read | Diff a deployment update while preserving placement |
 | `update_deployment` | Local write | Apply an exact deployment update plan |
+
+### Artifact Stores and release mode
+
+Schema v6 requires every Deployment to declare `release_mode: source | artifact`.
+`source` is valid only for local and preview stages. Staging and production must use
+`artifact`, which requires the Application to have a Laravel build policy naming one
+registered Deployment-capable Target, one registered Artifact Store, and the bounded
+`laravel_v1` packaging policy. Exact build runtime inputs remain Deployment pins. Migration
+does not infer any of these choices: callers supply an exact release-mode
+map and any required store and build-policy definitions to both migration calls. Schema v5
+documents remain unreadable until that reviewed migration is applied.
+
+Artifact Store endpoints are HTTPS-only host-and-optional-port values; URL schemes, paths,
+userinfo, and query strings are rejected. Authentication is either the selected Target's
+ambient identity or separate publisher/reader references in the built-in `local-sops`
+store. There are no profile, credential-file, object-key, or path inputs.
+
+| Tool | Access | Purpose |
+| --- | --- | --- |
+| `plan_verify_artifact_store_publisher` | Read | Content-address a Build Target-side versioning, encryption, write/read/checksum, and exact-version-delete probe |
+| `verify_artifact_store_publisher` | Remote write | Run that probe and return bounded evidence plus the exact version of a fixed Gimme reader-capability object |
+| `plan_verify_artifact_store_reader` | Read | Content-address an exact read of that fixed object version on a Deployment Target |
+| `verify_artifact_store_reader` | Remote read | Prove the reader identity can read and checksum the exact version without any write/delete operation or publisher fallback |
+
+Probe bytes are generated and consumed on the Target and never transit MCP. Referenced
+credentials use protected temporary files on both controller and Target and are removed in
+`finally` cleanup. Results contain only fixed status fields, SHA-256 values, and the opaque
+reader object version; provider errors and credentials are not returned.
 
 ## Managed AWS RDS PostgreSQL resources
 

@@ -21,9 +21,9 @@ from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
-    AWSSecretsManagerStore, ApplicationConfig,
+    AWSSecretsManagerStore, ApplicationBuildPolicy, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration,
-    Resource, ResourceConfig, S3BackupDestination, SecretReference,
+    Resource, ResourceConfig, S3ArtifactStore, S3BackupDestination, SecretReference,
     SecretStore, StateStore, TargetConfig,
     legacy_app, legacy_server, target_sites,
 )
@@ -41,6 +41,7 @@ from gimme.managed_valkey_recovery_orchestration import (
 from gimme.control_plane_registration_orchestration import (
     ControlPlaneRegistrationOrchestrator,
 )
+from gimme.artifact_store_orchestration import ArtifactStoreOrchestrator
 from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
@@ -79,6 +80,9 @@ SnapshotName = Annotated[
 CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
 RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
+ObjectVersion = Annotated[
+    str, Field(pattern=r"^[A-Za-z0-9._+=/-]{1,1024}$", min_length=1, max_length=1024)
+]
 RecoveryPointId = Annotated[str, Field(pattern=r"^rp_[a-f0-9]{20}$")]
 RestoreComponent = Literal["postgres", "valkey"]
 RestoreComponents = Annotated[list[RestoreComponent], Field(min_length=1, max_length=2)]
@@ -120,6 +124,15 @@ def _managed_resource_orchestrator() -> ManagedResourceOrchestrator:
         assert_plan=_assert_plan,
         runner=runner,
         context=_context,
+    )
+
+
+def _artifact_store_orchestrator() -> ArtifactStoreOrchestrator:
+    return ArtifactStoreOrchestrator(
+        store=store,
+        runner=runner,
+        assert_plan=_assert_plan,
+        legacy_server=legacy_server,
     )
 
 
@@ -672,10 +685,18 @@ def _migration_observations() -> dict[str, dict[str, str]]:
     return observations
 
 
-def _migration_state() -> ControlState:
-    if store.exists() and store.raw_state().get("schema_version") == 3:
-        return store.state_migration({})
-    return store.state_migration(_migration_observations())
+def _migration_state(
+    release_modes: dict[str, Literal["source", "artifact"]],
+    artifact_stores: dict[str, S3ArtifactStore],
+    application_builds: dict[str, ApplicationBuildPolicy],
+) -> ControlState:
+    if store.exists() and store.raw_state().get("schema_version") in {3, 4, 5}:
+        return store.state_migration(
+            {}, release_modes, artifact_stores, application_builds
+        )
+    return store.state_migration(
+        _migration_observations(), release_modes, artifact_stores, application_builds
+    )
 
 
 @mcp.resource("gimme://state")
@@ -711,6 +732,12 @@ def secret_store_resource(name: str) -> dict[str, object]:
 @mcp.resource("gimme://backup-destinations/{name}")
 def backup_destination_resource(name: str) -> dict[str, object]:
     return store.load().backup_destinations[name].model_dump(mode="json")
+
+
+@mcp.resource("gimme://artifact-stores/{name}")
+def artifact_store_resource(name: str) -> dict[str, object]:
+    """Read bounded Artifact Store policy; authentication contains references only."""
+    return store.load().artifact_stores[name].model_dump(mode="json")
 
 
 @mcp.resource("gimme://resources/{name}")
@@ -776,22 +803,32 @@ def operation_trace_resource(correlation_id: str) -> dict[str, object]:
 
 @mcp.tool(annotations=READ)
 @_journal_plan("state_migration")
-def plan_state_migration() -> dict[str, object]:
-    """Inspect exact installed versions and plan migration to schema-v5 state."""
-    if store.exists() and store.raw_state().get("schema_version") == 5:
-        raise ValueError("schema-v5 state already exists")
-    return migration_plan(_migration_state(), str(store.root))
+def plan_state_migration(
+    release_modes: dict[str, Literal["source", "artifact"]],
+    artifact_stores: dict[str, S3ArtifactStore],
+    application_builds: dict[str, ApplicationBuildPolicy],
+) -> dict[str, object]:
+    """Plan schema-v6 state from explicit release modes and artifact policy."""
+    if store.exists() and store.raw_state().get("schema_version") == 6:
+        raise ValueError("schema-v6 state already exists")
+    state = _migration_state(release_modes, artifact_stores, application_builds)
+    return migration_plan(state, str(store.root))
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("state_migration")
-def apply_state_migration(plan_id: PlanId) -> dict[str, object]:
-    """Atomically write schema-v5 state after re-observing exact installed versions."""
-    state = _migration_state()
+def apply_state_migration(
+    release_modes: dict[str, Literal["source", "artifact"]],
+    artifact_stores: dict[str, S3ArtifactStore],
+    application_builds: dict[str, ApplicationBuildPolicy],
+    plan_id: PlanId,
+) -> dict[str, object]:
+    """Atomically write reviewed schema-v6 state from explicit release policy."""
+    state = _migration_state(release_modes, artifact_stores, application_builds)
     expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
     store.save(state)
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 5}
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 6}
 
 
 @mcp.tool(annotations=READ)
@@ -1064,6 +1101,108 @@ def remove_backup_destination(name: Name, plan_id: PlanId) -> dict[str, object]:
 def list_backup_destinations() -> dict[str, object]:
     """List registered S3-compatible Backup Destinations without credentials."""
     return {"backup_destinations": store.load().model_dump(mode="json")["backup_destinations"]}
+
+
+@mcp.tool(annotations=READ)
+def list_artifact_stores() -> dict[str, object]:
+    """List bounded Artifact Store policy without resolving credential references."""
+    return {"artifact_stores": store.load().model_dump(mode="json")["artifact_stores"]}
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("register_artifact_store", "name")
+def plan_register_artifact_store(
+    name: Name, definition: S3ArtifactStore
+) -> dict[str, object]:
+    """Plan local registration without contacting a Target or object store."""
+    return _control_plane_registration_orchestrator().plan_register_artifact_store(
+        name, definition
+    )
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("register_artifact_store", "name")
+def register_artifact_store(
+    name: Name, definition: S3ArtifactStore, plan_id: PlanId
+) -> dict[str, object]:
+    """Apply one reviewed local-only Artifact Store registration."""
+    return _control_plane_registration_orchestrator().register_artifact_store(
+        name, definition, plan_id
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("update_artifact_store", "name")
+def plan_update_artifact_store(
+    name: Name, definition: S3ArtifactStore
+) -> dict[str, object]:
+    """Plan a local Artifact Store policy replacement."""
+    return _control_plane_registration_orchestrator().plan_update_artifact_store(
+        name, definition
+    )
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("update_artifact_store", "name")
+def update_artifact_store(
+    name: Name, definition: S3ArtifactStore, plan_id: PlanId
+) -> dict[str, object]:
+    """Apply one reviewed local-only Artifact Store policy replacement."""
+    return _control_plane_registration_orchestrator().update_artifact_store(
+        name, definition, plan_id
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("remove_artifact_store", "name")
+def plan_remove_artifact_store(name: Name) -> dict[str, object]:
+    """Plan local removal when no Application build policy references the store."""
+    return _control_plane_registration_orchestrator().plan_remove_artifact_store(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("remove_artifact_store", "name")
+def remove_artifact_store(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Apply one reviewed local-only Artifact Store removal."""
+    return _control_plane_registration_orchestrator().remove_artifact_store(name, plan_id)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("verify_artifact_store_publisher", "name")
+def plan_verify_artifact_store_publisher(name: Name, target: Name) -> dict[str, object]:
+    """Plan a Build Target-side encrypted versioned round-trip and exact deletion."""
+    return _artifact_store_orchestrator().plan_verification(name, target, "publisher")
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("verify_artifact_store_publisher", "name")
+def verify_artifact_store_publisher(
+    name: Name, target: Name, plan_id: PlanId
+) -> dict[str, object]:
+    """Run the reviewed publisher probe without streaming object bytes through MCP."""
+    return _artifact_store_orchestrator().verify(name, target, "publisher", plan_id)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("verify_artifact_store_reader", "name")
+def plan_verify_artifact_store_reader(
+    name: Name, target: Name, reader_version: ObjectVersion
+) -> dict[str, object]:
+    """Plan an exact read of the fixed Gimme capability object with reader authority."""
+    return _artifact_store_orchestrator().plan_verification(
+        name, target, "reader", reader_version
+    )
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("verify_artifact_store_reader", "name")
+def verify_artifact_store_reader(
+    name: Name, target: Name, reader_version: ObjectVersion, plan_id: PlanId
+) -> dict[str, object]:
+    """Prove exact read access without write, delete, or publisher credential fallback."""
+    return _artifact_store_orchestrator().verify(
+        name, target, "reader", plan_id, reader_version
+    )
 
 
 def _recovery_context(

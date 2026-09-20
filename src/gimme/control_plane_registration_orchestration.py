@@ -6,6 +6,7 @@ from typing import Any, Callable
 from gimme.control import (
     AWSProviderAccount,
     AWSSecretsManagerStore,
+    S3ArtifactStore,
     S3BackupDestination,
     SecretStore,
 )
@@ -303,3 +304,76 @@ class ControlPlaneRegistrationOrchestrator:
         self.assert_plan(expected, plan_id)
         self.store.save(self.delete(self.store.load(), "backup_destinations", name))
         return {"changed": True, "backup_destination": name}
+
+    def artifact_store_registration_plan(
+        self, name: str, definition: S3ArtifactStore, *, update: bool
+    ) -> dict[str, object]:
+        state = self.store.load()
+        exists = name in state.artifact_stores
+        if update != exists:
+            raise ValueError(
+                "artifact store already exists" if exists else "artifact store missing"
+            )
+        proposed = self.replace(state, "artifact_stores", name, definition)
+        return exact_plan({
+            "kind": "artifact_store_update" if update else "artifact_store_registration",
+            "name": name,
+            "current": (
+                state.artifact_stores[name].model_dump(mode="json") if exists else None
+            ),
+            "proposed": proposed.artifact_stores[name].model_dump(mode="json"),
+            "effects": [
+                "replace local desired state only",
+                "make no Target or object-store changes",
+            ],
+        })
+
+    def plan_register_artifact_store(
+        self, name: str, definition: S3ArtifactStore
+    ) -> dict[str, object]:
+        return self.artifact_store_registration_plan(name, definition, update=False)
+
+    def register_artifact_store(
+        self, name: str, definition: S3ArtifactStore, plan_id: str
+    ) -> dict[str, object]:
+        expected = self.plan_register_artifact_store(name, definition)
+        self.assert_plan(expected, plan_id)
+        self.store.save(self.replace(self.store.load(), "artifact_stores", name, definition))
+        return {"changed": True, "artifact_store": name}
+
+    def plan_update_artifact_store(
+        self, name: str, definition: S3ArtifactStore
+    ) -> dict[str, object]:
+        return self.artifact_store_registration_plan(name, definition, update=True)
+
+    def update_artifact_store(
+        self, name: str, definition: S3ArtifactStore, plan_id: str
+    ) -> dict[str, object]:
+        expected = self.plan_update_artifact_store(name, definition)
+        self.assert_plan(expected, plan_id)
+        self.store.save(self.replace(self.store.load(), "artifact_stores", name, definition))
+        return {"changed": True, "artifact_store": name}
+
+    def plan_remove_artifact_store(self, name: str) -> dict[str, object]:
+        state = self.store.load()
+        if name not in state.artifact_stores:
+            raise KeyError("artifact store is not registered")
+        if any(
+            application.build is not None and application.build.artifact_store == name
+            for application in state.applications.values()
+        ):
+            raise ValueError("artifact store is still referenced by an application")
+        return exact_plan({
+            "kind": "artifact_store_removal",
+            "name": name,
+            "effects": [
+                "remove local desired state only",
+                "make no Target or object-store changes",
+            ],
+        })
+
+    def remove_artifact_store(self, name: str, plan_id: str) -> dict[str, object]:
+        expected = self.plan_remove_artifact_store(name)
+        self.assert_plan(expected, plan_id)
+        self.store.save(self.delete(self.store.load(), "artifact_stores", name))
+        return {"changed": True, "artifact_store": name}

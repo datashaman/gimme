@@ -578,6 +578,177 @@ if __name__ == "__main__":
 PYTHON;
 }
 
+function artifact_store_probe_script(): string
+{
+    return <<<'PYTHON'
+import base64
+import hashlib
+import json
+import re
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+def safe_exception_hook(_kind, _error, _traceback):
+    print("GIMME_ARTIFACT_STORE_ERROR|verification_failed", file=sys.stderr)
+
+sys.excepthook = safe_exception_hook
+
+policy = json.loads(base64.b64decode(sys.argv[1], validate=True))
+role, version, credential_argument = sys.argv[2:5]
+if set(policy) != {"name", "bucket", "region", "endpoint", "addressing", "encryption"}:
+    raise SystemExit("artifact store policy has an unexpected shape")
+if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", policy["name"]) is None:
+    raise SystemExit("artifact store name is invalid")
+if role not in {"publisher", "reader"}:
+    raise SystemExit("artifact probe role is invalid")
+
+client_options = {
+    "region_name": policy["region"],
+    "config": Config(
+        signature_version="s3v4",
+        s3={"addressing_style": (
+            "virtual" if policy["addressing"] == "virtual_hosted" else "path"
+        )},
+        retries={"max_attempts": 3, "mode": "standard"},
+    ),
+}
+if policy["endpoint"] is not None:
+    client_options["endpoint_url"] = "https://" + policy["endpoint"]
+if credential_argument != "-":
+    path = Path(credential_argument)
+    details = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(details.st_mode):
+        raise SystemExit("refusing to read a non-regular credential document")
+    credentials = json.loads(path.read_text())
+    allowed = {"access_key_id", "secret_access_key", "session_token"}
+    if not isinstance(credentials, dict) or not set(credentials) <= allowed or not {
+        "access_key_id", "secret_access_key"
+    } <= set(credentials):
+        raise SystemExit("credential document has an unexpected shape")
+    if any(not isinstance(value, str) or not value or len(value) > 4096
+           for value in credentials.values()):
+        raise SystemExit("credential document contains an invalid value")
+    client_options.update({
+        "aws_access_key_id": credentials["access_key_id"],
+        "aws_secret_access_key": credentials["secret_access_key"],
+    })
+    if "session_token" in credentials:
+        client_options["aws_session_token"] = credentials["session_token"]
+
+client = boto3.client("s3", **client_options)
+bucket = policy["bucket"]
+prefix = "gimme/artifact-store-capabilities/" + hashlib.sha256(
+    policy["name"].encode()
+).hexdigest()[:20]
+reader_key = prefix + "/reader-v1.check"
+reader_body = b"gimme-artifact-reader-capability-v1\n"
+reader_sha256 = hashlib.sha256(reader_body).hexdigest()
+
+def encryption_arguments():
+    encryption = policy["encryption"]
+    if encryption["method"] == "aes256":
+        return {"ServerSideEncryption": "AES256"}, "AES256"
+    return {
+        "ServerSideEncryption": "aws:kms",
+        "SSEKMSKeyId": encryption["kms_key_arn"],
+    }, "aws:kms"
+
+def encryption_confirmed(response, expected):
+    if response.get("ServerSideEncryption") != expected:
+        return False
+    if expected == "aws:kms":
+        return response.get("SSEKMSKeyId") == policy["encryption"]["kms_key_arn"]
+    return True
+
+def exact_body(key, object_version):
+    response = client.get_object(Bucket=bucket, Key=key, VersionId=object_version)
+    try:
+        return response["Body"].read()
+    finally:
+        response["Body"].close()
+
+if role == "reader":
+    if re.fullmatch(r"[A-Za-z0-9._+=/-]{1,1024}", version) is None:
+        raise SystemExit("reader object version is invalid")
+    body = exact_body(reader_key, version)
+    if hashlib.sha256(body).hexdigest() != reader_sha256:
+        raise SystemExit("reader capability checksum mismatch")
+    result = {
+        "status": "ready",
+        "role": "reader",
+        "versioning": "exact-version-read",
+        "checksum": reader_sha256,
+    }
+else:
+    versioning = client.get_bucket_versioning(Bucket=bucket).get("Status")
+    if versioning != "Enabled":
+        raise SystemExit("artifact store bucket versioning is not enabled")
+    encryption, expected_encryption = encryption_arguments()
+    probe_key = prefix + "/publisher/" + secrets.token_hex(16) + ".check"
+    probe_body = secrets.token_bytes(64)
+    probe_sha256 = hashlib.sha256(probe_body).hexdigest()
+    probe_version = None
+    try:
+        response = client.put_object(
+            Bucket=bucket, Key=probe_key, Body=probe_body,
+            Metadata={"gimme-sha256": probe_sha256},
+            **encryption,
+        )
+        probe_version = response.get("VersionId")
+        if not isinstance(probe_version, str) or not probe_version:
+            raise RuntimeError("artifact store did not return a probe object version")
+        if not encryption_confirmed(response, expected_encryption):
+            raise RuntimeError("artifact store did not confirm required encryption")
+        if hashlib.sha256(exact_body(probe_key, probe_version)).hexdigest() != probe_sha256:
+            raise RuntimeError("publisher capability checksum mismatch")
+    finally:
+        if probe_version is not None:
+            client.delete_object(Bucket=bucket, Key=probe_key, VersionId=probe_version)
+    try:
+        client.head_object(Bucket=bucket, Key=probe_key, VersionId=probe_version)
+    except ClientError as error:
+        if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 404:
+            raise
+    else:
+        raise RuntimeError("publisher probe version still exists after exact-version delete")
+    reader_version = None
+    try:
+        reader_response = client.put_object(
+            Bucket=bucket, Key=reader_key, Body=reader_body,
+            Metadata={"gimme-sha256": reader_sha256},
+            **encryption,
+        )
+        reader_version = reader_response.get("VersionId")
+        if not isinstance(reader_version, str) or not reader_version:
+            raise RuntimeError("artifact store did not return a reader object version")
+        if not encryption_confirmed(reader_response, expected_encryption):
+            raise RuntimeError("artifact store did not encrypt the reader capability object")
+    except Exception:
+        if reader_version is not None:
+            client.delete_object(Bucket=bucket, Key=reader_key, VersionId=reader_version)
+        raise
+    result = {
+        "status": "ready",
+        "role": "publisher",
+        "versioning": "enabled",
+        "encryption": policy["encryption"]["method"],
+        "checksum": probe_sha256,
+        "probe_deleted": True,
+        "reader_version": reader_version,
+    }
+
+encoded = base64.b64encode(json.dumps(result, sort_keys=True).encode()).decode()
+print("GIMME_ARTIFACT_STORE_RESULT|" + encoded)
+PYTHON;
+}
+
+
 function managed_postgres_bind_script(): string
 {
     return <<<'PYTHON'

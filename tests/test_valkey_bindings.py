@@ -31,6 +31,9 @@ def v4() -> dict:
     """The example as schema-v4 state: the Deployment binds `resources.cache`."""
     value = document()
     value["schema_version"] = 4
+    value.pop("artifact_stores")
+    value["applications"]["example"].pop("build")
+    value["targets"].pop("buildbox")
     value["resources"].pop(NAME)
     resources = value["deployments"]["example-local"]["resources"]
     resources["cache"] = resources.pop("valkey")["resource"]
@@ -40,7 +43,7 @@ def v4() -> dict:
 def migrate(tmp_path: Path, value: dict) -> ControlState:
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "state.json").write_text(json.dumps(value))
-    return StateStore(tmp_path).state_migration({})
+    return StateStore(tmp_path).state_migration({}, {"example-local": "source"})
 
 
 # --- the typed binding -----------------------------------------------------------------
@@ -142,7 +145,7 @@ def test_a_v4_cache_binding_becomes_a_cache_use(tmp_path) -> None:
     migrated = migrate(tmp_path, v4())
 
     binding = migrated.deployments["example-local"].resources.valkey
-    assert migrated.schema_version == 5
+    assert migrated.schema_version == 6
     assert binding is not None and (binding.resource, binding.uses) == ("devbox-valkey", ["cache"])
 
 
@@ -201,7 +204,7 @@ def test_ambiguous_v4_state_fails_migration_and_writes_nothing(tmp_path, mutate)
     (tmp_path / "state.json").write_text(original)
 
     with pytest.raises((ValueError, ValidationError)):
-        StateStore(tmp_path).state_migration({})
+        StateStore(tmp_path).state_migration({}, {"example-local": "source"})
 
     assert (tmp_path / "state.json").read_text() == original
 
@@ -214,8 +217,8 @@ def test_v4_state_is_not_loadable_until_migrated(tmp_path) -> None:
         StateStore(tmp_path).load()
 
 
-def test_v5_state_cannot_be_migrated_again(tmp_path) -> None:
-    with pytest.raises(ValueError, match="schema-v5 state already exists"):
+def test_v6_state_cannot_be_migrated_again(tmp_path) -> None:
+    with pytest.raises(ValueError, match="schema-v6 state already exists"):
         migrate(tmp_path, document())
 
 
