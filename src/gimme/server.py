@@ -14,7 +14,7 @@ from typing import Annotated, Any, Callable, Iterator, Literal, ParamSpec, TypeV
 
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from gimme import recovery as recovery_module
 from gimme import resources_postgres as resources_postgres_module
@@ -400,9 +400,9 @@ def _bounded_marker_values(
     return values
 
 
-def _replace(state: ControlState, collection: str, name: str, value: object) -> ControlState:
+def _replace(state: ControlState, collection: str, name: str, value: BaseModel) -> ControlState:
     document = state.model_dump(mode="json")
-    document[collection][name] = value.model_dump(mode="json")  # type: ignore[attr-defined]
+    document[collection][name] = value.model_dump(mode="json")
     return ControlState.model_validate(document)
 
 
