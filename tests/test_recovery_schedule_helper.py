@@ -14,6 +14,7 @@ def helper_namespace() -> dict[str, object]:
     source = (ROOT / "scripts" / "gimme-provision-recovery-schedule").read_text()
     source = source.replace("__GIMME_POLICY_ID__", "test-policy")
     source = source.replace('"__GIMME_APPS_ROOT__"', json.dumps("/srv/gimme/apps"))
+    source = source.replace('"__GIMME_RUNNER_SHA256__"', '"test-runner-sha256"')
     namespace: dict[str, object] = {"__name__": "gimme_recovery_schedule_helper"}
     exec(compile(source, "gimme-provision-recovery-schedule", "exec"), namespace)
     return namespace
@@ -197,6 +198,9 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
     runner = tmp_path / "gimme-recovery-runner"
     runner.write_text("#!/bin/sh\n")
     runner.chmod(0o755)
+    helper["EXPECTED_RUNNER_SHA256"] = helper["hashlib"].sha256(
+        runner.read_bytes()
+    ).hexdigest()
     class RootOwnedRunner:
         def __fspath__(self):
             return str(runner)
@@ -213,6 +217,9 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
         def stat(self):
             details = runner.stat()
             return SimpleNamespace(st_mode=details.st_mode, st_uid=os.getuid())
+
+        def read_bytes(self):
+            return runner.read_bytes()
 
     helper.update({
         "EXPECTED_APPS_ROOT": apps,
@@ -256,6 +263,26 @@ def test_reconcile_installs_exact_units_and_is_idempotent(tmp_path, monkeypatch)
     })
     helper["reconcile"]()
     assert calls == []
+
+
+def test_reconcile_rejects_a_tampered_runner_before_unit_mutation(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    configure_filesystem(helper, tmp_path, authority())
+    Path(str(helper["RUNNER"])).write_text("#!/bin/sh\nexit 1\n")
+    calls: list[list[str]] = []
+    monkeypatch.setitem(helper, "run", lambda command: calls.append(command))
+    monkeypatch.setitem(helper, "succeeds", lambda _command: False)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    with pytest.raises(RuntimeError, match="validated Recovery Schedule runner"):
+        helper["reconcile"]()
+
+    assert calls == []
+    assert not helper["SYSTEMD_ROOT"].exists()
 
 
 def test_manual_cadence_removes_units_authority_and_credentials(tmp_path, monkeypatch) -> None:

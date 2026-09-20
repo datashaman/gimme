@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Installed the standalone Recovery Schedule runner, shared Target capture module, and fixed
+  Valkey capture program as root-owned Target bootstrap assets. Their sources now participate in
+  the Target-bound helper policy; stack inspection fails back to bootstrap when an asset is
+  missing, and the privileged schedule reconciler verifies the exact post-substitution runner
+  SHA-256 before it mutates or enables any unit.
 - Added an independent protected transfer and systemd credential channel for scheduled managed
   Valkey capture. The Deployer boundary accepts only a regular local credential file, cleans both
   remote transfers unconditionally, and the privileged helper independently validates the exact

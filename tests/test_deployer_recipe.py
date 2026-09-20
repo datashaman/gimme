@@ -601,6 +601,25 @@ def test_target_bootstrap_streams_bounded_phase_progress() -> None:
     assert all(f"GIMME_BOOTSTRAP|{stage}|" in bootstrap for stage in stages)
 
 
+def test_target_bootstrap_installs_content_bound_recovery_runtime() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:provision:stack'", 1)[1].split(
+        "task('gimme:bootstrap:database-admin'", 1
+    )[0]
+    state = (ROOT / "deploy/state.php").read_text()
+
+    for source in (
+        "scripts/gimme-recovery-runner", "src/gimme/target_capture.py",
+        "scripts/gimme-capture-valkey",
+    ):
+        assert source in state
+    assert "__GIMME_RUNNER_SHA256__" in task
+    assert "hash('sha256', $recoveryRunner)" in task
+    assert r'mv "\$recovery_runner_tmp" /usr/local/libexec/gimme-recovery-runner' in task
+    assert r'mv "\$target_capture_tmp" /usr/local/libexec/gimme_target_capture.py' in task
+    assert r'mv "\$valkey_capture_tmp" /usr/local/libexec/gimme-capture-valkey' in task
+
+
 def test_deployment_health_gates_candidate_before_live_activation() -> None:
     plan = rendered_deploy_plan(
         {
