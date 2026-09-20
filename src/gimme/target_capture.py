@@ -159,8 +159,19 @@ class BotoObjectStore:
             self.client = boto_module.client("s3", **kwargs)
         except CaptureFailure:
             raise
-        except Exception:
-            raise CaptureFailure("destination_unavailable") from None
+        except PermissionError:
+            raise CaptureFailure("provider_runtime_access_denied") from None
+        except OSError:
+            raise CaptureFailure("provider_runtime_unavailable") from None
+        except Exception as error:
+            code = (
+                "provider_configuration_invalid"
+                if type(error).__name__ in {
+                    "ConfigParseError", "InvalidConfigError", "ProfileNotFound",
+                }
+                else "provider_client_unavailable"
+            )
+            raise CaptureFailure(code) from None
         self.destination = destination
 
     def _encryption(self) -> dict[str, str]:

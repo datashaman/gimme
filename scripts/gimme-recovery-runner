@@ -46,7 +46,8 @@ OUTCOMES = {
 }
 ERROR_CODES = OUTCOMES | {
     "maintenance_failed", "postgres_capture_failed", "valkey_capture_failed",
-    "publish_failed",
+    "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
+    "provider_configuration_invalid", "provider_client_unavailable",
 }
 AUTHORITY_KEYS = {
     "schema_version", "deployment", "target", "policy_fingerprint", "cadence",
@@ -385,6 +386,10 @@ def mapped_capture_failure(error: Exception, default: str) -> RunnerFailure:
         "recovery_component_verification_failed": "verification_failed",
         "recovery_manifest_tampered": "verification_failed",
         "recovery_manifest_invalid": "verification_failed",
+        "provider_runtime_access_denied": "provider_runtime_access_denied",
+        "provider_runtime_unavailable": "provider_runtime_unavailable",
+        "provider_configuration_invalid": "provider_configuration_invalid",
+        "provider_client_unavailable": "provider_client_unavailable",
     }
     return RunnerFailure(mapped.get(safe, default))
 
@@ -613,6 +618,8 @@ def execute_scheduled(
             "credentials_unavailable", "credentials_expired", "destination_unavailable",
             "policy_stale", "verification_failed",
         } else "capture_failed"
+        if code.startswith("provider_"):
+            outcome = "destination_unavailable"
         error_code = code if code in ERROR_CODES else outcome
         status.update({
             "finished_at": datetime.now(UTC).isoformat(), "outcome": outcome,

@@ -4,6 +4,8 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from gimme import recovery
 from gimme.target_capture import (
     BotoObjectStore, Component, ObjectMetadata, capture_postgres, capture_valkey, publish,
@@ -342,3 +344,19 @@ def test_only_derived_systemd_valkey_credential_path_uses_mount_security() -> No
     assert not systemd_valkey_credential(Path(
         "/run/credentials/gimme-recovery-example-app.service/aws"
     ))
+
+
+def test_boto_client_initialization_maps_only_fixed_exception_class() -> None:
+    class Boto:
+        @staticmethod
+        def client(*_args, **_kwargs):
+            raise PermissionError("secret provider path")
+
+    selected = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "backups",
+        "region": "us-east-1", "endpoint": None, "addressing": "path",
+        "encryption": {"method": "aes256"}, "auth_mode": "stored",
+    }
+    with pytest.raises(CaptureFailure, match="^provider_runtime_access_denied$"):
+        BotoObjectStore(selected, {"access_key_id": "id", "secret_access_key": "key"},
+                        boto_module=Boto)

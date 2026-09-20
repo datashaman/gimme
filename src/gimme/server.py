@@ -1050,7 +1050,8 @@ def _valid_recovery_attempt_status(status: object, name: str) -> bool:
     }
     error_codes = outcomes | {
         "maintenance_failed", "postgres_capture_failed", "valkey_capture_failed",
-        "publish_failed",
+        "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
+        "provider_configuration_invalid", "provider_client_unavailable",
     }
     if (
         not isinstance(status, dict) or set(status) != fields
