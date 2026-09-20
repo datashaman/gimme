@@ -736,6 +736,19 @@ def test_postgres_restore_task_uses_request_scoped_protected_atomic_state() -> N
     assert "escapeshellarg($bytes)" in task
 
 
+def test_restore_verification_runs_database_and_health_checks_behind_maintenance() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:verify-application'", 1)[1].split(
+        "task('gimme:recovery:maintenance'", 1
+    )[0]
+
+    assert "migrate:status" in task
+    assert "laravel_candidate_health_script()" in task
+    assert "in_array('live', $probe['phases'], true)" in task
+    assert "GIMME_RESTORE_VERIFY|ready" in task
+    assert "laravel_live_health_script()" not in task
+
+
 def _fake_psql(tmp_path: Path, *, fail: bool = False, message: str | None = None) -> Path:
     """A stand-in psql that records argv and stdin. It cannot judge SQL semantics, so the
     statements it receives are additionally exercised against a real server by hand; these

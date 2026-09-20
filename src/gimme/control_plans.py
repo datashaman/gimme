@@ -345,6 +345,33 @@ def deployment_restore_plan(
     })
 
 
+def restore_verification_plan(
+    deployment_name: str, request_id: str, restore: dict[str, object],
+) -> dict[str, Any]:
+    state = str(restore["state"])
+    ready = state in {
+        "data_replaced", "verification_failed", "verification_succeeded",
+        "cleanup_completed", "completed",
+    }
+    return exact_plan({
+        "kind": "restore_verification",
+        "deployment": deployment_name,
+        "request_id": request_id,
+        "source_recovery_point_id": restore["source_recovery_point_id"],
+        "state": state,
+        "ready": ready,
+        "readiness_issues": [] if ready else ["restore_data_not_replaced"],
+        "effects": [
+            "keep public routing on the fixed maintenance response",
+            "resume only the managed processes active before restore",
+            "verify restored database connectivity and configured live-health probes privately",
+            "re-quiesce managed processes and remain in maintenance on any failure",
+            "drop the verified previous database only after private verification",
+            "restore normal routing only after cleanup and a final private verification",
+        ],
+    })
+
+
 def recovery_point_deletion_plan(
     deployment_name: str,
     destination_name: str,
@@ -354,6 +381,7 @@ def recovery_point_deletion_plan(
     bytes: int,
     final_verified_point: bool,
     safety_protected: bool,
+    restore_protected: bool,
     inventory_fingerprint: str,
     manifest_fingerprint: str,
     state: str,
@@ -368,6 +396,7 @@ def recovery_point_deletion_plan(
             "components": components,
             "bytes": bytes,
             "safety_protected": safety_protected,
+            "restore_protected": restore_protected,
             "final_verified_point": final_verified_point,
             "inventory_fingerprint": inventory_fingerprint,
             "manifest_fingerprint": manifest_fingerprint,

@@ -153,6 +153,26 @@ def marker_paths(instance: str) -> tuple[Path, Path]:
     return MARKER_ROOT / f"{instance}.json", MARKER_ROOT / f"{instance}.caddy"
 
 
+def exit_receipt_path(instance: str) -> Path:
+    return MARKER_ROOT / f"{instance}.exit.json"
+
+
+def read_exit_receipt(instance: str) -> dict[str, Any] | None:
+    path = exit_receipt_path(instance)
+    if not path.exists():
+        return None
+    value = load_json(path, os.geteuid())
+    if (
+        set(value) != {"schema_version", "deployment", "request_id"}
+        or value.get("schema_version") != 1
+        or value.get("deployment") != instance
+        or not isinstance(value.get("request_id"), str)
+        or REQUEST_ID.fullmatch(value["request_id"]) is None
+    ):
+        fail("maintenance exit receipt is invalid")
+    return value
+
+
 def read_marker(instance: str) -> dict[str, Any] | None:
     marker_path, _backup = marker_paths(instance)
     if not marker_path.exists():
@@ -185,6 +205,7 @@ def enter(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
         fail("maintenance is owned by another request")
     site_path = authority["site_path"]
     if marker is None:
+        exit_receipt_path(instance).unlink(missing_ok=True)
         if site_path.is_symlink() or not site_path.is_file():
             fail("deployment route is not a regular file")
         original = site_path.read_bytes()
@@ -238,9 +259,19 @@ def quiesce_processes(instance: str, request_id: str, owner: int, sudo_user: str
 
 
 def exit_maintenance(instance: str, request_id: str, owner: int, sudo_user: str) -> None:
+    marker_path, backup_path = marker_paths(instance)
+    receipt = read_exit_receipt(instance)
+    if receipt is not None and receipt["request_id"] == request_id:
+        marker_path.unlink(missing_ok=True)
+        backup_path.unlink(missing_ok=True)
+        return
+    marker = read_marker(instance)
+    if marker is None:
+        fail("maintenance exit state is ambiguous")
+    if marker["request_id"] != request_id:
+        fail("maintenance is owned by another request")
     resume_processes(instance, request_id, owner, sudo_user)
     authority = load_authority(instance, request_id, owner, sudo_user)
-    marker_path, backup_path = marker_paths(instance)
     if backup_path.is_symlink() or not backup_path.is_file():
         fail("maintenance route backup is invalid")
     backup = backup_path.stat()
@@ -252,6 +283,9 @@ def exit_maintenance(instance: str, request_id: str, owner: int, sudo_user: str)
         fail("maintenance route backup is invalid")
     atomic_write(authority["site_path"], backup_path.read_bytes(), 0o644)
     reload_caddy()
+    atomic_write(exit_receipt_path(instance), json.dumps({
+        "schema_version": 1, "deployment": instance, "request_id": request_id,
+    }, sort_keys=True, separators=(",", ":")).encode(), 0o600)
     marker_path.unlink()
     backup_path.unlink()
 

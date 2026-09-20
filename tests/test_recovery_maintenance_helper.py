@@ -111,6 +111,48 @@ def test_exit_refuses_another_requests_marker(tmp_path, monkeypatch) -> None:
     assert auth["site_path"].read_text() == "example.test {\n\trespond 503\n}\n"
 
 
+def test_exit_retry_is_a_no_op_after_route_was_already_restored(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    auth = authority(tmp_path)
+    monkeypatch.setitem(helper, "MARKER_ROOT", tmp_path / "markers")
+    monkeypatch.setitem(helper, "CADDYFILE", tmp_path / "Caddyfile")
+    monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
+    active = set(auth["units"])
+    monkeypatch.setitem(helper, "succeeds", lambda command: command[-1] in active)
+
+    def run(command):
+        if command[:2] == ["systemctl", "stop"]:
+            active.discard(command[-1])
+        elif command[:2] == ["systemctl", "start"]:
+            active.add(command[-1])
+
+    monkeypatch.setitem(helper, "run", run)
+    helper["enter"]("example-app", "request-1", 1000, "deployer")
+    helper["exit_maintenance"]("example-app", "request-1", 1000, "deployer")
+
+    helper["exit_maintenance"]("example-app", "request-1", 1000, "deployer")
+
+    assert auth["site_path"].read_text() == "example.test {\n\trespond 200\n}\n"
+    receipt = json.loads(
+        (tmp_path / "markers" / "example-app.exit.json").read_text()
+    )
+    assert receipt["request_id"] == "request-1"
+
+
+def test_exit_without_marker_or_matching_receipt_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    auth = authority(tmp_path)
+    monkeypatch.setitem(helper, "MARKER_ROOT", tmp_path / "markers")
+    monkeypatch.setitem(helper, "load_authority", lambda *_args: auth)
+
+    with pytest.raises(RuntimeError, match="exit state is ambiguous"):
+        helper["exit_maintenance"]("example-app", "request-1", 1000, "deployer")
+
+
 def test_restore_can_resume_then_requiesce_processes_without_restoring_route(
     tmp_path, monkeypatch
 ) -> None:

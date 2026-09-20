@@ -34,7 +34,7 @@ REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 RESTORE_STATES = (
     "started", "maintenance_entered", "safety_verified", "safety_not_required",
     "artifact_verified", "shadow_verified", "data_replaced", "verification_failed",
-    "completed",
+    "verification_succeeded", "cleanup_completed", "completed",
 )
 RESTORE_TRANSITIONS = {
     None: {"started"},
@@ -44,8 +44,10 @@ RESTORE_TRANSITIONS = {
     "safety_not_required": {"artifact_verified"},
     "artifact_verified": {"shadow_verified"},
     "shadow_verified": {"data_replaced"},
-    "data_replaced": {"verification_failed", "completed"},
-    "verification_failed": {"verification_failed", "completed"},
+    "data_replaced": {"verification_failed", "verification_succeeded"},
+    "verification_failed": {"verification_failed", "verification_succeeded"},
+    "verification_succeeded": {"verification_failed", "cleanup_completed"},
+    "cleanup_completed": {"verification_failed", "completed"},
     "completed": set(),
 }
 
@@ -526,6 +528,95 @@ def list_restore_records(
     ]
     records.sort(key=lambda record: str(record["updated_at"]), reverse=True)
     return records
+
+
+def recovery_point_source_protected(
+    destination: S3BackupDestination, credentials: Credentials, adapter: S3Adapter,
+    deployment: str, point_id: str,
+) -> bool:
+    """Protect a source point while any schema-v2 Restore using it is incomplete."""
+    prefix = f"{RESTORE_PREFIX}/{deployment}/"
+    keys = adapter.list_keys(destination, credentials, prefix)
+    if len(keys) > 10_000:
+        raise RecoveryError("restore_record_limit")
+    request_ids: set[str] = set()
+    for key in keys:
+        remainder = key[len(prefix):]
+        request_id, separator, event_name = remainder.partition("/")
+        if (
+            separator != "/" or REQUEST_ID.fullmatch(request_id) is None
+            or re.fullmatch(r"[0-9]{6}\.json", event_name) is None
+        ):
+            raise RecoveryError("restore_record_invalid")
+        request_ids.add(request_id)
+    for request_id in request_ids:
+        try:
+            record = load_restore_record(
+                destination, credentials, adapter, deployment, request_id
+            )
+        except RecoveryError as exc:
+            if str(exc) != "restore_record_invalid":
+                raise
+            request_keys = sorted(
+                key for key in keys
+                if key.startswith(f"{prefix}{request_id}/")
+            )
+            legacy = True
+            for sequence, key in enumerate(request_keys):
+                metadata = adapter.head_object(destination, credentials, key)
+                if (
+                    metadata is None
+                    or metadata.bytes > MAX_MANIFEST_BYTES
+                    or metadata.version_id is None
+                    or VERSION_ID.fullmatch(metadata.version_id) is None
+                    or metadata.server_side_encryption == ""
+                ):
+                    legacy = False
+                    break
+                try:
+                    raw = adapter.get_object(
+                        destination, credentials, key, metadata.version_id
+                    )
+                    if (
+                        len(raw) > MAX_MANIFEST_BYTES
+                        or hashlib.sha256(raw).hexdigest() != metadata.sha256
+                    ):
+                        legacy = False
+                        break
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeError):
+                    legacy = False
+                    break
+                if (
+                    not isinstance(event, dict)
+                    or set(event) != {
+                        "schema_version", "deployment", "request_id", "sequence",
+                        "state", "safety_recovery_point_id",
+                    }
+                    or event.get("schema_version") != 1
+                    or event.get("deployment") != deployment
+                    or event.get("request_id") != request_id
+                    or event.get("sequence") != sequence
+                    or event.get("state") not in RESTORE_STATES
+                    or (
+                        event.get("safety_recovery_point_id") is not None
+                        and RECOVERY_POINT_ID.fullmatch(
+                            str(event.get("safety_recovery_point_id"))
+                        ) is None
+                    )
+                    or key != restore_event_key(deployment, request_id, sequence)
+                ):
+                    legacy = False
+                    break
+            if legacy:
+                continue
+            raise
+        if (
+            record["source_recovery_point_id"] == point_id
+            and record["state"] != "completed"
+        ):
+            return True
+    return False
 
 
 def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
