@@ -782,10 +782,20 @@ def verify_backup_destination() -> None:
 
     verify_postgres_restore(gimme)
 
-    tamper_component(
+    postgres_key = (
         "gimme/recovery-points/"
         f"{RECOVERY_DEPLOYMENT}/{result['recovery_point']['recovery_point_id']}/postgres.dump"
     )
+    bound_version = supersede_component(postgres_key)
+    superseded_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
+    superseded_ids = {
+        item["recovery_point_id"] for item in superseded_inventory["recovery_points"]
+    }
+    if point_id not in superseded_ids:
+        raise AssertionError(
+            f"unreferenced object version altered the Recovery Point: {superseded_inventory}"
+        )
+    remove_component_version(postgres_key, bound_version)
     tampered_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
     tampered_ids = {item["recovery_point_id"] for item in tampered_inventory["recovery_points"]}
     if point_id in tampered_ids:
@@ -798,8 +808,24 @@ def verify_backup_destination() -> None:
             raise AssertionError(f"MinIO credential leaked into {path}")
 
 
-def tamper_component(key: str) -> None:
-    minio_client().put_object(Bucket=BACKUP_BUCKET, Key=key, Body=b"corrupted-after-publish")
+def supersede_component(key: str) -> str:
+    client = minio_client()
+    versions = client.list_object_versions(Bucket=BACKUP_BUCKET, Prefix=key).get(
+        "Versions", []
+    )
+    bound = next(
+        (item for item in versions if item["Key"] == key and item["IsLatest"]), None
+    )
+    if bound is None:
+        raise AssertionError("published component version is missing")
+    client.put_object(Bucket=BACKUP_BUCKET, Key=key, Body=b"corrupted-after-publish")
+    return str(bound["VersionId"])
+
+
+def remove_component_version(key: str, version_id: str) -> None:
+    minio_client().delete_object(
+        Bucket=BACKUP_BUCKET, Key=key, VersionId=version_id
+    )
 
 
 if __name__ == "__main__":
