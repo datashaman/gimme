@@ -1597,7 +1597,7 @@ def apply_restore_deployment(
     confirmation: str,
     components: RestoreComponents | None = None,
 ) -> dict[str, object]:
-    """Prepare and atomically activate one reviewed PostgreSQL Restore.
+    """Prepare and activate one reviewed full or partial Deployment Restore.
 
     The deployment remains in request-owned maintenance for a separate verified
     completion step.

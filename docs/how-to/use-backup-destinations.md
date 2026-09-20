@@ -150,7 +150,7 @@ interface. A partial failure leaves the point in `deletion_failed` with bounded 
 counts. Retry the original call with the same plan and confirmations; already-absent exact
 versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destination policy.
 
-For the PostgreSQL Restore procedure, Target-loss replacement, and failed-verification
-recovery, see [Restore a PostgreSQL Deployment](restore-a-postgresql-deployment.md).
+For the full or partial Deployment Restore procedure, Target-loss replacement, and
+failed-verification recovery, see [Restore a Deployment](restore-a-postgresql-deployment.md).
 Scheduled/systemd-timer cadences and automatic `retain_last` pruning remain separate work
 described in [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).
