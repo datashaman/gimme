@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added a content-addressed, secret-reference-free Recovery Schedule authority model to
+  Deployment Resource plans. It binds the normalized policy, registered Deployment/Target,
+  immutable placement, selected Resource provenance, destination execution policy, fixed unit
+  identities, stable delay, and status identity while exposing only ambient/stored auth mode.
 - Added a bounded Recovery Schedule Status tool/resource projection. Manual cadence reports
   disabled locally; scheduled cadence observes only the exact Deployment-derived timer and
   collapses missing, malformed, or unavailable target observations to fixed secret-safe fields.

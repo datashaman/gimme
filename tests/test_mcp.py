@@ -46,6 +46,7 @@ from gimme.secrets import SecretMetadata
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
 import gimme.recovery as recovery_module
+import gimme.recovery_schedule as recovery_schedule_module
 from gimme.server import mcp
 
 
@@ -844,6 +845,108 @@ def test_on_demand_recovery_plan_preserves_normalized_scheduled_policy(
     }
     assert plan["retain_last"] == 30
     assert plan["ready"] is True
+
+
+def test_deployment_resource_plan_includes_secret_safe_schedule_authority(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    deployment = state.deployments["example-app"]
+    destination = S3BackupDestination(
+        bucket="gimme-backups", region="us-east-1", encryption=SSEAES256(),
+        auth=CredentialReferenceBackupAuth(
+            access_key_id=SecretReference(
+                store="local-sops", secret="minio", field="access_key_id"
+            ),
+            secret_access_key=SecretReference(
+                store="local-sops", secret="minio", field="secret_access_key"
+            ),
+        ),
+    )
+    scheduled = deployment.model_copy(update={
+        "recovery": RecoveryPolicy(
+            destination="primary", cadence={"kind": "hourly", "minute": 15}
+        )
+    })
+    selected.save(state.model_copy(update={
+        "backup_destinations": {"primary": destination},
+        "deployments": {"example-app": scheduled},
+    }))
+
+    plan = server_module.plan_deployment_resources("example-app")
+
+    assert plan["recovery_schedule"] == {
+        "enabled": True,
+        "cadence": {"kind": "hourly", "minute": 15},
+        "calendar": "*-*-* *:15:00 UTC",
+        "logical_timezone": "UTC",
+        "stable_delay_seconds": recovery_schedule_module.stable_delay_seconds(
+            "example-app"
+        ),
+        "policy_fingerprint": recovery_schedule_module.policy_fingerprint(
+            scheduled.recovery
+        ),
+        "authority_fingerprint": plan["recovery_schedule"]["authority_fingerprint"],
+        "auth_mode": "stored",
+        "service": "gimme-recovery-example-app.service",
+        "timer": "gimme-recovery-example-app.timer",
+    }
+    encoded = json.dumps(plan, sort_keys=True)
+    assert "access_key_id" not in encoded
+    assert "secret_access_key" not in encoded
+    assert "minio" not in encoded
+    authority = recovery_schedule_module.runner_authority(
+        "example-app", scheduled, "primary", destination,
+        {"postgres": {
+            "name": "devbox-postgres", "provider": "target_local",
+            "kind": "postgres", "version": "17.2",
+        }},
+    )
+    assert "minio" not in json.dumps(authority, sort_keys=True)
+    assert authority["destination"]["auth_mode"] == "stored"
+
+
+def test_private_runner_authority_changes_with_bound_execution_policy() -> None:
+    state = recovery_state()
+    deployment = state.deployments["example-app"]
+    destination = state.backup_destinations["primary"]
+    first = recovery_schedule_module.runner_authority(
+        "example-app", deployment, "primary", destination,
+        {"postgres": {
+            "name": "devbox-postgres", "provider": "target_local",
+            "kind": "postgres", "version": "17.2",
+        }},
+    )
+    changed = recovery_schedule_module.runner_authority(
+        "example-app",
+        deployment.model_copy(update={
+            "recovery": deployment.recovery.model_copy(update={"retain_last": 8})
+        }),
+        "primary", destination,
+        {"postgres": {
+            "name": "devbox-postgres", "provider": "target_local",
+            "kind": "postgres", "version": "17.2",
+        }},
+    )
+
+    assert first["placement"] == deployment.placement.model_dump(mode="json")
+    assert first["resources"] == {"postgres": {
+        "name": "devbox-postgres", "provider": "target_local",
+        "kind": "postgres", "version": "17.2",
+    }}
+    assert first["status_identity"] == "example-app"
+    assert recovery_schedule_module.schedule_plan(first)["authority_fingerprint"] != (
+        recovery_schedule_module.schedule_plan(changed)["authority_fingerprint"]
+    )
+    with pytest.raises(ValueError, match="resource authority mismatch"):
+        recovery_schedule_module.runner_authority(
+            "example-app", deployment, "primary", destination,
+            {"postgres": {
+                "name": "other-postgres", "provider": "target_local",
+                "kind": "postgres", "version": "17.2",
+            }},
+        )
 
 
 def test_manual_recovery_schedule_status_is_local_and_disabled(

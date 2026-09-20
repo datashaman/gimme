@@ -166,3 +166,6 @@ Inspect `get_recovery_schedule_status(deployment)` or
 `gimme://deployments/{name}/recovery-schedule` for bounded timer state and logical/effective next
 UTC times. `status_unavailable` means the Target observation could not be obtained; destination
 manifests remain the authoritative Recovery Point inventory.
+Before apply, inspect the `recovery_schedule` section of `plan_deployment_resources`. Its
+authority fingerprint changes with policy, placement, selected Resource provenance, destination
+execution policy, or auth mode, while the plan exposes no secret reference or credential path.
