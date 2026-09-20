@@ -1164,8 +1164,8 @@ SELECT CASE WHEN
 SQL;
     $command = 'result=$(psql --no-psqlrc -Atq -d ' . escapeshellarg($database) .
         ' -c ' . escapeshellarg($query) . ' 2>/dev/null) || ' .
-        '{ printf %s\\n GIMME_POSTGRES_RESTORE_PREFLIGHT_FAILED >&2; exit 1; }; ' .
-        'case "$result" in empty|nonempty) printf %s\\n ' .
+        '{ printf "%s\\n" GIMME_POSTGRES_RESTORE_PREFLIGHT_FAILED >&2; exit 1; }; ' .
+        'case "$result" in empty|nonempty) printf "%s\\n" ' .
         '"GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" ;; *) exit 1 ;; esac';
     $output = trim(run('bash -c ' . escapeshellarg($command), timeout: 60));
     writeln($output);

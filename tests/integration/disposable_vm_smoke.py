@@ -590,24 +590,6 @@ def verify_postgres_restore(gimme) -> None:
     gimme.update_resource(
         "integration-postgres", resource, str(revert_plan["plan_id"])
     )
-    inspection = gimme._run_deployment(
-        "gimme:recovery:inspect-postgres", RECOVERY_DEPLOYMENT, timeout=60
-    )
-    marker_fragments = []
-    for line in inspection.output.splitlines():
-        position = line.find("GIMME")
-        if position >= 0:
-            marker_fragments.append(
-                re.sub(r"[^A-Za-z0-9_|-]", "?", line[position:])[:100]
-            )
-    print(
-        "[DEBUG-restore-marker] "
-        + json.dumps({
-            "lines": len(inspection.output.splitlines()),
-            "markers": marker_fragments,
-        }),
-        flush=True,
-    )
     rejected = gimme.plan_restore_deployment(
         RECOVERY_DEPLOYMENT, incompatible_point_id, "ci-version-reject"
     )
