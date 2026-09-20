@@ -1,0 +1,364 @@
+#!/usr/bin/python3
+# GIMME_POLICY_ID=__GIMME_POLICY_ID__
+"""Reconcile one policy-bound Recovery Schedule as root."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import grp
+import os
+import pwd
+import re
+import stat
+import subprocess  # nosec B404 -- fixed executable argv only
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+
+EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+TRANSFER_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "recovery-schedules"
+AUTHORITY_ROOT = Path("/etc/gimme/recovery-schedules")
+STATUS_ROOT = Path("/var/lib/gimme/recovery-schedules")
+SYSTEMD_ROOT = Path("/etc/systemd/system")
+RUNNER = Path("/usr/local/libexec/gimme-recovery-runner")
+NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+TARGET = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
+RESOURCE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}$")
+FINGERPRINT = re.compile(r"^[a-f0-9]{64}$")
+KMS_ARN = re.compile(
+    r"^arn:(?:aws|aws-us-gov):kms:[a-z]{2}(?:-gov)?-[a-z]+-\d:\d{12}:key/"
+    r"[0-9a-fA-F-]{36}$"
+)
+BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
+PLACEMENT_PATH = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,255}$")
+DATABASE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+CACHE_PREFIX = re.compile(r"^[a-zA-Z0-9:_-]{1,160}$")
+HOST = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$")
+MAX_STATE_BYTES = 64 * 1024
+EXECUTABLES = {"systemctl": "/usr/bin/systemctl"}
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def require_object(value: Any, keys: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        fail(f"invalid {name}")
+    return value
+
+
+def require_string(value: Any, pattern: re.Pattern[str], name: str) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        fail(f"invalid {name}")
+    return value
+
+
+def require_int(value: Any, minimum: int, maximum: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        fail(f"invalid {name}")
+    return value
+
+
+def require_endpoint(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > 261 or any(c in value for c in "\r\n\0"):
+        fail("invalid destination endpoint")
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        fail("invalid destination endpoint")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        fail("invalid destination endpoint")
+    return value
+
+
+def validate_cadence(value: Any) -> tuple[dict[str, Any], str | None]:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        fail("invalid cadence")
+    kind = value["kind"]
+    if kind == "manual":
+        require_object(value, {"kind"}, "manual cadence")
+        return value, None
+    if kind == "hourly":
+        require_object(value, {"kind", "minute"}, "hourly cadence")
+        minute = require_int(value["minute"], 0, 59, "cadence minute")
+        return value, f"*-*-* *:{minute:02d}:00 UTC"
+    expected = {"kind", "hour", "minute"}
+    if kind == "weekly":
+        expected.add("weekday")
+    require_object(value, expected, f"{kind} cadence")
+    hour = require_int(value["hour"], 0, 23, "cadence hour")
+    minute = require_int(value["minute"], 0, 59, "cadence minute")
+    if kind == "daily":
+        return value, f"*-*-* {hour:02d}:{minute:02d}:00 UTC"
+    if kind == "weekly" and value["weekday"] in {
+        "mon", "tue", "wed", "thu", "fri", "sat", "sun"
+    }:
+        return value, f"{value['weekday'].title()} *-*-* {hour:02d}:{minute:02d}:00 UTC"
+    fail("invalid cadence kind")
+
+
+def validate_placement(value: Any) -> dict[str, Any]:
+    placement = require_object(value, {
+        "instance", "relative_path", "database_identifier", "cache_prefix", "site_host"
+    }, "placement")
+    require_string(placement["instance"], re.compile(r"^[a-z][a-z0-9-]{0,93}$"), "instance")
+    relative = require_string(placement["relative_path"], PLACEMENT_PATH, "relative path")
+    if ".." in Path(relative).parts or Path(relative).is_absolute():
+        fail("invalid relative path")
+    require_string(placement["database_identifier"], DATABASE, "database identifier")
+    require_string(placement["cache_prefix"], CACHE_PREFIX, "cache prefix")
+    require_string(placement["site_host"], HOST, "site host")
+    return placement
+
+
+def validate_authority(value: Any, deployment: str) -> dict[str, Any]:
+    authority = require_object(value, {
+        "schema_version", "deployment", "target", "policy_fingerprint", "cadence",
+        "calendar", "stable_delay_seconds", "retain_last", "quiesce_wait_seconds",
+        "components", "placement", "resources", "destination", "status_identity",
+    }, "Recovery Schedule authority")
+    if authority["schema_version"] != 1 or authority["deployment"] != deployment:
+        fail("Recovery Schedule authority identity mismatch")
+    require_string(authority["target"], TARGET, "target")
+    require_string(authority["policy_fingerprint"], FINGERPRINT, "policy fingerprint")
+    _cadence, calendar = validate_cadence(authority["cadence"])
+    if authority["calendar"] != calendar:
+        fail("Recovery Schedule calendar mismatch")
+    require_int(authority["stable_delay_seconds"], 0, 300, "stable delay")
+    require_int(authority["retain_last"], 1, 365, "retain_last")
+    require_int(authority["quiesce_wait_seconds"], 1, 300, "quiesce wait")
+    components = authority["components"]
+    if components not in (["postgres"], ["postgres", "valkey"]):
+        fail("invalid Recovery Schedule components")
+    validate_placement(authority["placement"])
+    resources = authority["resources"]
+    if not isinstance(resources, dict) or set(resources) != set(components):
+        fail("invalid Recovery Schedule resources")
+    for component, resource in resources.items():
+        item = require_object(resource, {"name", "provider", "kind", "version"}, "resource")
+        require_string(item["name"], RESOURCE, "resource name")
+        if item["kind"] != component or item["provider"] not in {
+            "target_local", "aws_rds_postgres", "aws_elasticache_valkey"
+        }:
+            fail("invalid resource provenance")
+        require_string(item["version"], VERSION, "resource version")
+    destination = require_object(authority["destination"], {
+        "name", "provider", "bucket", "region", "endpoint", "addressing", "encryption",
+        "auth_mode",
+    }, "destination")
+    require_string(destination["name"], RESOURCE, "destination name")
+    if destination["provider"] != "s3_compatible":
+        fail("invalid destination provider")
+    require_string(destination["bucket"], BUCKET, "destination bucket")
+    require_string(destination["region"], REGION, "destination region")
+    require_endpoint(destination["endpoint"])
+    if destination["addressing"] not in {"virtual_hosted", "path"}:
+        fail("invalid destination addressing")
+    encryption = destination["encryption"]
+    if not isinstance(encryption, dict):
+        fail("invalid destination encryption")
+    if encryption.get("method") == "AES256":
+        require_object(encryption, {"method"}, "destination encryption")
+    elif encryption.get("method") == "kms":
+        require_object(encryption, {"method", "kms_key_arn"}, "destination encryption")
+        require_string(encryption["kms_key_arn"], KMS_ARN, "destination KMS key")
+    else:
+        fail("invalid destination encryption")
+    if destination["auth_mode"] not in {"ambient", "stored"}:
+        fail("invalid destination auth mode")
+    if authority["status_identity"] != deployment:
+        fail("Recovery Schedule status identity mismatch")
+    return authority
+
+
+def load_authority(deployment: str, sudo_uid: int) -> dict[str, Any]:
+    if TRANSFER_ROOT.is_symlink():
+        fail("Recovery Schedule transfer directory must not be a symlink")
+    path = TRANSFER_ROOT / f"{deployment}.json"
+    if path.is_symlink():
+        fail("Recovery Schedule desired state must not be a symlink")
+    details = path.stat()
+    if not stat.S_ISREG(details.st_mode) or details.st_uid != sudo_uid:
+        fail("Recovery Schedule desired state has unsafe ownership")
+    if details.st_mode & (stat.S_IRWXG | stat.S_IRWXO) or details.st_size > MAX_STATE_BYTES:
+        fail("Recovery Schedule desired state has unsafe permissions or size")
+    return validate_authority(json.loads(path.read_text()), deployment)
+
+
+def run(command: list[str]) -> None:
+    if not command or command[0] not in EXECUTABLES:
+        fail("Recovery Schedule helper attempted an unexpected executable")
+    subprocess.run([EXECUTABLES[command[0]], *command[1:]], check=True)  # nosec B603
+
+
+def succeeds(command: list[str]) -> bool:
+    if not command or command[0] not in EXECUTABLES:
+        fail("Recovery Schedule helper attempted an unexpected executable")
+    return subprocess.run(  # nosec B603
+        [EXECUTABLES[command[0]], *command[1:]], check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def atomic_write(path: Path, content: str, mode: int) -> bool:
+    if path.is_file() and not path.is_symlink() and path.read_text() == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, mode)
+        os.chown(temp, 0, 0)
+        os.replace(temp, path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def service_unit(deployment: str, account: pwd.struct_passwd) -> str:
+    authority = AUTHORITY_ROOT / f"{deployment}.json"
+    group = grp.getgrgid(account.pw_gid).gr_name
+    return (
+        "[Unit]\n"
+        f"Description=Gimme Recovery Schedule for {deployment}\n"
+        "After=network-online.target\nWants=network-online.target\n\n"
+        "[Service]\nType=oneshot\n"
+        f"User={account.pw_name}\nGroup={group}\n"
+        f"ExecStart={RUNNER} scheduled {deployment}\n"
+        f"LoadCredential=authority:{authority}\n"
+        f"StateDirectory=gimme/recovery-schedules/{deployment}\n"
+        "RuntimeMaxSec=7200\nTimeoutStopSec=30\n"
+        "NoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\n"
+        "ProtectSystem=strict\nProtectHome=true\nProtectKernelTunables=true\n"
+        "ProtectKernelModules=true\nProtectControlGroups=true\nProtectClock=true\n"
+        "ProtectHostname=true\nRestrictSUIDSGID=true\nLockPersonality=true\n"
+        "RestrictRealtime=true\nCapabilityBoundingSet=\nAmbientCapabilities=\n"
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nUMask=0077\n"
+    )
+
+
+def timer_unit(deployment: str, calendar: str) -> str:
+    return (
+        "[Unit]\n"
+        f"Description=Gimme Recovery Schedule timer for {deployment}\n\n"
+        "[Timer]\n"
+        f"OnCalendar={calendar}\nPersistent=true\nAccuracySec=1s\n"
+        f"Unit=gimme-recovery-{deployment}.service\n\n"
+        "[Install]\nWantedBy=timers.target\n"
+    )
+
+
+def disable(unit: str) -> None:
+    if succeeds(["systemctl", "is-enabled", "--quiet", unit]) or succeeds(
+        ["systemctl", "is-active", "--quiet", unit]
+    ):
+        run(["systemctl", "disable", "--now", unit])
+
+
+def remove_schedule(deployment: str) -> bool:
+    service = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.service"
+    timer = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.timer"
+    disable(timer.name)
+    disable(service.name)
+    changed = False
+    for path in (service, timer, AUTHORITY_ROOT / f"{deployment}.json"):
+        if path.exists() or path.is_symlink():
+            path.unlink()
+            changed = True
+    credential = AUTHORITY_ROOT / f"{deployment}.credentials"
+    if credential.exists() or credential.is_symlink():
+        credential.unlink()
+        changed = True
+    status_directory = STATUS_ROOT / deployment
+    status = status_directory / "status.json"
+    if status.exists() or status.is_symlink():
+        status.unlink()
+        changed = True
+    if status_directory.is_dir() and not status_directory.is_symlink():
+        try:
+            status_directory.rmdir()
+        except OSError:
+            pass
+    return changed
+
+
+def reconcile() -> None:
+    if os.geteuid() != 0:
+        fail("gimme-provision-recovery-schedule must run as root")
+    if len(sys.argv) != 2:
+        fail("gimme-provision-recovery-schedule requires one Deployment identity")
+    deployment = require_string(sys.argv[1], NAME, "Deployment identity")
+    sudo_user = os.environ.get("SUDO_USER")
+    if (
+        not isinstance(sudo_user, str)
+        or re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]{0,31}", sudo_user) is None
+    ):
+        fail("invalid sudo caller")
+    account = pwd.getpwnam(sudo_user)
+    authority = load_authority(deployment, account.pw_uid)
+    service = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.service"
+    timer = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.timer"
+    calendar = authority["calendar"]
+    if calendar is None:
+        changed = remove_schedule(deployment)
+    else:
+        runner_details = RUNNER.stat() if RUNNER.exists() and not RUNNER.is_symlink() else None
+        if (
+            runner_details is None
+            or not stat.S_ISREG(runner_details.st_mode)
+            or runner_details.st_uid != 0
+            or runner_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not os.access(RUNNER, os.X_OK)
+        ):
+            fail("validated Recovery Schedule runner is not installed")
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
+        fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+        rendered_service = service_unit(deployment, account)
+        rendered_timer = timer_unit(deployment, calendar)
+        desired = (
+            (AUTHORITY_ROOT / f"{deployment}.json", encoded),
+            (service, rendered_service),
+            (timer, rendered_timer),
+        )
+        replacing = any(
+            not path.is_file() or path.is_symlink() or path.read_text() != content
+            for path, content in desired
+        )
+        if replacing:
+            # Any interrupted multi-file replacement is fail-closed. The next apply
+            # converges the individually atomic files before re-enabling the timer.
+            disable(timer.name)
+        changed = atomic_write(AUTHORITY_ROOT / f"{deployment}.json", encoded, 0o600)
+        changed = atomic_write(service, rendered_service, 0o644) or changed
+        changed = atomic_write(timer, rendered_timer, 0o644) or changed
+        if changed:
+            run(["systemctl", "daemon-reload"])
+        if not succeeds(["systemctl", "is-enabled", "--quiet", timer.name]):
+            run(["systemctl", "enable", timer.name])
+        if changed or not succeeds(["systemctl", "is-active", "--quiet", timer.name]):
+            run(["systemctl", "restart", timer.name])
+        print(f"recovery_schedule.authority_sha256={fingerprint}")
+    if changed and calendar is None:
+        run(["systemctl", "daemon-reload"])
+    print("recovery_schedule.units_changed=" + ("yes" if changed else "no"))
+
+
+if __name__ == "__main__":
+    try:
+        reconcile()
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"gimme-provision-recovery-schedule: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

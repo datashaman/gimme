@@ -630,14 +630,18 @@ BASH;
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
         '[ -x /usr/local/sbin/gimme-recovery-maintenance ] && ' .
         '[ -x /usr/local/sbin/gimme-postgres-restore-swap ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-recovery-maintenance && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-postgres-restore-swap && " .
         'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-provision-recovery-schedule probe ' .
+        '>/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-recovery-maintenance enter probe probe ' .
         '>/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap swap probe probe ' .
@@ -829,10 +833,14 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
         'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
-        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1'
+        'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-provision-recovery-schedule probe ' .
+        '>/dev/null 2>&1'
     );
     writeln('GIMME_HELPER|' . ($helperReady ? 'ready' : 'bootstrap_required'));
     $packages = configured_packages();
@@ -890,6 +898,9 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $processHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-provision-processes'
     );
+    $scheduleHelperTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-provision-recovery-schedule'
+    );
     $recoveryHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-recovery-maintenance'
     );
@@ -897,6 +908,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         __DIR__ . '/scripts/gimme-postgres-restore-swap'
     );
     if ($helperTemplate === false || $processHelperTemplate === false ||
+        $scheduleHelperTemplate === false ||
         $recoveryHelperTemplate === false || $postgresSwapHelperTemplate === false) {
         throw new \RuntimeException('Missing privileged helper source');
     }
@@ -940,6 +952,12 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         $processHelperTemplate,
     );
     $processHelper = str_replace('__GIMME_POLICY_ID__', $policy, $processHelper);
+    $scheduleHelper = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $scheduleHelperTemplate,
+    );
+    $scheduleHelper = str_replace('__GIMME_POLICY_ID__', $policy, $scheduleHelper);
     $recoveryHelper = str_replace(
         '"__GIMME_APPS_ROOT__"',
         json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
@@ -965,6 +983,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     );
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
+    $scheduleHelperEncoded = escapeshellarg(base64_encode($scheduleHelper));
     $recoveryHelperEncoded = escapeshellarg(base64_encode($recoveryHelper));
     $postgresSwapHelperEncoded = escapeshellarg(base64_encode($postgresSwapHelper));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
@@ -973,6 +992,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $sudoers = escapeshellarg(
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n" .
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-recovery-schedule *\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *\n"
         . "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-postgres-restore-swap *\n"
     );
@@ -1021,16 +1041,20 @@ printf 'GIMME_BOOTSTRAP|state|writing validated desired state\n'
 printf 'GIMME_BOOTSTRAP|helpers|installing privileged helpers\n'
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
 process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
+schedule_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-recovery-schedule.XXXXXX)
 recovery_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-recovery-maintenance.XXXXXX)
 postgres_swap_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-postgres-restore-swap.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$schedule_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
 printf %s {$processHelperEncoded} | base64 -d > "\$process_helper_tmp"
 chown root:root "\$process_helper_tmp"
 chmod 0755 "\$process_helper_tmp"
+printf %s {$scheduleHelperEncoded} | base64 -d > "\$schedule_helper_tmp"
+chown root:root "\$schedule_helper_tmp"
+chmod 0755 "\$schedule_helper_tmp"
 printf %s {$recoveryHelperEncoded} | base64 -d > "\$recovery_helper_tmp"
 chown root:root "\$recovery_helper_tmp"
 chmod 0755 "\$recovery_helper_tmp"
@@ -1044,6 +1068,7 @@ printf 'GIMME_BOOTSTRAP|policy|validating sudo policy\n'
 visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
 mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
+mv "\$schedule_helper_tmp" /usr/local/sbin/gimme-provision-recovery-schedule
 mv "\$recovery_helper_tmp" /usr/local/sbin/gimme-recovery-maintenance
 mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack

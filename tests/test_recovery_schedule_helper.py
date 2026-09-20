@@ -1,0 +1,229 @@
+import json
+import os
+import pwd
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def helper_namespace() -> dict[str, object]:
+    source = (ROOT / "scripts" / "gimme-provision-recovery-schedule").read_text()
+    source = source.replace("__GIMME_POLICY_ID__", "test-policy")
+    source = source.replace('"__GIMME_APPS_ROOT__"', json.dumps("/srv/gimme/apps"))
+    namespace: dict[str, object] = {"__name__": "gimme_recovery_schedule_helper"}
+    exec(compile(source, "gimme-provision-recovery-schedule", "exec"), namespace)
+    return namespace
+
+
+def authority(cadence: dict[str, object] | None = None) -> dict[str, object]:
+    selected = cadence or {"kind": "hourly", "minute": 15}
+    calendars = {
+        "manual": None,
+        "hourly": "*-*-* *:15:00 UTC",
+        "daily": "*-*-* 02:00:00 UTC",
+        "weekly": "Sun *-*-* 02:00:00 UTC",
+    }
+    return {
+        "schema_version": 1,
+        "deployment": "example-app",
+        "target": "devbox",
+        "policy_fingerprint": "a" * 64,
+        "cadence": selected,
+        "calendar": calendars[str(selected["kind"])],
+        "stable_delay_seconds": 123,
+        "retain_last": 7,
+        "quiesce_wait_seconds": 30,
+        "components": ["postgres"],
+        "placement": {
+            "instance": "example-app",
+            "relative_path": "deployments/example-app",
+            "database_identifier": "example_app",
+            "cache_prefix": "gimme:example-app:",
+            "site_host": "example.test",
+        },
+        "resources": {
+            "postgres": {
+                "name": "primary-db",
+                "provider": "target_local",
+                "kind": "postgres",
+                "version": "16.4",
+            }
+        },
+        "destination": {
+            "name": "primary",
+            "provider": "s3_compatible",
+            "bucket": "gimme-backups",
+            "region": "us-east-1",
+            "endpoint": None,
+            "addressing": "virtual_hosted",
+            "encryption": {"method": "AES256"},
+            "auth_mode": "ambient",
+        },
+        "status_identity": "example-app",
+    }
+
+
+@pytest.mark.parametrize(
+    ("cadence", "calendar"),
+    [
+        ({"kind": "manual"}, None),
+        ({"kind": "hourly", "minute": 15}, "*-*-* *:15:00 UTC"),
+        ({"kind": "daily", "hour": 2, "minute": 0}, "*-*-* 02:00:00 UTC"),
+        (
+            {"kind": "weekly", "weekday": "sun", "hour": 2, "minute": 0},
+            "Sun *-*-* 02:00:00 UTC",
+        ),
+    ],
+)
+def test_authority_accepts_only_derived_calendars(cadence, calendar) -> None:
+    helper = helper_namespace()
+    value = authority(cadence)
+    value["calendar"] = calendar
+
+    assert helper["validate_authority"](value, "example-app") == value
+
+    value["calendar"] = "*-*-* *:*:00"
+    with pytest.raises(RuntimeError, match="calendar mismatch"):
+        helper["validate_authority"](value, "example-app")
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("cadence", "timezone"), "Africa/Johannesburg"),
+        (("destination", "endpoint"), "https://example.test/unsafe/path"),
+        (("placement", "relative_path"), "../escape"),
+        (("resources", "postgres", "name"), "db; shutdown"),
+        (("stable_delay_seconds",), 301),
+    ],
+)
+def test_authority_rejects_unbounded_execution_inputs(path, value) -> None:
+    helper = helper_namespace()
+    selected = authority()
+    target = selected
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    with pytest.raises(RuntimeError):
+        helper["validate_authority"](selected, "example-app")
+
+
+def test_units_use_only_fixed_runner_and_hardening() -> None:
+    helper = helper_namespace()
+    helper["grp"] = SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer"))
+    account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
+
+    service = helper["service_unit"]("example-app", account)
+    timer = helper["timer_unit"]("example-app", "*-*-* *:15:00 UTC")
+
+    assert "ExecStart=/usr/local/libexec/gimme-recovery-runner scheduled example-app" in service
+    assert "LoadCredential=authority:/etc/gimme/recovery-schedules/example-app.json" in service
+    assert "NoNewPrivileges=true" in service
+    assert "ProtectSystem=strict" in service
+    assert "CapabilityBoundingSet=" in service
+    assert "OnCalendar=*-*-* *:15:00 UTC" in timer
+    assert "Persistent=true" in timer
+    assert "RandomizedDelaySec" not in timer
+
+
+def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) -> None:
+    apps = tmp_path / "apps"
+    transfer = apps / ".gimme" / "recovery-schedules"
+    transfer.mkdir(parents=True)
+    state = transfer / "example-app.json"
+    state.write_text(json.dumps(selected))
+    state.chmod(0o600)
+    runner = tmp_path / "gimme-recovery-runner"
+    runner.write_text("#!/bin/sh\n")
+    runner.chmod(0o755)
+    class RootOwnedRunner:
+        def __fspath__(self):
+            return str(runner)
+
+        def __str__(self):
+            return str(runner)
+
+        def exists(self):
+            return True
+
+        def is_symlink(self):
+            return False
+
+        def stat(self):
+            details = runner.stat()
+            return SimpleNamespace(st_mode=details.st_mode, st_uid=0)
+
+    helper.update({
+        "EXPECTED_APPS_ROOT": apps,
+        "TRANSFER_ROOT": transfer,
+        "AUTHORITY_ROOT": tmp_path / "etc" / "recovery-schedules",
+        "STATUS_ROOT": tmp_path / "var" / "recovery-schedules",
+        "SYSTEMD_ROOT": tmp_path / "systemd",
+        "RUNNER": RootOwnedRunner(),
+    })
+
+
+def test_reconcile_installs_exact_units_and_is_idempotent(tmp_path, monkeypatch) -> None:
+    helper = helper_namespace()
+    configure_filesystem(helper, tmp_path, authority())
+    calls: list[list[str]] = []
+    active: set[tuple[str, ...]] = set()
+    monkeypatch.setitem(helper, "run", lambda command: calls.append(command))
+    monkeypatch.setitem(helper, "succeeds", lambda command: tuple(command) in active)
+    monkeypatch.setattr(helper["os"], "chown", lambda *_args: None)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    helper["reconcile"]()
+
+    systemd = helper["SYSTEMD_ROOT"]
+    assert (systemd / "gimme-recovery-example-app.service").is_file()
+    assert (systemd / "gimme-recovery-example-app.timer").is_file()
+    stored = helper["AUTHORITY_ROOT"] / "example-app.json"
+    assert stored.stat().st_mode & 0o777 == 0o600
+    assert ["systemctl", "daemon-reload"] in calls
+    assert ["systemctl", "enable", "gimme-recovery-example-app.timer"] in calls
+    assert ["systemctl", "restart", "gimme-recovery-example-app.timer"] in calls
+
+    calls.clear()
+    active.update({
+        ("systemctl", "is-enabled", "--quiet", "gimme-recovery-example-app.timer"),
+        ("systemctl", "is-active", "--quiet", "gimme-recovery-example-app.timer"),
+    })
+    helper["reconcile"]()
+    assert calls == []
+
+
+def test_manual_cadence_removes_units_authority_and_credentials(tmp_path, monkeypatch) -> None:
+    helper = helper_namespace()
+    configure_filesystem(helper, tmp_path, authority({"kind": "manual"}))
+    systemd = helper["SYSTEMD_ROOT"]
+    systemd.mkdir(parents=True)
+    authority_root = helper["AUTHORITY_ROOT"]
+    authority_root.mkdir(parents=True)
+    for path in (
+        systemd / "gimme-recovery-example-app.service",
+        systemd / "gimme-recovery-example-app.timer",
+        authority_root / "example-app.json",
+        authority_root / "example-app.credentials",
+    ):
+        path.write_text("old")
+    calls: list[list[str]] = []
+    monkeypatch.setitem(helper, "run", lambda command: calls.append(command))
+    monkeypatch.setitem(helper, "succeeds", lambda _command: True)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    helper["reconcile"]()
+
+    assert not list(systemd.glob("gimme-recovery-example-app.*"))
+    assert not list(authority_root.glob("example-app*"))
+    assert ["systemctl", "disable", "--now", "gimme-recovery-example-app.timer"] in calls
+    assert ["systemctl", "daemon-reload"] in calls

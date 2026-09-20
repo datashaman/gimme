@@ -11,6 +11,7 @@ REQUIRED_FILES = (
     "deploy/aws-rds-global-bundle.pem",
     "scripts/gimme-provision-stack",
     "scripts/gimme-provision-processes",
+    "scripts/gimme-provision-recovery-schedule",
     "scripts/gimme-recovery-maintenance",
     "scripts/gimme-postgres-restore-swap",
     "scripts/gimme-capture-valkey",
