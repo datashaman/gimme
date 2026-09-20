@@ -250,6 +250,27 @@ def test_recovery_schedule_authority_crosses_as_canonical_json(
     )
 
 
+def test_recovery_schedule_valkey_credential_crosses_as_protected_file_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    credential = tmp_path / "valkey.json"
+    credential.write_text('{"username":"admin","password":"secret"}')
+
+    runner(tmp_path).run(
+        "gimme:recovery:schedule-reconcile", server(),
+        recovery_schedule_valkey_file=credential,
+    )
+
+    assert captured["GIMME_RECOVERY_SCHEDULE_VALKEY_FILE"] == str(credential)
+
+
 def test_multiple_health_probes_cross_runner_boundary_with_phase_policy(
     tmp_path: Path, monkeypatch
 ) -> None:

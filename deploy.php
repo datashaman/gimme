@@ -2064,6 +2064,8 @@ task('gimme:recovery:schedule-reconcile', function () use (
     )));
     $localCredential = getenv('GIMME_SECRET_FILE') ?: '';
     $remoteCredential = "{$directory}/{$deployment}.credentials";
+    $localValkeyCredential = getenv('GIMME_RECOVERY_SCHEDULE_VALKEY_FILE') ?: '';
+    $remoteValkeyCredential = "{$directory}/{$deployment}.valkey-credentials";
     try {
         if ($localCredential !== '') {
             if (!is_file($localCredential) || is_link($localCredential)) {
@@ -2072,6 +2074,15 @@ task('gimme:recovery:schedule-reconcile', function () use (
             upload($localCredential, $remoteCredential);
             run('chmod 0600 ' . escapeshellarg($remoteCredential));
         }
+        if ($localValkeyCredential !== '') {
+            if (!is_file($localValkeyCredential) || is_link($localValkeyCredential)) {
+                throw new \RuntimeException(
+                    'Unsafe local Recovery Schedule Valkey credential transfer'
+                );
+            }
+            upload($localValkeyCredential, $remoteValkeyCredential);
+            run('chmod 0600 ' . escapeshellarg($remoteValkeyCredential));
+        }
         run(
             'sudo -n /usr/local/sbin/gimme-provision-recovery-schedule ' .
             escapeshellarg($deployment),
@@ -2079,7 +2090,10 @@ task('gimme:recovery:schedule-reconcile', function () use (
             timeout: 1800,
         );
     } finally {
-        run('rm -f ' . escapeshellarg($remoteCredential));
+        run(
+            'rm -f ' . escapeshellarg($remoteCredential) . ' ' .
+            escapeshellarg($remoteValkeyCredential)
+        );
     }
 });
 

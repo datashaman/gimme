@@ -157,6 +157,7 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     assert "ExecStart=/usr/local/libexec/gimme-recovery-runner scheduled example-app" in service
     assert "LoadCredential=authority:/etc/gimme/recovery-schedules/example-app.json" in service
     assert "LoadCredential=aws:" not in service
+    assert "LoadCredential=valkey:" not in service
     assert (
         "LoadCredential=aws:/etc/gimme/recovery-schedules/example-app.credentials"
         in stored_service
@@ -167,6 +168,23 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     assert "OnCalendar=*-*-* *:15:00 UTC" in timer
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec" not in timer
+
+
+def test_units_load_valkey_credential_only_from_fixed_installed_path() -> None:
+    helper = helper_namespace()
+    helper["grp"] = SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer"))
+    account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
+
+    service = helper["service_unit"](
+        "example-app", account, stored_credentials=False,
+        stored_valkey_credentials=True,
+    )
+
+    assert (
+        "LoadCredential=valkey:/etc/gimme/recovery-schedules/"
+        "example-app.valkey-credentials" in service
+    )
+    assert "LoadCredential=aws:" not in service
 
 
 def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) -> None:
@@ -254,6 +272,7 @@ def test_manual_cadence_removes_units_authority_and_credentials(tmp_path, monkey
         systemd / "gimme-recovery-example-app.timer",
         authority_root / "example-app.json",
         authority_root / "example-app.credentials",
+        authority_root / "example-app.valkey-credentials",
     ):
         path.write_text("old")
     calls: list[list[str]] = []
@@ -341,3 +360,68 @@ def test_missing_stored_credential_error_does_not_expose_path(tmp_path) -> None:
 
     assert str(failure.value) == "Recovery Schedule credential transfer is unavailable"
     assert ".credentials" not in str(failure.value)
+
+
+def test_stored_valkey_credentials_are_independently_installed_and_removed(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    selected = authority()
+    selected["components"] = ["postgres", "valkey"]
+    selected["resources"]["valkey"] = {
+        "name": "cache", "provider": "aws_elasticache_valkey",
+        "kind": "valkey", "version": "9.0",
+    }
+    selected["valkey_execution"] = {
+        "prefix": "{gimme:example-app}:", "host": "cache.example.test",
+        "port": 6379, "tls": True, "auth_mode": "stored",
+    }
+    configure_filesystem(helper, tmp_path, selected)
+    transfer = helper["TRANSFER_ROOT"] / "example-app.valkey-credentials"
+    transfer.write_text(json.dumps({"username": "admin", "password": "secret-canary"}))
+    transfer.chmod(0o600)
+    monkeypatch.setitem(helper, "run", lambda _command: None)
+    monkeypatch.setitem(helper, "succeeds", lambda _command: False)
+    monkeypatch.setattr(helper["os"], "chown", lambda *_args: None)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    helper["reconcile"]()
+
+    installed = helper["AUTHORITY_ROOT"] / "example-app.valkey-credentials"
+    assert json.loads(installed.read_text()) == {
+        "username": "admin", "password": "secret-canary",
+    }
+    assert installed.stat().st_mode & 0o777 == 0o600
+    assert not transfer.exists()
+    unit = (helper["SYSTEMD_ROOT"] / "gimme-recovery-example-app.service").read_text()
+    assert "LoadCredential=valkey:" in unit
+    assert "admin" not in unit
+    assert "secret-canary" not in unit
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"username": "admin"},
+        {"username": "admin", "password": "line\nbreak"},
+        {"username": "admin", "password": "secret", "extra": "value"},
+    ],
+)
+def test_invalid_valkey_credentials_fail_before_mutation_and_remove_transfer(
+    tmp_path, credentials
+) -> None:
+    helper = helper_namespace()
+    configure_filesystem(helper, tmp_path, authority())
+    transfer = helper["TRANSFER_ROOT"] / "example-app.valkey-credentials"
+    transfer.write_text(json.dumps(credentials))
+    transfer.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="credential"):
+        helper["load_transferred_valkey_credentials"](
+            "example-app", os.getuid(), "stored"
+        )
+
+    assert not transfer.exists()
+    assert not helper["AUTHORITY_ROOT"].exists()

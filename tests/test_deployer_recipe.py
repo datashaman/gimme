@@ -321,11 +321,14 @@ def test_recovery_schedule_reconciliation_uses_fixed_protected_transfer() -> Non
     assert '"{$appsRoot}/.gimme/recovery-schedules"' in task
     assert '"{$directory}/{$deployment}.json"' in task
     assert '"{$directory}/{$deployment}.credentials"' in task
+    assert '"{$directory}/{$deployment}.valkey-credentials"' in task
     assert "upload($localCredential, $remoteCredential)" in task
+    assert "upload($localValkeyCredential, $remoteValkeyCredential)" in task
     assert "chmod 0600" in task
     assert "sudo -n /usr/local/sbin/gimme-provision-recovery-schedule" in task
     assert "finally" in task
     assert "rm -f" in task
+    assert "GIMME_RECOVERY_SCHEDULE_VALKEY_FILE" in task
     assert task.index("invoke('gimme:recovery:runtime-status')") < task.index(
         "recovery_schedule_state_write_command("
     ) < task.index("try {")

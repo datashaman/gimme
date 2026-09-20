@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added an independent protected transfer and systemd credential channel for scheduled managed
+  Valkey capture. The Deployer boundary accepts only a regular local credential file, cleans both
+  remote transfers unconditionally, and the privileged helper independently validates the exact
+  username/password document before atomically installing it as root-owned mode 0600 and exposing
+  it only as `LoadCredential=valkey`; local/manual policy removes stale Valkey material.
 - Extended the private Recovery Schedule authority with the bounded, secret-free Valkey
   execution contract needed by the shared Target capture core: derived namespace, observed or
   loopback endpoint, fixed TLS posture, and credential mode. The privileged helper validates the

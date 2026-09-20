@@ -144,6 +144,7 @@ class DeployerRunner:
         resource_database: str | None = None,
         resource_trust_bundle_sha256: str | None = None,
         recovery_schedule_authority: dict[str, object] | None = None,
+        recovery_schedule_valkey_file: Path | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -283,6 +284,13 @@ class DeployerRunner:
             environment["GIMME_RECOVERY_SCHEDULE_JSON"] = json.dumps(
                 recovery_schedule_authority, sort_keys=True, separators=(",", ":")
             )
+        if recovery_schedule_valkey_file is not None:
+            if recovery_schedule_valkey_file.is_symlink():
+                raise ValueError("recovery_schedule_valkey_file must be a regular local file")
+            resolved_valkey_file = recovery_schedule_valkey_file.resolve()
+            if not resolved_valkey_file.is_file():
+                raise ValueError("recovery_schedule_valkey_file must be a regular local file")
+            environment["GIMME_RECOVERY_SCHEDULE_VALKEY_FILE"] = str(resolved_valkey_file)
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if deployment_name is not None:
