@@ -117,6 +117,7 @@ def test_helper_accepts_isolated_environment_site() -> None:
                     "/srv/gimme/apps/example-app/environments/feature-x/current/public"
                 ),
                 "php_fpm_socket": "/run/php/php8.4-fpm.sock",
+                "database_identifier": "gimme_example_app_feature_x",
             }
         }
     )
@@ -140,6 +141,7 @@ def test_helper_rejects_environment_document_root_escape() -> None:
                     "site_host": "feature-x.example-app.devbox.local",
                     "document_root": "/etc/current/public",
                     "php_fpm_socket": "/run/php/php8.4-fpm.sock",
+                    "database_identifier": "gimme_example_app_feature_x",
                 }
             }
         )

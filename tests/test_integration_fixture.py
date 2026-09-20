@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -7,6 +8,25 @@ from gimme.control import StateStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SMOKE_SPEC = importlib.util.spec_from_file_location(
+    "disposable_vm_smoke", ROOT / "tests/integration/disposable_vm_smoke.py"
+)
+assert SMOKE_SPEC is not None and SMOKE_SPEC.loader is not None
+disposable_vm_smoke = importlib.util.module_from_spec(SMOKE_SPEC)
+SMOKE_SPEC.loader.exec_module(disposable_vm_smoke)
+
+
+def test_deployment_route_status_does_not_depend_on_runner_dns(monkeypatch) -> None:
+    observed: list[str] = []
+
+    def fake_ssh(*arguments: str) -> str:
+        observed.extend(arguments)
+        return "200"
+
+    monkeypatch.setattr(disposable_vm_smoke, "ssh", fake_ssh)
+
+    assert disposable_vm_smoke.deployment_route_status() == "200"
+    assert "smoke-default.gimme-ci.local:80:127.0.0.1" in observed
 
 
 def test_disposable_vm_fixture_writes_current_isolated_state(tmp_path: Path) -> None:
@@ -33,4 +53,6 @@ def test_disposable_vm_fixture_writes_current_isolated_state(tmp_path: Path) -> 
     assert state.deployments["smoke-default"].placement != (
         state.deployments["smoke-preview"].placement
     )
+    assert state.applications["smoke"].default_health is not None
+    assert state.applications["smoke"].default_health.path == "/up"
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600

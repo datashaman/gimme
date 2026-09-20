@@ -1,0 +1,210 @@
+#!/usr/bin/python3
+# GIMME_POLICY_ID=__GIMME_POLICY_ID__
+"""Swap one policy-bound Deployment database as the PostgreSQL superuser."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+from pathlib import Path
+from typing import Any
+
+
+EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+ALLOWED_DATABASES = json.loads("__GIMME_ALLOWED_DATABASES_JSON__")
+RESTORE_ROOT = EXPECTED_APPS_ROOT / ".gimme" / "restores"
+INSTANCE = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
+REQUEST = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+DATABASE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+MAX_STATE_BYTES = 16 * 1024
+RUNUSER = "/usr/sbin/runuser"
+PSQL = "/usr/bin/psql"
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def load_state(
+    instance: str, request_id: str, owner: int, expected_phase: str
+) -> dict[str, Any]:
+    path = RESTORE_ROOT / instance / f"{request_id}.json"
+    if path.is_symlink():
+        fail("restore authority must not be a symlink")
+    details = path.stat()
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != owner
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or not 0 < details.st_size <= MAX_STATE_BYTES
+    ):
+        fail("restore authority protection invalid")
+    value = json.loads(path.read_text())
+    required = {
+        "schema_version", "deployment", "request_id", "database", "role",
+        "sha256", "bytes", "phase", "live_oid", "shadow_oid",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("deployment") != instance
+        or value.get("request_id") != request_id
+        or value.get("database") != ALLOWED_DATABASES.get(instance)
+        or DATABASE.fullmatch(str(value.get("database"))) is None
+        or value.get("role") != value.get("database")
+        or value.get("phase") != expected_phase
+        or not isinstance(value.get("live_oid"), int)
+        or isinstance(value.get("live_oid"), bool)
+        or value["live_oid"] <= 0
+        or not isinstance(value.get("shadow_oid"), int)
+        or isinstance(value.get("shadow_oid"), bool)
+        or value["shadow_oid"] <= 0
+    ):
+        fail("restore authority identity invalid")
+    return value
+
+
+def query(statement: str, variables: dict[str, str]) -> str:
+    arguments = [
+        RUNUSER, "-u", "postgres", "--", PSQL, "--no-psqlrc", "-Atq",
+        "-v", "ON_ERROR_STOP=1",
+        *[item for key, value in sorted(variables.items()) for item in ("-v", f"{key}={value}")],
+        "-d", "postgres",
+    ]
+    result = subprocess.run(  # nosec B603
+        arguments, input=statement.encode(), check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, timeout=60,
+    )
+    if len(result.stdout) > 256:
+        fail("restore observation output invalid")
+    return result.stdout.decode("ascii", "strict").strip()
+
+
+def database_oid(name: str) -> int | None:
+    output = query(
+        "SELECT oid FROM pg_database WHERE datname = :'name';\n", {"name": name}
+    )
+    if output == "":
+        return None
+    if not output.isdigit() or int(output) <= 0:
+        fail("restore database observation invalid")
+    return int(output)
+
+
+def rename_database(current: str, replacement: str) -> None:
+    query(
+        "SELECT format('ALTER DATABASE %I RENAME TO %I', :'current', :'replacement') "
+        "\\gexec\n",
+        {"current": current, "replacement": replacement},
+    )
+
+
+def drop_database(database: str) -> None:
+    query(
+        "SELECT format('DROP DATABASE %I', :'database') \\gexec\n",
+        {"database": database},
+    )
+
+
+def derived_identities(database: str, request_id: str) -> tuple[str, str]:
+    digest = hashlib.sha256(
+        f"gimme-postgres-restore-v1\0{database}\0{request_id}".encode()
+    ).hexdigest()[:24]
+    return f"gimme_shadow_{digest}", f"gimme_previous_{digest}"
+
+
+def swap(state: dict[str, Any]) -> None:
+    database = state["database"]
+    shadow, previous = derived_identities(database, state["request_id"])
+    live_oid, shadow_oid = state["live_oid"], state["shadow_oid"]
+    observed = {
+        "live": database_oid(database),
+        "shadow": database_oid(shadow),
+        "previous": database_oid(previous),
+    }
+    if observed == {"live": shadow_oid, "shadow": None, "previous": live_oid}:
+        return
+    if observed == {"live": live_oid, "shadow": shadow_oid, "previous": None}:
+        query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
+            {"database": database},
+        )
+        rename_database(database, previous)
+    elif observed != {"live": None, "shadow": shadow_oid, "previous": live_oid}:
+        fail("restore swap state ambiguous")
+    try:
+        rename_database(shadow, database)
+    except Exception:
+        if database_oid(database) is None and database_oid(previous) == live_oid:
+            rename_database(previous, database)
+        raise
+    if database_oid(database) != shadow_oid or database_oid(previous) != live_oid:
+        fail("restore swap verification failed")
+
+
+def cleanup(state: dict[str, Any]) -> None:
+    database = state["database"]
+    shadow, previous = derived_identities(database, state["request_id"])
+    live_oid, shadow_oid = state["live_oid"], state["shadow_oid"]
+    observed = {
+        "live": database_oid(database),
+        "shadow": database_oid(shadow),
+        "previous": database_oid(previous),
+    }
+    if observed == {"live": shadow_oid, "shadow": None, "previous": None}:
+        return
+    if observed != {"live": shadow_oid, "shadow": None, "previous": live_oid}:
+        fail("restore cleanup state ambiguous")
+    query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
+        {"database": previous},
+    )
+    drop_database(previous)
+    if database_oid(database) != shadow_oid or database_oid(previous) is not None:
+        fail("restore cleanup verification failed")
+
+
+def main() -> None:
+    if len(sys.argv) != 4 or sys.argv[1] not in {"swap", "cleanup"}:
+        fail("restore swap arguments invalid")
+    action, instance, request_id = sys.argv[1:]
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if (
+        not isinstance(ALLOWED_DATABASES, dict)
+        or not ALLOWED_DATABASES
+        or any(
+            not isinstance(key, str)
+            or INSTANCE.fullmatch(key) is None
+            or not isinstance(value, str)
+            or DATABASE.fullmatch(value) is None
+            for key, value in ALLOWED_DATABASES.items()
+        )
+        or INSTANCE.fullmatch(instance) is None
+        or REQUEST.fullmatch(request_id) is None
+        or sudo_user == ""
+    ):
+        fail("restore swap identity invalid")
+    owner = pwd.getpwnam(sudo_user).pw_uid
+    expected_phase = "shadow_verified" if action == "swap" else "data_replaced"
+    {"swap": swap, "cleanup": cleanup}[action](
+        load_state(instance, request_id, owner, expected_phase)
+    )
+    print(f"GIMME_POSTGRES_PRIVILEGED_RESTORE|{action}_ready")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError, RuntimeError,
+            subprocess.SubprocessError):
+        print("GIMME_POSTGRES_PRIVILEGED_SWAP_FAILED|swap_failed", file=sys.stderr)
+        raise SystemExit(1) from None

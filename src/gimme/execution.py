@@ -12,6 +12,7 @@ REQUIRED_FILES = (
     "scripts/gimme-provision-stack",
     "scripts/gimme-provision-processes",
     "scripts/gimme-recovery-maintenance",
+    "scripts/gimme-postgres-restore-swap",
     "scripts/gimme-capture-valkey",
     "scripts/gimme-restore-postgres",
     "vendor/deployer/deployer/bin/dep",

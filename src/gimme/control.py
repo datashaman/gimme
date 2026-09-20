@@ -1569,6 +1569,7 @@ def target_sites(state: ControlState, target_name: str) -> list[dict[str, str]]:
                 "site_host": deployment.placement.site_host,
                 "document_root": document_root,
                 "php_fpm_socket": php_socket,
+                "database_identifier": deployment.placement.database_identifier,
             }
         )
     return sites
