@@ -1091,16 +1091,22 @@ class Rollout(BaseModel):
     deployment: str = Field(pattern=DEPLOYMENT_NAME.pattern)
     target: str = Field(pattern=TARGET_NAME.pattern)
     generation: int = Field(ge=1, le=2_147_483_647)
-    phase: Literal["preparing", "active", "degraded"]
+    phase: Literal[
+        "preparing", "active", "completing", "reversing",
+        "completed", "reversed", "degraded",
+    ]
     stable: RolloutArtifact
     candidate: RolloutArtifact
     stable_weight: int = Field(default=100, ge=0, le=100)
     candidate_weight: int = Field(default=0, ge=0, le=100)
     temporary_slots: Literal[1] = 1
     backend_ready: bool = False
-    background_owner: Literal["stable"] = "stable"
+    background_owner: Literal["stable", "candidate"] = "stable"
     drift: Literal["none", "target_unavailable", "backend_unavailable"] = "none"
-    outcome: Literal["preparing", "ready", "prepare_failed"] = "preparing"
+    outcome: Literal[
+        "preparing", "ready", "prepare_failed", "completing", "reversing",
+        "completed", "reversed", "complete_failed", "reverse_failed",
+    ] = "preparing"
     policy_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
     contract_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
     evidence_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
@@ -1123,6 +1129,8 @@ class Rollout(BaseModel):
             raise ValueError("active rollout requires a ready candidate backend")
         if self.phase == "active" and self.outcome != "ready":
             raise ValueError("active rollout requires a ready outcome")
+        if self.phase in {"completed", "reversed"} and self.outcome != self.phase:
+            raise ValueError("terminal rollout phase and outcome must match")
         return self
 
 

@@ -233,6 +233,9 @@ Rollout is completed or reversed. Shift reviewed traffic with `plan_rollout_weig
 `apply_rollout_weights`; weights assign new cookie-accepting cohorts and are not an instantaneous
 global request percentage. Existing signed cohorts stay sticky while their backend is nonzero and
 healthy, and failed transitions restore the prior route before desired weights can change.
+At `0/100`, `plan_complete_rollout` / `complete_rollout` promote the candidate and hand off
+background ownership; `plan_reverse_rollout` / `reverse_rollout` restore stable from any
+recoverable phase. Both release temporary capacity only after verified Target cleanup.
 
 See [Build once and deploy an Application Artifact](docs/how-to/use-application-artifacts.md)
 for migration, IAM separation, publishing, multi-Target deployment, promotion, rollback,

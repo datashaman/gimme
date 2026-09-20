@@ -146,7 +146,9 @@ class RolloutOrchestrator:
             )
             or observed.get("stable_health") not in {"ready", "unavailable", "unknown"}
             or observed.get("candidate_health") not in {"ready", "unavailable", "unknown"}
-            or observed.get("phase") != "active"
+            or observed.get("phase") not in {
+                "active", "completing", "reversing", "completed", "reversed"
+            }
             or any(
                 not isinstance(observed.get(field), str)
                 or re.fullmatch(r"rollout_[0-9a-f]{64}", observed[field]) is None
@@ -158,7 +160,34 @@ class RolloutOrchestrator:
             != _fingerprint(rollout.candidate.model_dump(mode="json"))
             or not isinstance(observed.get("route_fingerprint"), str)
             or re.fullmatch(r"rollout_[0-9a-f]{64}", observed["route_fingerprint"]) is None
-            or observed.get("outcome") not in {"ready", "route_restored"}
+            or observed.get("outcome") not in {
+                "ready", "route_restored", "completing", "reversing",
+                "completed", "reversed",
+            }
+            or (
+                observed.get("phase") in {"completed", "reversed"}
+                and observed.get("outcome") != observed.get("phase")
+            )
+            or (
+                observed.get("phase") == "completed"
+                and (
+                    observed.get("stable_weight") != 0
+                    or observed.get("candidate_weight") != 100
+                    or observed.get("stable_eligible") is not False
+                    or observed.get("candidate_eligible") is not True
+                    or observed.get("candidate_health") != "ready"
+                )
+            )
+            or (
+                observed.get("phase") == "reversed"
+                and (
+                    observed.get("stable_weight") != 100
+                    or observed.get("candidate_weight") != 0
+                    or observed.get("stable_eligible") is not True
+                    or observed.get("candidate_eligible") is not False
+                    or observed.get("stable_health") != "ready"
+                )
+            )
         ):
             raise RuntimeError("rollout_target_state_invalid")
         return observed
@@ -375,6 +404,205 @@ class RolloutOrchestrator:
 
         return public_rollout(self.store.update(persist).rollouts[name])
 
+    def _lifecycle_context(self, name: str, action: str) -> dict[str, object]:
+        state = self.store.load()
+        current = state.rollouts.get(name)
+        if current is None:
+            raise ValueError("deployment has no Rollout to finalize")
+        if current.phase in {"completed", "reversed"}:
+            raise ValueError("Rollout is already terminal")
+        terminal = "completed" if action == "complete" else "reversed"
+        transition = "completing" if action == "complete" else "reversing"
+        observed = self._observed(name, current)
+        target_done = (
+            observed.get("phase") == terminal
+            and observed.get("outcome") == terminal
+        )
+        allowed = {"active", "degraded", transition}
+        if action == "reverse":
+            allowed.add("preparing")
+        if current.phase not in allowed:
+            raise ValueError(f"Rollout cannot {action} from phase {current.phase}")
+        if action == "complete" and (
+            current.candidate_weight != 100
+            or not current.backend_ready
+            or current.candidate_health != "ready"
+        ):
+            raise ValueError("Rollout completion requires 100% healthy candidate traffic")
+        if not target_done:
+            refreshed = self._context(name)
+            current = refreshed["state"].rollouts[name]
+            state = refreshed["state"]
+            observed = self._observed(name, current)
+            if action == "complete" and not observed.get("configured"):
+                raise ValueError("Rollout route is missing")
+            if observed.get("configured") and (
+                observed.get("route_fingerprint") != current.route_fingerprint
+                or observed.get("stable_weight") != current.stable_weight
+                or observed.get("candidate_weight") != current.candidate_weight
+                or observed.get("phase") not in {"active", transition}
+            ):
+                raise ValueError("Rollout Target generation is mismatched")
+        deployment = state.deployments[name]
+        application = state.applications[deployment.application]
+        if _fingerprint(self._policy(state, deployment, application)) != current.policy_fingerprint:
+            raise ValueError("Rollout policy changed")
+        current_affinity = current.affinity_generation or current.generation
+        affinity = 1 if current_affinity == 2_147_483_647 else current_affinity + 1
+        route_fingerprint = _fingerprint({
+            "action": action,
+            "generation": current.generation,
+            "affinity_generation": affinity,
+            "stable": current.stable.model_dump(mode="json"),
+            "candidate": current.candidate.model_dump(mode="json"),
+        })
+        return {
+            "state": state,
+            "deployment": deployment,
+            "desired": current.model_copy(update={"affinity_generation": affinity}),
+            "current": current,
+            "observed": observed,
+            "action": action,
+            "transition": transition,
+            "terminal": terminal,
+            "route_fingerprint": route_fingerprint,
+            "target_done": target_done,
+        }
+
+    @staticmethod
+    def _lifecycle_plan(name: str, context: dict[str, object]) -> dict[str, object]:
+        current: Rollout = context["current"]
+        action = context["action"]
+        return exact_plan({
+            "kind": f"rollout_{action}",
+            "deployment": name,
+            "generation": current.generation,
+            "current_phase": current.phase,
+            "desired_phase": context["terminal"],
+            "stable": current.stable.model_dump(mode="json"),
+            "candidate": current.candidate.model_dump(mode="json"),
+            "weights": {
+                "stable": current.stable_weight,
+                "candidate": current.candidate_weight,
+            },
+            "background_owner": current.background_owner,
+            "affinity_generation": context["desired"].affinity_generation,
+            "current_route_fingerprint": current.route_fingerprint,
+            "terminal_route_fingerprint": context["route_fingerprint"],
+            "policy_fingerprint": current.policy_fingerprint,
+            "contract_fingerprint": current.contract_fingerprint,
+            "evidence_fingerprint": current.evidence_fingerprint,
+            "retry": current.phase == context["transition"],
+            "target_already_applied": context["target_done"],
+            "effects": [
+                "verify the selected web backend and current generation",
+                "transactionally converge the sole live route and background processes",
+                "rotate affinity and retire the temporary candidate backend",
+                "release temporary capacity only after verified cleanup",
+                "restore the prior route and stable process owner on failure",
+                "return retired artifacts to ordinary release retention",
+            ],
+        })
+
+    def plan_complete(self, name: str) -> dict[str, object]:
+        return self._lifecycle_plan(name, self._lifecycle_context(name, "complete"))
+
+    def plan_reverse(self, name: str) -> dict[str, object]:
+        return self._lifecycle_plan(name, self._lifecycle_context(name, "reverse"))
+
+    def _apply_lifecycle(self, name: str, action: str, plan_id: str) -> dict[str, object]:
+        context = self._lifecycle_context(name, action)
+        self.assert_plan(self._lifecycle_plan(name, context), plan_id)
+        current: Rollout = context["current"]
+
+        if not context["target_done"]:
+            def begin(state: ControlState) -> ControlState:
+                rollout = state.rollouts.get(name)
+                if rollout != current:
+                    raise ValueError("Rollout changed before finalization")
+                updated = rollout.model_copy(update={
+                    "phase": context["transition"],
+                    "outcome": context["transition"],
+                })
+                return state.model_copy(update={
+                    "rollouts": {**state.rollouts, name: updated}
+                })
+
+            self.store.update(begin)
+            policy = self._routing_policy(
+                context, current.stable_weight, current.candidate_weight,
+                context["route_fingerprint"],
+            )
+            policy.update({
+                "action": action,
+                "affinity_generation": context["desired"].affinity_generation,
+                "candidate_build_id": current.candidate.build_id,
+            })
+            try:
+                result = self.run_deployment(
+                    f"gimme:rollout:{action}", name,
+                    rollout_policy=policy, timeout=1800,
+                )
+                observed = self._validate_observed(
+                    current, _target_result(result.output)
+                )
+                if (
+                    observed.get("phase") != context["terminal"]
+                    or observed.get("outcome") != context["terminal"]
+                    or observed.get("route_fingerprint")
+                    != context["route_fingerprint"]
+                    or observed.get("affinity_generation")
+                    != context["desired"].affinity_generation
+                ):
+                    raise RuntimeError("invalid terminal state")
+            except Exception:
+                def degrade(state: ControlState) -> ControlState:
+                    rollout = state.rollouts.get(name)
+                    if rollout is None or rollout.generation != current.generation:
+                        return state
+                    updated = rollout.model_copy(update={
+                        "phase": "degraded",
+                        "outcome": f"{action}_failed",
+                    })
+                    return state.model_copy(update={
+                        "rollouts": {**state.rollouts, name: updated}
+                    })
+
+                self.store.update(degrade)
+                raise RuntimeError(f"rollout_{action}_failed") from None
+
+        def finish(state: ControlState) -> ControlState:
+            rollout = state.rollouts.get(name)
+            if rollout is None or rollout.generation != current.generation:
+                raise ValueError("Rollout changed during finalization")
+            completed = action == "complete"
+            updated = rollout.model_copy(update={
+                "phase": context["terminal"],
+                "outcome": context["terminal"],
+                "stable_weight": 0 if completed else 100,
+                "candidate_weight": 100 if completed else 0,
+                "affinity_generation": context["desired"].affinity_generation,
+                "route_fingerprint": context["route_fingerprint"],
+                "stable_eligible": not completed,
+                "candidate_eligible": completed,
+                "stable_health": "ready",
+                "candidate_health": "ready" if completed else "unavailable",
+                "background_owner": "candidate" if completed else "stable",
+                "backend_ready": False,
+                "drift": "none",
+            })
+            return state.model_copy(update={
+                "rollouts": {**state.rollouts, name: updated}
+            })
+
+        return public_rollout(self.store.update(finish).rollouts[name])
+
+    def complete(self, name: str, plan_id: str) -> dict[str, object]:
+        return self._apply_lifecycle(name, "complete", plan_id)
+
+    def reverse(self, name: str, plan_id: str) -> dict[str, object]:
+        return self._apply_lifecycle(name, "reverse", plan_id)
+
     def _runtime_fingerprint(
         self, name: str, deployment: Any, application: Any, identity: dict[str, object]
     ) -> str:
@@ -414,7 +642,12 @@ class RolloutOrchestrator:
             raise ValueError("rollout requires artifact release mode")
         if deployment.stage not in {"staging", "production"}:
             raise ValueError("rollout requires staging or production")
-        existing = state.rollouts.get(name)
+        recorded = state.rollouts.get(name)
+        existing = (
+            None
+            if recorded is not None and recorded.phase in {"completed", "reversed"}
+            else recorded
+        )
         if existing is None:
             capacity = fleet_state(state)["targets"][deployment.target]
             if capacity["overcommitted"] or capacity["free_slots"] < 1:
@@ -456,13 +689,14 @@ class RolloutOrchestrator:
                 "reader_credential_versions", []
             ),
         })
-        generation = (
-            existing.generation
-            if existing is not None
-            else 1 + int(hashlib.sha256(
+        if existing is not None:
+            generation = existing.generation
+        else:
+            generation = 1 + int(hashlib.sha256(
                 f"{name}\0{stable.build_id}\0{candidate.build_id}".encode()
             ).hexdigest()[:7], 16)
-        )
+            if recorded is not None and generation == recorded.generation:
+                generation = 1 if generation == 2_147_483_647 else generation + 1
         desired = Rollout(
             deployment=name,
             target=deployment.target,
@@ -531,7 +765,7 @@ class RolloutOrchestrator:
 
         def reserve(state: ControlState) -> ControlState:
             current = state.rollouts.get(name)
-            if current is not None:
+            if current is not None and current.phase not in {"completed", "reversed"}:
                 if current.generation != desired.generation:
                     raise ValueError("rollout generation conflicts with current state")
                 return state
