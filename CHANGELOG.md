@@ -5,11 +5,15 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Enforced `retain_last` after every newly published or idempotently verified on-demand
+  Recovery Point. Automatic retention selects verified, unprotected points oldest-first,
+  uses the sole exact-version deletion primitive, never deletes the successful replacement,
+  and stops on the first failure with a bounded `backup_succeeded_retention_failed` result.
 - Began scheduled Recovery Policy support with strict manual/hourly/daily/weekly UTC cadence
   unions, `retain_last` from 1 through 365 (default 7), exact systemd-calendar normalization,
   latest-slot catch-up calculations, stable 0–300 second Deployment jitter, and deterministic
   policy-and-slot-scoped scheduled request identities. This slice adds policy and pure scheduling
-  semantics only; target runner, timer reconciliation, status, and retention execution remain.
+  semantics only; target runner, timer reconciliation, and status remain.
   Existing state without these fields loads as manual cadence with the documented defaults.
 - Added an executable opt-in ElastiCache recovery/rotation live matrix for an isolated registered
   Resource and Deployment. Separate `GIMME_AWS_VALKEY_LIVE_CREATE=1` and

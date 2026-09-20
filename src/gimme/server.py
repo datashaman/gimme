@@ -1360,6 +1360,10 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
             return {
                 "changed": False,
                 "recovery_point": recovery_module.public_recovery_point(existing),
+                "retention": recovery_module.enforce_recovery_retention(
+                    destination_name, destination, credentials, backup_s3, name,
+                    deployment.recovery.retain_last, point_id,
+                ),
             }
         database_name = deployment.resources.database
         database = state.resources[database_name] if database_name is not None else None
@@ -1404,10 +1408,14 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
                     destination_name, destination, credentials, backup_s3, name, point_id, dumps,
                     before_publish=restore_runtime if deployment.recovery.valkey else None,
                 )
-    return {
-        "changed": True,
-        "recovery_point": recovery_module.public_recovery_point(manifest),
-    }
+        return {
+            "changed": True,
+            "recovery_point": recovery_module.public_recovery_point(manifest),
+            "retention": recovery_module.enforce_recovery_retention(
+                destination_name, destination, credentials, backup_s3, name,
+                deployment.recovery.retain_last, point_id,
+            ),
+        }
 
 
 @mcp.tool(annotations=READ)

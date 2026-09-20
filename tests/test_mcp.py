@@ -750,12 +750,16 @@ def test_create_recovery_point_end_to_end_and_duplicate_apply_is_a_no_op(
         "example-app", "req-1", str(plan["plan_id"])
     )
     assert result["changed"] is True
+    assert result["retention"] == {
+        "outcome": "succeeded", "error_code": None, "deleted": 0, "remaining": 1,
+    }
     assert len(calls) == 1
 
     duplicate = server_module.create_recovery_point(
         "example-app", "req-1", str(plan["plan_id"])
     )
     assert duplicate["changed"] is False
+    assert duplicate["retention"] == result["retention"]
     assert len(calls) == 1, "duplicate apply must not re-run pg_dump"
 
     inventory = server_module.list_recovery_points("example-app")
@@ -767,6 +771,51 @@ def test_create_recovery_point_end_to_end_and_duplicate_apply_is_a_no_op(
     assert "pg-dump-bytes" not in encoded
     assert "gimme/recovery-points" not in encoded
     assert "version_id" not in encoded
+
+
+def test_on_demand_recovery_enforces_verified_retention_after_publication(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    deployment = selected.deployment("example-app")
+    selected.save(selected.load().model_copy(update={
+        "deployments": {
+            "example-app": deployment.model_copy(update={
+                "recovery": deployment.recovery.model_copy(update={"retain_last": 1})
+            })
+        }
+    }))
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    captures = 0
+
+    def fake_run(*args, **kwargs):
+        nonlocal captures
+        captures += 1
+        content = f"dump-{captures}".encode()
+        kwargs["backup_local_path"].write_bytes(content)
+        return CommandResult(
+            ["dep"], 0, f"GIMME_BACKUP|{hashlib.sha256(content).hexdigest()}|{len(content)}"
+        )
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    first_plan = server_module.plan_create_recovery_point("example-app", "req-1")
+    first = server_module.create_recovery_point(
+        "example-app", "req-1", str(first_plan["plan_id"])
+    )
+    second_plan = server_module.plan_create_recovery_point("example-app", "req-2")
+    second = server_module.create_recovery_point(
+        "example-app", "req-2", str(second_plan["plan_id"])
+    )
+
+    assert first["retention"]["deleted"] == 0
+    assert second["retention"] == {
+        "outcome": "succeeded", "error_code": None, "deleted": 1, "remaining": 1,
+    }
+    inventory = server_module.list_recovery_points("example-app")["recovery_points"]
+    assert [point["recovery_point_id"] for point in inventory] == [
+        second["recovery_point"]["recovery_point_id"]
+    ]
 
 
 def test_on_demand_recovery_plan_preserves_normalized_scheduled_policy(

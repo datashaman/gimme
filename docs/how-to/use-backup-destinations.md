@@ -152,8 +152,12 @@ versions are skipped. Gimme never bypasses S3 Object Lock, legal hold, or destin
 
 For the full or partial Deployment Restore procedure, Target-loss replacement, and
 failed-verification recovery, see [Restore a Deployment](restore-a-postgresql-deployment.md).
-Scheduled/systemd-timer cadences and automatic `retain_last` pruning remain separate work
-described in [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).
+Scheduled/systemd-timer execution remains separate work described in
+[ADR 0002](../adr/0002-deployment-scoped-recovery-points.md). Successful on-demand capture now
+enforces `retain_last`: verified, unprotected points are removed oldest-first after the
+replacement verifies. A pruning failure preserves the new point, stops further deletion, and
+returns `backup_succeeded_retention_failed`; retry retention with a later successful capture or
+use the explicit manual deletion workflow.
 
 The policy model already accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence
 shapes and a bounded `retain_last` value from 1 through 365. Until timer reconciliation lands,
