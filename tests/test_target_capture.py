@@ -328,3 +328,17 @@ def test_valkey_capture_reuses_fixed_binary_and_validates_marker(tmp_path) -> No
     assert component.kind == "valkey"
     assert component.records == 2
     component.path.unlink()
+
+
+def test_only_derived_systemd_valkey_credential_path_uses_mount_security() -> None:
+    from gimme.target_capture import systemd_valkey_credential
+
+    assert systemd_valkey_credential(Path(
+        "/run/credentials/gimme-recovery-example-app.service/valkey"
+    ))
+    assert not systemd_valkey_credential(Path(
+        "/tmp/gimme-recovery-example-app.service/valkey"
+    ))
+    assert not systemd_valkey_credential(Path(
+        "/run/credentials/gimme-recovery-example-app.service/aws"
+    ))

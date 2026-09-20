@@ -262,6 +262,17 @@ def recovery_point_id(deployment: str, destination: str, request_id: str) -> str
     return f"rp_{digest}"
 
 
+def systemd_valkey_credential(path: Path) -> bool:
+    """Recognize only the root-controlled credential mount of a derived schedule unit."""
+    return (
+        path.name == "valkey"
+        and path.parent.parent == Path("/run/credentials")
+        and re.fullmatch(
+            r"gimme-recovery-[a-z][a-z0-9-]{0,63}\.service", path.parent.name,
+        ) is not None
+    )
+
+
 def component_key(deployment: str, point_id: str, kind: str) -> str:
     if NAME.fullmatch(deployment) is None or POINT.fullmatch(point_id) is None:
         raise CaptureFailure("recovery_request_identity_invalid")
@@ -355,8 +366,10 @@ def capture_valkey(
         raise CaptureFailure("recovery_valkey_provenance_invalid")
     if credential_path is not None and (
         not credential_path.is_file()
-        or credential_path.is_symlink()
-        or credential_path.stat().st_mode & 0o077
+        or (
+            not systemd_valkey_credential(credential_path)
+            and (credential_path.is_symlink() or credential_path.stat().st_mode & 0o077)
+        )
     ):
         raise CaptureFailure("credentials_unavailable")
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
