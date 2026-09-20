@@ -44,6 +44,14 @@ OUTCOMES = {
     "credentials_unavailable", "credentials_expired", "destination_unavailable",
     "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
 }
+ERROR_CODES = OUTCOMES | {
+    "maintenance_failed", "maintenance_route_validation_failed",
+    "maintenance_route_reload_failed", "maintenance_quiesce_wait_failed",
+    "maintenance_process_control_failed", "postgres_capture_failed",
+    "valkey_capture_failed",
+    "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
+    "provider_configuration_invalid", "provider_client_unavailable",
+}
 AUTHORITY_KEYS = {
     "schema_version", "deployment", "target", "policy_fingerprint", "cadence",
     "calendar", "stable_delay_seconds", "retain_last", "quiesce_wait_seconds",
@@ -109,7 +117,7 @@ def validate_status(document: dict[str, Any]) -> dict[str, Any]:
         set(document) != STATUS_KEYS
         or document.get("schema_version") != 1
         or document["outcome"] not in OUTCOMES | {None}
-        or document["error_code"] not in OUTCOMES | {None}
+        or document["error_code"] not in ERROR_CODES | {None}
         or NAME.fullmatch(str(document["deployment"])) is None
         or any(
             value is not None and (
@@ -189,7 +197,7 @@ def attempt_status(
 ) -> dict[str, Any]:
     if (
         outcome not in OUTCOMES | {None}
-        or error_code not in OUTCOMES | {None}
+        or error_code not in ERROR_CODES | {None}
         or NAME.fullmatch(deployment) is None
     ):
         raise RunnerFailure("status_unavailable")
@@ -209,15 +217,49 @@ def attempt_status(
     }
 
 
+def startup_failure_status(
+    deployment: str, authority: dict[str, Any] | None, outcome: str,
+    observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist a bounded result when activation fails before execute_scheduled starts."""
+    now = utc(observed_at or datetime.now(UTC))
+    slot = None
+    if isinstance(authority, dict) and isinstance(authority.get("cadence"), dict):
+        try:
+            slot = latest_slot(authority["cadence"], now)
+        except RunnerFailure:
+            pass
+    status = attempt_status(deployment, slot or now, now, outcome, finished_at=now,
+                            error_code=outcome)
+    if slot is None:
+        status["last_logical_slot"] = None
+    return status
+
+
+def record_startup_failure(
+    state: Path, deployment: str, authority: dict[str, Any] | None, outcome: str,
+) -> bool:
+    """Best-effort status must never replace the original fixed activation failure."""
+    try:
+        atomic_status(
+            state / "status.json",
+            startup_failure_status(deployment, authority, outcome),
+        )
+    except Exception:
+        return False
+    return True
+
+
 def load_credential(
-    path: Path | None, keys: set[str] | tuple[set[str], ...]
+    path: Path | None, keys: set[str] | tuple[set[str], ...], *, systemd: bool = False,
 ) -> dict[str, str] | None:
     if path is None:
         return None
     try:
         details = path.stat()
         if (
-            path.is_symlink() or not path.is_file() or details.st_mode & 0o077
+            (not systemd and (path.is_symlink() or details.st_mode & 0o077))
+            or not path.is_file()
             or details.st_size > 16 * 1024
         ):
             raise RunnerFailure("credentials_unavailable")
@@ -239,11 +281,12 @@ def load_credential(
     return value
 
 
-def load_document(path: Path, max_bytes: int) -> dict[str, Any]:
+def load_document(path: Path, max_bytes: int, *, systemd: bool = False) -> dict[str, Any]:
     try:
         details = path.stat()
         if (
-            path.is_symlink() or not path.is_file() or details.st_mode & 0o077
+            (not systemd and (path.is_symlink() or details.st_mode & 0o077))
+            or not path.is_file()
             or not 1 <= details.st_size <= max_bytes
         ):
             raise RunnerFailure("policy_stale")
@@ -323,18 +366,40 @@ def maintenance(
         result = execute(
             [SUDO, "-n", MAINTENANCE_HELPER, action, instance, request],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=900, check=False,
+            stderr=subprocess.PIPE, timeout=900, check=False, text=True,
         )
         if result.returncode != 0:
-            raise RunnerFailure("capture_failed")
+            marker = "GIMME_RECOVERY_MAINTENANCE_FAILED|"
+            reported = result.stderr.strip() if isinstance(result.stderr, str) else ""
+            code = reported.removeprefix(marker) if reported.startswith(marker) else ""
+            if code not in ERROR_CODES or not code.startswith("maintenance_"):
+                code = "maintenance_failed"
+            raise RunnerFailure(code)
         succeeded = True
     except RunnerFailure:
         raise
     except Exception:
-        raise RunnerFailure("capture_failed") from None
+        raise RunnerFailure("maintenance_failed") from None
     finally:
         if action == "exit" and succeeded:
             request_path.unlink(missing_ok=True)
+
+
+def mapped_capture_failure(error: Exception, default: str) -> RunnerFailure:
+    safe = str(error)
+    mapped = {
+        "credentials_unavailable": "credentials_unavailable",
+        "credentials_expired": "credentials_expired",
+        "destination_unavailable": "destination_unavailable",
+        "recovery_component_verification_failed": "verification_failed",
+        "recovery_manifest_tampered": "verification_failed",
+        "recovery_manifest_invalid": "verification_failed",
+        "provider_runtime_access_denied": "provider_runtime_access_denied",
+        "provider_runtime_unavailable": "provider_runtime_unavailable",
+        "provider_configuration_invalid": "provider_configuration_invalid",
+        "provider_client_unavailable": "provider_client_unavailable",
+    }
+    return RunnerFailure(mapped.get(safe, default))
 
 
 def capture_recovery(
@@ -380,11 +445,13 @@ def capture_recovery(
         or (destination["auth_mode"] == "stored") != (aws_credentials is not None)
     ):
         raise RunnerFailure("policy_stale")
+    stage = "capture"
     try:
         store = object_store or target_capture.BotoObjectStore(destination, aws_credentials)
         point_id = target_capture.recovery_point_id(
             deployment, destination["name"], scheduled_request
         )
+        stage = "postgres_capture"
         components = [target_capture.capture_postgres(
             placement["database_identifier"], postgres["version"], directory,
         )]
@@ -403,11 +470,13 @@ def capture_recovery(
                 or valkey.get("kind") != "valkey"
             ):
                 raise RunnerFailure("policy_stale")
+            stage = "valkey_capture"
             components.append(target_capture.capture_valkey(
                 execution["prefix"], execution["host"], execution["port"],
                 execution["tls"], valkey["version"], directory,
                 valkey_credential_path,
             ))
+        stage = "publish"
         return target_capture.publish(
             store, deployment, destination["name"], point_id, components,
             observed_at=observed_at, before_publish=before_publish,
@@ -415,16 +484,7 @@ def capture_recovery(
     except RunnerFailure:
         raise
     except Exception as error:
-        safe = str(error)
-        mapped = {
-            "credentials_unavailable": "credentials_unavailable",
-            "credentials_expired": "credentials_expired",
-            "destination_unavailable": "destination_unavailable",
-            "recovery_component_verification_failed": "verification_failed",
-            "recovery_manifest_tampered": "verification_failed",
-            "recovery_manifest_invalid": "verification_failed",
-        }
-        raise RunnerFailure(mapped.get(safe, "capture_failed")) from None
+        raise mapped_capture_failure(error, f"{stage}_failed") from None
     finally:
         for component in locals().get("components", []):
             try:
@@ -472,13 +532,16 @@ def execute_capture_policy(
     if REQUEST.fullmatch(capture_request) is None:
         raise RunnerFailure("policy_stale")
     destination = authority["destination"]
-    store = target_capture.BotoObjectStore(destination, aws_credentials)
-    point_id = target_capture.recovery_point_id(
-        deployment, str(destination["name"]), capture_request
-    )
-    manifest = target_capture.find_recovery_point(
-        store, deployment, str(destination["name"]), point_id
-    )
+    try:
+        store = target_capture.BotoObjectStore(destination, aws_credentials)
+        point_id = target_capture.recovery_point_id(
+            deployment, str(destination["name"]), capture_request
+        )
+        manifest = target_capture.find_recovery_point(
+            store, deployment, str(destination["name"]), point_id
+        )
+    except Exception as error:
+        raise mapped_capture_failure(error, "capture_failed") from None
     changed = manifest is None
     if manifest is None:
         maintenance_active = False
@@ -563,9 +626,12 @@ def execute_scheduled(
             "credentials_unavailable", "credentials_expired", "destination_unavailable",
             "policy_stale", "verification_failed",
         } else "capture_failed"
+        if code.startswith("provider_"):
+            outcome = "destination_unavailable"
+        error_code = code if code in ERROR_CODES else outcome
         status.update({
             "finished_at": datetime.now(UTC).isoformat(), "outcome": outcome,
-            "error_code": outcome,
+            "error_code": error_code,
         })
     except Exception:
         status.update({
@@ -626,8 +692,14 @@ def main() -> int:
         return 1
     credentials = Path(credentials_value)
     state = Path(state_value)
+    systemd_credentials = credentials == (
+        Path("/run/credentials") / f"gimme-recovery-{deployment}.service"
+    )
+    authority = None
     try:
-        authority = load_document(credentials / "authority", 64 * 1024)
+        authority = load_document(
+            credentials / "authority", 64 * 1024, systemd=systemd_credentials,
+        )
         if authority.get("deployment") != deployment:
             raise RunnerFailure("policy_stale")
         destination = authority.get("destination")
@@ -640,6 +712,7 @@ def main() -> int:
                 {"access_key_id", "secret_access_key"},
                 {"access_key_id", "secret_access_key", "session_token"},
             ),
+            systemd=systemd_credentials,
         )
         valkey_path = (
             credentials / "valkey"
@@ -647,7 +720,9 @@ def main() -> int:
             else None
         )
         if valkey_path is not None:
-            load_credential(valkey_path, {"username", "password"})
+            load_credential(
+                valkey_path, {"username", "password"}, systemd=systemd_credentials,
+            )
         target_capture = load_target_capture()
         placement = authority.get("placement")
         relative = placement.get("relative_path") if isinstance(placement, dict) else None
@@ -678,9 +753,21 @@ def main() -> int:
         return 0 if result["outcome"] in {
             "succeeded", "backup_succeeded_retention_failed", "deployment_busy",
         } else 1
-    except RunnerFailure:
+    except RunnerFailure as error:
+        if operation == "scheduled":
+            outcome = str(error)
+            if outcome not in {
+                "policy_stale", "credentials_unavailable", "credentials_expired",
+                "destination_unavailable", "capture_failed", "verification_failed",
+            }:
+                outcome = "policy_stale"
+            record_startup_failure(state, deployment, authority, outcome)
         return 1
     except Exception:
+        if operation == "scheduled":
+            record_startup_failure(
+                state, deployment, authority, "capture_failed",
+            )
         return 1
 
 

@@ -1048,11 +1048,19 @@ def _valid_recovery_attempt_status(status: object, name: str) -> bool:
         "credentials_unavailable", "credentials_expired", "destination_unavailable",
         "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
     }
+    error_codes = outcomes | {
+        "maintenance_failed", "maintenance_route_validation_failed",
+        "maintenance_route_reload_failed", "maintenance_quiesce_wait_failed",
+        "maintenance_process_control_failed", "postgres_capture_failed",
+        "valkey_capture_failed",
+        "publish_failed", "provider_runtime_access_denied", "provider_runtime_unavailable",
+        "provider_configuration_invalid", "provider_client_unavailable",
+    }
     if (
         not isinstance(status, dict) or set(status) != fields
         or status.get("schema_version") != 1 or status.get("deployment") != name
         or status.get("outcome") not in outcomes | {None}
-        or status.get("error_code") not in outcomes | {None}
+        or status.get("error_code") not in error_codes | {None}
         or status.get("retention_outcome") not in {
             None, "succeeded", "backup_succeeded_retention_failed",
         }

@@ -65,6 +65,23 @@ def test_status_is_atomic_bounded_and_secret_safe(tmp_path) -> None:
     assert "secret-canary" not in path.read_text()
 
 
+def test_systemd_credential_boundary_does_not_reapply_source_inode_rules(tmp_path) -> None:
+    runner = runner_namespace()
+    target = tmp_path / "target"
+    target.write_text('{"access_key_id":"id","secret_access_key":"secret"}')
+    target.chmod(0o644)
+    credential = tmp_path / "aws"
+    credential.symlink_to(target)
+
+    with pytest.raises(runner["RunnerFailure"], match="^credentials_unavailable$"):
+        runner["load_credential"](
+            credential, {"access_key_id", "secret_access_key"},
+        )
+    assert runner["load_credential"](
+        credential, {"access_key_id", "secret_access_key"}, systemd=True,
+    ) == {"access_key_id": "id", "secret_access_key": "secret"}
+
+
 def runner_authority() -> dict[str, object]:
     policy = RecoveryPolicy(
         destination="primary", valkey=True,
@@ -263,12 +280,42 @@ def test_runner_maintenance_uses_only_fixed_helper_and_protected_request(
     assert "shell" not in calls[0][1]
 
     runner["maintenance"]("enter", authority, "scheduled-abc", execute=execute)
-    with pytest.raises(runner["RunnerFailure"], match="^capture_failed$"):
+    with pytest.raises(runner["RunnerFailure"], match="^maintenance_failed$"):
         runner["maintenance"](
             "exit", authority, "scheduled-abc",
             execute=lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
         )
     assert request.exists(), "failed runtime restoration must preserve retry authority"
+
+
+def test_runner_maintenance_accepts_only_fixed_helper_failure_codes(
+    tmp_path, monkeypatch
+) -> None:
+    runner = runner_namespace()
+    runner["EXPECTED_APPS_ROOT"] = tmp_path
+    authority = runner_authority()
+
+    def fixed_failure(_argv, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stderr=("GIMME_RECOVERY_MAINTENANCE_FAILED|"
+                    "maintenance_route_validation_failed\n"),
+        )
+
+    with pytest.raises(
+        runner["RunnerFailure"], match="^maintenance_route_validation_failed$"
+    ):
+        runner["maintenance"](
+            "enter", authority, "scheduled-abc", execute=fixed_failure
+        )
+
+    def unsafe_failure(_argv, **_kwargs):
+        return SimpleNamespace(returncode=1, stderr="secret provider output\n")
+
+    with pytest.raises(runner["RunnerFailure"], match="^maintenance_failed$"):
+        runner["maintenance"](
+            "enter", authority, "scheduled-abc", execute=unsafe_failure
+        )
 
 
 def test_scheduled_execution_records_busy_without_capture(tmp_path) -> None:
@@ -304,6 +351,38 @@ def test_scheduled_execution_records_expired_session_credentials(tmp_path) -> No
 
     assert result["outcome"] == "credentials_expired"
     assert result["error_code"] == "credentials_expired"
+
+
+def test_scheduled_execution_records_fixed_capture_stage_without_raw_error(tmp_path) -> None:
+    runner = runner_namespace()
+    runner["acquire_lock"] = lambda _path: SimpleNamespace(close=lambda: None)
+    runner["execute_capture_policy"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        runner["RunnerFailure"]("valkey_capture_failed")
+    )
+
+    result = runner["execute_scheduled"](
+        runner_authority(), SimpleNamespace(), tmp_path / "status.json",
+        tmp_path / "lock", tmp_path / "capture",
+        observed_at=datetime(2026, 9, 20, 10, 20, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "capture_failed"
+    assert result["error_code"] == "valkey_capture_failed"
+
+
+def test_shared_policy_maps_destination_startup_without_provider_text(tmp_path) -> None:
+    runner = runner_namespace()
+
+    class Core:
+        class BotoObjectStore:
+            def __init__(self, _destination, _credentials):
+                raise RuntimeError("destination_unavailable")
+
+    with pytest.raises(runner["RunnerFailure"], match="^destination_unavailable$"):
+        runner["execute_capture_policy"](
+            runner_authority(), "scheduled-abc", Core, tmp_path,
+            valkey_credential_path=tmp_path / "valkey",
+        )
 
 
 def test_on_demand_uses_shared_capture_policy_and_deployment_lock(tmp_path) -> None:
@@ -384,6 +463,37 @@ def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypat
     )
     assert observed["kwargs"]["aws_credentials"] is None
     assert observed["kwargs"]["valkey_credential_path"] == valkey
+
+
+def test_runner_main_records_bounded_startup_failure(tmp_path, monkeypatch) -> None:
+    runner = runner_namespace()
+    credentials = tmp_path / "credentials"
+    state = tmp_path / "state"
+    credentials.mkdir()
+    state.mkdir()
+    authority = runner_authority()
+    authority_path = credentials / "authority"
+    authority_path.write_text(json.dumps(authority))
+    authority_path.chmod(0o600)
+    valkey = credentials / "valkey"
+    valkey.write_text('{"username":"admin","password":"secret"}')
+    valkey.chmod(0o600)
+    runner["load_target_capture"] = lambda: (_ for _ in ()).throw(
+        runner["RunnerFailure"]("policy_stale")
+    )
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
+    monkeypatch.setenv("STATE_DIRECTORY", str(state))
+    monkeypatch.setattr(
+        runner["sys"], "argv", ["gimme-recovery-runner", "scheduled", "example-app"]
+    )
+
+    assert runner["main"]() == 1
+    status = json.loads((state / "status.json").read_text())
+    assert status["deployment"] == "example-app"
+    assert status["outcome"] == "policy_stale"
+    assert status["error_code"] == "policy_stale"
+    assert status["last_logical_slot"] is not None
+    assert set(status) == runner["STATUS_KEYS"]
 
 
 def test_runner_main_emits_one_bounded_on_demand_result(tmp_path, monkeypatch, capsys) -> None:

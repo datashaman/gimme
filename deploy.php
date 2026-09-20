@@ -2305,7 +2305,10 @@ LUA;
             'valkey-cli --raw EVAL ' . escapeshellarg($lua) . ' 0 ' .
             escapeshellarg($cachePrefix) . ' >/dev/null'
         );
-        run('dropdb --if-exists --force ' . escapeshellarg($database));
+        run(
+            'PGOPTIONS=' . escapeshellarg("-c role={$database}") .
+            ' dropdb --if-exists --force ' . escapeshellarg($database)
+        );
         run('dropuser --if-exists ' . escapeshellarg($database));
     }
 
@@ -2377,7 +2380,10 @@ return 1
 LUA;
         run('valkey-cli --raw EVAL ' . escapeshellarg($lua) . ' 0 ' .
             escapeshellarg($cachePrefix) . ' >/dev/null');
-        run('dropdb --if-exists --force ' . escapeshellarg($database));
+        run(
+            'PGOPTIONS=' . escapeshellarg("-c role={$database}") .
+            ' dropdb --if-exists --force ' . escapeshellarg($database)
+        );
         run('dropuser --if-exists ' . escapeshellarg($database));
     }
     $quotedPath = escapeshellarg($deployPath);

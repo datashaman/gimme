@@ -4,6 +4,8 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from gimme import recovery
 from gimme.target_capture import (
     BotoObjectStore, Component, ObjectMetadata, capture_postgres, capture_valkey, publish,
@@ -305,6 +307,32 @@ def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() ->
     assert Boto.observed["aws_access_key_id"] == "access-canary"
 
 
+def test_boto_store_maps_exact_head_absence_without_hiding_other_failures() -> None:
+    class Missing(RuntimeError):
+        response = {"Error": {"Code": "NoSuchKey"}}
+
+    class Client:
+        @staticmethod
+        def head_object(**_kwargs):
+            raise Missing("provider detail")
+
+    class Boto:
+        @staticmethod
+        def client(*_args, **_kwargs):
+            return Client()
+
+    selected = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "backups",
+        "region": "us-east-1", "endpoint": None, "addressing": "path",
+        "encryption": {"method": "aes256"}, "auth_mode": "stored",
+    }
+    store = BotoObjectStore(
+        selected, {"access_key_id": "id", "secret_access_key": "key"}, boto_module=Boto,
+    )
+
+    assert store.head("missing") is None
+
+
 def test_valkey_capture_reuses_fixed_binary_and_validates_marker(tmp_path) -> None:
     observed = {}
 
@@ -328,3 +356,33 @@ def test_valkey_capture_reuses_fixed_binary_and_validates_marker(tmp_path) -> No
     assert component.kind == "valkey"
     assert component.records == 2
     component.path.unlink()
+
+
+def test_only_derived_systemd_valkey_credential_path_uses_mount_security() -> None:
+    from gimme.target_capture import systemd_valkey_credential
+
+    assert systemd_valkey_credential(Path(
+        "/run/credentials/gimme-recovery-example-app.service/valkey"
+    ))
+    assert not systemd_valkey_credential(Path(
+        "/tmp/gimme-recovery-example-app.service/valkey"
+    ))
+    assert not systemd_valkey_credential(Path(
+        "/run/credentials/gimme-recovery-example-app.service/aws"
+    ))
+
+
+def test_boto_client_initialization_maps_only_fixed_exception_class() -> None:
+    class Boto:
+        @staticmethod
+        def client(*_args, **_kwargs):
+            raise PermissionError("secret provider path")
+
+    selected = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "backups",
+        "region": "us-east-1", "endpoint": None, "addressing": "path",
+        "encryption": {"method": "aes256"}, "auth_mode": "stored",
+    }
+    with pytest.raises(CaptureFailure, match="^provider_runtime_access_denied$"):
+        BotoObjectStore(selected, {"access_key_id": "id", "secret_access_key": "key"},
+                        boto_module=Boto)
