@@ -18,10 +18,12 @@ from gimme.recovery import (
     list_restore_records,
     load_restore_record,
     manifest_key,
+    materialize_recovery_component,
     preflight_backup_destination,
     recovery_point_deletion_targets,
     recovery_point_id,
     restore_event_key,
+    safety_recovery_point_id,
     safety_recovery_point_protected,
 )
 
@@ -118,6 +120,14 @@ def test_preflight_leaves_no_residual_objects() -> None:
     assert version_id == "v1", "must delete the exact version the probe wrote, not the latest"
 
 
+def test_safety_recovery_point_identity_has_a_separate_deterministic_domain() -> None:
+    ordinary = recovery_point_id("checkout", "primary", "restore-1")
+    safety = safety_recovery_point_id("checkout", "primary", "restore-1")
+
+    assert safety == safety_recovery_point_id("checkout", "primary", "restore-1")
+    assert safety != ordinary
+
+
 def test_preflight_cleans_up_probe_object_even_on_failure() -> None:
     class MismatchS3(FakeS3):
         def get_object(self, destination, credentials, key) -> bytes:
@@ -184,6 +194,47 @@ def test_postgres_and_valkey_publish_together_in_one_manifest(tmp_path: Path) ->
     assert [item["kind"] for item in manifest["components"]] == ["postgres", "valkey"]
     assert manifest["components"][1]["records"] == 0
     assert adapter.puts == 3  # both components, then the sole manifest
+
+
+def test_materialize_recovery_component_reads_exact_version_and_protects_file(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+    output = tmp_path / "restore" / "postgres.dump"
+
+    component = materialize_recovery_component(
+        "primary", destination(), None, adapter, "checkout", point_id,
+        "postgres", output,
+    )
+
+    assert component == manifest["components"][0]
+    assert output.read_bytes() == b"pg-dump-bytes"
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_materialize_recovery_component_rejects_tampered_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+    component = manifest["components"][0]
+    adapter.objects[str(component["key"])] = b"same-byte-count"
+    output = tmp_path / "restore" / "postgres.dump"
+
+    with pytest.raises(RecoveryError, match="recovery_manifest_tampered"):
+        materialize_recovery_component(
+            "primary", destination(), None, adapter, "checkout", point_id,
+            "postgres", output,
+        )
+
+    assert not output.exists()
 
 
 def test_components_are_verified_before_runtime_restore_and_manifest_publish(

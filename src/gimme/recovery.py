@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +29,7 @@ VERSION_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
 FORMAT_ID = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
 RESOURCE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,63}$")
 MAX_MANIFEST_BYTES = 8 * 1024
+MAX_COMPONENT_BYTES = 512 * 1024 * 1024
 REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 RESTORE_STATES = (
     "started", "maintenance_entered", "safety_verified", "safety_not_required",
@@ -319,6 +322,16 @@ def preflight_backup_destination(
 def recovery_point_id(deployment: str, destination: str, request_id: str) -> str:
     digest = hashlib.sha256(
         f"gimme-recovery-point-v1\0{deployment}\0{destination}\0{request_id}".encode()
+    ).hexdigest()[:20]
+    return f"rp_{digest}"
+
+
+def safety_recovery_point_id(
+    deployment: str, destination: str, restore_request_id: str
+) -> str:
+    digest = hashlib.sha256(
+        f"gimme-safety-recovery-point-v1\0{deployment}\0{destination}\0"
+        f"{restore_request_id}".encode()
     ).hexdigest()[:20]
     return f"rp_{digest}"
 
@@ -634,6 +647,49 @@ def find_recovery_point(
     if adapter.head_object(destination, credentials, key) is None:
         return None
     return _load_manifest(destination, credentials, adapter, deployment, destination_name, point_id)
+
+
+def materialize_recovery_component(
+    destination_name: str, destination: S3BackupDestination, credentials: Credentials,
+    adapter: S3Adapter, deployment: str, point_id: str, kind: str, path: Path,
+) -> dict[str, object]:
+    """Write one exact manifest-owned component to a protected local file."""
+    if path.exists() or path.is_symlink() or not path.is_absolute():
+        raise RecoveryError("restore_artifact_path_invalid")
+    manifest = _load_manifest(
+        destination, credentials, adapter, deployment, destination_name, point_id
+    )
+    component = next(
+        (item for item in manifest["components"] if item["kind"] == kind),  # type: ignore[union-attr]
+        None,
+    )
+    if component is None:
+        raise RecoveryError("restore_component_missing")
+    if int(component["bytes"]) > MAX_COMPONENT_BYTES:
+        raise RecoveryError("restore_component_too_large")
+    body = adapter.get_object(
+        destination, credentials, str(component["key"]), str(component["version_id"])
+    )
+    if (
+        len(body) != component["bytes"]
+        or len(body) > MAX_COMPONENT_BYTES
+        or hashlib.sha256(body).hexdigest() != component["sha256"]
+    ):
+        raise RecoveryError("restore_component_verification_failed")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return component
 
 
 def create_recovery_point(
