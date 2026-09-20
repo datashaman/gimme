@@ -832,7 +832,13 @@ def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object])
     current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
     current_target = gimme.store.load().targets[TARGET]
     replacement_target = current_target.model_copy(
-        update={"hostname": REPLACEMENT_HOSTNAME}
+        update={
+            "hostname": REPLACEMENT_HOSTNAME,
+            "system_hostname": "gimme-ci-replacement",
+            "network": current_target.network.model_copy(
+                update={"mdns_name": "gimme-ci-replacement"}
+            ),
+        }
     )
     target_update = gimme.plan_update_target(TARGET, replacement_target)
     gimme.update_target(TARGET, replacement_target, str(target_update["plan_id"]))
