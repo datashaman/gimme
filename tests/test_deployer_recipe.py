@@ -601,6 +601,8 @@ def test_artifact_mode_replaces_source_and_dependency_tasks() -> None:
     assert "packageManager" not in artifact_preflight
     assert "GIMME_ARTIFACT_SECRET_FILE" in recipe
     assert "{{release_path}}" in recipe
+    assert "get('deploy_path') . '/current'" in recipe
+    assert "GIMME_PLATFORM|" in artifact_preflight
 
 
 def test_artifact_plan_preserves_health_activation_process_and_cleanup_order() -> None:

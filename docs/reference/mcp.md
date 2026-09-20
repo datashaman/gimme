@@ -186,7 +186,22 @@ metadata before mutable release tasks. The normal shared paths, environment acti
 optimization and migrations, candidate/live health gates, symlink activation, automatic live
 rollback, worker refresh, and retained-release cleanup then apply. Artifact destinations execute
 no Git checkout, Composer install, Node/package-manager install, or frontend build. Explicit
-rollback and promotion remain source-mode-only.
+rollback remains source-mode-only.
+
+Artifact promotion is also content-addressed. `plan_promotion` reads the source Deployment's fixed
+`current` release metadata, verifies its readonly shape and canonical immutable-tree digest, and
+reconstructs the destination-context build identity without contacting the Build Target or Git.
+The plan is ready only when the destination yields the same `build_id`, uses the same Application
+and release contract, can read the exact manifest/package versions, and proves matching PHP,
+extension, OS, and architecture capability. Health and process declarations are compared through
+secret-free canonical digests. An incompatible plan returns only `artifact_incompatible` and the
+fixed action `publish_destination_context_artifact_first`.
+
+`promote_deployment` re-reads the live source metadata and all destination evidence under both
+Deployment locks. It materializes through the same safe artifact path and records the destination
+commit only after activation, live health, and managed-process refresh succeed. Failure leaves the
+desired destination source and prior live release unchanged. Promotion never invokes the Build
+Target, Git, Composer, Node, or a frontend build.
 
 Optional build-only secrets are safe environment-name mappings to bounded local-SOPS references.
 They are resolved only after plan acceptance, transferred through protected temporary files, and
@@ -309,8 +324,8 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 | `apply_deployment` | Remote change | Deploy the exact reviewed source revision or materialize the exact reviewed artifact with health gates |
 | `list_releases` | Remote read | List retained releases and the current release |
 | `rollback_deployment` | Remote change | Restore the previous release after exact confirmation |
-| `plan_promotion` | Remote read | Pin the live commit from one deployment for another |
-| `promote_deployment` | Remote change | Deploy and record the exact promoted commit |
+| `plan_promotion` | Remote read | Pin the live source commit or verify and pin one compatible live artifact for another Deployment |
+| `promote_deployment` | Remote change | Deploy the reviewed commit/artifact and record its exact commit only after success |
 | `plan_remove_deployment` | Read | Plan route, process, data, and release cleanup |
 | `remove_deployment` | Remote change | Perform exact confirmed cleanup and remove local registration |
 

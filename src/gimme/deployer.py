@@ -262,6 +262,7 @@ class DeployerRunner:
             operation = artifact_request.get("operation")
             if operation not in {
                 "inspect", "publication", "build", "inventory", "resolve", "materialize",
+                "release",
             }:
                 raise ValueError("artifact request operation is invalid")
             encoded_request = json.dumps(

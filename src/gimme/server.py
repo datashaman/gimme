@@ -154,6 +154,7 @@ def _artifact_deployment_orchestrator() -> ArtifactDeploymentOrchestrator:
         runner=runner,
         build_orchestrator=_artifact_build_orchestrator(),
         legacy_server=legacy_server,
+        run_deployment=_run_deployment,
     )
 
 
