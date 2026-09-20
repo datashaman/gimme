@@ -214,7 +214,7 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 | Tool | Access | Purpose |
 | --- | --- | --- |
 | `plan_deployment_resources` | Read | Plan routing, database/cache identities, environment, secrets, and processes, and for a managed Valkey binding the secret-free contract |
-| `apply_deployment_resources` | Remote write | Reconcile the exact resource plan |
+| `apply_deployment_resources` | Remote write | Reconcile the exact resource plan and return only a bounded outcome after secret resolution |
 | `plan_deployment` | Remote read | Resolve one commit, verify pins, and render the Deployer graph |
 | `apply_deployment` | Remote change | Deploy the exact reviewed revision with health gates |
 | `list_releases` | Remote read | List retained releases and the current release |

@@ -3183,21 +3183,26 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
         {**deployment.secrets, **_valkey_runtime(name, state, deployment)[1]},
         cast(list[dict[str, str]], expected["secret_versions"]), aws_secrets,
     )
-    with _deployment_resource_lock(name):
-        runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
-                   sites=target_sites(state, deployment.target),
-                   network_mode=target.network.mode,
-                   mise_version=target.runtimes.mise_version, timeout=1800)
-        with protected_secret_file(resolved) as secret_file:
-            result = _run_deployment("gimme:provision:app", name, secret_file=secret_file,
-                                     secret_manifest=cast(
-                                         list[dict[str, str]], expected["secret_versions"]
-                                     ),
-                                     timeout=1800)
-        save_applied_secret_manifest(
-            store.root, name, cast(list[dict[str, str]], expected["secret_versions"])
-        )
-    return _result(result)
+    try:
+        with _deployment_resource_lock(name):
+            runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
+                       sites=target_sites(state, deployment.target),
+                       network_mode=target.network.mode,
+                       mise_version=target.runtimes.mise_version, timeout=1800)
+            with protected_secret_file(resolved) as secret_file:
+                _run_deployment("gimme:provision:app", name, secret_file=secret_file,
+                                secret_manifest=cast(
+                                    list[dict[str, str]], expected["secret_versions"]
+                                ),
+                                timeout=1800)
+            save_applied_secret_manifest(
+                store.root, name, cast(list[dict[str, str]], expected["secret_versions"])
+            )
+    except Exception:
+        # Remote activation includes transactional rollback, but neither successful nor
+        # failed Deployer output is a safe MCP surface after plaintext resolution.
+        raise SecretError("deployment_secret_activation_failed") from None
+    return {"changed": True, "deployment": name}
 
 
 @mcp.tool(annotations=READ)

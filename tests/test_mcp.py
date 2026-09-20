@@ -40,6 +40,7 @@ from gimme.deployer import CommandResult
 from gimme.recovery import ObjectMetadata, RecoveryError
 from gimme.recovery import append_restore_event, recovery_point_id, restore_event_key
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
+from gimme.secrets import SecretMetadata
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
 import gimme.recovery as recovery_module
@@ -435,6 +436,102 @@ def test_plan_and_apply_have_linked_secret_safe_journal_events(tmp_path, monkeyp
     journal = (tmp_path / "state" / "operations.jsonl").read_text()
     assert "secret-client-branch" not in journal
     assert "do-not-journal-this" not in journal
+
+
+def test_external_secret_canary_never_crosses_mcp_or_failure_surfaces(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    canary = "gimme-secret-canary-must-not-escape"
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+    external = AWSSecretsManagerStore(
+        provider_account="production", region="us-east-1", prefix="gimme/apps"
+    )
+    state = selected.load()
+    deployment = state.deployments["example-app"].model_copy(update={
+        "secrets": {
+            "PRIVATE_TOKEN": SecretReference(
+                store="external", secret="private/identity", field="TOKEN"
+            )
+        }
+    })
+    selected.save(state.model_copy(update={
+        "provider_accounts": {"production": account},
+        "secret_stores": {**state.secret_stores, "external": external},
+        "deployments": {"example-app": deployment},
+    }))
+
+    class CanaryAWS:
+        def known_regions(self):
+            return {"us-east-1"}
+
+        def verify_role(self, account, role_arn):
+            return None
+
+        def describe(self, account, store_name, store, secret):
+            return SecretMetadata("version-private", "private-arn")
+
+        def resolve(self, account, store_name, store, secret, version_id):
+            return json.dumps({"TOKEN": canary})
+
+    monkeypatch.setattr(server_module, "aws_secrets", CanaryAWS())
+    temporary_paths: list[Path] = []
+    fail_activation = False
+
+    def fake_run(task, *args, **kwargs):
+        nonlocal fail_activation
+        if task == "gimme:provision:app":
+            secret_file = kwargs["secret_file"]
+            assert json.loads(secret_file.read_text()) == {"PRIVATE_TOKEN": canary}
+            temporary_paths.append(secret_file)
+            if fail_activation:
+                raise RuntimeError(f"private rollback output: {canary}")
+        if task == "gimme:diagnose:deployment":
+            return CommandResult(
+                ["dep", canary], 0,
+                f"{canary}\nGIMME_DIAGNOSTIC|release|ready|{'a' * 40}",
+            )
+        return CommandResult(["dep", canary], 0, f"private output: {canary}")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_deployment_resources("example-app")
+    applied = server_module.apply_deployment_resources(
+        "example-app", str(plan["plan_id"])
+    )
+    diagnostics = server_module.diagnose_deployment("example-app")
+
+    assert applied["changed"] is True
+    assert all(not path.exists() for path in temporary_paths)
+    public = [
+        plan, applied, diagnostics,
+        server_module.secret_store_resource("external"),
+        server_module.list_operations(subject="example-app"),
+    ]
+    assert canary not in json.dumps(public, sort_keys=True, default=str)
+    assert "private/identity" not in json.dumps(public, sort_keys=True, default=str)
+
+    fail_activation = True
+    retry = server_module.plan_deployment_resources("example-app")
+    with pytest.raises(
+        server_module.SecretError, match="^deployment_secret_activation_failed$"
+    ) as failure:
+        server_module.apply_deployment_resources(
+            "example-app", str(retry["plan_id"])
+        )
+    assert canary not in str(failure.value)
+    assert all(not path.exists() for path in temporary_paths)
+
+    assert canary not in selected.state_path.read_text()
+    durable = "\n".join(path.read_text() for path in (
+        selected.root / "operations.jsonl",
+        selected.root / "applied-secrets" / "example-app.json",
+    ))
+    assert canary not in durable
+    assert "private/identity" not in durable
 
 
 def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> None:

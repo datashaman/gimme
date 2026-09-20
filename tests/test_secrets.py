@@ -166,6 +166,34 @@ def test_missing_aws_reference_is_classified_without_value_retrieval(tmp_path: P
 
 
 @pytest.mark.parametrize(
+    ("provider_code", "safe_code"),
+    [
+        ("AccessDeniedException", "access_denied"),
+        ("ResourceNotFoundException", "missing"),
+        ("InvalidRequestException", "disabled_or_deleting"),
+        ("DecryptionFailureException", "revoked"),
+        ("ThrottlingException", "throttled"),
+        ("PrivateProviderFailure", "unavailable"),
+    ],
+)
+def test_every_provider_failure_discards_raw_canary_details(
+    provider_code: str, safe_code: str,
+) -> None:
+    canary = "gimme-secret-canary-must-not-escape"
+
+    class ProviderFailure(Exception):
+        response = {
+            "Error": {"Code": provider_code, "Message": canary},
+            "private": canary,
+        }
+
+    bounded = secrets_module._provider_error(ProviderFailure(canary), "metadata")
+
+    assert str(bounded) == f"aws_secret_metadata_{safe_code}"
+    assert canary not in str(bounded)
+
+
+@pytest.mark.parametrize(
     ("value", "code"),
     [
         ('{"TOKEN":"first","TOKEN":"second"}', "aws_secret_duplicate_field"),
