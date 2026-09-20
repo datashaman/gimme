@@ -42,7 +42,9 @@ or delete the source or Safety Recovery Point while a Restore is unresolved.
 
 Before mutation, Gimme captures and verifies one request-bound Safety Recovery Point containing
 exactly the selected non-empty or ambiguously empty destinations. PostgreSQL-only Safety contains
-only PostgreSQL; Valkey-only Safety contains only the registered prefix; full Safety contains both.
+only PostgreSQL; Valkey-only Safety contains only the registered prefix. Full Restore usually
+protects both, but omits a selected destination that is proven empty; the plan and Restore Record
+expose the exact bounded `safety_components` set.
 It verifies each exact immutable source object version. Full Restore then loads and checks a
 derived PostgreSQL shadow, clears/replays/verifies only the registered Valkey prefix, and performs
 the OID-bound PostgreSQL name swap last. The previous database remains available through private

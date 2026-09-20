@@ -368,7 +368,12 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             "selected_components", "untouched_components", "partial",
             "destinations", "request_fingerprint",
         }
-    ) or document.get("schema_version") not in {2, 3, 4}:
+    ) or (
+        document.get("schema_version") == 5 and set(document) != common_keys | {
+            "selected_components", "untouched_components", "partial",
+            "destinations", "request_fingerprint", "safety_components",
+        }
+    ) or document.get("schema_version") not in {2, 3, 4, 5}:
         raise RecoveryError("restore_record_invalid")
     destination = document.get("destination")
     if (
@@ -423,9 +428,18 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             "destinations": [destination],
             "request_fingerprint": None,
         }
+    if document["schema_version"] in {2, 3, 4}:
+        document = {
+            **document,
+            "safety_components": (
+                [] if document["safety_recovery_point_id"] is None
+                else list(document["selected_components"])
+            ),
+        }
     selected = document.get("selected_components")
     untouched = document.get("untouched_components")
     destinations = document.get("destinations")
+    safety_components = document.get("safety_components")
     if (
         not isinstance(selected, list)
         or not 1 <= len(selected) <= 2
@@ -457,7 +471,7 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             for item in destinations
         )
         or (
-            document["schema_version"] == 4
+            document["schema_version"] in {4, 5}
             and document.get("request_fingerprint") is not None
             and (
                 len(destinations) != len(selected)
@@ -479,6 +493,12 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             ) is None
         )
         or document.get("partial") != bool(untouched)
+        or not isinstance(safety_components, list)
+        or len(safety_components) != len(set(safety_components))
+        or not set(safety_components) <= set(selected)
+        or (document.get("safety_recovery_point_id") is None) != (
+            safety_components == []
+        )
     ):
         raise RecoveryError("restore_record_invalid")
     return document
@@ -537,10 +557,14 @@ def append_restore_event(
     partial: bool = False,
     destinations: list[dict[str, object]] | None = None,
     request_fingerprint: str | None = None,
+    safety_components: list[str] | None = None,
 ) -> dict[str, object]:
     """Append and round-trip one immutable, secret-safe Restore transition."""
     events = _restore_events(destination, credentials, adapter, deployment, request_id)
     previous = events[-1] if events else None
+    normalized_selected = (
+        ["postgres"] if selected_components is None else selected_components
+    )
     identity = {
         "source_recovery_point_id": source_recovery_point_id,
         "destination": {
@@ -550,9 +574,7 @@ def append_restore_event(
             "version": destination_version,
         },
         "safety_recovery_point_id": safety_recovery_point_id,
-        "selected_components": (
-            ["postgres"] if selected_components is None else selected_components
-        ),
+        "selected_components": normalized_selected,
         "untouched_components": (
             [] if untouched_components is None else untouched_components
         ),
@@ -566,6 +588,11 @@ def append_restore_event(
             }] if destinations is None else destinations
         ),
         "request_fingerprint": request_fingerprint,
+        "safety_components": (
+            normalized_selected
+            if safety_components is None and safety_recovery_point_id is not None
+            else [] if safety_components is None else safety_components
+        ),
     }
     if previous is not None and any(previous[key] != value for key, value in identity.items()):
         raise RecoveryError("restore_request_conflict")
@@ -574,7 +601,7 @@ def append_restore_event(
         raise RecoveryError("restore_transition_invalid")
     sequence = len(events)
     event = _validate_restore_event({
-        "schema_version": 4, "deployment": deployment, "request_id": request_id,
+        "schema_version": 5, "deployment": deployment, "request_id": request_id,
         "sequence": sequence, "state": state, "created_at": datetime.now(UTC).isoformat(),
         **identity,
     })
@@ -618,6 +645,7 @@ def load_restore_record(
         "partial": latest["partial"],
         "destinations": latest["destinations"],
         "request_fingerprint": latest["request_fingerprint"],
+        "safety_components": latest["safety_components"],
     }
 
 

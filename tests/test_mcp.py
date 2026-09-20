@@ -788,13 +788,14 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     assert plan["destinations"] == [
         {
             "resource": "devbox-postgres", "provider": "target_local",
-            "kind": "postgres", "version": "17.2", "empty": False,
+            "kind": "postgres", "version": "17.2", "empty": True,
         },
         {
             "resource": "devbox-valkey", "provider": "target_local",
             "kind": "valkey", "version": "8.0.1",
         },
     ]
+    assert plan["safety_components"] == ["valkey"]
 
     partial = server_module.plan_restore_deployment(
         "example-app", point, "restore-2", ["postgres"]
@@ -809,6 +810,7 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
         "resource": "devbox-postgres", "provider": "target_local",
         "kind": "postgres", "version": "17.2", "empty": True,
     }]
+    assert partial["safety_components"] == []
     assert partial["confirmation"] == (
         f"PARTIAL RESTORE DEPLOYMENT example-app FROM {point} COMPONENTS postgres "
         "BREAK CONSISTENCY WITH valkey"
@@ -1788,7 +1790,7 @@ def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_muta
     }
 
 
-def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
+def test_full_restore_protects_only_nonempty_components_and_retries_in_order(
     tmp_path, monkeypatch
 ) -> None:
     selected = use_recovery_store(tmp_path, monkeypatch)
@@ -1851,14 +1853,9 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
         action = kwargs.get("postgres_restore_action")
         calls.append((task, action))
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
         if task == "gimme:backup:dump-postgres":
-            safety_pg = b"safety-pg"
-            kwargs["backup_local_path"].write_bytes(safety_pg)
-            return CommandResult(
-                ["dep"], 0,
-                f"GIMME_BACKUP|{hashlib.sha256(safety_pg).hexdigest()}|{len(safety_pg)}",
-            )
+            raise AssertionError("empty PostgreSQL destination must not be captured")
         if task == "gimme:backup:capture-valkey":
             kwargs["backup_local_path"].write_bytes(valkey_body)
             return CommandResult(
@@ -1889,6 +1886,7 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
 
     monkeypatch.setattr(server_module, "_run_deployment", fake_run)
     plan = server_module.plan_restore_deployment("example-app", point, "restore-full")
+    assert plan["safety_components"] == ["valkey"]
     with pytest.raises(RecoveryError, match="^restore_swap_failed$"):
         server_module.apply_restore_deployment(
             "example-app", point, "restore-full", str(plan["plan_id"]),
@@ -1921,6 +1919,7 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
         "example-app", "restore-full",
     )
     assert record["request_fingerprint"] == plan["request_fingerprint"]
+    assert record["safety_components"] == ["valkey"]
     assert record["destinations"] == [
         {
             "resource": "devbox-postgres", "provider": "target_local",
@@ -1973,7 +1972,7 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
         ),
     )
     assert safety is not None
-    assert [item["kind"] for item in safety["components"]] == ["postgres", "valkey"]
+    assert [item["kind"] for item in safety["components"]] == ["valkey"]
 
 
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:
