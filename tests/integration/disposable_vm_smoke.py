@@ -711,6 +711,21 @@ def postgres_blocker(database: str, *, wait_for_database: bool = False) -> subpr
     return process
 
 
+def postgres_admin(statement: str) -> str:
+    """Run one internally fixed statement without OpenSSH shell re-tokenization."""
+    return ssh_python_output(textwrap.dedent(
+        f"""
+        import subprocess
+        result = subprocess.run(
+            ["psql", "-Atq", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+             "-c", {statement!r}],
+            check=True, text=True, stdout=subprocess.PIPE,
+        )
+        print(result.stdout.strip())
+        """
+    ))
+
+
 def wait_for_postgres_blocker(database: str, *, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     statement = (
@@ -719,7 +734,7 @@ def wait_for_postgres_blocker(database: str, *, timeout: float = 30) -> None:
         "AND application_name = 'gimme-integration-blocker'"
     )
     while time.monotonic() < deadline:
-        if ssh("psql", "-Atq", "-d", "postgres", "-c", statement) == "1":
+        if postgres_admin(statement) == "1":
             return
         time.sleep(0.05)
     raise AssertionError("PostgreSQL blocker did not connect")
@@ -738,17 +753,15 @@ def stop_postgres_blocker(process: subprocess.Popen, database: str) -> None:
         f"WHERE datname = '{database}' "
         "AND application_name = 'gimme-integration-blocker'"
     )
-    ssh("psql", "-Atq", "-d", "postgres", "-c", statement)
+    postgres_admin(statement)
 
 
 def set_database_connections(database: str, allowed: bool) -> None:
     if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
         raise AssertionError("invalid fixed integration database identity")
     action = "true" if allowed else "false"
-    ssh(
-        "sudo", "-n", "-u", "postgres", "psql", "-d", "postgres",
-        "-v", "ON_ERROR_STOP=1", "-c",
-        f'ALTER DATABASE "{database}" ALLOW_CONNECTIONS {action}',
+    postgres_admin(
+        f'ALTER DATABASE "{database}" ALLOW_CONNECTIONS {action}'
     )
 
 
