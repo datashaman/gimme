@@ -781,6 +781,16 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     assert plan["selected_components"] == ["postgres", "valkey"]
     assert plan["untouched_components"] == []
     assert plan["partial"] is False
+    assert plan["destinations"] == [
+        {
+            "resource": "devbox-postgres", "provider": "target_local",
+            "kind": "postgres", "version": "17.2", "empty": True,
+        },
+        {
+            "resource": "devbox-valkey", "provider": "target_local",
+            "kind": "valkey", "version": "8.0.1",
+        },
+    ]
 
     partial = server_module.plan_restore_deployment(
         "example-app", point, "restore-2", ["postgres"]
@@ -790,10 +800,33 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     assert partial["selected_components"] == ["postgres"]
     assert partial["untouched_components"] == ["valkey"]
     assert partial["partial"] is True
+    assert partial["destinations"] == [{
+        "resource": "devbox-postgres", "provider": "target_local",
+        "kind": "postgres", "version": "17.2", "empty": True,
+    }]
     assert partial["confirmation"] == (
         f"PARTIAL RESTORE DEPLOYMENT example-app FROM {point} COMPONENTS postgres "
         "BREAK CONSISTENCY WITH valkey"
     )
+
+    changed = selected.load()
+    changed.resources["devbox-valkey"] = ResourceConfig(
+        target="devbox", kind="valkey", version="8.0.2"
+    )
+    selected.save(changed)
+    incompatible = server_module.plan_restore_deployment(
+        "example-app", point, "restore-3", ["valkey"]
+    )
+
+    assert incompatible["selected_components"] == ["valkey"]
+    assert incompatible["untouched_components"] == ["postgres"]
+    assert incompatible["destinations"] == [{
+        "resource": "devbox-valkey", "provider": "target_local",
+        "kind": "valkey", "version": "8.0.2",
+    }]
+    assert incompatible["readiness_issues"] == [
+        "valkey_restore_unsupported", "valkey_destination_incompatible",
+    ]
 
 
 def test_restore_component_selector_is_bounded_normalized_and_explicitly_partial() -> None:

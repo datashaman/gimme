@@ -1360,6 +1360,25 @@ def _deployment_restore_plan(
         component for component in available_components
         if component not in selected_components
     ]
+    valkey_destination: dict[str, str] | None = None
+    if "valkey" in selected_components:
+        binding = deployment.resources.valkey
+        valkey_resource_name = binding.resource if binding is not None else None
+        valkey_resource = (
+            state.resources.get(valkey_resource_name)
+            if valkey_resource_name is not None else None
+        )
+        if isinstance(valkey_resource, ResourceConfig) and valkey_resource.kind == "valkey":
+            valkey_destination = {
+                "resource": str(valkey_resource_name), "provider": "target_local",
+                "kind": "valkey", "version": valkey_resource.version,
+            }
+        elif isinstance(valkey_resource, AWSElastiCacheValkeyResource):
+            valkey_destination = {
+                "resource": str(valkey_resource_name),
+                "provider": "aws_elasticache_valkey", "kind": "valkey",
+                "version": valkey_resource.engine_version,
+            }
     resource_name = deployment.resources.database
     resource = state.resources[resource_name] if resource_name is not None else None
     if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
@@ -1413,6 +1432,7 @@ def _deployment_restore_plan(
         manifest_components,
         resource_name, resource.version, original_empty,
         selected_components,
+        valkey_destination,
         None if existing_restore is None else str(existing_restore["state"]),
         request_conflict,
         destination_changed,
