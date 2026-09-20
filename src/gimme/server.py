@@ -24,17 +24,18 @@ from gimme.control import (
     AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
     ControlState, DeploymentConfig, DeploymentRegistration,
-    ManualRecoveryCadence, Resource, ResourceConfig, S3BackupDestination, SecretReference,
+    Resource, ResourceConfig, S3BackupDestination, SecretReference,
     SecretStore, StateStore, TargetConfig,
-    legacy_app, legacy_server, new_placement, target_sites,
+    legacy_app, legacy_server, target_sites,
 )
 from gimme.control_plans import (
-    deployment_removal_plan, exact_plan, migration_plan, registration_update_plan,
+    exact_plan, migration_plan, registration_update_plan,
     resource_cleanup_plan,
     resource_forget_plan, valkey_destroy_plan,
     valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
+from gimme.deployment_lifecycle_orchestration import DeploymentLifecycleOrchestrator
 from gimme.deployment_resource_orchestration import DeploymentResourceOrchestrator
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.journal import OperationJournal
@@ -145,6 +146,22 @@ def _target_runtime_orchestrator() -> TargetRuntimeOrchestrator:
         run_deployment=_run_deployment,
         deployment_resource_lock=_deployment_resource_lock,
         assert_plan=_assert_plan,
+        result=_result,
+    )
+
+
+def _deployment_lifecycle_orchestrator() -> DeploymentLifecycleOrchestrator:
+    """Compose Deployment registration and removal from current adapters."""
+    return DeploymentLifecycleOrchestrator(
+        store=store,
+        runner=runner,
+        context=_context,
+        run_deployment=_run_deployment,
+        deployment_resource_lock=_deployment_resource_lock,
+        assert_plan=_assert_plan,
+        replace=_replace,
+        delete=_delete,
+        recovery_schedule_authority=_recovery_schedule_authority,
         result=_result,
     )
 
@@ -1787,14 +1804,7 @@ def apply_forget_resource(name: Name, plan_id: PlanId, confirmation: str) -> dic
 @_journal_apply("register_deployment", "name")
 def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[str, object]:
     """Register a deployment and allocate its immutable placement identities."""
-    state = store.load()
-    if name in state.deployments:
-        raise ValueError("deployment already exists; use plan_update_deployment")
-    target = state.targets[definition.target]
-    deployment = definition.materialize(new_placement(name, target, domain=definition.domain))
-    store.save(_replace(state, "deployments", name, deployment))
-    return {"changed": True, "deployment": name,
-            "placement": deployment.placement.model_dump(mode="json")}
+    return _deployment_lifecycle_orchestrator().register_deployment(name, definition)
 
 
 @mcp.tool(annotations=READ)
@@ -1802,14 +1812,9 @@ def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[
 def plan_update_deployment(name: Name,
                            definition: DeploymentRegistration) -> dict[str, object]:
     """Show a deployment update while preserving immutable placement fields."""
-    state = store.load()
-    current = state.deployments[name]
-    placement = current.placement
-    if definition.domain is not None and definition.domain != placement.site_host:
-        placement = placement.model_copy(update={"site_host": definition.domain})
-    proposed = definition.materialize(placement)
-    _replace(state, "deployments", name, proposed)
-    return registration_update_plan("deployment_update", name, current, proposed)
+    return _deployment_lifecycle_orchestrator().plan_update_deployment(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -1817,12 +1822,9 @@ def plan_update_deployment(name: Name,
 def update_deployment(name: Name, definition: DeploymentRegistration,
                       plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed deployment update to local desired state."""
-    with _deployment_resource_lock(name):
-        expected = plan_update_deployment(name, definition)
-        _assert_plan(expected, plan_id)
-        proposed = DeploymentConfig.model_validate(expected["proposed"])
-        store.save(_replace(store.load(), "deployments", name, proposed))
-        return {"changed": True, "deployment": name}
+    return _deployment_lifecycle_orchestrator().update_deployment(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
@@ -1924,46 +1926,16 @@ def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict
 @_journal_plan("remove_deployment", "name")
 def plan_remove_deployment(name: Name) -> dict[str, object]:
     """Plan complete cleanup of one deployment and its isolated resources."""
-    _, deployment, target, _ = _context(name)
-    return deployment_removal_plan(name, deployment, target)
+    return _deployment_lifecycle_orchestrator().plan_remove_deployment(name)
 
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("remove_deployment", "name")
 def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Remove a deployment after exact plan and confirmation checks."""
-    with _deployment_resource_lock(name):
-        expected = plan_remove_deployment(name)
-        _assert_plan(expected, plan_id)
-        if confirmation != expected["confirmation"]:
-            raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-        state, deployment, _target, _application = _context(name)
-        if deployment.recovery is not None:
-            cleanup_deployment = deployment.model_copy(update={
-                "recovery": deployment.recovery.model_copy(update={
-                    "cadence": ManualRecoveryCadence(), "valkey": False,
-                })
-            })
-            authority = _recovery_schedule_authority(name, state, cleanup_deployment)
-            if authority is None:
-                raise RuntimeError("Recovery Schedule cleanup authority is unavailable")
-            try:
-                _run_deployment(
-                    "gimme:recovery:schedule-reconcile", name,
-                    recovery_schedule_authority=authority, timeout=1800,
-                )
-            except Exception:
-                raise RuntimeError("recovery_schedule_cleanup_failed") from None
-        result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
-        state = _delete(store.load(), "deployments", name)
-        store.save(state)
-        (store.root / "applied-secrets" / f"{name}.json").unlink(missing_ok=True)
-        target = state.targets[expected["target"]]
-        runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
-                   sites=target_sites(state, str(expected["target"])),
-                   network_mode=target.network.mode,
-                   mise_version=target.runtimes.mise_version, timeout=1800)
-        return _result(result)
+    return _deployment_lifecycle_orchestrator().remove_deployment(
+        name, plan_id, confirmation
+    )
 
 
 @mcp.tool(annotations=READ)
