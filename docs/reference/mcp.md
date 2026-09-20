@@ -297,6 +297,14 @@ pruning floor after a verified replacement exists; it does not prevent an operat
 manually reducing inventory below that number. Deleting the final verified point requires
 both exact confirmations returned by the plan.
 
+A Deployment Recovery Policy normalizes `retain_last` to 7 by default (accepted range 1–365)
+and accepts exactly one UTC cadence shape: `{kind: manual}`, `{kind: hourly, minute: 0}`,
+`{kind: daily, hour: 2, minute: 0}`, or
+`{kind: weekly, weekday: sun, hour: 2, minute: 0}`. The shown clock fields are defaults;
+hour is 0–23 and minute is 0–59. Arbitrary time zones, seconds, cron expressions, and extra
+calendar fields are rejected. Scheduled runner, timer reconciliation, schedule status, and
+retention execution are separate follow-on slices.
+
 Deletion accepts only a registered Deployment and Recovery Point ID. The private manifest
 supplies every object key and exact S3 version; callers cannot provide a key, prefix, path,
 or version. Components are deleted and verified one at a time, with the exact manifest

@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Began scheduled Recovery Policy support with strict manual/hourly/daily/weekly UTC cadence
+  unions, `retain_last` from 1 through 365 (default 7), exact systemd-calendar normalization,
+  latest-slot catch-up calculations, stable 0–300 second Deployment jitter, and deterministic
+  policy-and-slot-scoped scheduled request identities. This slice adds policy and pure scheduling
+  semantics only; target runner, timer reconciliation, status, and retention execution remain.
+  Existing state without these fields loads as manual cadence with the documented defaults.
 - Added an executable opt-in ElastiCache recovery/rotation live matrix for an isolated registered
   Resource and Deployment. Separate `GIMME_AWS_VALKEY_LIVE_CREATE=1` and
   `GIMME_AWS_VALKEY_LIVE_DESTROY=1` flags authorize creation/rotation and exact deletion. The

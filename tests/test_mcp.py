@@ -769,6 +769,31 @@ def test_create_recovery_point_end_to_end_and_duplicate_apply_is_a_no_op(
     assert "version_id" not in encoded
 
 
+def test_on_demand_recovery_plan_preserves_normalized_scheduled_policy(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    deployment = selected.deployment("example-app")
+    selected.save(selected.load().model_copy(update={
+        "deployments": {
+            "example-app": deployment.model_copy(update={
+                "recovery": RecoveryPolicy(
+                    destination="primary", cadence={"kind": "weekly", "weekday": "mon"},
+                    retain_last=30,
+                )
+            })
+        }
+    }))
+
+    plan = server_module.plan_create_recovery_point("example-app", "manual-request")
+
+    assert plan["cadence"] == {
+        "kind": "weekly", "weekday": "mon", "hour": 2, "minute": 0,
+    }
+    assert plan["retain_last"] == 30
+    assert plan["ready"] is True
+
+
 def test_restore_record_tool_and_resource_are_destination_authoritative(
     tmp_path, monkeypatch
 ) -> None:

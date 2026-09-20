@@ -570,18 +570,74 @@ class S3BackupDestination(BaseModel):
         return self
 
 
+class ManualRecoveryCadence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["manual"] = "manual"
+
+
+class HourlyRecoveryCadence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["hourly"] = "hourly"
+    minute: int = Field(default=0, ge=0, le=59)
+
+    @field_validator("minute", mode="before")
+    @classmethod
+    def strict_minute(cls, value: object) -> object:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("minute must be an integer")
+        return value
+
+
+class DailyRecoveryCadence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["daily"] = "daily"
+    hour: int = Field(default=2, ge=0, le=23)
+    minute: int = Field(default=0, ge=0, le=59)
+
+    @field_validator("hour", "minute", mode="before")
+    @classmethod
+    def strict_clock(cls, value: object) -> object:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("schedule clock fields must be integers")
+        return value
+
+
+class WeeklyRecoveryCadence(DailyRecoveryCadence):
+    kind: Literal["weekly"] = "weekly"
+    weekday: Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"] = "sun"
+
+
+RecoveryCadence = Annotated[
+    ManualRecoveryCadence | HourlyRecoveryCadence | DailyRecoveryCadence
+    | WeeklyRecoveryCadence,
+    Field(discriminator="kind"),
+]
+
+
 class RecoveryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     destination: str = Field(pattern=BACKUP_DESTINATION_NAME.pattern)
     valkey: bool = False
     quiesce_wait_seconds: int = Field(default=30, ge=1, le=300)
+    cadence: RecoveryCadence = Field(default_factory=ManualRecoveryCadence)
+    retain_last: int = Field(default=7, ge=1, le=365)
 
     @field_validator("quiesce_wait_seconds", mode="before")
     @classmethod
     def strict_quiesce_wait(cls, value: object) -> object:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError("quiesce_wait_seconds must be an integer")
+        return value
+
+    @field_validator("retain_last", mode="before")
+    @classmethod
+    def strict_retain_last(cls, value: object) -> object:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("retain_last must be an integer")
         return value
 
     @field_validator("valkey", mode="before")

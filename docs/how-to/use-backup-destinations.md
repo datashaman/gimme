@@ -154,3 +154,7 @@ For the full or partial Deployment Restore procedure, Target-loss replacement, a
 failed-verification recovery, see [Restore a Deployment](restore-a-postgresql-deployment.md).
 Scheduled/systemd-timer cadences and automatic `retain_last` pruning remain separate work
 described in [ADR 0002](../adr/0002-deployment-scoped-recovery-points.md).
+
+The policy model already accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence
+shapes and a bounded `retain_last` value from 1 through 365. Until timer reconciliation lands,
+leave `cadence` as `{kind: manual}`; the default is manual and the default retained count is 7.

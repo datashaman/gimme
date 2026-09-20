@@ -219,7 +219,9 @@
         "valkey": {"resource": "devbox-valkey", "uses": ["cache"]}
       },
       "recovery": {
+        "cadence": {"kind": "manual"},
         "destination": "primary",
+        "retain_last": 7,
         "valkey": false,
         "quiesce_wait_seconds": 30
       },
