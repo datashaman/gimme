@@ -197,7 +197,7 @@ def ssh(*arguments: str) -> str:
         ["ssh", "-o", "BatchMode=yes", HOSTNAME, *arguments],
         check=True,
         text=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
     )
     return result.stdout.strip()
 
@@ -208,7 +208,7 @@ def ssh_python(program: str) -> None:
         input=program,
         check=True,
         text=True,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
     )
 
 
@@ -218,7 +218,7 @@ def ssh_python_output(program: str) -> str:
         input=program,
         check=True,
         text=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
     ).stdout.strip()
 
 
@@ -542,8 +542,8 @@ def restore_probe_value() -> str:
         import subprocess
         result = subprocess.run(
             ["psql", "-Atq", "-d", {database!r}, "-c",
-             "SELECT value FROM gimme_restore_probe WHERE id = 1"],
-            check=True, text=True, capture_output=True,
+             {f"SET ROLE {database}; SELECT value FROM gimme_restore_probe WHERE id = 1"!r}],
+            check=True, text=True, stdout=subprocess.PIPE,
         )
         print(result.stdout.strip())
         """
