@@ -173,6 +173,12 @@ def setup() -> None:
                 "provider": "target_local",
                 "version": "1.0",
             },
+            "integration-valkey-replacement": {
+                "target": TARGET,
+                "kind": "valkey",
+                "provider": "target_local",
+                "version": "1.0",
+            },
         },
         "deployments": {
             "smoke-default": deployment(
@@ -402,11 +408,13 @@ def pin_resources() -> None:
         r"(\d+(?:\.\d+){0,3})",
         "PostgreSQL",
     )
-    state["resources"]["integration-valkey"]["version"] = observed_version(
+    valkey_version = observed_version(
         ssh("valkey-server", "--version"),
         r"v=(\d+(?:\.\d+){0,3})",
         "Valkey",
     )
+    state["resources"]["integration-valkey"]["version"] = valkey_version
+    state["resources"]["integration-valkey-replacement"]["version"] = valkey_version
     write_json(STATE_PATH, state)
 
 
@@ -817,6 +825,55 @@ def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object])
     assert_restore_maintenance()
     assert_recovery_valkey_state(paired_seed["expected"], unrelated_dump)
     complete_restore(gimme, "ci-empty-valkey")
+
+    from gimme.control import DeploymentRegistration, ResourceBindings, ValkeyBinding
+
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    replacement_registration = DeploymentRegistration.from_deployment(current).model_copy(
+        update={"resources": ResourceBindings(
+            database=current.resources.database,
+            valkey=ValkeyBinding(
+                resource="integration-valkey-replacement", uses=["cache"]
+            ),
+        )}
+    )
+    update = gimme.plan_update_deployment(
+        RECOVERY_DEPLOYMENT, replacement_registration
+    )
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, replacement_registration, str(update["plan_id"])
+    )
+    rebound = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    if rebound.placement != current.placement:
+        raise AssertionError("Valkey Resource replacement changed immutable placement")
+    resources = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
+    gimme.apply_deployment_resources(RECOVERY_DEPLOYMENT, str(resources["plan_id"]))
+
+    mutate_recovery_valkey_state()
+    replacement = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-replacement-valkey", ["valkey"]
+    )
+    replacement_destination = replacement["destinations"][0]
+    replacement_resource = gimme.store.load().resources[
+        "integration-valkey-replacement"
+    ]
+    if (
+        not replacement["ready"]
+        or replacement_destination["resource"] != "integration-valkey-replacement"
+        or replacement_destination["provider"] != "target_local"
+        or replacement_destination["kind"] != "valkey"
+        or replacement_destination["version"] != replacement_resource.version
+    ):
+        raise AssertionError(
+            f"replacement Valkey Resource was not accepted: {replacement}"
+        )
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-replacement-valkey",
+        str(replacement["plan_id"]), str(replacement["confirmation"]), ["valkey"],
+    )
+    assert_restore_maintenance()
+    assert_recovery_valkey_state(paired_seed["expected"], unrelated_dump)
+    complete_restore(gimme, "ci-replacement-valkey")
 
 
 def verify_postgres_restore(gimme) -> None:
