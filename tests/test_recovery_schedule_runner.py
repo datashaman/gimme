@@ -65,6 +65,23 @@ def test_status_is_atomic_bounded_and_secret_safe(tmp_path) -> None:
     assert "secret-canary" not in path.read_text()
 
 
+def test_systemd_credential_boundary_does_not_reapply_source_inode_rules(tmp_path) -> None:
+    runner = runner_namespace()
+    target = tmp_path / "target"
+    target.write_text('{"access_key_id":"id","secret_access_key":"secret"}')
+    target.chmod(0o644)
+    credential = tmp_path / "aws"
+    credential.symlink_to(target)
+
+    with pytest.raises(runner["RunnerFailure"], match="^credentials_unavailable$"):
+        runner["load_credential"](
+            credential, {"access_key_id", "secret_access_key"},
+        )
+    assert runner["load_credential"](
+        credential, {"access_key_id", "secret_access_key"}, systemd=True,
+    ) == {"access_key_id": "id", "secret_access_key": "secret"}
+
+
 def runner_authority() -> dict[str, object]:
     policy = RecoveryPolicy(
         destination="primary", valkey=True,

@@ -229,14 +229,15 @@ def startup_failure_status(
 
 
 def load_credential(
-    path: Path | None, keys: set[str] | tuple[set[str], ...]
+    path: Path | None, keys: set[str] | tuple[set[str], ...], *, systemd: bool = False,
 ) -> dict[str, str] | None:
     if path is None:
         return None
     try:
         details = path.stat()
         if (
-            path.is_symlink() or not path.is_file() or details.st_mode & 0o077
+            (not systemd and (path.is_symlink() or details.st_mode & 0o077))
+            or not path.is_file()
             or details.st_size > 16 * 1024
         ):
             raise RunnerFailure("credentials_unavailable")
@@ -258,11 +259,12 @@ def load_credential(
     return value
 
 
-def load_document(path: Path, max_bytes: int) -> dict[str, Any]:
+def load_document(path: Path, max_bytes: int, *, systemd: bool = False) -> dict[str, Any]:
     try:
         details = path.stat()
         if (
-            path.is_symlink() or not path.is_file() or details.st_mode & 0o077
+            (not systemd and (path.is_symlink() or details.st_mode & 0o077))
+            or not path.is_file()
             or not 1 <= details.st_size <= max_bytes
         ):
             raise RunnerFailure("policy_stale")
@@ -645,9 +647,14 @@ def main() -> int:
         return 1
     credentials = Path(credentials_value)
     state = Path(state_value)
+    systemd_credentials = credentials == (
+        Path("/run/credentials") / f"gimme-recovery-{deployment}.service"
+    )
     authority = None
     try:
-        authority = load_document(credentials / "authority", 64 * 1024)
+        authority = load_document(
+            credentials / "authority", 64 * 1024, systemd=systemd_credentials,
+        )
         if authority.get("deployment") != deployment:
             raise RunnerFailure("policy_stale")
         destination = authority.get("destination")
@@ -660,6 +667,7 @@ def main() -> int:
                 {"access_key_id", "secret_access_key"},
                 {"access_key_id", "secret_access_key", "session_token"},
             ),
+            systemd=systemd_credentials,
         )
         valkey_path = (
             credentials / "valkey"
@@ -667,7 +675,9 @@ def main() -> int:
             else None
         )
         if valkey_path is not None:
-            load_credential(valkey_path, {"username", "password"})
+            load_credential(
+                valkey_path, {"username", "password"}, systemd=systemd_credentials,
+            )
         target_capture = load_target_capture()
         placement = authority.get("placement")
         relative = placement.get("relative_path") if isinstance(placement, dict) else None
