@@ -350,6 +350,17 @@ def test_recovery_schedule_runtime_probe_is_fixed_and_bounded() -> None:
     assert "GIMME_RECOVERY_SCHEDULE_JSON" not in task
 
 
+def test_recovery_schedule_status_reads_only_the_fixed_runner_marker() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:schedule-status'", 1)[1].split(
+        "task('gimme:recovery:runtime-status'", 1
+    )[0]
+
+    assert "/usr/local/libexec/gimme-recovery-runner status" in task
+    assert "GIMME_RECOVERY_STATUS" in task
+    assert "[A-Za-z0-9+\\/=]{1,24576}" in task
+
+
 def test_recovery_schedule_state_writer_is_bounded_and_secret_free() -> None:
     state = (ROOT / "deploy/state.php").read_text().split(
         "function recovery_schedule_state_write_command", 1

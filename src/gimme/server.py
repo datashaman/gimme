@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -29,9 +30,9 @@ from gimme import valkey_recovery
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
-    ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource, Resource,
-    ResourceConfig, S3BackupDestination, SecretReference, SecretStore, StateStore, TargetConfig,
-    ValkeyBinding,
+    ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource,
+    ManualRecoveryCadence, Resource, ResourceConfig, S3BackupDestination, SecretReference,
+    SecretStore, StateStore, TargetConfig, ValkeyBinding,
     legacy_app, legacy_server, new_placement, runs_horizon, target_sites,
 )
 from gimme.control_plans import (
@@ -797,6 +798,49 @@ def _recovery_valkey_execution(
     }
 
 
+def _recovery_schedule_authority(
+    name: str, state: ControlState, deployment: DeploymentConfig,
+) -> dict[str, object] | None:
+    if deployment.recovery is None:
+        return None
+    destination_name = deployment.recovery.destination
+    resource_provenance: dict[str, dict[str, str]] = {}
+    for component, resource_name in (
+        ("postgres", deployment.resources.database),
+        (
+            "valkey",
+            None if deployment.resources.valkey is None
+            else deployment.resources.valkey.resource,
+        ),
+    ):
+        if resource_name is None or (
+            component == "valkey" and not deployment.recovery.valkey
+        ):
+            continue
+        resource = state.resources[resource_name]
+        version = (
+            resource.version if isinstance(resource, ResourceConfig)
+            else resource.engine_version
+        )
+        resource_provenance[component] = {
+            "name": resource_name, "provider": resource.provider,
+            "kind": resource.kind, "version": version,
+        }
+    valkey_execution = (
+        None if deployment.recovery.cadence.kind == "manual"
+        else _recovery_valkey_execution(name, state, deployment)
+    )
+    if (
+        deployment.recovery.valkey and deployment.recovery.cadence.kind != "manual"
+        and valkey_execution is None
+    ):
+        return None
+    return recovery_schedule_module.runner_authority(
+        name, deployment, destination_name, state.backup_destinations[destination_name],
+        resource_provenance, valkey_execution,
+    )
+
+
 def _resource_plan(name: str) -> dict[str, Any]:
     state, deployment, target, application = _context(name)
     secret_versions, secret_issues = _secret_plan(name, state, deployment)
@@ -808,40 +852,9 @@ def _resource_plan(name: str) -> dict[str, Any]:
         + _valkey_runtime(name, state, deployment)[3]
     )
     schedule = None
-    if deployment.recovery is not None:
-        destination_name = deployment.recovery.destination
-        resource_provenance: dict[str, dict[str, str]] = {}
-        for component, resource_name in (
-            ("postgres", deployment.resources.database),
-            (
-                "valkey",
-                None if deployment.resources.valkey is None
-                else deployment.resources.valkey.resource,
-            ),
-        ):
-            if resource_name is None or (
-                component == "valkey" and not deployment.recovery.valkey
-            ):
-                continue
-            resource = state.resources[resource_name]
-            version = (
-                resource.version if isinstance(resource, ResourceConfig)
-                else resource.engine_version
-            )
-            resource_provenance[component] = {
-                "name": resource_name,
-                "provider": resource.provider,
-                "kind": resource.kind,
-                "version": version,
-            }
-        valkey_execution = _recovery_valkey_execution(name, state, deployment)
-        if not deployment.recovery.valkey or valkey_execution is not None:
-            authority = recovery_schedule_module.runner_authority(
-                name, deployment, destination_name,
-                state.backup_destinations[destination_name], resource_provenance,
-                valkey_execution,
-            )
-            schedule = recovery_schedule_module.schedule_plan(authority)
+    authority = _recovery_schedule_authority(name, state, deployment)
+    if authority is not None:
+        schedule = recovery_schedule_module.schedule_plan(authority)
     plan = deployment_resource_plan(
         name, deployment, target, application,
         missing_secrets=issues, secret_versions=secret_versions,
@@ -1018,6 +1031,51 @@ def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
 
 
+def _valid_recovery_attempt_status(status: object, name: str) -> bool:
+    fields = {
+        "schema_version", "deployment", "last_logical_slot", "started_at", "finished_at",
+        "outcome", "error_code", "recovery_point_id", "last_verified_recovery_point_id",
+        "retention_outcome", "retention_deleted", "retention_remaining",
+    }
+    outcomes = {
+        "succeeded", "backup_succeeded_retention_failed", "deployment_busy", "policy_stale",
+        "credentials_unavailable", "credentials_expired", "destination_unavailable",
+        "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
+    }
+    if (
+        not isinstance(status, dict) or set(status) != fields
+        or status.get("schema_version") != 1 or status.get("deployment") != name
+        or status.get("outcome") not in outcomes | {None}
+        or status.get("error_code") not in outcomes | {None}
+        or status.get("retention_outcome") not in {
+            None, "succeeded", "backup_succeeded_retention_failed",
+        }
+    ):
+        return False
+    for key in ("last_logical_slot", "started_at", "finished_at"):
+        value = status.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > 64:
+            return False
+        try:
+            if datetime.fromisoformat(value).tzinfo is None:
+                return False
+        except ValueError:
+            return False
+    for key in ("recovery_point_id", "last_verified_recovery_point_id"):
+        value = status.get(key)
+        if value is not None and (
+            not isinstance(value, str) or re.fullmatch(r"rp_[a-f0-9]{20}", value) is None
+        ):
+            return False
+    return all(
+        isinstance(status.get(key), int) and not isinstance(status.get(key), bool)
+        and 0 <= status[key] <= 10_000
+        for key in ("retention_deleted", "retention_remaining")
+    )
+
+
 def _recovery_schedule_status(
     name: str, observed_at: datetime | None = None,
 ) -> dict[str, object]:
@@ -1057,10 +1115,13 @@ def _recovery_schedule_status(
             "gimme:recovery:schedule-status", name, timeout=60
         )
         markers = []
+        status_markers = []
         for raw in observation.output.splitlines():
             line = raw.split("] ", 1)[-1].strip()
             if line.startswith("GIMME_RECOVERY_TIMER|"):
                 markers.append(line.split("|"))
+            elif line.startswith("GIMME_RECOVERY_STATUS|"):
+                status_markers.append(line.split("|", 1)[1])
         if (
             len(markers) != 1 or len(markers[0]) != 3
             or markers[0][1] not in {"missing", "enabled", "disabled"}
@@ -1077,6 +1138,17 @@ def _recovery_schedule_status(
             "outcome": None,
             "error_code": None,
         })
+        if len(status_markers) == 1:
+            encoded = status_markers[0]
+            if len(encoded) <= 24_576:
+                raw_status = base64.b64decode(encoded, validate=True)
+                if len(raw_status) <= 16 * 1024:
+                    status = json.loads(raw_status)
+                    if _valid_recovery_attempt_status(status, name):
+                        result.update({
+                            key: status[key] for key in status
+                            if key not in {"schema_version", "deployment"}
+                        })
     except Exception:
         return result
     return result
@@ -3435,6 +3507,43 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
         # Remote activation includes transactional rollback, but neither successful nor
         # failed Deployer output is a safe MCP surface after plaintext resolution.
         raise SecretError("deployment_secret_activation_failed") from None
+    authority = _recovery_schedule_authority(name, state, deployment)
+    if authority is not None:
+        destination = state.backup_destinations[deployment.recovery.destination]
+        try:
+            destination_credentials = None
+            if authority["calendar"] is not None:
+                _planned, destination_credentials = _backup_destination_credentials(
+                    state, destination
+                )
+            aws_values = (
+                {} if destination_credentials is None else {
+                    "access_key_id": destination_credentials[0],
+                    "secret_access_key": destination_credentials[1],
+                }
+            )
+            valkey_values: dict[str, str] = {}
+            binding = deployment.resources.valkey
+            if (
+                authority["calendar"] is not None
+                and deployment.recovery.valkey and binding is not None
+            ):
+                resource = state.resources[binding.resource]
+                valkey_values = _valkey_capture_credential(
+                    state, binding.resource, resource
+                )
+            with ExitStack() as protected:
+                aws_file = protected.enter_context(protected_secret_file(aws_values))
+                valkey_file = protected.enter_context(
+                    protected_secret_file(valkey_values)
+                )
+                _run_deployment(
+                    "gimme:recovery:schedule-reconcile", name,
+                    secret_file=aws_file, recovery_schedule_authority=authority,
+                    recovery_schedule_valkey_file=valkey_file, timeout=1800,
+                )
+        except Exception:
+            raise SecretError("recovery_schedule_activation_failed") from None
     return {"changed": True, "deployment": name}
 
 
@@ -3544,6 +3653,23 @@ def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[st
         _assert_plan(expected, plan_id)
         if confirmation != expected["confirmation"]:
             raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
+        state, deployment, _target, _application = _context(name)
+        if deployment.recovery is not None:
+            cleanup_deployment = deployment.model_copy(update={
+                "recovery": deployment.recovery.model_copy(update={
+                    "cadence": ManualRecoveryCadence(), "valkey": False,
+                })
+            })
+            authority = _recovery_schedule_authority(name, state, cleanup_deployment)
+            if authority is None:
+                raise RuntimeError("Recovery Schedule cleanup authority is unavailable")
+            try:
+                _run_deployment(
+                    "gimme:recovery:schedule-reconcile", name,
+                    recovery_schedule_authority=authority, timeout=1800,
+                )
+            except Exception:
+                raise RuntimeError("recovery_schedule_cleanup_failed") from None
         result = _run_deployment("gimme:remove:deployment", name, timeout=1800)
         state = _delete(store.load(), "deployments", name)
         store.save(state)

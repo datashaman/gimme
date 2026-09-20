@@ -128,14 +128,15 @@ def runner_authority(
         )
     ):
         raise ValueError("Recovery Schedule resource authority mismatch")
-    if policy.valkey:
+    manual = policy.cadence.kind == "manual"
+    if policy.valkey and not (manual and valkey_execution is None):
         if (
             not isinstance(valkey_execution, dict)
             or set(valkey_execution) != {"prefix", "host", "port", "tls", "auth_mode"}
             or valkey_execution.get("auth_mode") not in {"none", "stored"}
         ):
             raise ValueError("Recovery Schedule Valkey execution authority mismatch")
-    elif valkey_execution is not None:
+    elif not policy.valkey and valkey_execution is not None:
         raise ValueError("Recovery Schedule Valkey execution authority mismatch")
     cadence = policy.cadence.model_dump(mode="json")
     authority: dict[str, object] = {

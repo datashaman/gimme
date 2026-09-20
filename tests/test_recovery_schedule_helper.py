@@ -120,6 +120,18 @@ def test_authority_accepts_only_bounded_valkey_execution() -> None:
         helper["validate_authority"](value, "example-app")
 
 
+def test_manual_valkey_authority_requires_no_runtime_endpoint_or_credential() -> None:
+    helper = helper_namespace()
+    value = authority({"kind": "manual"})
+    value["components"] = ["postgres", "valkey"]
+    value["resources"]["valkey"] = {
+        "name": "cache", "provider": "aws_elasticache_valkey",
+        "kind": "valkey", "version": "9.0",
+    }
+
+    assert helper["validate_authority"](value, "example-app") == value
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     [

@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 POINT = re.compile(r"^rp_[a-f0-9]{20}$")
@@ -499,6 +499,7 @@ def publish(
     components: list[Component],
     *,
     observed_at: datetime | None = None,
+    before_publish: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     existing = _existing_manifest(store, deployment, destination, point_id)
     if existing is not None:
@@ -557,6 +558,8 @@ def publish(
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         if len(encoded) > MAX_MANIFEST_BYTES:
             raise CaptureFailure("recovery_manifest_too_large")
+        if before_publish is not None:
+            before_publish()
         key = manifest_key(deployment, point_id)
         try:
             store.put(key, encoded, hashlib.sha256(encoded).hexdigest())
@@ -572,6 +575,13 @@ def publish(
             with suppress(Exception):
                 store.delete(key, version_id)
         raise
+
+
+def find_recovery_point(
+    store: ObjectStore, deployment: str, destination: str, point_id: str,
+) -> dict[str, object] | None:
+    """Return one fully verified immutable point, or None when it is unpublished."""
+    return _existing_manifest(store, deployment, destination, point_id)
 
 
 def verified_inventory(

@@ -966,6 +966,74 @@ def test_private_runner_authority_changes_with_bound_execution_policy() -> None:
         )
 
 
+def test_resource_apply_reconciles_recovery_schedule_after_application_secrets(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    deployment = state.deployments["example-app"].model_copy(update={
+        "recovery": RecoveryPolicy(
+            destination="primary", cadence={"kind": "hourly", "minute": 15}
+        )
+    })
+    target = state.targets["devbox"]
+    selected.save(state.model_copy(update={
+        "deployments": {"example-app": deployment},
+        "targets": {"devbox": target.model_copy(update={
+            "stack": target.stack.model_copy(update={
+                "packages": [*target.stack.packages, "python3-boto3"]
+            })
+        })},
+    }))
+    calls = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs))
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_deployment_resources("example-app")
+    result = server_module.apply_deployment_resources(
+        "example-app", str(plan["plan_id"])
+    )
+
+    assert result["changed"] is True
+    schedule = next(item for item in calls if item[0] == "gimme:recovery:schedule-reconcile")
+    assert schedule[1]["recovery_schedule_authority"]["deployment"] == "example-app"
+    assert schedule[1]["secret_file"] is None
+    assert schedule[1]["recovery_schedule_valkey_file"] is None
+    assert [item[0] for item in calls].index("gimme:provision:app") < calls.index(schedule)
+
+
+def test_deployment_removal_disables_schedule_before_deleting_placement(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs))
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_remove_deployment("example-app")
+    server_module.remove_deployment(
+        "example-app", str(plan["plan_id"]), "REMOVE example-app"
+    )
+
+    tasks = [item[0] for item in calls]
+    assert tasks.index("gimme:recovery:schedule-reconcile") < tasks.index(
+        "gimme:remove:deployment"
+    )
+    authority = next(
+        item[1]["recovery_schedule_authority"] for item in calls
+        if item[0] == "gimme:recovery:schedule-reconcile"
+    )
+    assert authority["calendar"] is None
+    assert authority["valkey_execution"] is None
+    assert "example-app" not in selected.load().deployments
+
+
 def test_recovery_valkey_execution_projects_only_bounded_runtime_metadata(
     monkeypatch,
 ) -> None:
@@ -1048,11 +1116,23 @@ def test_scheduled_recovery_status_exposes_only_bounded_observation(
             })
         }
     }))
+    attempt = {
+        "schema_version": 1, "deployment": "example-app",
+        "last_logical_slot": "2026-09-19T02:00:00+00:00",
+        "started_at": "2026-09-19T02:01:00+00:00",
+        "finished_at": "2026-09-19T02:02:00+00:00", "outcome": "succeeded",
+        "error_code": None, "recovery_point_id": "rp_" + "a" * 20,
+        "last_verified_recovery_point_id": "rp_" + "a" * 20,
+        "retention_outcome": "succeeded", "retention_deleted": 1,
+        "retention_remaining": 7,
+    }
+    marker = base64.b64encode(json.dumps(attempt).encode()).decode()
     monkeypatch.setattr(
         server_module.runner, "run",
         lambda *args, **kwargs: CommandResult(
             ["dep", "private-command"], 0,
-            "private output\nGIMME_RECOVERY_TIMER|enabled|active\n",
+            "private output\nGIMME_RECOVERY_TIMER|enabled|active\n"
+            f"GIMME_RECOVERY_STATUS|{marker}\n",
         ),
     )
 
@@ -1064,7 +1144,9 @@ def test_scheduled_recovery_status_exposes_only_bounded_observation(
     assert status["timer_state"] == "active"
     assert status["timer_enabled"] is True
     assert status["timer_active"] is True
-    assert status["outcome"] is None
+    assert status["outcome"] == "succeeded"
+    assert status["recovery_point_id"] == "rp_" + "a" * 20
+    assert status["retention_deleted"] == 1
     assert "private" not in json.dumps(status)
 
 

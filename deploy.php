@@ -2040,6 +2040,15 @@ task('gimme:recovery:schedule-status', function () use ($app): void {
         'GIMME_RECOVERY_TIMER|' . ($enabled ? 'enabled' : 'disabled') .
         '|' . ($active ? 'active' : 'inactive')
     );
+    $status = trim(run(
+        '/usr/local/libexec/gimme-recovery-runner status ' . escapeshellarg($deployment) .
+        ' 2>/dev/null || true'
+    ));
+    if ($status !== '' && preg_match(
+        '/^GIMME_RECOVERY_STATUS\|[A-Za-z0-9+\/=]{1,24576}$/', $status
+    )) {
+        writeln($status);
+    }
 });
 
 task('gimme:recovery:runtime-status', function (): void {
