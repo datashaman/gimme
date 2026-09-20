@@ -1542,6 +1542,16 @@ def verify_backup_destination() -> None:
 
     verify_recovery_schedule_matrix(gimme, definition)
 
+    with patch.object(
+        gimme, "_backup_destination_credentials",
+        return_value=(None, ("gimme-ci", "gimme-ci-secret")),
+    ):
+        verify_backup_workflows(gimme)
+
+
+def verify_backup_workflows(gimme) -> None:
+    """Exercise on-demand capture, Restore, and deletion with stored fixture auth."""
+
     seeded = seed_recovery_valkey_state()
     plan = gimme.plan_create_recovery_point(RECOVERY_DEPLOYMENT, "ci-smoke-1")
     result = gimme.create_recovery_point(
@@ -1767,8 +1777,22 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
     if status["last_logical_slot"] is None or status["recovery_point_id"] is None:
         raise AssertionError(f"scheduled status omitted verified identities: {status}")
 
-    # Switching both auth and cadence removes persisted scheduled authority and secrets.
+    # Ambient workload identity must not persist a scheduled credential even while enabled.
     update_destination(ambient_definition)
+    apply_policy({"kind": "hourly", "minute": 29})
+    ambient_service = ssh("sudo", "systemctl", "cat", f"{unit}.service")
+    if "LoadCredential=aws:" in ambient_service:
+        raise AssertionError("ambient Backup Destination persisted a credential")
+    ambient_authority = ssh(
+        "sudo", "find", "/etc/gimme/recovery-schedules", "-maxdepth", "1",
+        "-name", f"{RECOVERY_DEPLOYMENT}.credentials", "-print",
+    )
+    if ambient_authority:
+        raise AssertionError(
+            f"ambient Backup Destination retained stored credentials: {ambient_authority}"
+        )
+
+    # Switching cadence removes all scheduled authority, units, status, and secrets.
     apply_policy({"kind": "manual"})
     if ssh("sudo", "systemctl", "show", f"{unit}.timer", "-p", "LoadState", "--value") != (
         "not-found"
@@ -1780,6 +1804,11 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
     )
     if authority:
         raise AssertionError(f"manual cadence retained scheduled authority: {authority}")
+
+    # The remaining on-demand matrix runs without Target workload identity, so restore the
+    # stored destination policy. Manual cadence must still leave no scheduled credential.
+    update_destination(stored)
+    apply_policy({"kind": "manual"})
 
 
 def supersede_component(key: str) -> str:
