@@ -16,7 +16,7 @@ can create the ElastiCache service-linked role. Record the account id, region, p
 security-group ids, role ARNs, and Secret Store prefix in a private state file; do not record any
 secret value.
 
-Register that inventory in an isolated `GIMME_STATE_DIRECTORY`, then run the create, inspect,
+Register that inventory in an isolated `GIMME_STATE_DIR`, then run the create, inspect,
 bind, destroy, final-snapshot purge, and retained-secret purge plans and applies. Use a unique
 Resource name derived from the run id. Confirm the expected pending phases (`creating`,
 `deleting`, and `waiting_for_user_group`) by repeating the same confirmed apply; never issue a
@@ -49,3 +49,39 @@ service-linked role only if this disposable account has no other ElastiCache use
 the isolated Gimme state directory. A failed teardown is an operational failure: leave the tagged
 objects intact, report their identifiers to the operator, and retry the same bounded cleanup rather
 than broadening the target selection.
+
+## Run the executable recovery matrix
+
+The isolated state must contain one deployed application bound to one managed Valkey Resource.
+The Resource needs the inspection, resolver, and destructive roles documented in the Valkey
+how-to. Use a fresh run id for every invocation. The program refuses the repository's normal
+`config` directory and requires separate exact opt-ins for AWS creation/rotation and destruction:
+
+```bash
+GIMME_STATE_DIR=/absolute/path/to/isolated-state \
+GIMME_AWS_VALKEY_LIVE_CREATE=1 \
+GIMME_AWS_VALKEY_LIVE_DESTROY=1 \
+GIMME_AWS_VALKEY_RESOURCE=example-valkey \
+GIMME_AWS_VALKEY_DEPLOYMENT=example-live \
+GIMME_AWS_VALKEY_RUN_ID=gimme-live-20260920-a \
+uv run python tests/integration/aws_valkey_recovery_live_smoke.py
+```
+
+The executable test converges the registered Resource, reconciles its binding, activates the
+current Deployment environment, and rotates that Deployment's credential through the normal Gimme
+plan/apply tools. It then simulates external loss, proves ordinary `apply_resource` refuses to
+silently create an empty group, restores from the exact final snapshot through
+`plan_restore_resource` / `apply_restore_resource`, verifies the bound Deployment and retained
+credential, and removes the test-only snapshot. The restored registered Resource remains ready at
+the end; it is the same Resource the operator supplied, not an extra test group.
+
+Simulating loss is the one operation that cannot go through an MCP tool: exposing deletion of a
+still-bound group while preserving desired state would violate Gimme's destructive safeguards.
+The harness therefore calls the same narrow provider adapter used by Gimme with the exact derived
+group identity and an exact run-derived final-snapshot name. It never accepts an AWS ARN, group id,
+snapshot name, user id, secret id, command, or path from the caller. Snapshot cleanup uses that
+same exact test identity. A mode-0600 marker in the isolated state correlates deletion, restore,
+and snapshot cleanup, so repeating the same run id resumes those phases without issuing a second
+group deletion. A snapshot with no matching marker fails closed. If recovery fails after loss
+simulation, keep the snapshot and isolated state intact and rerun the same command or investigate
+before deleting anything.
