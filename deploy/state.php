@@ -222,13 +222,15 @@ function privileged_helper_source_hashes(): array
 {
     $hashes = [];
     foreach ([
-        'gimme-provision-stack', 'gimme-provision-processes',
-        'gimme-provision-recovery-schedule',
-        'gimme-recovery-maintenance', 'gimme-postgres-restore-swap',
+        'scripts/gimme-provision-stack', 'scripts/gimme-provision-processes',
+        'scripts/gimme-provision-recovery-schedule',
+        'scripts/gimme-recovery-maintenance', 'scripts/gimme-postgres-restore-swap',
+        'scripts/gimme-recovery-runner', 'scripts/gimme-capture-valkey',
+        'src/gimme/target_capture.py',
     ] as $name) {
-        $source = file_get_contents(dirname(__DIR__) . "/scripts/{$name}");
+        $source = file_get_contents(dirname(__DIR__) . "/{$name}");
         if ($source === false) {
-            throw new \RuntimeException("Missing privileged helper source: {$name}");
+            throw new \RuntimeException("Missing Target execution source: {$name}");
         }
         $hashes[$name] = hash('sha256', $source);
     }

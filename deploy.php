@@ -633,6 +633,9 @@ BASH;
         '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
         '[ -x /usr/local/sbin/gimme-recovery-maintenance ] && ' .
         '[ -x /usr/local/sbin/gimme-postgres-restore-swap ] && ' .
+        '[ -x /usr/local/libexec/gimme-recovery-runner ] && ' .
+        '[ -f /usr/local/libexec/gimme_target_capture.py ] && ' .
+        '[ -x /usr/local/libexec/gimme-capture-valkey ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
@@ -834,6 +837,9 @@ task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
+        '[ -x /usr/local/libexec/gimme-recovery-runner ] && ' .
+        '[ -f /usr/local/libexec/gimme_target_capture.py ] && ' .
+        '[ -x /usr/local/libexec/gimme-capture-valkey ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
@@ -907,10 +913,17 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $postgresSwapHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-postgres-restore-swap'
     );
+    $recoveryRunnerTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-recovery-runner'
+    );
+    $targetCapture = file_get_contents(__DIR__ . '/src/gimme/target_capture.py');
+    $valkeyCapture = file_get_contents(__DIR__ . '/scripts/gimme-capture-valkey');
     if ($helperTemplate === false || $processHelperTemplate === false ||
         $scheduleHelperTemplate === false ||
-        $recoveryHelperTemplate === false || $postgresSwapHelperTemplate === false) {
-        throw new \RuntimeException('Missing privileged helper source');
+        $recoveryHelperTemplate === false || $postgresSwapHelperTemplate === false ||
+        $recoveryRunnerTemplate === false || $targetCapture === false ||
+        $valkeyCapture === false) {
+        throw new \RuntimeException('Missing Target execution source');
     }
     $policy = privileged_helper_policy(
         $packages,
@@ -981,11 +994,22 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $postgresSwapHelper = str_replace(
         '__GIMME_POLICY_ID__', $policy, $postgresSwapHelper
     );
+    $recoveryRunner = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $recoveryRunnerTemplate,
+    );
+    $scheduleHelper = str_replace(
+        '__GIMME_RUNNER_SHA256__', hash('sha256', $recoveryRunner), $scheduleHelper
+    );
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
     $scheduleHelperEncoded = escapeshellarg(base64_encode($scheduleHelper));
     $recoveryHelperEncoded = escapeshellarg(base64_encode($recoveryHelper));
     $postgresSwapHelperEncoded = escapeshellarg(base64_encode($postgresSwapHelper));
+    $recoveryRunnerEncoded = escapeshellarg(base64_encode($recoveryRunner));
+    $targetCaptureEncoded = escapeshellarg(base64_encode($targetCapture));
+    $valkeyCaptureEncoded = escapeshellarg(base64_encode($valkeyCapture));
     $packageWords = implode(' ', array_map('escapeshellarg', $packages));
     $miseVersion = escapeshellarg(configured_mise_version() ?? '');
     $user = escapeshellarg($remoteUser);
@@ -1044,8 +1068,12 @@ process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
 schedule_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-recovery-schedule.XXXXXX)
 recovery_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-recovery-maintenance.XXXXXX)
 postgres_swap_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-postgres-restore-swap.XXXXXX)
+install -d -m 0755 /usr/local/libexec
+recovery_runner_tmp=\$(mktemp /usr/local/libexec/.gimme-recovery-runner.XXXXXX)
+target_capture_tmp=\$(mktemp /usr/local/libexec/.gimme_target_capture.py.XXXXXX)
+valkey_capture_tmp=\$(mktemp /usr/local/libexec/.gimme-capture-valkey.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$schedule_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$schedule_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$recovery_runner_tmp" "\$target_capture_tmp" "\$valkey_capture_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
@@ -1061,6 +1089,15 @@ chmod 0755 "\$recovery_helper_tmp"
 printf %s {$postgresSwapHelperEncoded} | base64 -d > "\$postgres_swap_helper_tmp"
 chown root:root "\$postgres_swap_helper_tmp"
 chmod 0755 "\$postgres_swap_helper_tmp"
+printf %s {$recoveryRunnerEncoded} | base64 -d > "\$recovery_runner_tmp"
+chown root:root "\$recovery_runner_tmp"
+chmod 0755 "\$recovery_runner_tmp"
+printf %s {$targetCaptureEncoded} | base64 -d > "\$target_capture_tmp"
+chown root:root "\$target_capture_tmp"
+chmod 0644 "\$target_capture_tmp"
+printf %s {$valkeyCaptureEncoded} | base64 -d > "\$valkey_capture_tmp"
+chown root:root "\$valkey_capture_tmp"
+chmod 0755 "\$valkey_capture_tmp"
 printf %s {$sudoers} > "\$sudoers_tmp"
 chown root:root "\$sudoers_tmp"
 chmod 0440 "\$sudoers_tmp"
@@ -1071,6 +1108,9 @@ mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
 mv "\$schedule_helper_tmp" /usr/local/sbin/gimme-provision-recovery-schedule
 mv "\$recovery_helper_tmp" /usr/local/sbin/gimme-recovery-maintenance
 mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap
+mv "\$recovery_runner_tmp" /usr/local/libexec/gimme-recovery-runner
+mv "\$target_capture_tmp" /usr/local/libexec/gimme_target_capture.py
+mv "\$valkey_capture_tmp" /usr/local/libexec/gimme-capture-valkey
 mv "\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack
 trap - EXIT
 printf 'GIMME_BOOTSTRAP|reconcile|applying target desired state\n'

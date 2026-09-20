@@ -25,6 +25,7 @@ AUTHORITY_ROOT = Path("/etc/gimme/recovery-schedules")
 STATUS_ROOT = Path("/var/lib/gimme/recovery-schedules")
 SYSTEMD_ROOT = Path("/etc/systemd/system")
 RUNNER = Path("/usr/local/libexec/gimme-recovery-runner")
+EXPECTED_RUNNER_SHA256 = "__GIMME_RUNNER_SHA256__"
 NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TARGET = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 RESOURCE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -503,13 +504,24 @@ def reconcile() -> None:
     if calendar is None:
         changed = remove_schedule(deployment)
     else:
-        runner_details = RUNNER.stat() if RUNNER.exists() and not RUNNER.is_symlink() else None
+        try:
+            runner_details = (
+                RUNNER.stat() if RUNNER.exists() and not RUNNER.is_symlink() else None
+            )
+            runner_sha256 = (
+                hashlib.sha256(RUNNER.read_bytes()).hexdigest()
+                if runner_details is not None else None
+            )
+        except OSError:
+            runner_details = None
+            runner_sha256 = None
         if (
             runner_details is None
             or not stat.S_ISREG(runner_details.st_mode)
             or runner_details.st_uid != ROOT_UID
             or runner_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             or not os.access(RUNNER, os.X_OK)
+            or runner_sha256 != EXPECTED_RUNNER_SHA256
         ):
             fail("validated Recovery Schedule runner is not installed")
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
