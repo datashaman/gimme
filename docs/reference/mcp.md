@@ -304,6 +304,9 @@ version last. A partial failure remains visible as `deletion_failed`; retry the 
 apply with the same plan and confirmations. Safety points remain protected until their
 authoritative Restore record is `completed`; source Recovery Points are likewise protected
 while any Restore using them is incomplete. Object Lock or legal hold is never bypassed.
+Provider protection and access failures return only fixed `recovery_point_object_protected`
+or `recovery_point_deletion_denied` outcomes; transport, malformed-response, deletion, and
+verification failures collapse to fixed `recovery_point_deletion_failed`.
 
 Restore transitions are append-only, immutable objects in the bound Backup Destination.
 `list_restores` and `gimme://deployments/{name}/restores/{request_id}` expose only the

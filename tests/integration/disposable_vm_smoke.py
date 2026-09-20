@@ -527,10 +527,142 @@ def create_minio_bucket() -> None:
     client = minio_client()
     existing = {bucket["Name"] for bucket in client.list_buckets().get("Buckets", [])}
     if BACKUP_BUCKET not in existing:
-        client.create_bucket(Bucket=BACKUP_BUCKET)
+        client.create_bucket(Bucket=BACKUP_BUCKET, ObjectLockEnabledForBucket=True)
     client.put_bucket_versioning(
         Bucket=BACKUP_BUCKET, VersioningConfiguration={"Status": "Enabled"}
     )
+
+
+def recovery_point_object_versions(
+    deployment: str, point_id: str,
+) -> list[tuple[str, str]]:
+    """Resolve the test's exact private versions before invoking the public delete tool."""
+    client = minio_client()
+    manifest_key = f"gimme/recovery-points/{deployment}/{point_id}/manifest.json"
+    manifest_version = str(
+        client.head_object(Bucket=BACKUP_BUCKET, Key=manifest_key)["VersionId"]
+    )
+    manifest = json.loads(client.get_object(
+        Bucket=BACKUP_BUCKET, Key=manifest_key, VersionId=manifest_version,
+    )["Body"].read())
+    return [
+        *[(str(item["key"]), str(item["version_id"])) for item in manifest["components"]],
+        (manifest_key, manifest_version),
+    ]
+
+
+def assert_exact_versions_removed_without_markers(
+    exact_versions: list[tuple[str, str]],
+) -> None:
+    client = minio_client()
+    for key, version_id in exact_versions:
+        versions = client.list_object_versions(Bucket=BACKUP_BUCKET, Prefix=key)
+        if any(
+            item["Key"] == key and str(item["VersionId"]) == version_id
+            for item in versions.get("Versions", [])
+        ):
+            raise AssertionError("Recovery Point deletion retained an exact object version")
+        if any(item["Key"] == key for item in versions.get("DeleteMarkers", [])):
+            raise AssertionError("Recovery Point deletion created a delete marker")
+
+
+def verify_recovery_point_deletion(gimme) -> None:
+    """Exercise the exact-version destructive protocol against real versioned MinIO."""
+    ordinary_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-delete-ordinary"
+    )
+    ordinary = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-delete-ordinary", str(ordinary_plan["plan_id"])
+    )["recovery_point"]
+    ordinary_id = str(ordinary["recovery_point_id"])
+    ordinary_versions = recovery_point_object_versions(RECOVERY_DEPLOYMENT, ordinary_id)
+    deletion = gimme.plan_delete_recovery_point(RECOVERY_DEPLOYMENT, ordinary_id)
+    deleted = gimme.delete_recovery_point(
+        RECOVERY_DEPLOYMENT, ordinary_id, str(deletion["plan_id"]),
+        str(deletion["confirmation"]), deletion["last_recovery_point_confirmation"],
+    )
+    if deleted["state"] != "deleted" or not deleted["changed"]:
+        raise AssertionError(f"ordinary Recovery Point deletion failed: {deleted}")
+    assert_exact_versions_removed_without_markers(ordinary_versions)
+    duplicate = gimme.delete_recovery_point(
+        RECOVERY_DEPLOYMENT, ordinary_id, str(deletion["plan_id"]),
+        str(deletion["confirmation"]), deletion["last_recovery_point_confirmation"],
+    )
+    if duplicate["changed"] or duplicate["state"] != "deleted":
+        raise AssertionError(f"completed deletion was not idempotent: {duplicate}")
+
+    final_deployment = "smoke-preview"
+    final_plan = gimme.plan_create_recovery_point(final_deployment, "ci-delete-final")
+    final_point = gimme.create_recovery_point(
+        final_deployment, "ci-delete-final", str(final_plan["plan_id"])
+    )["recovery_point"]
+    final_id = str(final_point["recovery_point_id"])
+    final_versions = recovery_point_object_versions(final_deployment, final_id)
+    final_delete = gimme.plan_delete_recovery_point(final_deployment, final_id)
+    if final_delete["last_recovery_point_confirmation"] is None:
+        raise AssertionError("final Recovery Point did not require stronger confirmation")
+    try:
+        gimme.delete_recovery_point(
+            final_deployment, final_id, str(final_delete["plan_id"]),
+            str(final_delete["confirmation"]),
+        )
+    except ValueError as exc:
+        if "last Recovery Point" not in str(exc):
+            raise
+    else:
+        raise AssertionError("final Recovery Point was deleted without stronger confirmation")
+    gimme.delete_recovery_point(
+        final_deployment, final_id, str(final_delete["plan_id"]),
+        str(final_delete["confirmation"]),
+        str(final_delete["last_recovery_point_confirmation"]),
+    )
+    assert_exact_versions_removed_without_markers(final_versions)
+
+    protected_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-delete-protected"
+    )
+    protected = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-delete-protected", str(protected_plan["plan_id"])
+    )["recovery_point"]
+    protected_id = str(protected["recovery_point_id"])
+    protected_versions = recovery_point_object_versions(RECOVERY_DEPLOYMENT, protected_id)
+    manifest_key, manifest_version = protected_versions[-1]
+    client = minio_client()
+    client.put_object_legal_hold(
+        Bucket=BACKUP_BUCKET, Key=manifest_key, VersionId=manifest_version,
+        LegalHold={"Status": "ON"},
+    )
+    protected_delete = gimme.plan_delete_recovery_point(
+        RECOVERY_DEPLOYMENT, protected_id
+    )
+    arguments = (
+        RECOVERY_DEPLOYMENT, protected_id, str(protected_delete["plan_id"]),
+        str(protected_delete["confirmation"]),
+        protected_delete["last_recovery_point_confirmation"],
+    )
+    try:
+        gimme.delete_recovery_point(*arguments)
+    except Exception as exc:
+        if str(exc) not in {
+            "recovery_point_object_protected", "recovery_point_deletion_denied",
+        }:
+            raise AssertionError(f"Object Lock failure was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("Object Lock unexpectedly permitted manifest deletion")
+    [partial] = [
+        item for item in gimme.list_recovery_points(RECOVERY_DEPLOYMENT)["recovery_points"]
+        if item["recovery_point_id"] == protected_id
+    ]
+    if partial["state"] != "deletion_failed" or partial["remaining_components"] != 0:
+        raise AssertionError(f"partial deletion was not inventory-visible: {partial}")
+    client.put_object_legal_hold(
+        Bucket=BACKUP_BUCKET, Key=manifest_key, VersionId=manifest_version,
+        LegalHold={"Status": "OFF"},
+    )
+    retried = gimme.delete_recovery_point(*arguments)
+    if retried["state"] != "deleted":
+        raise AssertionError(f"partial deletion retry did not complete: {retried}")
+    assert_exact_versions_removed_without_markers(protected_versions)
 
 
 def install_restore_fixture() -> None:
@@ -1138,6 +1270,17 @@ def verify_postgres_restore(gimme) -> None:
     )
     if not safety_plan["safety_protected"]:
         raise AssertionError("unresolved Safety Recovery Point was not protected")
+    try:
+        gimme.delete_recovery_point(
+            RECOVERY_DEPLOYMENT, str(safety_id), str(safety_plan["plan_id"]),
+            str(safety_plan["confirmation"]),
+            safety_plan["last_recovery_point_confirmation"],
+        )
+    except RecoveryError as exc:
+        if str(exc) != "recovery_point_safety_protected":
+            raise AssertionError(f"unresolved Safety failure was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("unresolved Safety Recovery Point was deleted")
 
     artisan = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/current/artisan"
     blocked_artisan = f"{artisan}.process-failure"
@@ -1217,6 +1360,18 @@ def verify_postgres_restore(gimme) -> None:
         RECOVERY_DEPLOYMENT, str(safety_id)
     )["safety_protected"]:
         raise AssertionError("completed Restore did not release its Safety point")
+    completed_safety = gimme.plan_delete_recovery_point(
+        RECOVERY_DEPLOYMENT, str(safety_id)
+    )
+    completed_safety_result = gimme.delete_recovery_point(
+        RECOVERY_DEPLOYMENT, str(safety_id), str(completed_safety["plan_id"]),
+        str(completed_safety["confirmation"]),
+        completed_safety["last_recovery_point_confirmation"],
+    )
+    if completed_safety_result["state"] != "deleted":
+        raise AssertionError(
+            f"completed Safety Recovery Point was not deletable: {completed_safety_result}"
+        )
 
     set_restore_probe("after")
     compensation_request = "ci-swap-compensation"
@@ -1438,6 +1593,7 @@ def verify_backup_destination() -> None:
     verify_valkey_restore(gimme, str(point_id), seeded)
     reconcile_replacement_helper_policy(gimme)
     verify_postgres_restore(gimme)
+    verify_recovery_point_deletion(gimme)
 
     postgres_key = (
         "gimme/recovery-points/"

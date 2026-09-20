@@ -1274,8 +1274,12 @@ def delete_recovery_point_versions(
     )
     deleted = 0
     def deletion_error(exc: Exception) -> RecoveryError:
-        if isinstance(exc, RecoveryError) and "access_denied" in str(exc):
-            return RecoveryError("recovery_point_deletion_denied")
+        if isinstance(exc, RecoveryError):
+            code = str(exc)
+            if code == "backup_destination_cleanup_object_protected":
+                return RecoveryError("recovery_point_object_protected")
+            if code == "backup_destination_cleanup_access_denied":
+                return RecoveryError("recovery_point_deletion_denied")
         return RecoveryError("recovery_point_deletion_failed")
 
     try:

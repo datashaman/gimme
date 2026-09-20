@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -363,6 +364,166 @@ def test_partial_delete_stays_visible_and_retry_is_idempotent(tmp_path: Path) ->
     )
     assert result["state"] == "deleted"
     assert adapter.objects == {}
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected"),
+    [
+        pytest.param(
+            "backup_destination_cleanup_object_protected",
+            "recovery_point_object_protected", id="object-lock",
+        ),
+        pytest.param(
+            "backup_destination_cleanup_object_protected",
+            "recovery_point_object_protected", id="legal-hold",
+        ),
+        pytest.param(
+            "backup_destination_cleanup_access_denied",
+            "recovery_point_deletion_denied", id="access-denial",
+        ),
+        pytest.param(
+            "backup_destination_cleanup_unavailable",
+            "recovery_point_deletion_failed", id="provider-unavailable",
+        ),
+    ],
+)
+def test_delete_provider_failures_are_fixed_and_secret_safe(
+    tmp_path: Path, provider_error: str, expected: str,
+) -> None:
+    class RejectedDeleteS3(FakeS3):
+        def delete_object(self, destination, credentials, key, version_id=None) -> None:
+            raise RecoveryError(provider_error)
+
+    adapter = RejectedDeleteS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+
+    with pytest.raises(RecoveryError, match=f"^{expected}$") as raised:
+        delete_recovery_point_versions(
+            "primary", destination(), None, adapter, "checkout", point_id
+        )
+
+    assert str(raised.value) == expected
+
+
+@pytest.mark.parametrize("failure", ["timeout", "malformed_response", "verification"])
+def test_delete_transport_and_verification_failures_are_deterministic(
+    tmp_path: Path, failure: str,
+) -> None:
+    class BrokenDeleteS3(FakeS3):
+        deleted = False
+
+        def delete_object(self, destination, credentials, key, version_id=None) -> None:
+            if not key.endswith("/manifest.json"):
+                if failure == "timeout":
+                    raise TimeoutError("private endpoint timed out")
+                if failure == "malformed_response":
+                    self.deleted = True
+                    return
+                if failure == "verification":
+                    return
+            super().delete_object(destination, credentials, key, version_id)
+
+        def head_object(self, destination, credentials, key, version_id=None):
+            if self.deleted and failure == "malformed_response":
+                return object()
+            return super().head_object(destination, credentials, key, version_id)
+
+    adapter = BrokenDeleteS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+
+    with pytest.raises(RecoveryError, match="^recovery_point_deletion_failed$") as raised:
+        delete_recovery_point_versions(
+            "primary", destination(), None, adapter, "checkout", point_id
+        )
+
+    assert "private" not in str(raised.value)
+
+
+def test_delete_rejects_duplicate_manifest_references(tmp_path: Path) -> None:
+    adapter = FakeS3()
+    point_id = recovery_point_id("checkout", "primary", "req-1")
+    manifest = create_recovery_point(
+        "primary", destination(), None, adapter, "checkout", point_id, dump(tmp_path)
+    )
+    key = manifest_key("checkout", point_id)
+    duplicate = {**manifest, "components": [*manifest["components"], manifest["components"][0]]}
+    adapter.objects[key] = json.dumps(duplicate, sort_keys=True, separators=(",", ":")).encode()
+
+    with pytest.raises(RecoveryError, match="^recovery_manifest_invalid$"):
+        delete_recovery_point_versions(
+            "primary", destination(), None, adapter, "checkout", point_id
+        )
+
+    assert adapter.deletes == []
+
+
+def test_shared_destination_operations_remain_deployment_isolated_under_concurrency(
+    tmp_path: Path,
+) -> None:
+    """The retention action intentionally uses the sole deletion primitive from #11."""
+    adapter = FakeS3()
+    identities = {
+        "delete": ("checkout", recovery_point_id("checkout", "primary", "delete")),
+        "restore": ("billing", recovery_point_id("billing", "primary", "restore")),
+        "retention": ("billing", recovery_point_id("billing", "primary", "retention")),
+    }
+    for operation, (deployment, point_id) in identities.items():
+        create_recovery_point(
+            "primary", destination(), None, adapter, deployment, point_id,
+            dump(tmp_path, content=operation.encode()),
+        )
+
+    backup_id = recovery_point_id("checkout", "primary", "backup")
+    restored = tmp_path / "restored" / "postgres.dump"
+    barrier = threading.Barrier(4)
+    errors: list[Exception] = []
+
+    def concurrent(operation) -> None:
+        try:
+            barrier.wait(timeout=1)
+            operation()
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    operations = [
+        lambda: delete_recovery_point_versions(
+            "primary", destination(), None, adapter, *identities["delete"]
+        ),
+        lambda: create_recovery_point(
+            "primary", destination(), None, adapter, "checkout", backup_id,
+            dump(tmp_path, content=b"backup"),
+        ),
+        lambda: materialize_recovery_component(
+            "primary", destination(), None, adapter, *identities["restore"],
+            "postgres", restored,
+        ),
+        lambda: delete_recovery_point_versions(
+            "primary", destination(), None, adapter, *identities["retention"]
+        ),
+    ]
+    threads = [threading.Thread(target=concurrent, args=(operation,)) for operation in operations]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert restored.read_bytes() == b"restore"
+    checkout = list_recovery_points(
+        "primary", destination(), None, adapter, "checkout"
+    )["recovery_points"]
+    billing = list_recovery_points(
+        "primary", destination(), None, adapter, "billing"
+    )["recovery_points"]
+    assert {item["recovery_point_id"] for item in checkout} == {backup_id}
+    assert {item["recovery_point_id"] for item in billing} == {identities["restore"][1]}
 
 
 def test_safety_point_is_protected_until_its_restore_record_completes(tmp_path: Path) -> None:
