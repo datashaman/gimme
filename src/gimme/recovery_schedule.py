@@ -5,10 +5,13 @@ import hashlib
 import json
 
 from gimme.control import (
+    CredentialReferenceBackupAuth,
+    DeploymentConfig,
     HourlyRecoveryCadence,
     ManualRecoveryCadence,
     RecoveryCadence,
     RecoveryPolicy,
+    S3BackupDestination,
     WeeklyRecoveryCadence,
 )
 
@@ -93,3 +96,92 @@ def scheduled_request_id(
 
 def effective_execution(logical_slot: datetime, deployment: str) -> datetime:
     return _utc(logical_slot) + timedelta(seconds=stable_delay_seconds(deployment))
+
+
+def runner_authority(
+    deployment_name: str,
+    deployment: DeploymentConfig,
+    destination_name: str,
+    destination: S3BackupDestination,
+    resource_provenance: dict[str, dict[str, str]],
+) -> dict[str, object]:
+    """Build the strict secret-reference-free authority consumed by a target runner."""
+    policy = deployment.recovery
+    if policy is None or policy.destination != destination_name:
+        raise ValueError("Recovery Schedule destination authority mismatch")
+    expected_resources = {
+        "postgres": deployment.resources.database,
+        **(
+            {"valkey": deployment.resources.valkey.resource}
+            if policy.valkey and deployment.resources.valkey is not None else {}
+        ),
+    }
+    if (
+        None in expected_resources.values()
+        or set(resource_provenance) != set(expected_resources)
+        or any(
+            set(item) != {"name", "provider", "kind", "version"}
+            or item["name"] != expected_resources[component]
+            or item["kind"] != component
+            for component, item in resource_provenance.items()
+        )
+    ):
+        raise ValueError("Recovery Schedule resource authority mismatch")
+    cadence = policy.cadence.model_dump(mode="json")
+    authority: dict[str, object] = {
+        "schema_version": 1,
+        "deployment": deployment_name,
+        "target": deployment.target,
+        "policy_fingerprint": policy_fingerprint(policy),
+        "cadence": cadence,
+        "calendar": systemd_calendar(policy.cadence),
+        "stable_delay_seconds": stable_delay_seconds(deployment_name),
+        "retain_last": policy.retain_last,
+        "quiesce_wait_seconds": policy.quiesce_wait_seconds,
+        "components": ["postgres", *(["valkey"] if policy.valkey else [])],
+        "placement": deployment.placement.model_dump(mode="json"),
+        "resources": resource_provenance,
+        "destination": {
+            "name": destination_name,
+            "provider": destination.provider,
+            "bucket": destination.bucket,
+            "region": destination.region,
+            "endpoint": destination.endpoint,
+            "addressing": destination.addressing,
+            "encryption": destination.encryption.model_dump(mode="json"),
+            "auth_mode": (
+                "stored"
+                if isinstance(destination.auth, CredentialReferenceBackupAuth)
+                else "ambient"
+            ),
+        },
+        "status_identity": deployment_name,
+    }
+    return authority
+
+
+def schedule_plan(authority: dict[str, object]) -> dict[str, object]:
+    """Project private runner authority into an inspectable secret-safe plan."""
+    deployment = str(authority["deployment"])
+    cadence = authority["cadence"]
+    enabled = isinstance(cadence, dict) and cadence.get("kind") != "manual"
+    destination = authority["destination"]
+    if not isinstance(destination, dict) or destination.get("auth_mode") not in {
+        "ambient", "stored",
+    }:
+        raise ValueError("Recovery Schedule destination authority is invalid")
+    fingerprint = hashlib.sha256(json.dumps(
+        authority, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    return {
+        "enabled": enabled,
+        "cadence": cadence,
+        "calendar": authority["calendar"],
+        "logical_timezone": "UTC",
+        "stable_delay_seconds": authority["stable_delay_seconds"],
+        "policy_fingerprint": authority["policy_fingerprint"],
+        "authority_fingerprint": fingerprint,
+        "auth_mode": destination["auth_mode"],
+        "service": f"gimme-recovery-{deployment}.service" if enabled else None,
+        "timer": f"gimme-recovery-{deployment}.timer" if enabled else None,
+    }

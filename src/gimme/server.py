@@ -759,9 +759,44 @@ def _resource_plan(name: str) -> dict[str, Any]:
     issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
         state, deployment
     ) + _valkey_runtime(name, state, deployment)[3]
-    plan = deployment_resource_plan(name, deployment, target, application,
-                                    missing_secrets=issues, secret_versions=secret_versions,
-                                    valkey_contract=_contract_summary(name, state, deployment))
+    schedule = None
+    if deployment.recovery is not None:
+        destination_name = deployment.recovery.destination
+        resource_provenance: dict[str, dict[str, str]] = {}
+        for component, resource_name in (
+            ("postgres", deployment.resources.database),
+            (
+                "valkey",
+                None if deployment.resources.valkey is None
+                else deployment.resources.valkey.resource,
+            ),
+        ):
+            if resource_name is None or (
+                component == "valkey" and not deployment.recovery.valkey
+            ):
+                continue
+            resource = state.resources[resource_name]
+            version = (
+                resource.version if isinstance(resource, ResourceConfig)
+                else resource.engine_version
+            )
+            resource_provenance[component] = {
+                "name": resource_name,
+                "provider": resource.provider,
+                "kind": resource.kind,
+                "version": version,
+            }
+        authority = recovery_schedule_module.runner_authority(
+            name, deployment, destination_name, state.backup_destinations[destination_name],
+            resource_provenance,
+        )
+        schedule = recovery_schedule_module.schedule_plan(authority)
+    plan = deployment_resource_plan(
+        name, deployment, target, application,
+        missing_secrets=issues, secret_versions=secret_versions,
+        valkey_contract=_contract_summary(name, state, deployment),
+        recovery_schedule=schedule,
+    )
     if issues:
         plan["readiness_issues"] = issues
         plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})

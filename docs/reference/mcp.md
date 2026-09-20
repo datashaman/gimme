@@ -310,6 +310,13 @@ hour is 0–23 and minute is 0–59. Arbitrary time zones, seconds, cron express
 calendar fields are rejected. Scheduled runner, timer reconciliation, and schedule status are
 separate follow-on slices; scheduled execution will invoke the same retention path.
 
+`plan_deployment_resources` includes a content-addressed `recovery_schedule` projection when a
+Recovery Policy is bound. It shows enabled/manual state, normalized cadence and UTC calendar,
+stable Deployment delay, policy and complete authority fingerprints, ambient/stored auth mode,
+and fixed service/timer identities. The private authority fingerprint also binds immutable
+placement, selected Resource names/providers/kinds/versions, destination execution policy, and
+status identity. Secret references, credential filenames, and resolved credentials are omitted.
+
 `gimme://deployments/{name}/recovery-schedule` and `get_recovery_schedule_status` expose
 the same bounded projection. Manual cadence reports a locally known disabled timer without
 contacting the Target. A scheduled cadence queries only its Deployment-derived timer and returns
