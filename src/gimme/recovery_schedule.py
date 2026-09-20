@@ -104,6 +104,7 @@ def runner_authority(
     destination_name: str,
     destination: S3BackupDestination,
     resource_provenance: dict[str, dict[str, str]],
+    valkey_execution: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the strict secret-reference-free authority consumed by a target runner."""
     policy = deployment.recovery
@@ -127,9 +128,18 @@ def runner_authority(
         )
     ):
         raise ValueError("Recovery Schedule resource authority mismatch")
+    if policy.valkey:
+        if (
+            not isinstance(valkey_execution, dict)
+            or set(valkey_execution) != {"prefix", "host", "port", "tls", "auth_mode"}
+            or valkey_execution.get("auth_mode") not in {"none", "stored"}
+        ):
+            raise ValueError("Recovery Schedule Valkey execution authority mismatch")
+    elif valkey_execution is not None:
+        raise ValueError("Recovery Schedule Valkey execution authority mismatch")
     cadence = policy.cadence.model_dump(mode="json")
     authority: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment": deployment_name,
         "target": deployment.target,
         "policy_fingerprint": policy_fingerprint(policy),
@@ -156,6 +166,7 @@ def runner_authority(
             ),
         },
         "status_identity": deployment_name,
+        "valkey_execution": valkey_execution,
     }
     return authority
 

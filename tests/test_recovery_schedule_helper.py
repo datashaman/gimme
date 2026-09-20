@@ -28,7 +28,7 @@ def authority(cadence: dict[str, object] | None = None) -> dict[str, object]:
         "weekly": "Sun *-*-* 02:00:00 UTC",
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment": "example-app",
         "target": "devbox",
         "policy_fingerprint": "a" * 64,
@@ -64,6 +64,7 @@ def authority(cadence: dict[str, object] | None = None) -> dict[str, object]:
             "auth_mode": "ambient",
         },
         "status_identity": "example-app",
+        "valkey_execution": None,
     }
 
 
@@ -97,6 +98,25 @@ def test_authority_accepts_registered_raw_s3_endpoint() -> None:
     value["destination"]["endpoint"] = "minio.example.test:9000"
 
     assert helper["validate_authority"](value, "example-app") == value
+
+
+def test_authority_accepts_only_bounded_valkey_execution() -> None:
+    helper = helper_namespace()
+    value = authority()
+    value["components"] = ["postgres", "valkey"]
+    value["resources"]["valkey"] = {
+        "name": "cache", "provider": "aws_elasticache_valkey",
+        "kind": "valkey", "version": "8.0",
+    }
+    value["valkey_execution"] = {
+        "prefix": "{gimme:example-app}:", "host": "cache.example.test",
+        "port": 6379, "tls": True, "auth_mode": "stored",
+    }
+
+    assert helper["validate_authority"](value, "example-app") == value
+    value["valkey_execution"]["host"] = "cache; shutdown"
+    with pytest.raises(RuntimeError):
+        helper["validate_authority"](value, "example-app")
 
 
 @pytest.mark.parametrize(

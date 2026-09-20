@@ -767,6 +767,34 @@ def _recovery_schedule_runtime_issues(
     return []
 
 
+def _recovery_valkey_execution(
+    name: str, state: ControlState, deployment: DeploymentConfig
+) -> dict[str, object] | None:
+    policy = deployment.recovery
+    binding = deployment.resources.valkey
+    if policy is None or not policy.valkey or binding is None:
+        return None
+    resource = state.resources[binding.resource]
+    if isinstance(resource, ResourceConfig):
+        return {
+            "prefix": deployment.placement.cache_prefix,
+            "host": "127.0.0.1",
+            "port": 6379,
+            "tls": False,
+            "auth_mode": "none",
+        }
+    values, credentials, _probe, issues = _valkey_runtime(name, state, deployment)
+    if issues or not credentials:
+        return None
+    return {
+        "prefix": f"{{gimme:{name}}}:",
+        "host": values["GIMME_VALKEY_HOST"],
+        "port": int(values["GIMME_VALKEY_PORT"]),
+        "tls": True,
+        "auth_mode": "stored",
+    }
+
+
 def _resource_plan(name: str) -> dict[str, Any]:
     state, deployment, target, application = _context(name)
     secret_versions, secret_issues = _secret_plan(name, state, deployment)
@@ -804,11 +832,14 @@ def _resource_plan(name: str) -> dict[str, Any]:
                 "kind": resource.kind,
                 "version": version,
             }
-        authority = recovery_schedule_module.runner_authority(
-            name, deployment, destination_name, state.backup_destinations[destination_name],
-            resource_provenance,
-        )
-        schedule = recovery_schedule_module.schedule_plan(authority)
+        valkey_execution = _recovery_valkey_execution(name, state, deployment)
+        if not deployment.recovery.valkey or valkey_execution is not None:
+            authority = recovery_schedule_module.runner_authority(
+                name, deployment, destination_name,
+                state.backup_destinations[destination_name], resource_provenance,
+                valkey_execution,
+            )
+            schedule = recovery_schedule_module.schedule_plan(authority)
     plan = deployment_resource_plan(
         name, deployment, target, application,
         missing_secrets=issues, secret_versions=secret_versions,

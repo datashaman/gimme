@@ -15,6 +15,7 @@ from gimme.config import (
 )
 from gimme.control import (
     AWSNetwork,
+    AWSElastiCacheValkeyResource,
     AWSProviderAccount,
     AWSRDSPostgresResource,
     AWSSecretsManagerStore,
@@ -963,6 +964,53 @@ def test_private_runner_authority_changes_with_bound_execution_policy() -> None:
                 "kind": "postgres", "version": "17.2",
             }},
         )
+
+
+def test_recovery_valkey_execution_projects_only_bounded_runtime_metadata(
+    monkeypatch,
+) -> None:
+    state = recovery_state()
+    deployment = state.deployments["example-app"].model_copy(update={
+        "recovery": RecoveryPolicy(destination="primary", valkey=True)
+    })
+    local = server_module._recovery_valkey_execution("example-app", state, deployment)
+    assert local == {
+        "prefix": "gimme:example-app:", "host": "127.0.0.1", "port": 6379,
+        "tls": False, "auth_mode": "none",
+    }
+
+    managed = AWSElastiCacheValkeyResource(
+        aws_network="production", administration_target="devbox",
+        engine_version="9.0", node_type="cache.t4g.small",
+        security_group_id="sg-0123456789abcdef0",
+        administration_security_group_id="sg-0123456789abcdef1",
+        workload_secret_store="production", snapshot_window="02:00-03:00",
+        maintenance_window="sun:03:00-sun:04:00",
+    )
+    managed_state = state.model_copy(update={
+        "resources": {**state.resources, "devbox-valkey": managed}
+    })
+    monkeypatch.setattr(
+        server_module, "_valkey_runtime",
+        lambda *args: ({}, {}, None, ["valkey_resource_not_ready"]),
+    )
+    assert server_module._recovery_valkey_execution(
+        "example-app", managed_state, deployment
+    ) is None
+
+    monkeypatch.setattr(
+        server_module, "_valkey_runtime",
+        lambda *args: (
+            {"GIMME_VALKEY_HOST": "cache.example.test", "GIMME_VALKEY_PORT": "6380"},
+            {"username": object(), "password": object()}, None, [],
+        ),
+    )
+    assert server_module._recovery_valkey_execution(
+        "example-app", managed_state, deployment
+    ) == {
+        "prefix": "{gimme:example-app}:", "host": "cache.example.test", "port": 6380,
+        "tls": True, "auth_mode": "stored",
+    }
 
 
 def test_manual_recovery_schedule_status_is_local_and_disabled(
