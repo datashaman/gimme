@@ -1203,6 +1203,90 @@ def test_failed_restore_verification_requiesces_and_never_cleans_up_or_exits(
     )["state"] == "verification_failed"
 
 
+def test_cleanup_and_maintenance_exit_failures_resume_from_authoritative_state(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "cleanup-source")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    identity = {
+        "source_recovery_point_id": point,
+        "destination_resource": "devbox-postgres",
+        "destination_provider": "target_local",
+        "destination_kind": "postgres",
+        "destination_version": "17.2",
+    }
+    for restore_state in (
+        "started", "maintenance_entered", "safety_not_required",
+        "artifact_verified", "shadow_verified", "data_replaced",
+    ):
+        append_restore_event(
+            selected.load().backup_destinations["primary"], None, adapter,
+            "example-app", "restore-boundaries", restore_state, **identity,
+        )
+
+    cleanup_attempts = 0
+    exit_attempts = 0
+
+    def fake_run(task, *args, **kwargs):
+        nonlocal cleanup_attempts, exit_attempts
+        if task == "gimme:recovery:verify-application":
+            return CommandResult(["dep"], 0, "GIMME_RESTORE_VERIFY|ready")
+        if (
+            task == "gimme:recovery:postgres"
+            and kwargs.get("postgres_restore_action") == "cleanup"
+        ):
+            cleanup_attempts += 1
+            if cleanup_attempts == 1:
+                raise RuntimeError("private cleanup failure")
+        if (
+            task == "gimme:recovery:maintenance"
+            and kwargs.get("recovery_action") == "exit"
+        ):
+            exit_attempts += 1
+            if exit_attempts == 1:
+                raise RuntimeError("private exit failure")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    first = server_module.plan_verify_restore("example-app", "restore-boundaries")
+    with pytest.raises(RecoveryError, match="^restore_cleanup_failed$"):
+        server_module.apply_verify_restore(
+            "example-app", "restore-boundaries", str(first["plan_id"])
+        )
+    assert server_module.restore_record_resource(
+        "example-app", "restore-boundaries"
+    )["state"] == "verification_succeeded"
+
+    second = server_module.plan_verify_restore("example-app", "restore-boundaries")
+    with pytest.raises(RecoveryError, match="^restore_maintenance_exit_failed$"):
+        server_module.apply_verify_restore(
+            "example-app", "restore-boundaries", str(second["plan_id"])
+        )
+    assert server_module.restore_record_resource(
+        "example-app", "restore-boundaries"
+    )["state"] == "cleanup_completed"
+
+    third = server_module.plan_verify_restore("example-app", "restore-boundaries")
+    completed = server_module.apply_verify_restore(
+        "example-app", "restore-boundaries", str(third["plan_id"])
+    )
+    assert completed["state"] == "completed"
+    assert cleanup_attempts == 2
+    assert exit_attempts == 2
+
+
 def test_apply_restore_failure_stays_in_maintenance_and_retry_resumes_at_swap(
     tmp_path, monkeypatch
 ) -> None:
@@ -1637,8 +1721,10 @@ def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_muta
         ],
     )
     calls: list[tuple[str, str | None]] = []
+    valkey_attempts = 0
 
     def fake_run(task, *args, **kwargs):
+        nonlocal valkey_attempts
         calls.append((task, kwargs.get("recovery_action")))
         if task == "gimme:backup:capture-valkey":
             kwargs["backup_local_path"].write_bytes(valkey_body)
@@ -1651,6 +1737,9 @@ def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_muta
         if task == "gimme:recovery:valkey":
             assert kwargs["backup_local_path"].read_bytes() == valkey_body
             assert kwargs["valkey_restore_records"] == 0
+            valkey_attempts += 1
+            if valkey_attempts == 1:
+                raise RuntimeError("interrupted after prefix mutation")
             return CommandResult(["dep"], 0, "GIMME_VALKEY_RESTORE|0|0")
         if task == "gimme:recovery:verify-application":
             return CommandResult(["dep"], 0, "GIMME_RESTORE_VERIFY|ready")
@@ -1662,11 +1751,24 @@ def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_muta
     )
     assert plan["ready"] is True
 
+    with pytest.raises(RecoveryError, match="^valkey_restore_failed$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, "restore-valkey", str(plan["plan_id"]),
+            str(plan["confirmation"]), ["valkey"],
+        )
+    assert server_module.restore_record_resource(
+        "example-app", "restore-valkey"
+    )["state"] == "artifact_verified"
+
+    retry = server_module.plan_restore_deployment(
+        "example-app", point, "restore-valkey", ["valkey"]
+    )
     applied = server_module.apply_restore_deployment(
-        "example-app", point, "restore-valkey", str(plan["plan_id"]),
-        str(plan["confirmation"]), ["valkey"],
+        "example-app", point, "restore-valkey", str(retry["plan_id"]),
+        str(retry["confirmation"]), ["valkey"],
     )
     assert applied["state"] == "data_replaced"
+    assert valkey_attempts == 2
     assert not any("postgres" in task for task, _action in calls)
 
     verify = server_module.plan_verify_restore("example-app", "restore-valkey")
@@ -1741,12 +1843,15 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
         ],
     )
     calls: list[tuple[str, str | None]] = []
+    valkey_attempts = 0
+    swap_attempts = 0
 
     def fake_run(task, *args, **kwargs):
+        nonlocal valkey_attempts, swap_attempts
         action = kwargs.get("postgres_restore_action")
         calls.append((task, action))
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
         if task == "gimme:backup:dump-postgres":
             safety_pg = b"safety-pg"
             kwargs["backup_local_path"].write_bytes(safety_pg)
@@ -1763,10 +1868,16 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
                 "2026-09-20T02:00:00+00:00",
             )
         if task == "gimme:recovery:valkey":
+            assert kwargs["backup_local_path"].read_bytes() == valkey_body
+            valkey_attempts += 1
             return CommandResult(
                 ["dep", "private-command-argument"], 0,
                 "GIMME_VALKEY_RESTORE|1|0\nprivate-raw-output",
             )
+        if task == "gimme:recovery:postgres" and action == "swap":
+            swap_attempts += 1
+            if swap_attempts == 1:
+                raise RuntimeError("private swap interruption")
         if task == "gimme:recovery:verify-application":
             return CommandResult(
                 ["dep", "private-command-argument"], 0,
@@ -1778,12 +1889,26 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
 
     monkeypatch.setattr(server_module, "_run_deployment", fake_run)
     plan = server_module.plan_restore_deployment("example-app", point, "restore-full")
+    with pytest.raises(RecoveryError, match="^restore_swap_failed$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, "restore-full", str(plan["plan_id"]),
+            str(plan["confirmation"]),
+        )
+    assert server_module.restore_record_resource(
+        "example-app", "restore-full"
+    )["state"] == "shadow_verified"
+
+    retry = server_module.plan_restore_deployment(
+        "example-app", point, "restore-full"
+    )
     applied = server_module.apply_restore_deployment(
-        "example-app", point, "restore-full", str(plan["plan_id"]),
-        str(plan["confirmation"]),
+        "example-app", point, "restore-full", str(retry["plan_id"]),
+        str(retry["confirmation"]),
     )
 
     assert applied["state"] == "data_replaced"
+    assert valkey_attempts == 2
+    assert swap_attempts == 2
     prepare = calls.index(("gimme:recovery:postgres", "prepare"))
     replace = next(
         index for index, call in enumerate(calls)
@@ -1825,7 +1950,7 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
         base64.b64encode(private_payload).decode(),
         "gimme:example-app:", "gimme_example_app", "gimme/recovery-points",
         "private-object-version", "private-access-key", "private-secret-key",
-        "private-command-argument", "private-raw-output",
+        "private-command-argument", "private-raw-output", "private swap interruption",
     ):
         assert protected not in public_text
     changed = selected.load()

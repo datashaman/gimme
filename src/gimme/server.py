@@ -1764,6 +1764,9 @@ def apply_restore_deployment(
                         else "recovery_runtime_restore_failed"
                     ) from None
                 advance("safety_verified")
+        resume_valkey_from_shadow = (
+            current == "shadow_verified" and "valkey" in selected_components
+        )
         with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
             local_sources = {
                 "postgres": Path(directory) / "postgres.dump",
@@ -1780,6 +1783,17 @@ def apply_restore_deployment(
                             local_sources[selected_kind],
                         )
                     )
+            elif resume_valkey_from_shadow:
+                # Valkey mutation has no finer-grained authoritative transition: a
+                # retry must clear and replay the complete prefix before any
+                # PostgreSQL swap. The per-call operation directory is ephemeral,
+                # so rematerialize the exact bound archive for that replay.
+                source_components["valkey"] = (
+                    recovery_module.materialize_recovery_component(
+                        destination_name, destination, credentials, backup_s3,
+                        name, recovery_point_id, "valkey", local_sources["valkey"],
+                    )
+                )
             if current in {"safety_verified", "safety_not_required"}:
                 advance("artifact_verified")
             if current == "artifact_verified":
@@ -1803,6 +1817,11 @@ def apply_restore_deployment(
                         local_sources["valkey"], state, deployment,
                     )
                 advance("shadow_verified")
+            elif resume_valkey_from_shadow:
+                _restore_valkey_component(
+                    name, request_id, source_components["valkey"],
+                    local_sources["valkey"], state, deployment,
+                )
         if current == "shadow_verified":
             if "postgres" in selected_components:
                 postgres_component = source_components["postgres"]
