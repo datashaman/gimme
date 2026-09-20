@@ -334,6 +334,34 @@ def test_postgres_restore_context_crosses_runner_boundary_as_complete_tuple(
     assert "GIMME_RECOVERY_REQUEST_ID" not in captured
 
 
+def test_restore_source_size_crosses_runner_boundary_only_when_given(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.clear()
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    deployer = runner(tmp_path)
+
+    deployer.run("deploy", server())
+    assert "GIMME_RESTORE_SOURCE_BYTES" not in captured
+
+    deployer.run(
+        "gimme:recovery:inspect-postgres", server(), restore_source_bytes=42
+    )
+    assert captured["GIMME_RESTORE_SOURCE_BYTES"] == "42"
+
+    with pytest.raises(ValueError, match="restore source size is invalid"):
+        deployer.run(
+            "gimme:recovery:inspect-postgres", server(),
+            restore_source_bytes=512 * 1024 * 1024 + 1,
+        )
+
+
 @pytest.mark.parametrize(
     "values",
     [

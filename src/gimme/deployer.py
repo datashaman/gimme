@@ -130,6 +130,7 @@ class DeployerRunner:
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
         recovery_quiesce_wait: int | None = None,
+        restore_source_bytes: int | None = None,
         postgres_restore_action: str | None = None,
         postgres_restore_request_id: str | None = None,
         postgres_restore_sha256: str | None = None,
@@ -234,6 +235,10 @@ class DeployerRunner:
             environment["GIMME_RECOVERY_ACTION"] = recovery_action
             environment["GIMME_RECOVERY_REQUEST_ID"] = recovery_request_id
             environment["GIMME_RECOVERY_QUIESCE_WAIT"] = str(recovery_quiesce_wait)
+        if restore_source_bytes is not None:
+            if not 0 <= restore_source_bytes <= 512 * 1024 * 1024:
+                raise ValueError("restore source size is invalid")
+            environment["GIMME_RESTORE_SOURCE_BYTES"] = str(restore_source_bytes)
         if any(value is not None for value in (
             postgres_restore_action, postgres_restore_request_id,
             postgres_restore_sha256, postgres_restore_bytes

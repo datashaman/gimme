@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import tempfile
 from contextlib import ExitStack, contextmanager
@@ -303,6 +304,7 @@ def _run_deployment(
     recovery_action: str | None = None,
     recovery_request_id: str | None = None,
     recovery_quiesce_wait: int | None = None,
+    restore_source_bytes: int | None = None,
     postgres_restore_action: str | None = None,
     postgres_restore_request_id: str | None = None,
     postgres_restore_sha256: str | None = None,
@@ -358,6 +360,7 @@ def _run_deployment(
         recovery_action=recovery_action,
         recovery_request_id=recovery_request_id,
         recovery_quiesce_wait=recovery_quiesce_wait,
+        restore_source_bytes=restore_source_bytes,
         postgres_restore_action=postgres_restore_action,
         postgres_restore_request_id=postgres_restore_request_id,
         postgres_restore_sha256=postgres_restore_sha256,
@@ -1516,9 +1519,15 @@ def _deployment_restore_plan(
     if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
         raise RecoveryError("restore_destination_incompatible")
     states: set[str] = set()
+    capacity_ready = True
     if "postgres" in selected_components:
+        postgres_source = next(
+            item for item in manifest_components if item["kind"] == "postgres"
+        )
+        source_bytes = int(postgres_source["bytes"])
         observation = _run_deployment(
-            "gimme:recovery:inspect-postgres", name, timeout=60
+            "gimme:recovery:inspect-postgres", name,
+            restore_source_bytes=source_bytes, timeout=60,
         )
         states = _bounded_marker_values(
             observation.output, "GIMME_POSTGRES_RESTORE_PREFLIGHT|",
@@ -1526,6 +1535,17 @@ def _deployment_restore_plan(
         )
         if len(states) != 1 or not states <= {"empty", "nonempty"}:
             raise RecoveryError("restore_destination_inspection_failed")
+        capacity = _bounded_marker_values(
+            observation.output, "GIMME_POSTGRES_RESTORE_CAPACITY|",
+            {"ready", "insufficient"},
+        )
+        if len(capacity) != 1:
+            raise RecoveryError("restore_destination_inspection_failed")
+        required_bytes = source_bytes * 2 + 64 * 1024 * 1024
+        capacity_ready = (
+            capacity == {"ready"}
+            and shutil.disk_usage(tempfile.gettempdir()).free >= required_bytes
+        )
     try:
         existing_restore = recovery_module.load_restore_record(
             destination, credentials, backup_s3, name, request_id
@@ -1570,6 +1590,7 @@ def _deployment_restore_plan(
         existing_restore is not None
         and existing_restore["state"] in {
             "started", "maintenance_entered", "safety_failed",
+            "artifact_failed", "shadow_failed",
         }
         and original_empty != observed_empty
     )
@@ -1613,6 +1634,7 @@ def _deployment_restore_plan(
         original_empty,
         selected_components,
         safety_components=safety_components,
+        capacity_ready=capacity_ready,
         valkey_destination=valkey_destination,
         request_fingerprint=request_fingerprint,
         restore_state=None if existing_restore is None else str(existing_restore["state"]),
@@ -1732,7 +1754,8 @@ def apply_restore_deployment(
 
         if current is None:
             advance("started")
-        if current in {"started", "safety_failed"}:
+        resume_failure = current if current in {"artifact_failed", "shadow_failed"} else None
+        if current in {"started", "safety_failed", "artifact_failed", "shadow_failed"}:
             try:
                 _run_deployment(
                     "gimme:recovery:maintenance", name,
@@ -1742,7 +1765,12 @@ def apply_restore_deployment(
                 )
             except Exception:
                 raise RecoveryError("restore_maintenance_failed") from None
-            advance("maintenance_entered")
+            if resume_failure == "artifact_failed":
+                advance("safety_not_required" if safety_id is None else "safety_verified")
+            elif resume_failure == "shadow_failed":
+                advance("artifact_verified")
+            else:
+                advance("maintenance_entered")
         if current == "maintenance_entered":
             if safety_id is None:
                 advance("safety_not_required")
@@ -1779,28 +1807,47 @@ def apply_restore_deployment(
                 "postgres": Path(directory) / "postgres.dump",
                 "valkey": Path(directory) / "valkey.archive",
             }
-            if current in {
-                "safety_verified", "safety_not_required", "artifact_verified"
-            }:
-                for selected_kind in selected_components:
-                    source_components[selected_kind] = (
+            try:
+                if current in {
+                    "safety_verified", "safety_not_required", "artifact_verified"
+                }:
+                    for selected_kind in selected_components:
+                        source_components[selected_kind] = (
+                            recovery_module.materialize_recovery_component(
+                                destination_name, destination, credentials, backup_s3,
+                                name, recovery_point_id, selected_kind,
+                                local_sources[selected_kind],
+                            )
+                        )
+                elif resume_valkey_from_shadow:
+                    # Valkey mutation has no finer-grained authoritative transition: a
+                    # retry must clear and replay the complete prefix before any
+                    # PostgreSQL swap. The per-call operation directory is ephemeral,
+                    # so rematerialize the exact bound archive for that replay.
+                    source_components["valkey"] = (
                         recovery_module.materialize_recovery_component(
                             destination_name, destination, credentials, backup_s3,
-                            name, recovery_point_id, selected_kind,
-                            local_sources[selected_kind],
+                            name, recovery_point_id, "valkey", local_sources["valkey"],
                         )
                     )
-            elif resume_valkey_from_shadow:
-                # Valkey mutation has no finer-grained authoritative transition: a
-                # retry must clear and replay the complete prefix before any
-                # PostgreSQL swap. The per-call operation directory is ephemeral,
-                # so rematerialize the exact bound archive for that replay.
-                source_components["valkey"] = (
-                    recovery_module.materialize_recovery_component(
-                        destination_name, destination, credentials, backup_s3,
-                        name, recovery_point_id, "valkey", local_sources["valkey"],
+            except Exception as exc:
+                if resume_valkey_from_shadow:
+                    if isinstance(exc, RecoveryError):
+                        raise RecoveryError(str(exc)) from None
+                    raise RecoveryError("restore_artifact_failed") from None
+                advance("artifact_failed")
+                try:
+                    _run_deployment(
+                        "gimme:recovery:maintenance", name,
+                        recovery_action="exit", recovery_request_id=request_id,
+                        recovery_quiesce_wait=deployment.recovery.quiesce_wait_seconds,
+                        timeout=900,
                     )
-                )
+                except Exception:
+                    raise RecoveryError("recovery_runtime_restore_failed") from None
+                if isinstance(exc, RecoveryError):
+                    raise RecoveryError(str(exc)) from None
+                raise RecoveryError("restore_artifact_failed") from None
             if current in {"safety_verified", "safety_not_required"}:
                 advance("artifact_verified")
             if current == "artifact_verified":
@@ -1817,6 +1864,20 @@ def apply_restore_deployment(
                             timeout=3600,
                         )
                     except Exception:
+                        advance("shadow_failed")
+                        try:
+                            _run_deployment(
+                                "gimme:recovery:maintenance", name,
+                                recovery_action="exit", recovery_request_id=request_id,
+                                recovery_quiesce_wait=(
+                                    deployment.recovery.quiesce_wait_seconds
+                                ),
+                                timeout=900,
+                            )
+                        except Exception:
+                            raise RecoveryError(
+                                "recovery_runtime_restore_failed"
+                            ) from None
                         raise RecoveryError("restore_shadow_prepare_failed") from None
                 if "valkey" in selected_components:
                     _restore_valkey_component(

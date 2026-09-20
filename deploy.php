@@ -1173,11 +1173,14 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
 });
 
-task('gimme:recovery:inspect-postgres', function (): void {
+task('gimme:recovery:inspect-postgres', function () use ($appsRoot): void {
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
-    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)) {
+    $sourceBytes = required_env('GIMME_RESTORE_SOURCE_BYTES');
+    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[0-9]{1,9}$/', $sourceBytes) || (int) $sourceBytes > 536870912) {
         throw new \RuntimeException('Unsafe PostgreSQL recovery identity');
     }
+    $requiredBytes = ((int) $sourceBytes * 2) + 67108864;
     $query = <<<'SQL'
 SELECT CASE WHEN
     EXISTS (
@@ -1203,6 +1206,30 @@ SQL;
         '"GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" ;; *) exit 1 ;; esac';
     $output = trim(run('bash -c ' . escapeshellarg($command), timeout: 60));
     writeln($output);
+    $capacity = <<<'BASH'
+set -eu
+application_blocks=$(df -k --output=avail -- "$1" 2>/dev/null | tail -n 1 | tr -d ' ')
+data_directory=$(psql --no-psqlrc -Atq -d "$2" -c 'SHOW data_directory' 2>/dev/null)
+case "$data_directory" in /*) ;; *) exit 1 ;; esac
+postgres_blocks=$(df -k --output=avail -- "$data_directory" 2>/dev/null | tail -n 1 | tr -d ' ')
+case "$application_blocks:$postgres_blocks" in
+    *[!0-9:]*|:*|*:) exit 1 ;;
+esac
+required_blocks=$((($3 + 1023) / 1024))
+if [ "$application_blocks" -ge "$required_blocks" ] &&
+   [ "$postgres_blocks" -ge "$required_blocks" ]; then
+    printf '%s\n' 'GIMME_POSTGRES_RESTORE_CAPACITY|ready'
+else
+    printf '%s\n' 'GIMME_POSTGRES_RESTORE_CAPACITY|insufficient'
+fi
+BASH;
+    $capacityOutput = trim(run(
+        'bash -c ' . escapeshellarg($capacity) . ' -- ' .
+        escapeshellarg($appsRoot) . ' ' . escapeshellarg($database) . ' ' .
+        escapeshellarg((string) $requiredBytes),
+        timeout: 60,
+    ));
+    writeln($capacityOutput);
 });
 
 task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {

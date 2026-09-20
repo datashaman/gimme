@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastmcp import Client
 import pytest
@@ -810,10 +811,16 @@ def test_restore_plan_is_read_only_content_addressed_and_exactly_confirmed(
         ),
     )
     calls = []
+    capacity = "ready"
 
     def fake_run(task, *args, **kwargs):
         calls.append(task)
-        return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+        assert kwargs["restore_source_bytes"] == len(content)
+        return CommandResult(
+            ["dep"], 0,
+            "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\n"
+            f"GIMME_POSTGRES_RESTORE_CAPACITY|{capacity}",
+        )
 
     monkeypatch.setattr(server_module.runner, "run", fake_run)
 
@@ -837,6 +844,25 @@ def test_restore_plan_is_read_only_content_addressed_and_exactly_confirmed(
     )
     assert "database_identifier" not in str(plan)
     assert "gimme/recovery-points" not in str(plan)
+
+    capacity = "insufficient"
+    insufficient = server_module.plan_restore_deployment(
+        "example-app", point, "restore-remote-capacity"
+    )
+    assert insufficient["ready"] is False
+    assert insufficient["readiness_issues"] == ["restore_capacity_insufficient"]
+
+    capacity = "ready"
+    monkeypatch.setattr(
+        server_module.shutil, "disk_usage", lambda path: SimpleNamespace(free=0)
+    )
+    local_insufficient = server_module.plan_restore_deployment(
+        "example-app", point, "restore-local-capacity"
+    )
+    assert local_insufficient["ready"] is False
+    assert local_insufficient["readiness_issues"] == [
+        "restore_capacity_insufficient"
+    ]
 
 
 def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
@@ -870,7 +896,9 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     def inspect(task, *args, **kwargs):
         inspected.append(task)
         return CommandResult(
-            ["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty"
+            ["dep"], 0,
+            "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty\n"
+            "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
         )
 
     monkeypatch.setattr(server_module.runner, "run", inspect)
@@ -1001,7 +1029,9 @@ def test_restore_plan_rejects_a_changed_destination_after_request_start(
     monkeypatch.setattr(
         server_module.runner, "run",
         lambda *args, **kwargs: CommandResult(
-            ["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty"
+            ["dep"], 0,
+            "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\n"
+            "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
         ),
     )
 
@@ -1046,7 +1076,11 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
     def fake_run(task, *args, **kwargs):
         calls.append((task, kwargs.get("postgres_restore_action")))
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
         if task == "gimme:backup:dump-postgres":
             safety = b"safety-postgres-dump"
             kwargs["backup_local_path"].write_bytes(safety)
@@ -1155,7 +1189,11 @@ def test_safety_failure_restores_runtime_records_failure_and_retries(
         action = kwargs.get("recovery_action")
         actions.append((task, action))
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
         if task == "gimme:backup:dump-postgres":
             if fail_safety:
                 fail_safety = False
@@ -1221,7 +1259,11 @@ def test_safety_failure_reports_when_runtime_cannot_be_restored(
     def fake_run(task, *args, **kwargs):
         action = kwargs.get("recovery_action")
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
         if task == "gimme:backup:dump-postgres":
             raise RuntimeError("private provider failure")
         if task == "gimme:recovery:maintenance" and action == "exit":
@@ -1409,7 +1451,11 @@ def test_apply_restore_failure_stays_in_maintenance_and_retry_resumes_at_swap(
     def fake_run(task, *args, **kwargs):
         nonlocal fail_swap
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
         if task == "gimme:recovery:maintenance":
             maintenance_actions.append(kwargs["recovery_action"])
         if task == "gimme:recovery:postgres" and kwargs["postgres_restore_action"] == "swap":
@@ -1440,6 +1486,90 @@ def test_apply_restore_failure_stays_in_maintenance_and_retry_resumes_at_swap(
 
     assert result["state"] == "data_replaced"
     assert maintenance_actions == ["enter"], "retry must preserve the existing maintenance owner"
+
+
+@pytest.mark.parametrize("failure_boundary", ["artifact", "shadow"])
+def test_pre_swap_failure_restores_runtime_and_retry_reenters_maintenance(
+    tmp_path, monkeypatch, failure_boundary
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", f"{failure_boundary}-source")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+    maintenance_actions: list[str] = []
+    prepare_attempts = 0
+
+    def fake_run(task, *args, **kwargs):
+        nonlocal prepare_attempts
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
+        if task == "gimme:recovery:maintenance":
+            maintenance_actions.append(kwargs["recovery_action"])
+        if (
+            task == "gimme:recovery:postgres"
+            and kwargs["postgres_restore_action"] == "prepare"
+        ):
+            prepare_attempts += 1
+            if failure_boundary == "shadow" and prepare_attempts == 1:
+                raise RuntimeError("private shadow failure")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    if failure_boundary == "artifact":
+        materialize = recovery_module.materialize_recovery_component
+        attempts = 0
+
+        def fail_materialize_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RecoveryError("recovery_component_checksum_mismatch")
+            return materialize(*args, **kwargs)
+
+        monkeypatch.setattr(
+            recovery_module, "materialize_recovery_component", fail_materialize_once
+        )
+
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, f"restore-{failure_boundary}"
+    )
+    expected_error = (
+        "recovery_component_checksum_mismatch"
+        if failure_boundary == "artifact" else "restore_shadow_prepare_failed"
+    )
+    with pytest.raises(RecoveryError, match=f"^{expected_error}$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, f"restore-{failure_boundary}", str(plan["plan_id"]),
+            str(plan["confirmation"]),
+        )
+    assert server_module.restore_record_resource(
+        "example-app", f"restore-{failure_boundary}"
+    )["state"] == f"{failure_boundary}_failed"
+    assert maintenance_actions == ["enter", "exit"]
+
+    retry = server_module.plan_restore_deployment(
+        "example-app", point, f"restore-{failure_boundary}"
+    )
+    result = server_module.apply_restore_deployment(
+        "example-app", point, f"restore-{failure_boundary}", str(retry["plan_id"]),
+        str(retry["confirmation"]),
+    )
+    assert result["state"] == "data_replaced"
+    assert maintenance_actions == ["enter", "exit", "enter"]
 
 
 def test_delete_recovery_point_requires_both_confirmations_for_the_last_point(
@@ -1950,7 +2080,11 @@ def test_full_restore_protects_only_nonempty_components_and_retries_in_order(
         action = kwargs.get("postgres_restore_action")
         calls.append((task, action))
         if task == "gimme:recovery:inspect-postgres":
-            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty\n"
+                "GIMME_POSTGRES_RESTORE_CAPACITY|ready",
+            )
         if task == "gimme:backup:dump-postgres":
             raise AssertionError("empty PostgreSQL destination must not be captured")
         if task == "gimme:backup:capture-valkey":

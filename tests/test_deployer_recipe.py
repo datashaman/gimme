@@ -727,6 +727,11 @@ def test_postgres_restore_preflight_uses_only_fixed_catalog_inspection() -> None
     assert "pg_type" in task
     assert "pg_extension" in task
     assert "GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" in task
+    assert "required_env('GIMME_RESTORE_SOURCE_BYTES')" in task
+    assert "SHOW data_directory" in task
+    assert "df -k --output=avail" in task
+    assert "GIMME_POSTGRES_RESTORE_CAPACITY|ready" in task
+    assert "GIMME_POSTGRES_RESTORE_CAPACITY|insufficient" in task
     assert 'printf "%s\\\\n"' in task
     assert "writeln($output)" in task
     assert "DROP " not in task
