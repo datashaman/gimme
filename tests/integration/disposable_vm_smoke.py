@@ -796,12 +796,21 @@ def verify_backup_destination() -> None:
             f"unreferenced object version altered the Recovery Point: {superseded_inventory}"
         )
     remove_component_version(postgres_key, bound_version)
-    tampered_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
-    tampered_ids = {item["recovery_point_id"] for item in tampered_inventory["recovery_points"]}
-    if point_id in tampered_ids:
-        raise AssertionError(f"tampered component was not rejected: {tampered_inventory}")
-    if point_id not in tampered_inventory["rejected"]:
-        raise AssertionError(f"tampered manifest missing from rejected list: {tampered_inventory}")
+    missing_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
+    missing_point = next(
+        (
+            item for item in missing_inventory["recovery_points"]
+            if item["recovery_point_id"] == point_id
+        ),
+        None,
+    )
+    if missing_point is None or (
+        missing_point["state"], missing_point["deleted_components"],
+        missing_point["remaining_components"],
+    ) != ("deletion_failed", 1, 1):
+        raise AssertionError(
+            f"missing bound component did not enter deletion_failed: {missing_inventory}"
+        )
 
     for path in (STATE_PATH, STATE_DIRECTORY / "operations.jsonl"):
         if path.exists() and "gimme-ci-secret" in path.read_text():
