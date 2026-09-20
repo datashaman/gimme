@@ -16,7 +16,8 @@ stable intent, mutation boundary, and pairing of each primitive.
 - Target, Application, Resource, and Deployment registration tools create local entries
   directly. Provider Account and Secret Store registration is plan/apply because it verifies
   external identity and policy.
-- `rollback_deployment` and `remove_deployment` require exact confirmation text.
+- `rollback_deployment` and `remove_deployment` require exact confirmation text. Rollback uses
+  `ROLLBACK <deployment> TO <release>` from its reviewed plan.
 - Remote operations are restricted to registered targets and validated fields. There
   is no arbitrary shell, SQL, service, package, or filesystem-path tool.
 
@@ -323,7 +324,8 @@ The MCP server never accepts a sudo password. Run `uv run gimme-bootstrap-target
 | `plan_deployment` | Remote read | For source mode, resolve one commit; for artifact mode, resolve exact reviewed object versions and digests or report `artifact_missing`; verify runtime compatibility and render the Deployer graph |
 | `apply_deployment` | Remote change | Deploy the exact reviewed source revision or materialize the exact reviewed artifact with health gates |
 | `list_releases` | Remote read | List retained releases and the current release |
-| `rollback_deployment` | Remote change | Restore the previous release after exact confirmation |
+| `plan_rollback_deployment` | Remote read | Select and verify one exact retained predecessor with runtime, health, and process evidence |
+| `rollback_deployment` | Remote change | Apply the exact reviewed rollback after exact confirmation |
 | `plan_promotion` | Remote read | Pin the live source commit or verify and pin one compatible live artifact for another Deployment |
 | `promote_deployment` | Remote change | Deploy the reviewed commit/artifact and record its exact commit only after success |
 | `plan_remove_deployment` | Read | Plan route, process, data, and release cleanup |
@@ -337,6 +339,22 @@ For deployments with Horizon, queue workers, or a scheduler, planning also verif
 content-bound privileged process helper and required PHP process extensions. Apply is
 blocked before deployment when that preflight reports `bootstrap_required` or a missing
 extension.
+
+Rollback is content-addressed in both release modes. Planning reads the bounded Deployer
+inventory, selects the first valid retained predecessor, and binds current and target release
+names and identities, the complete inventory digest, runtime and OS/architecture evidence,
+health/process contracts, and the execution fingerprint. Artifact planning additionally validates
+both readonly metadata documents and recomputes both immutable-tree digests; source planning binds
+exact retained commits. It never repairs, rebuilds, downloads, or checks out a missing or damaged
+release.
+
+Apply requires the exact current `plan_id` and `ROLLBACK <deployment> TO <release>`. It recomputes
+the plan under the Deployment lock, then the Target independently checks the reviewed inventory
+and metadata hashes immediately before activation. The retained release regenerates only fixed
+Laravel environment-derived caches, passes candidate health, switches atomically, passes live
+health, and refreshes managed processes. A failure after the switch restores the former live
+symlink and process state. Results contain bounded release identity and hashes, never paths,
+object identities, raw metadata/output, commands, response bodies, or credentials.
 
 ### Secret planning and resolution
 

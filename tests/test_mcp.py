@@ -3,7 +3,6 @@ import dataclasses
 import hashlib
 import json
 import threading
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -524,6 +523,7 @@ async def test_hard_v6_tool_surface() -> None:
         "apply_deployment_resources",
         "plan_deployment",
         "apply_deployment",
+        "plan_rollback_deployment",
         "plan_promotion",
         "promote_deployment",
         "plan_artisan",
@@ -711,7 +711,12 @@ async def test_deployment_release_tool_schemas_remain_stable_across_module_extra
         "plan_deployment": ({"name"}, {"name"}, True),
         "apply_deployment": ({"name", "plan_id"}, {"name", "plan_id"}, False),
         "list_releases": ({"name"}, {"name"}, True),
-        "rollback_deployment": ({"name", "confirmation"}, {"name", "confirmation"}, False),
+        "plan_rollback_deployment": ({"name"}, {"name"}, True),
+        "rollback_deployment": (
+            {"name", "plan_id", "confirmation"},
+            {"name", "plan_id", "confirmation"},
+            False,
+        ),
         "plan_promotion": ({"source", "destination"}, {"source", "destination"}, True),
         "promote_deployment": (
             {"source", "destination", "plan_id"},
@@ -767,32 +772,22 @@ def test_deployment_resource_mcp_adapter_uses_current_orchestrator(monkeypatch) 
     assert seen == ["example-app"]
 
 
-def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> None:
+def test_deployment_release_orchestrator_owns_listing() -> None:
     calls: list[str] = []
-
-    class SourceStore:
-        @staticmethod
-        def deployment(name):
-            return sample_state().deployments[name]
-
-    @contextmanager
-    def lock(name):
-        calls.append(f"lock:{name}")
-        yield
 
     def run(task, name, **_kwargs):
         calls.append(f"{task}:{name}")
         return CommandResult([name], 0, task)
 
     orchestrator = DeploymentReleaseOrchestrator(
-        store=SourceStore(),
+        store=None,
         context=None,
         run_deployment=run,
         secret_plan=None,
         dns_issues=None,
         managed_database_issues=None,
         valkey_runtime=None,
-        deployment_resource_lock=lock,
+        deployment_resource_lock=None,
         deployment_resource_locks=None,
         assert_plan=None,
         replace=None,
@@ -800,16 +795,7 @@ def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> N
     )
 
     assert orchestrator.list_releases("example-app")["output"] == "releases"
-    with pytest.raises(ValueError, match="ROLLBACK example-app"):
-        orchestrator.rollback_deployment("example-app", "wrong")
-    assert orchestrator.rollback_deployment(
-        "example-app", "ROLLBACK example-app"
-    )["output"] == "rollback"
-    assert calls == [
-        "releases:example-app",
-        "lock:example-app",
-        "rollback:example-app",
-    ]
+    assert calls == ["releases:example-app"]
 
 
 def test_deployment_release_mcp_adapter_uses_current_orchestrator(monkeypatch) -> None:

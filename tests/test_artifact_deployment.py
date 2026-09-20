@@ -745,6 +745,106 @@ def test_extractor_enforces_archive_bounds(
     assert list(workspace_root.iterdir()) == []
 
 
+def write_artifact_release(root: Path, name: str, marker: str) -> dict[str, object]:
+    release = root / "releases" / name
+    release.mkdir(parents=True)
+    artisan = release / "artisan"
+    artisan.write_text(marker)
+    os.chmod(artisan, 0o755)
+    tree_digest = artifact_program.tree_digest([("artisan", artisan)])
+    metadata = {
+        "application": "example",
+        "commit": marker * 40,
+        "build_id": "build_v1_" + marker * 64,
+        "artifact_digest": marker * 64,
+        "tree_digest": tree_digest,
+        "bytes": 100,
+        "manifest_version": f"manifest-v{name}",
+        "package_version": f"package-v{name}",
+        "schema_version": 2,
+        "build_secrets_used": False,
+        "build_secret_count": 0,
+        "packaging_schema": "laravel_v1",
+        "release_mode": "artifact",
+        "promotion_seed": {
+            field: BUILD_IDENTITY[field]
+            for field in sorted({
+                "repository_fingerprint", "composer_lock_sha256",
+                "composer_lock_bytes", "frontend_lock", "capability",
+            })
+        },
+        "release_contract": RELEASE_CONTRACT,
+    }
+    metadata_path = release / ".gimme-artifact.json"
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    os.chmod(metadata_path, 0o444)
+    return metadata
+
+
+@pytest.mark.parametrize("release_mode", ["source", "artifact"])
+def test_rollback_inventory_selects_and_verifies_exact_predecessor(
+    tmp_path: Path, release_mode: str
+) -> None:
+    apps_root = tmp_path / "apps"
+    deploy_path = apps_root / "deployments" / "example"
+    (deploy_path / "releases").mkdir(parents=True)
+    expected = {}
+    for name, marker in (("1", "a"), ("2", "b")):
+        release = deploy_path / "releases" / name
+        if release_mode == "artifact":
+            expected[name] = write_artifact_release(deploy_path, name, marker)
+        else:
+            release.mkdir()
+            (release / "REVISION").write_text(marker * 40)
+            expected[name] = {"commit": marker * 40, "release_mode": "source"}
+    (deploy_path / ".dep").mkdir()
+    (deploy_path / ".dep" / "releases_log").write_text(
+        '\n'.join(json.dumps({"release_name": name}) for name in ("1", "2"))
+    )
+    (deploy_path / "current").symlink_to(deploy_path / "releases" / "2")
+
+    result = artifact_program.rollback_inventory(
+        apps_root, str(deploy_path), release_mode
+    )
+
+    assert result["status"] == "ready"
+    assert result["current"] == {"release": "2", "identity": expected["2"]}
+    assert result["target"] == {"release": "1", "identity": expected["1"]}
+    assert len(result["inventory_sha256"]) == 64
+
+    stale_request = {
+        "operation": "rollback",
+        "release_mode": release_mode,
+        "expected": {
+            "inventory_sha256": "0" * 64,
+            "current_release": "2",
+            "target_release": "1",
+            "current_metadata_sha256": "0" * 64,
+            "target_metadata_sha256": "0" * 64,
+        },
+    }
+    encoded = base64.b64encode(json.dumps(stale_request).encode()).decode()
+    with pytest.raises(artifact_program.ArtifactFailure, match="rollback_plan_stale"):
+        artifact_program.main([
+            "artifact.py", encoded, "-", str(apps_root), str(deploy_path)
+        ])
+
+    bad = deploy_path / "releases" / "1" / "BAD_RELEASE"
+    bad.write_text("bad")
+    with pytest.raises(artifact_program.ArtifactFailure, match="rollback_release_missing"):
+        artifact_program.rollback_inventory(apps_root, str(deploy_path), release_mode)
+    bad.unlink()
+
+    if release_mode == "artifact":
+        (deploy_path / "releases" / "1" / "artisan").write_text("tampered")
+        with pytest.raises(
+            artifact_program.ArtifactFailure, match="artifact_tree_digest_mismatch"
+        ):
+            artifact_program.rollback_inventory(
+                apps_root, str(deploy_path), release_mode
+            )
+
+
 def promotion_state() -> ControlState:
     state = artifact_state()
     original = state.deployments["example-local"]
@@ -940,6 +1040,28 @@ class PromotionSupport:
         return self.materialize_request(context), nullcontext(None)
 
 
+class RollbackSupport(PromotionSupport):
+    def __init__(self, store: MemoryStore, mode: str):
+        super().__init__(store)
+        self.mode = mode
+        self.inventory_version = "1" * 64
+
+    def rollback_inventory(self, name):
+        if self.mode == "artifact":
+            target = self.live_release(name)
+            current = {**target, "commit": "b" * 40}
+        else:
+            target = {"commit": "a" * 40, "release_mode": "source"}
+            current = {"commit": "b" * 40, "release_mode": "source"}
+        return {
+            "status": "ready",
+            "release_mode": self.mode,
+            "inventory_sha256": self.inventory_version,
+            "current": {"release": "2", "identity": current},
+            "target": {"release": "1", "identity": target},
+        }
+
+
 def promotion_operations(store: MemoryStore, support: PromotionSupport, calls: list):
     @contextmanager
     def locks(*_names):
@@ -955,6 +1077,19 @@ def promotion_operations(store: MemoryStore, support: PromotionSupport, calls: l
                     f"GIMME_PHP_EXTENSION|{extension}|ready"
                     for extension in store.load().applications["example"].php_extensions
                 ),
+            ])
+        elif task == "gimme:preflight:runtimes":
+            deployment = store.load().deployments[name]
+            output = "\n".join([
+                *(
+                    f"GIMME_RUNTIME|{runtime}|{pin.version}"
+                    for runtime, pin in deployment.runtimes.items()
+                ),
+                *(
+                    f"GIMME_PHP_EXTENSION|{extension}|ready"
+                    for extension in store.load().applications["example"].php_extensions
+                ),
+                "GIMME_PLATFORM|linux|x86_64",
             ])
         elif task == "deploy" and kwargs.get("arguments") == ("--plan",):
             output = "artifact promotion task graph"
@@ -1104,3 +1239,101 @@ def test_failed_artifact_promotion_does_not_update_destination_source() -> None:
             "artifact-source", "artifact-destination", plan["plan_id"]
         )
     assert store.deployment("artifact-destination").source == before
+
+
+@pytest.mark.parametrize("release_mode", ["source", "artifact"])
+def test_content_addressed_rollback_plans_and_applies_exact_release(
+    release_mode: str,
+) -> None:
+    state = promotion_state()
+    deployment = state.deployments["artifact-destination"].model_copy(
+        update={"release_mode": release_mode}
+    )
+    state = state.model_copy(update={
+        "deployments": {**state.deployments, "artifact-destination": deployment}
+    })
+    store = MemoryStore(state)
+    support = RollbackSupport(store, release_mode)
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+
+    plan = operations.plan_rollback_deployment("artifact-destination")
+    assert plan["ready"] is True
+    assert plan["current"]["release"] == "2"
+    assert plan["target"]["release"] == "1"
+    assert "promotion_seed" not in plan["target"]["identity"]
+    with pytest.raises(ValueError, match="ROLLBACK artifact-destination TO 1"):
+        operations.rollback_deployment(
+            "artifact-destination", plan["plan_id"], "wrong"
+        )
+
+    result = operations.rollback_deployment(
+        "artifact-destination",
+        plan["plan_id"],
+        "ROLLBACK artifact-destination TO 1",
+    )
+
+    assert result["status"] == "rolled_back"
+    assert "manifest_version" not in result["to"]["identity"]
+    assert "package_version" not in result["to"]["identity"]
+    applied = [call for call in calls if call[0] == "gimme:rollback"]
+    assert applied[-1][2]["rollback_release"] == "1"
+    assert applied[-1][2]["artifact_request"]["expected"]["target_release"] == "1"
+
+
+def test_rollback_rejects_changed_inventory_before_switch() -> None:
+    store = MemoryStore(promotion_state())
+    support = RollbackSupport(store, "artifact")
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+    plan = operations.plan_rollback_deployment("artifact-destination")
+    support.inventory_version = "2" * 64
+
+    with pytest.raises(ValueError, match="plan does not match current state"):
+        operations.rollback_deployment(
+            "artifact-destination",
+            plan["plan_id"],
+            "ROLLBACK artifact-destination TO 1",
+        )
+    assert not any(call[0] == "gimme:rollback" for call in calls)
+
+
+def test_artifact_rollback_rejects_incompatible_retained_build() -> None:
+    store = MemoryStore(promotion_state())
+    support = RollbackSupport(store, "artifact")
+    support.compatible = False
+
+    with pytest.raises(RuntimeError, match="rollback_release_incompatible"):
+        promotion_operations(store, support, []).plan_rollback_deployment(
+            "artifact-destination"
+        )
+
+
+def test_interrupted_rollback_can_retry_the_same_reviewed_plan() -> None:
+    store = MemoryStore(promotion_state())
+    support = RollbackSupport(store, "artifact")
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+    plan = operations.plan_rollback_deployment("artifact-destination")
+    original_run = operations.run_deployment
+    interrupted = True
+
+    def interrupt_once(task, name, **kwargs):
+        nonlocal interrupted
+        if task == "gimme:rollback" and interrupted:
+            interrupted = False
+            raise KeyboardInterrupt
+        return original_run(task, name, **kwargs)
+
+    operations = DeploymentReleaseOrchestrator(
+        **{**operations.__dict__, "run_deployment": interrupt_once}
+    )
+    confirmation = "ROLLBACK artifact-destination TO 1"
+
+    with pytest.raises(KeyboardInterrupt):
+        operations.rollback_deployment(
+            "artifact-destination", plan["plan_id"], confirmation
+        )
+    assert operations.rollback_deployment(
+        "artifact-destination", plan["plan_id"], confirmation
+    )["status"] == "rolled_back"

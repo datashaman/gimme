@@ -636,6 +636,25 @@ def test_artifact_plan_preserves_health_activation_process_and_cleanup_order() -
     )
 
 
+def test_reviewed_rollback_uses_retained_release_health_and_restoration_only() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:rollback'", 1)[1].split(
+        "task('gimme:preflight:stack'", 1
+    )[0]
+
+    assert task.index("artisan:optimize") < task.index("gimme:health:candidate")
+    assert task.index("gimme:health:candidate") < task.index("{{bin/symlink}}")
+    assert task.index("{{bin/symlink}}") < task.index("gimme:health:live")
+    assert task.index("gimme:health:live") < task.index("gimme:restart:workers")
+    assert "set('rollback_candidate', $current)" in task
+    assert "if ($observed === $candidate)" in task
+    assert "git " not in task
+    assert "composer" not in task
+    assert "invoke('gimme:artifact:run')" in task
+    assert "materialize" not in task
+    assert "deploy:update_code" not in task
+
+
 def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release() -> None:
     recipe = deployer_source()
     task = recipe.split("task('gimme:artisan'", 1)[1].split("task('gimme:service:status'", 1)[0]

@@ -261,6 +261,24 @@ def test_artifact_release_context_and_reader_file_use_separate_boundaries(
     assert json.loads(captured["GIMME_ARTIFACT_REQUEST_JSON"]) == request
 
 
+def test_rollback_release_is_a_bounded_dedicated_environment_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    deployer = runner(tmp_path)
+    deployer.run("gimme:rollback", server(), rollback_release="17")
+    assert captured["GIMME_ROLLBACK_RELEASE"] == "17"
+
+    with pytest.raises(ValueError, match="rollback_release is invalid"):
+        deployer.run("gimme:rollback", server(), rollback_release="../17")
+
+
 def test_recovery_schedule_authority_crosses_as_canonical_json(
     tmp_path: Path, monkeypatch
 ) -> None:

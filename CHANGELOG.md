@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Replaced confirmation-only rollback with a content-addressed plan/apply flow for source and
+  artifact releases. Planning selects and verifies the exact retained predecessor, runtime and
+  platform capability, health, and process effects. Apply rechecks the complete inventory on the
+  Target immediately before cache regeneration and candidate/live gates, switches atomically,
+  restores the prior release on failure, and returns only bounded release identity.
 - Added build-free artifact promotion. Planning validates the source Deployment's live readonly
   release metadata and immutable tree, recomputes the destination-context build identity locally,
   verifies the exact private publication with destination reader authority, and binds runtime,
