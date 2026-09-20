@@ -26,19 +26,20 @@ from gimme import valkey_recovery
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
     AWSSecretsManagerStore, ApplicationConfig,
-    ControlState, DeploymentConfig, DeploymentRegistration, DeploymentSource,
+    ControlState, DeploymentConfig, DeploymentRegistration,
     ManualRecoveryCadence, Resource, ResourceConfig, S3BackupDestination, SecretReference,
     SecretStore, StateStore, TargetConfig, ValkeyBinding,
     legacy_app, legacy_server, new_placement, runs_horizon, target_sites,
 )
 from gimme.control_plans import (
-    deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
+    deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, registration_update_plan,
     resource_binding_plan, resource_cleanup_plan, target_stack_plan,
     resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
     valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
+from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.journal import OperationJournal
 from gimme.recovery import ComponentDump, preflight_backup_destination
 from gimme.recovery_orchestration import RecoveryOrchestrator
@@ -118,6 +119,24 @@ def _managed_resource_orchestrator() -> ManagedResourceOrchestrator:
         elasticache_valkey=elasticache_valkey,
         deployment_resource_locks=_deployment_resource_locks,
         assert_plan=_assert_plan,
+    )
+
+
+def _deployment_release_orchestrator() -> DeploymentReleaseOrchestrator:
+    """Compose Deployment release orchestration from the current adapters."""
+    return DeploymentReleaseOrchestrator(
+        store=store,
+        context=_context,
+        run_deployment=_run_deployment,
+        secret_plan=_secret_plan,
+        dns_issues=_dns_issues,
+        managed_database_issues=_managed_database_issues,
+        valkey_runtime=_valkey_runtime,
+        deployment_resource_lock=_deployment_resource_lock,
+        deployment_resource_locks=_deployment_resource_locks,
+        assert_plan=_assert_plan,
+        replace=_replace,
+        result=_result,
     )
 
 
@@ -467,20 +486,6 @@ def _restore_valkey_component(
     )
 
 
-def _revision(name: str) -> str:
-    deployment = store.deployment(name)
-    if deployment.source.kind == "commit":
-        return deployment.source.ref
-    result = _run_deployment("gimme:resolve-revision", name, timeout=60)
-    for raw in result.output.splitlines():
-        line = raw.split("] ", 1)[-1].strip()
-        if line.startswith("GIMME_REVISION|"):
-            revision = line.split("|", 1)[1]
-            if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision):
-                return revision
-    raise RuntimeError("source did not resolve to one exact Git revision")
-
-
 def _dns_issues(deployment: DeploymentConfig, target: TargetConfig) -> list[str]:
     if target.network.mode != "public_dns":
         return []
@@ -648,54 +653,6 @@ def _resource_plan(name: str) -> dict[str, Any]:
         plan["readiness_issues"] = issues
         plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})
     return plan
-
-
-def _release_plan(name: str, revision: str | None = None) -> dict[str, Any]:
-    state, deployment, target, application = _context(name)
-    _, secret_issues = _secret_plan(name, state, deployment)
-    issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
-        state, deployment
-    ) + _valkey_runtime(name, state, deployment)[3]
-    if issues:
-        raise ValueError("deployment is not ready: " + "; ".join(issues))
-    selected = revision or _revision(name)
-    preflight = _run_deployment("gimme:preflight:runtimes", name, revision=selected,
-                                timeout=60)
-    processes, process_issues = _process_preflight(name, deployment, application)
-    rendered = _run_deployment("deploy", name, revision=selected,
-                               arguments=("--plan",), timeout=60)
-    return deployment_release_plan(name, deployment, target, application, selected,
-                                   rendered.output, {"declared": {
-                                       key: value.model_dump(mode="json")
-                                       for key, value in deployment.runtimes.items()
-                                   },
-                                                     "preflight": preflight.output},
-                                   processes, process_issues)
-
-
-def _process_preflight(
-    name: str, deployment: DeploymentConfig, application: ApplicationConfig
-) -> tuple[dict[str, object], list[str]]:
-    managed = application.framework == "laravel" and (
-        deployment.workers is not None or deployment.scheduler is not None
-    )
-    if not managed:
-        return {"required": False, "observed": {}}, []
-    result = _run_deployment("gimme:preflight:processes", name, timeout=60)
-    observed: dict[str, str] = {}
-    for raw in result.output.splitlines():
-        line = raw.split("] ", 1)[-1].strip()
-        if line.startswith("GIMME_") and "|" in line:
-            key, value = line.split("|", 1)
-            observed[key.removeprefix("GIMME_").lower()] = value
-    issues = []
-    if observed.get("process_helper") != "ready":
-        issues.append("privileged process helper requires target bootstrap")
-    if observed.get("pcntl") not in {"ready", "not_required"}:
-        issues.append("PHP pcntl extension is required for managed workers")
-    if observed.get("posix") not in {"ready", "not_required"}:
-        issues.append("PHP posix extension is required for Horizon")
-    return {"required": True, "observed": observed}, issues
 
 
 def _migration_targets() -> dict[str, TargetConfig]:
@@ -2292,89 +2249,43 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
 @_journal_plan("deployment", "name")
 def plan_deployment(name: Name) -> dict[str, object]:
     """Resolve source and pinned runtimes and render the exact Deployer task graph."""
-    return _release_plan(name)
+    return _deployment_release_orchestrator().plan_deployment(name)
 
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("deployment", "name")
 def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Deploy an exact reviewed revision with health gates and worker refresh."""
-    with _deployment_resource_lock(name):
-        expected = _release_plan(name)
-        _assert_plan(expected, plan_id)
-        if not expected["ready"]:
-            raise ValueError("deployment is not ready; inspect readiness_issues")
-        result = _run_deployment("deploy", name, revision=str(expected["revision"]),
-                                 timeout=1800)
-        _, deployment, _, application = _context(name)
-        if application.framework == "laravel" and (
-            deployment.workers is not None or deployment.scheduler is not None
-        ):
-            _run_deployment("gimme:provision:processes", name, timeout=1800)
-        return _result(result)
+    return _deployment_release_orchestrator().apply_deployment(name, plan_id)
 
 
 @mcp.tool(annotations=READ)
 def list_releases(name: Name) -> dict[str, object]:
     """List retained releases for one deployment and identify the current release."""
-    return _result(_run_deployment("releases", name))
+    return _deployment_release_orchestrator().list_releases(name)
 
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("rollback_deployment", "name")
 def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
     """Restore a deployment's prior retained release after exact confirmation."""
-    expected = f"ROLLBACK {name}"
-    if confirmation != expected:
-        raise ValueError(f"confirmation must exactly equal '{expected}'")
-    with _deployment_resource_lock(name):
-        return _result(_run_deployment("rollback", name))
+    return _deployment_release_orchestrator().rollback_deployment(name, confirmation)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("promotion", "source", "destination")
 def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
     """Plan deploying the source deployment's exact live commit to a destination."""
-    state, source_deployment, _, _ = _context(source)
-    destination_deployment = state.deployments[destination]
-    if source_deployment.application != destination_deployment.application:
-        raise ValueError("promotion requires deployments of the same application")
-    current = _run_deployment("gimme:current-revision", source, timeout=60)
-    revision = ""
-    for raw in current.output.splitlines():
-        line = raw.split("] ", 1)[-1].strip()
-        if line.startswith("GIMME_CURRENT_REVISION|"):
-            revision = line.split("|", 1)[1]
-    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", revision) is None:
-        raise RuntimeError("source deployment has no exact current revision")
-    return exact_plan({"kind": "promotion", "source": source, "destination": destination,
-                       "revision": revision, "release": _release_plan(destination, revision)})
+    return _deployment_release_orchestrator().plan_promotion(source, destination)
 
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("promotion", "source", "destination")
 def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict[str, object]:
     """Promote an exact reviewed live commit and pin the destination after success."""
-    with _deployment_resource_locks(source, destination):
-        expected = plan_promotion(source, destination)
-        _assert_plan(expected, plan_id)
-        release = cast(dict[str, object], expected["release"])
-        if not release["ready"]:
-            raise ValueError(
-                "destination deployment is not ready; inspect release readiness_issues"
-            )
-        revision = str(expected["revision"])
-        result = _run_deployment("deploy", destination, revision=revision, timeout=1800)
-        state = store.load()
-        deployment = state.deployments[destination].model_copy(
-            update={"source": DeploymentSource(kind="commit", ref=revision)})
-        application = state.applications[deployment.application]
-        if application.framework == "laravel" and (
-            deployment.workers is not None or deployment.scheduler is not None
-        ):
-            _run_deployment("gimme:provision:processes", destination, timeout=1800)
-        store.save(_replace(state, "deployments", destination, deployment))
-        return _result(result)
+    return _deployment_release_orchestrator().promote_deployment(
+        source, destination, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
