@@ -1738,6 +1738,10 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
             raise AssertionError("Recovery service unit exposed stored credentials")
         if ssh("sudo", "systemctl", "is-enabled", f"{unit}.timer") != "enabled":
             raise AssertionError("Recovery timer was not enabled")
+        # A just-enabled persistent timer may start its latest slot immediately. Stop that
+        # bounded activation before changing policy so this matrix does not leave old-jitter
+        # sleepers competing with the explicit catch-up probe below.
+        ssh("sudo", "systemctl", "stop", f"{unit}.service")
 
     # A daily slot one hour in the past avoids the stable jitter wait and exercises the
     # latest-slot catch-up through the real installed runner. A newly created persistent
@@ -1745,6 +1749,7 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
     # the activation systemd would coalesce after an established timer's downtime.
     past = datetime.now(UTC) - timedelta(hours=1)
     apply_policy({"kind": "daily", "hour": past.hour, "minute": past.minute})
+    ssh("sudo", "systemctl", "stop", f"{unit}.service")
     try:
         ssh("sudo", "systemctl", "start", f"{unit}.service")
     except subprocess.CalledProcessError:
