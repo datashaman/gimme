@@ -520,6 +520,9 @@ async def test_hard_v7_tool_surface() -> None:
         "register_deployment",
         "plan_register_deployment",
         "inspect_fleet",
+        "inspect_rollout",
+        "plan_start_rollout",
+        "start_rollout",
         "plan_target_stack",
         "apply_target_stack",
         "plan_deployment_runtimes",
@@ -574,6 +577,7 @@ async def test_hard_v7_tool_surface() -> None:
         "gimme://applications/{name}/artifacts/{build_id}",
         "gimme://resources/{name}",
         "gimme://deployments/{name}",
+        "gimme://deployments/{name}/rollout",
         "gimme://operations/{correlation_id}",
         "gimme://provider-accounts/{name}",
         "gimme://secret-stores/{name}",
@@ -771,6 +775,7 @@ def test_deployment_resource_mcp_adapter_uses_current_orchestrator(monkeypatch) 
         "_deployment_resource_orchestrator",
         FakeDeploymentResourceOrchestrator,
     )
+    monkeypatch.setattr(server_module, "_require_no_rollout", lambda *_names: None)
 
     assert server_module.plan_deployment_resources("example-app")["kind"] == (
         "deployment_resources"
@@ -1325,7 +1330,7 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 7
+    assert value["schema_version"] == 8
     assert "deployments" in value
 
 

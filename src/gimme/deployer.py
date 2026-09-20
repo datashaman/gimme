@@ -135,6 +135,7 @@ class DeployerRunner:
         artifact_reader_version: str | None = None,
         artifact_request: dict[str, object] | None = None,
         rollback_release: str | None = None,
+        rollout_generation: int | None = None,
         backup_local_path: Path | None = None,
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
@@ -277,6 +278,13 @@ class DeployerRunner:
             if re.fullmatch(r"[1-9][0-9]{0,19}", rollback_release) is None:
                 raise ValueError("rollback_release is invalid")
             environment["GIMME_ROLLBACK_RELEASE"] = rollback_release
+        if rollout_generation is not None:
+            if (
+                isinstance(rollout_generation, bool)
+                or not 1 <= rollout_generation <= 2_147_483_647
+            ):
+                raise ValueError("rollout_generation is invalid")
+            environment["GIMME_ROLLOUT_GENERATION"] = str(rollout_generation)
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if any(value is not None for value in (

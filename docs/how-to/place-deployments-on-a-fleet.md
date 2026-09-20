@@ -1,13 +1,14 @@
 # Place a Deployment on a registered Target fleet
 
-Schema v7 gives every Target a bounded `deployment_slots` capacity from 0 through 1024. Every
+Schema v8 gives every Target a bounded `deployment_slots` capacity from 0 through 1024. Every
 registered Deployment consumes one slot on its immutable Target until removal succeeds. Capacity
 is an admission-control count, not a CPU, memory, disk, or live-utilization guarantee.
 
 ## Migrate existing state
 
-Use `plan_state_migration` and `apply_state_migration` with the reviewed `plan_id` for schema-v6
-state; no artifact-policy arguments need to be repeated. Migration preserves
+Use `plan_state_migration` and `apply_state_migration` with the reviewed `plan_id` for schema-v7
+state; no artifact-policy arguments need to be repeated. Migration adds an empty Rollout
+collection and preserves
 every Deployment's Target and placement, records an explicit immutable placement decision, and
 sets each Target's capacity to `max(existing deployment count, 1)`. It therefore creates no
 accidental spare capacity. Increase capacity later with the normal Target update plan if desired.
@@ -45,7 +46,8 @@ last-slot claims cannot both succeed.
 
 ## Inspect and recover
 
-Read `gimme://fleet` for desired capacity, reservations, free slots, and overcommit without remote
+Read `gimme://fleet` for desired capacity, Deployment and temporary Rollout reservations, free
+slots, and overcommit without remote
 calls. Use `inspect_fleet` for bounded current readiness. Results contain fixed status codes and
 fingerprints, never raw command output, exception text, secrets, or credentials.
 

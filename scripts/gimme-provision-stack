@@ -44,7 +44,10 @@ ALLOWED_FRAMEWORKS = {"common", "laravel", "symfony", "wordpress", "static"}
 MAX_STATE_BYTES = 256 * 1024
 AVAHI_BEGIN = "# BEGIN GIMME MANAGED HOSTS"
 AVAHI_END = "# END GIMME MANAGED HOSTS"
-CADDY_IMPORT = "import /etc/caddy/gimme/*.caddy"
+CADDY_IMPORTS = (
+    "import /etc/caddy/gimme/*.caddy",
+    "import /etc/caddy/gimme-rollouts/*.caddy",
+)
 CADDY_ROOT = Path(
     "/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
 )
@@ -493,8 +496,15 @@ def reconcile() -> None:
 
     caddyfile = Path("/etc/caddy/Caddyfile")
     caddy_content = caddyfile.read_text()
-    if CADDY_IMPORT not in caddy_content.splitlines():
-        atomic_write(caddyfile, caddy_content.rstrip() + f"\n\n{CADDY_IMPORT}\n")
+    missing_imports = [
+        statement for statement in CADDY_IMPORTS
+        if statement not in caddy_content.splitlines()
+    ]
+    if missing_imports:
+        atomic_write(
+            caddyfile,
+            caddy_content.rstrip() + "\n\n" + "\n".join(missing_imports) + "\n",
+        )
 
     # Static Avahi host mappings publish a reverse record and collide when aliases
     # share the machine's own address. Remove Gimme's legacy block; persistent

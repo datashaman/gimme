@@ -1060,11 +1060,20 @@ def checked_release(apps_root: Path, argument: str) -> Path:
         details = release.lstat()
     except OSError:
         fail("artifact_release_invalid")
+    relative = resolved.relative_to(apps_root) if resolved.is_relative_to(apps_root) else None
+    release_boundary = relative is not None and "releases" in relative.parts
+    rollout_boundary = (
+        relative is not None
+        and len(relative.parts) >= 3
+        and relative.parts[-3] == "rollouts"
+        and re.fullmatch(r"[1-9][0-9]{0,9}", relative.parts[-2]) is not None
+        and int(relative.parts[-2]) <= 2_147_483_647
+        and relative.parts[-1] == "candidate"
+    )
     if (
         not release.is_absolute()
         or release != resolved
-        or not resolved.is_relative_to(apps_root)
-        or "releases" not in resolved.relative_to(apps_root).parts
+        or not (release_boundary or rollout_boundary)
         or release.is_symlink()
         or not stat.S_ISDIR(details.st_mode)
         or details.st_uid != os.getuid()

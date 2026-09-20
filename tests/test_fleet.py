@@ -210,6 +210,7 @@ def test_apply_rejects_changed_capacity_and_prevents_last_slot_overbooking(
         "free_slots": 0,
         "overcommitted": False,
         "reservations": [next(iter(desired.load().deployments))],
+        "temporary_rollout_reservations": [],
     }
 
 
@@ -323,5 +324,5 @@ def test_schema_v6_migration_preserves_placements_without_spare_capacity(
 
     migrated = desired.state_migration({}, {})
 
-    assert migrated.schema_version == 7
+    assert migrated.schema_version == 8
     assert migrated.targets["target-a"].deployment_slots == 1
