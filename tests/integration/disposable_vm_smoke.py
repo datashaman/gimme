@@ -634,7 +634,7 @@ def set_restore_probe(value: str) -> None:
     if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
         raise AssertionError("invalid fixed integration database identity")
     statement = (
-        f"SET ROLE {database}; "
+        f"SET client_min_messages = warning; SET ROLE {database}; "
         "CREATE TABLE IF NOT EXISTS gimme_restore_probe "
         "(id integer PRIMARY KEY, value text NOT NULL); "
         f"INSERT INTO gimme_restore_probe VALUES (1, '{value}') "
