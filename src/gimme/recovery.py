@@ -33,13 +33,15 @@ MAX_COMPONENT_BYTES = 512 * 1024 * 1024
 REQUEST_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 RESTORE_STATES = (
     "started", "maintenance_entered", "safety_verified", "safety_not_required",
+    "safety_failed",
     "artifact_verified", "shadow_verified", "data_replaced", "verification_failed",
     "verification_succeeded", "cleanup_completed", "completed",
 )
 RESTORE_TRANSITIONS = {
     None: {"started"},
     "started": {"maintenance_entered"},
-    "maintenance_entered": {"safety_verified", "safety_not_required"},
+    "maintenance_entered": {"safety_verified", "safety_not_required", "safety_failed"},
+    "safety_failed": {"maintenance_entered"},
     "safety_verified": {"artifact_verified"},
     "safety_not_required": {"artifact_verified"},
     "artifact_verified": {"shadow_verified"},

@@ -1029,6 +1029,122 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
     ) is False
 
 
+def test_safety_failure_restores_runtime_records_failure_and_retries(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source_body = b"source"
+    source = tmp_path / "source.dump"
+    source.write_bytes(source_body)
+    point = recovery_point_id("example-app", "primary", "safety-failure")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(source_body).hexdigest(), bytes=len(source_body),
+            resource_version="17.2",
+        ),
+    )
+    actions: list[tuple[str, str | None]] = []
+    fail_safety = True
+
+    def fake_run(task, *args, **kwargs):
+        nonlocal fail_safety
+        action = kwargs.get("recovery_action")
+        actions.append((task, action))
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+        if task == "gimme:backup:dump-postgres":
+            if fail_safety:
+                fail_safety = False
+                raise RuntimeError("protected data must not escape")
+            safety = b"safety"
+            kwargs["backup_local_path"].write_bytes(safety)
+            return CommandResult(
+                ["dep"], 0,
+                f"GIMME_BACKUP|{hashlib.sha256(safety).hexdigest()}|{len(safety)}",
+            )
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-safety", ["postgres"]
+    )
+    with pytest.raises(RecoveryError, match="^safety_failed$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, "restore-safety", str(plan["plan_id"]),
+            str(plan["confirmation"]), ["postgres"],
+        )
+
+    failed = server_module.restore_record_resource("example-app", "restore-safety")
+    assert failed["state"] == "safety_failed"
+    assert actions[-1] == ("gimme:recovery:maintenance", "exit")
+    assert not any(
+        task == "gimme:recovery:postgres" for task, _action in actions
+    ), "Safety failure must precede every source mutation"
+
+    retry = server_module.plan_restore_deployment(
+        "example-app", point, "restore-safety", ["postgres"]
+    )
+    completed_stage = server_module.apply_restore_deployment(
+        "example-app", point, "restore-safety", str(retry["plan_id"]),
+        str(retry["confirmation"]), ["postgres"],
+    )
+
+    assert completed_stage["state"] == "data_replaced"
+    assert actions.count(("gimme:recovery:maintenance", "enter")) == 2
+    assert server_module.restore_record_resource(
+        "example-app", "restore-safety"
+    )["state"] == "data_replaced"
+
+
+def test_safety_failure_reports_when_runtime_cannot_be_restored(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    source = tmp_path / "source.dump"
+    source.write_bytes(b"source")
+    point = recovery_point_id("example-app", "primary", "runtime-failure")
+    recovery_module.create_recovery_point(
+        "primary", selected.load().backup_destinations["primary"], None, adapter,
+        "example-app", point, recovery_module.ComponentDump(
+            kind="postgres", local_path=source,
+            sha256=hashlib.sha256(b"source").hexdigest(), bytes=6,
+            resource_version="17.2",
+        ),
+    )
+
+    def fake_run(task, *args, **kwargs):
+        action = kwargs.get("recovery_action")
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|nonempty")
+        if task == "gimme:backup:dump-postgres":
+            raise RuntimeError("private provider failure")
+        if task == "gimme:recovery:maintenance" and action == "exit":
+            raise RuntimeError("private runtime failure")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-runtime-failure", ["postgres"]
+    )
+    with pytest.raises(RecoveryError, match="^recovery_runtime_restore_failed$"):
+        server_module.apply_restore_deployment(
+            "example-app", point, "restore-runtime-failure", str(plan["plan_id"]),
+            str(plan["confirmation"]), ["postgres"],
+        )
+
+    record = server_module.restore_record_resource(
+        "example-app", "restore-runtime-failure"
+    )
+    assert record["state"] == "safety_failed"
+    assert "private" not in str(record)
+
+
 def test_failed_restore_verification_requiesces_and_never_cleans_up_or_exits(
     tmp_path, monkeypatch
 ) -> None:
