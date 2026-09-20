@@ -42,6 +42,7 @@ from gimme.control_plans import (
     valkey_provision_plan, valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
+from gimme.execution import execution_fingerprint
 from gimme.journal import OperationJournal
 from gimme.recovery import ComponentDump, RecoveryError, preflight_backup_destination
 from gimme.resources_postgres import ResourceError
@@ -1564,16 +1565,50 @@ def _deployment_restore_plan(
         and existing_restore["state"] in {"started", "maintenance_entered"}
         and original_empty != observed_empty
     )
+    selected_destinations = [
+        *([{
+            "resource": resource_name, "provider": "target_local",
+            "kind": "postgres", "version": resource.version,
+            "empty": original_empty,
+        }] if "postgres" in selected_components else []),
+        *(
+            [valkey_destination]
+            if "valkey" in selected_components and valkey_destination is not None
+            else []
+        ),
+    ]
+    request_fingerprint = StateStore.digest({
+        "kind": "deployment_restore_request",
+        "deployment": name,
+        "source_manifest": manifest,
+        "selected_components": selected_components,
+        "untouched_components": untouched_components,
+        "destinations": selected_destinations,
+        "recovery_policy": deployment.recovery.model_dump(mode="json"),
+        "placement": deployment.placement.model_dump(mode="json"),
+        "execution_fingerprint": execution_fingerprint(),
+    })
+    record_destinations = [
+        {key: value for key, value in item.items() if key != "empty"}
+        for item in selected_destinations
+    ]
+    if existing_restore is not None and (
+        existing_restore.get("request_fingerprint") not in {None, request_fingerprint}
+        or existing_restore.get("request_fingerprint") is not None
+        and existing_restore.get("destinations") != record_destinations
+    ):
+        request_conflict = True
     return deployment_restore_plan(
         name, recovery_point_id, request_id,
         manifest_components,
         resource_name, resource.version,
         original_empty and "valkey" not in selected_components,
         selected_components,
-        valkey_destination,
-        None if existing_restore is None else str(existing_restore["state"]),
-        request_conflict,
-        destination_changed,
+        valkey_destination=valkey_destination,
+        request_fingerprint=request_fingerprint,
+        restore_state=None if existing_restore is None else str(existing_restore["state"]),
+        request_conflict=request_conflict,
+        destination_changed=destination_changed,
     )
 
 
@@ -1651,6 +1686,10 @@ def apply_restore_deployment(
         if len(destinations) != len(selected_components):
             raise RecoveryError("restore_destination_incompatible")
         primary_destination = destinations[0]
+        record_destinations = [
+            {key: value for key, value in item.items() if key != "empty"}
+            for item in destinations
+        ]
         identity = {
             "source_recovery_point_id": recovery_point_id,
             "destination_provider": str(primary_destination["provider"]),
@@ -1661,6 +1700,14 @@ def apply_restore_deployment(
             "selected_components": selected_components,
             "untouched_components": untouched_components,
             "partial": bool(expected["partial"]),
+            "destinations": (
+                record_destinations if existing is None
+                else cast(list[dict[str, object]], existing["destinations"])
+            ),
+            "request_fingerprint": (
+                str(expected["request_fingerprint"]) if existing is None
+                else cast(str | None, existing["request_fingerprint"])
+            ),
         }
         current = None if existing is None else str(existing["state"])
         changed = False
@@ -1760,12 +1807,46 @@ def apply_restore_deployment(
 
 
 def _restore_verification_plan(name: str, request_id: str) -> dict[str, object]:
-    state, _deployment, _destination_name, destination = _recovery_context(name)
+    state, deployment, _destination_name, destination = _recovery_context(name)
     _, credentials = _backup_destination_credentials(state, destination)
     restore = recovery_module.load_restore_record(
         destination, credentials, backup_s3, name, request_id
     )
-    return restore_verification_plan(name, request_id, restore)
+    observed: list[dict[str, object]] = []
+    for kind in cast(list[str], restore["selected_components"]):
+        resource_name = (
+            deployment.resources.database if kind == "postgres"
+            else deployment.resources.valkey.resource
+            if deployment.resources.valkey is not None else None
+        )
+        resource = state.resources.get(resource_name) if resource_name else None
+        if (
+            kind == "postgres" and isinstance(resource, ResourceConfig)
+            and resource.kind == "postgres"
+        ):
+            observed.append({
+                "resource": resource_name, "provider": "target_local",
+                "kind": "postgres", "version": resource.version,
+            })
+        elif (
+            kind == "valkey" and isinstance(resource, ResourceConfig)
+            and resource.kind == "valkey"
+        ):
+            observed.append({
+                "resource": resource_name, "provider": "target_local",
+                "kind": "valkey", "version": resource.version,
+            })
+        elif kind == "valkey" and isinstance(resource, AWSElastiCacheValkeyResource):
+            observed.append({
+                "resource": resource_name, "provider": "aws_elasticache_valkey",
+                "kind": "valkey", "version": resource.engine_version,
+            })
+    recorded = cast(list[dict[str, object]], restore["destinations"])
+    if restore["request_fingerprint"] is None:
+        observed = observed[:len(recorded)]
+    return restore_verification_plan(
+        name, request_id, restore, identity_conflict=observed != recorded
+    )
 
 
 @mcp.tool(annotations=READ)
@@ -1804,6 +1885,12 @@ def apply_verify_restore(
             "selected_components": cast(list[str], restore["selected_components"]),
             "untouched_components": cast(list[str], restore["untouched_components"]),
             "partial": bool(restore["partial"]),
+            "destinations": cast(
+                list[dict[str, object]], restore["destinations"]
+            ),
+            "request_fingerprint": cast(
+                str | None, restore["request_fingerprint"]
+            ),
         }
         current = str(restore["state"])
         changed = False

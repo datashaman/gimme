@@ -361,7 +361,12 @@ def _validate_restore_event(document: object) -> dict[str, object]:
         document.get("schema_version") == 3 and set(document) != common_keys | {
             "selected_components", "untouched_components", "partial",
         }
-    ) or document.get("schema_version") not in {2, 3}:
+    ) or (
+        document.get("schema_version") == 4 and set(document) != common_keys | {
+            "selected_components", "untouched_components", "partial",
+            "destinations", "request_fingerprint",
+        }
+    ) or document.get("schema_version") not in {2, 3, 4}:
         raise RecoveryError("restore_record_invalid")
     destination = document.get("destination")
     if (
@@ -410,8 +415,15 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             "untouched_components": [],
             "partial": False,
         }
+    if document["schema_version"] in {2, 3}:
+        document = {
+            **document,
+            "destinations": [destination],
+            "request_fingerprint": None,
+        }
     selected = document.get("selected_components")
     untouched = document.get("untouched_components")
+    destinations = document.get("destinations")
     if (
         not isinstance(selected, list)
         or not 1 <= len(selected) <= 2
@@ -426,6 +438,44 @@ def _validate_restore_event(document: object) -> dict[str, object]:
             {"postgres"}, {"valkey"}, {"postgres", "valkey"}
         )
         or destination["kind"] not in selected
+        or not isinstance(destinations, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"resource", "provider", "kind", "version"}
+            or not isinstance(item.get("resource"), str)
+            or re.fullmatch(
+                r"[a-z][a-z0-9-]{0,63}", str(item.get("resource"))
+            ) is None
+            or item.get("kind") not in {"postgres", "valkey"}
+            or item.get("kind") == "postgres" and item.get("provider") != "target_local"
+            or item.get("kind") == "valkey" and item.get("provider") not in {
+                "target_local", "aws_elasticache_valkey"
+            }
+            or RESOURCE_VERSION.fullmatch(str(item.get("version"))) is None
+            for item in destinations
+        )
+        or (
+            document["schema_version"] == 4
+            and document.get("request_fingerprint") is not None
+            and (
+                len(destinations) != len(selected)
+                or [item["kind"] for item in destinations] != selected
+                or destinations[0] != destination
+            )
+        )
+        or (
+            (
+                document["schema_version"] in {2, 3}
+                or document.get("request_fingerprint") is None
+            )
+            and destinations != [destination]
+        )
+        or (
+            document.get("request_fingerprint") is not None
+            and re.fullmatch(
+                r"plan_[0-9a-f]{20}", str(document.get("request_fingerprint"))
+            ) is None
+        )
         or document.get("partial") != bool(untouched)
     ):
         raise RecoveryError("restore_record_invalid")
@@ -483,6 +533,8 @@ def append_restore_event(
     selected_components: list[str] | None = None,
     untouched_components: list[str] | None = None,
     partial: bool = False,
+    destinations: list[dict[str, object]] | None = None,
+    request_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """Append and round-trip one immutable, secret-safe Restore transition."""
     events = _restore_events(destination, credentials, adapter, deployment, request_id)
@@ -503,6 +555,15 @@ def append_restore_event(
             [] if untouched_components is None else untouched_components
         ),
         "partial": partial,
+        "destinations": (
+            [{
+                "resource": destination_resource,
+                "provider": destination_provider,
+                "kind": destination_kind,
+                "version": destination_version,
+            }] if destinations is None else destinations
+        ),
+        "request_fingerprint": request_fingerprint,
     }
     if previous is not None and any(previous[key] != value for key, value in identity.items()):
         raise RecoveryError("restore_request_conflict")
@@ -511,7 +572,7 @@ def append_restore_event(
         raise RecoveryError("restore_transition_invalid")
     sequence = len(events)
     event = _validate_restore_event({
-        "schema_version": 3, "deployment": deployment, "request_id": request_id,
+        "schema_version": 4, "deployment": deployment, "request_id": request_id,
         "sequence": sequence, "state": state, "created_at": datetime.now(UTC).isoformat(),
         **identity,
     })
@@ -553,6 +614,8 @@ def load_restore_record(
         "selected_components": latest["selected_components"],
         "untouched_components": latest["untouched_components"],
         "partial": latest["partial"],
+        "destinations": latest["destinations"],
+        "request_fingerprint": latest["request_fingerprint"],
     }
 
 
