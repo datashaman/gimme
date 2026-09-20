@@ -1448,6 +1448,46 @@ def test_valkey_capture_failure_restores_runtime_and_publishes_nothing(
     assert adapter.objects == {}
 
 
+def test_valkey_only_restore_safety_captures_exact_selected_component(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    calls: list[str] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append(task)
+        assert task == "gimme:backup:capture-valkey"
+        content = b'{"format":"gimme-valkey-v1"}\n'
+        kwargs["backup_local_path"].write_bytes(content)
+        return CommandResult(
+            ["dep"], 0,
+            "GIMME_VALKEY_BACKUP|"
+            f"{hashlib.sha256(content).hexdigest()}|{len(content)}|0|"
+            "2026-09-20T02:00:00+00:00",
+        )
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    request_id = "restore-valkey"
+    safety_id = recovery_module.safety_recovery_point_id(
+        "example-app", "primary", request_id
+    )
+
+    safety = server_module._capture_restore_safety(
+        "example-app", request_id, safety_id, ["valkey"], state,
+        state.deployments["example-app"], "primary",
+        state.backup_destinations["primary"], None,
+    )
+
+    assert calls == ["gimme:backup:capture-valkey"]
+    assert safety["safety"] is True
+    assert safety["restore_request_id"] == request_id
+    assert [item["kind"] for item in safety["components"]] == ["valkey"]
+    assert safety["components"][0]["resource_version"] == "8.0.1"
+
+
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:
     use_recovery_store(tmp_path, monkeypatch)
     monkeypatch.setattr(server_module, "backup_s3", FakeS3())
