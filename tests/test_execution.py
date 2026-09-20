@@ -17,6 +17,7 @@ def write_execution_tree(root: Path) -> None:
         "scripts/gimme-postgres-restore-swap": "postgres-swap-helper-v1\n",
         "scripts/gimme-capture-valkey": "valkey-capture-v1\n",
         "scripts/gimme-restore-postgres": "postgres-restore-v1\n",
+        "scripts/gimme-restore-valkey": "valkey-restore-v1\n",
         "vendor/deployer/deployer/bin/dep": "deployer-bin-v1\n",
         "vendor/deployer/deployer/src/functions.php": "deployer-functions-v1\n",
         "pyproject.toml": "python-project-v1\n",

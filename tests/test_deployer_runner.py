@@ -351,3 +351,35 @@ def test_postgres_restore_context_must_be_complete_and_use_a_fixed_action(
 ) -> None:
     with pytest.raises(ValueError, match="PostgreSQL restore inputs must be complete"):
         runner(tmp_path).run("gimme:recovery:postgres", server(), **values)
+
+
+def test_valkey_restore_context_crosses_runner_boundary_as_complete_tuple(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    runner(tmp_path).run(
+        "gimme:recovery:valkey", server(),
+        valkey_restore_request_id="restore-1",
+        valkey_restore_sha256="a" * 64,
+        valkey_restore_bytes=42,
+        valkey_restore_records=3,
+    )
+
+    assert captured["GIMME_VALKEY_RESTORE_REQUEST_ID"] == "restore-1"
+    assert captured["GIMME_VALKEY_RESTORE_SHA256"] == "a" * 64
+    assert captured["GIMME_VALKEY_RESTORE_BYTES"] == "42"
+    assert captured["GIMME_VALKEY_RESTORE_RECORDS"] == "3"
+
+
+def test_valkey_restore_context_must_be_complete(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Valkey restore inputs must be complete"):
+        runner(tmp_path).run(
+            "gimme:recovery:valkey", server(), valkey_restore_request_id="restore-1"
+        )

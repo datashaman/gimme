@@ -1264,6 +1264,69 @@ task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {
     );
 });
 
+task('gimme:recovery:valkey', function () use ($appsRoot, $instance): void {
+    $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');
+    $request = required_env('GIMME_VALKEY_RESTORE_REQUEST_ID');
+    $sha256 = required_env('GIMME_VALKEY_RESTORE_SHA256');
+    $bytes = required_env('GIMME_VALKEY_RESTORE_BYTES');
+    $records = required_env('GIMME_VALKEY_RESTORE_RECORDS');
+    $cachePrefix = required_env('GIMME_CACHE_PREFIX');
+    if (!preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $request) ||
+        !preg_match('/^[0-9a-f]{64}$/', $sha256) ||
+        !preg_match('/^[0-9]{1,9}$/', $bytes) || (int) $bytes > 536870912 ||
+        !preg_match('/^[0-9]{1,6}$/', $records) || (int) $records > 100000 ||
+        !preg_match(
+            '/^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$/',
+            $cachePrefix,
+        )) {
+        throw new \RuntimeException('Unsafe Valkey restore request');
+    }
+    $probe = json_decode(getenv('GIMME_VALKEY_PROBE_JSON') ?: 'null', true);
+    $host = is_array($probe) ? ($probe['host'] ?? null) : '127.0.0.1';
+    $port = is_array($probe) ? ($probe['port'] ?? null) : 6379;
+    $tls = is_array($probe) ? 'yes' : 'no';
+    if (!is_string($host) || !valid_endpoint($host) || !is_int($port) ||
+        $port < 1 || $port > 65535) {
+        throw new \RuntimeException('Unsafe Valkey restore endpoint');
+    }
+    $directory = "{$appsRoot}/.gimme/restores/{$instance}";
+    $remotePath = "{$directory}/{$request}.valkey";
+    $remoteSecret = "{$directory}/{$request}.secret.json";
+    $localSecret = getenv('GIMME_SECRET_FILE') ?: '';
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    try {
+        if (is_link($localPath) || !is_file($localPath)) {
+            throw new \RuntimeException('Unsafe Valkey restore artifact');
+        }
+        upload($localPath, $remotePath);
+        run('chmod 0600 ' . escapeshellarg($remotePath));
+        if ($localSecret !== '') {
+            if (is_link($localSecret) || !is_file($localSecret)) {
+                throw new \RuntimeException('Unsafe Valkey restore credential');
+            }
+            upload($localSecret, $remoteSecret);
+            run('chmod 0600 ' . escapeshellarg($remoteSecret));
+        }
+        $program = file_get_contents(__DIR__ . '/scripts/gimme-restore-valkey');
+        if ($program === false) {
+            throw new \RuntimeException('Missing Valkey restore program');
+        }
+        $output = run(
+            'printf %s ' . escapeshellarg(base64_encode($program)) .
+            ' | base64 -d | python3 - ' . escapeshellarg($remotePath) . ' ' .
+            escapeshellarg($cachePrefix) . ' ' . escapeshellarg($host) . ' ' .
+            escapeshellarg((string) $port) . ' ' . escapeshellarg($tls) . ' ' .
+            escapeshellarg($localSecret === '' ? '-' : $remoteSecret) . ' ' .
+            escapeshellarg($sha256) . ' ' . escapeshellarg($bytes) . ' ' .
+            escapeshellarg($records),
+            timeout: 3600,
+        );
+        writeln($output);
+    } finally {
+        run('rm -f ' . escapeshellarg($remotePath) . ' ' . escapeshellarg($remoteSecret));
+    }
+});
+
 task('gimme:recovery:verify-application', function () use (
     $app,
     $framework,
