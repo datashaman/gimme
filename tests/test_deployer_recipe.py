@@ -702,7 +702,16 @@ def test_valkey_recovery_capture_is_binary_safe_prefix_bounded_and_non_global() 
     assert "base64.b64encode(result[0])" in program
     assert "key.startswith(prefix)" in program
     assert "GIMME_VALKEY_BACKUP|" in program
-    assert all(command not in program for command in ('"KEYS"', '"SAVE"', '"BGSAVE"', '"FLUSHALL"'))
+    assert 'session.call("EVAL", script, 1, key)' in program
+    assert 'redis.call("SCAN"' not in program
+    prohibited = (
+        "KEYS", "SAVE", "BGSAVE", "FLUSHALL", "FLUSHDB", "SHUTDOWN",
+        "CONFIG", "SCRIPT",
+    )
+    assert all(
+        re.search(rf"\.call\(\s*['\"]{command}['\"]", program) is None
+        for command in prohibited
+    )
     assert "download($remotePath, $localPath)" in task
     assert "rm -f " in task
 
@@ -744,6 +753,7 @@ def test_postgres_restore_task_uses_request_scoped_protected_atomic_state() -> N
 
 def test_valkey_restore_task_is_request_scoped_prefix_bounded_and_cleans_up() -> None:
     recipe = deployer_source()
+    program = (ROOT / "scripts" / "gimme-restore-valkey").read_text()
     task = recipe.split("task('gimme:recovery:valkey'", 1)[1].split(
         "task('gimme:recovery:verify-application'", 1
     )[0]
@@ -758,6 +768,20 @@ def test_valkey_restore_task_is_request_scoped_prefix_bounded_and_cleans_up() ->
     assert "python3 - " in task
     assert "rm -f " in task
     assert task.index("try {") < task.index("upload($localPath") < task.index("} finally {")
+    assert 'session.call("SCAN", cursor, "MATCH", prefix + b"*", "COUNT", 1000)' in program
+    assert 'session.call("UNLINK", *keys[offset:offset + UNLINK_BATCH])' in program
+    assert 'arguments = ("RESTORE", key, 0 if expiry is None else expiry' in program
+    assert 'session.call("DUMP", key)' in program
+    assert 'session.call("PEXPIRETIME", key)' in program
+    assert 'session.call("TIME")' in program
+    prohibited = (
+        "KEYS", "SAVE", "BGSAVE", "FLUSHALL", "FLUSHDB", "SHUTDOWN",
+        "CONFIG", "SCRIPT", "EVAL",
+    )
+    assert all(
+        re.search(rf"\.call\(\s*['\"]{command}['\"]", program) is None
+        for command in prohibited
+    )
 
 
 def test_restore_verification_runs_database_and_health_checks_behind_maintenance() -> None:
