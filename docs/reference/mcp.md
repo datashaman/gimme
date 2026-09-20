@@ -319,8 +319,10 @@ and its stronger confirmation states that consistency with untouched components 
 broken. Plans expose only bounded destination Resource provenance for selected components. Valkey
 planning requires the registered destination to have a supported provider and `valkey` kind, then
 compares its exact version with the source component version.
-The current execution slice supports PostgreSQL selection; selecting Valkey returns the fixed
-`valkey_restore_unsupported` readiness issue until the transport/execution slice lands.
+The current state-machine slice supports PostgreSQL selection; selecting Valkey returns the fixed
+`valkey_restore_unsupported` readiness issue until Valkey activation is connected.
+Valkey-only planning resolves PostgreSQL binding provenance but does not run PostgreSQL catalog
+inspection or inspect its data.
 
 For PostgreSQL selection, planning compares the source and current target-local PostgreSQL
 versions exactly and runs one fixed catalog inspection to
