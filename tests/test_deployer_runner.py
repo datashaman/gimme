@@ -223,6 +223,33 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
     }]
 
 
+def test_recovery_schedule_authority_crosses_as_canonical_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    authority = {
+        "schema_version": 1,
+        "deployment": "example-app",
+        "calendar": "*-*-* *:00:00 UTC",
+    }
+
+    runner(tmp_path).run(
+        "gimme:recovery:schedule-reconcile",
+        server(),
+        recovery_schedule_authority=authority,
+    )
+
+    assert captured["GIMME_RECOVERY_SCHEDULE_JSON"] == json.dumps(
+        authority, sort_keys=True, separators=(",", ":")
+    )
+
+
 def test_multiple_health_probes_cross_runner_boundary_with_phase_policy(
     tmp_path: Path, monkeypatch
 ) -> None:

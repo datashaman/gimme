@@ -1996,6 +1996,67 @@ task('gimme:recovery:schedule-status', function () use ($app): void {
     );
 });
 
+task('gimme:recovery:schedule-reconcile', function () use (
+    $app,
+    $appsRoot,
+    $hostname,
+    $mdnsName,
+    $remoteUser,
+): void {
+    if ($app === '') {
+        throw new \RuntimeException('Recovery Schedule reconciliation requires a Deployment');
+    }
+    $deployment = required_env('GIMME_DEPLOYMENT');
+    if (!preg_match('/^[a-z][a-z0-9-]{0,63}$/', $deployment)) {
+        throw new \RuntimeException('Unsafe Recovery Schedule Deployment identity');
+    }
+    $policy = privileged_helper_policy(
+        configured_packages(),
+        configured_services(),
+        $hostname,
+        $mdnsName,
+        $remoteUser,
+        $appsRoot,
+        configured_sites($appsRoot, $mdnsName),
+    );
+    $policyLine = escapeshellarg("# GIMME_POLICY_ID={$policy}");
+    if (!test(
+        '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
+        'sudo -n -l /usr/local/sbin/gimme-provision-recovery-schedule ' .
+        escapeshellarg($deployment) . ' >/dev/null 2>&1'
+    )) {
+        throw new \RuntimeException(
+            'Recovery Schedule reconciliation requires the current privileged helper'
+        );
+    }
+    $directory = "{$appsRoot}/.gimme/recovery-schedules";
+    $statePath = "{$directory}/{$deployment}.json";
+    run('bash -c ' . escapeshellarg(recovery_schedule_state_write_command(
+        $statePath,
+        $deployment,
+    )));
+    $localCredential = getenv('GIMME_SECRET_FILE') ?: '';
+    $remoteCredential = "{$directory}/{$deployment}.credentials";
+    try {
+        if ($localCredential !== '') {
+            if (!is_file($localCredential) || is_link($localCredential)) {
+                throw new \RuntimeException('Unsafe local Recovery Schedule credential transfer');
+            }
+            upload($localCredential, $remoteCredential);
+            run('chmod 0600 ' . escapeshellarg($remoteCredential));
+        }
+        run(
+            'sudo -n /usr/local/sbin/gimme-provision-recovery-schedule ' .
+            escapeshellarg($deployment),
+            forceOutput: true,
+            timeout: 1800,
+        );
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteCredential));
+    }
+});
+
 task('gimme:restart:workers', function (): void {
     $workers = configured_workers();
     if (!is_array($workers) || ($workers['enabled'] ?? null) !== true) {

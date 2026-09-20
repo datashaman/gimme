@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the fixed Deployer transfer boundary for Recovery Schedule reconciliation. The runner
+  accepts canonical secret-free authority JSON through a dedicated environment field; the remote
+  task writes a caller-owned mode-0600 desired-state document below the configured applications
+  root, optionally uploads one protected credential transfer, invokes only the policy-bound
+  helper with the derived Deployment identity, and unconditionally removes transfer residue.
+  The task is not yet called by resource apply, so this slice cannot activate a schedule.
 - Added the Recovery Schedule helper's stored-credential boundary. A scheduled stored-auth
   authority now requires one fixed caller-owned mode-0600 transfer containing exactly the two
   resolved S3 credential values; the helper validates and removes the transfer before mutation,
