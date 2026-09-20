@@ -1,3 +1,4 @@
+import base64
 import dataclasses
 import hashlib
 import json
@@ -1690,10 +1691,34 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
 ) -> None:
     selected = use_recovery_store(tmp_path, monkeypatch)
     state = selected.load()
-    adapter = FakeS3()
+
+    class PrivateVersionS3(FakeS3):
+        def put_object(self, destination, credentials, key, body, sha256):
+            written = super().put_object(destination, credentials, key, body, sha256)
+            version_id = f"private-object-version-{self.puts}"
+            self.versions[key] = version_id
+            return dataclasses.replace(written, version_id=version_id)
+
+    adapter = PrivateVersionS3()
     monkeypatch.setattr(server_module, "backup_s3", adapter)
+    monkeypatch.setattr(
+        server_module, "_backup_destination_credentials",
+        lambda state, destination: (
+            None, ("private-access-key", "private-secret-key")
+        ),
+    )
     pg_body = b"source-pg"
-    valkey_body = b'{"format":"gimme-valkey-v1"}\n'
+    private_key = b"gimme:example-app:private-key"
+    private_payload = b"private-valkey-payload"
+    valkey_body = (
+        b'{"format":"gimme-valkey-v1"}\n'
+        + json.dumps({
+            "dump": base64.b64encode(private_payload).decode(),
+            "expires_at_ms": None,
+            "key": base64.b64encode(private_key).decode(),
+        }, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
     postgres = tmp_path / "source.pg"
     valkey = tmp_path / "source.valkey"
     postgres.write_bytes(pg_body)
@@ -1711,7 +1736,7 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
                 kind="valkey", local_path=valkey,
                 sha256=hashlib.sha256(valkey_body).hexdigest(),
                 bytes=len(valkey_body), resource_version="8.0.1",
-                format="gimme-valkey-v1", records=0,
+                format="gimme-valkey-v1", records=1,
             ),
         ],
     )
@@ -1734,12 +1759,22 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
             return CommandResult(
                 ["dep"], 0,
                 "GIMME_VALKEY_BACKUP|"
-                f"{hashlib.sha256(valkey_body).hexdigest()}|{len(valkey_body)}|0|"
+                f"{hashlib.sha256(valkey_body).hexdigest()}|{len(valkey_body)}|1|"
                 "2026-09-20T02:00:00+00:00",
             )
         if task == "gimme:recovery:valkey":
-            return CommandResult(["dep"], 0, "GIMME_VALKEY_RESTORE|0|0")
-        return CommandResult(["dep"], 0, "maintenance")
+            return CommandResult(
+                ["dep", "private-command-argument"], 0,
+                "GIMME_VALKEY_RESTORE|1|0\nprivate-raw-output",
+            )
+        if task == "gimme:recovery:verify-application":
+            return CommandResult(
+                ["dep", "private-command-argument"], 0,
+                "GIMME_RESTORE_VERIFY|ready\nprivate-raw-output",
+            )
+        return CommandResult(
+            ["dep", "private-command-argument"], 0, "private-raw-output"
+        )
 
     monkeypatch.setattr(server_module, "_run_deployment", fake_run)
     plan = server_module.plan_restore_deployment("example-app", point, "restore-full")
@@ -1771,6 +1806,28 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
             "kind": "valkey", "version": "8.0.1",
         },
     ]
+    verification = server_module.plan_verify_restore("example-app", "restore-full")
+    completed = server_module.apply_verify_restore(
+        "example-app", "restore-full", str(verification["plan_id"])
+    )
+    public_surfaces = [
+        plan, applied, record, verification, completed,
+        server_module.list_recovery_points("example-app"),
+        server_module.list_restores("example-app"),
+        server_module.restore_record_resource("example-app", "restore-full"),
+        server_module.list_operations(subject="example-app"),
+    ]
+    public_text = json.dumps(public_surfaces, sort_keys=True, default=str)
+    public_text += (selected.root / "operations.jsonl").read_text()
+    for protected in (
+        pg_body.decode(), private_key.decode(), private_payload.decode(),
+        base64.b64encode(private_key).decode(),
+        base64.b64encode(private_payload).decode(),
+        "gimme:example-app:", "gimme_example_app", "gimme/recovery-points",
+        "private-object-version", "private-access-key", "private-secret-key",
+        "private-command-argument", "private-raw-output",
+    ):
+        assert protected not in public_text
     changed = selected.load()
     changed.resources["devbox-valkey"] = ResourceConfig(
         target="devbox", kind="valkey", version="8.0.2"
