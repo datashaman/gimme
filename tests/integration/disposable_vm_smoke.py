@@ -1672,12 +1672,12 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
                 BACKUP_DESTINATION, definition, str(plan["plan_id"])
             )
 
-    def apply_policy(cadence) -> dict[str, object]:
+    def apply_policy(cadence, *, retain_last: int = 2) -> dict[str, object]:
         current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
         proposed = DeploymentRegistration.from_deployment(current).model_copy(update={
             "recovery": RecoveryPolicy(
                 destination=BACKUP_DESTINATION, valkey=True,
-                quiesce_wait_seconds=1, cadence=cadence, retain_last=2,
+                quiesce_wait_seconds=1, cadence=cadence, retain_last=retain_last,
             )
         })
         update = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
@@ -1808,7 +1808,7 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
     # The remaining on-demand matrix runs without Target workload identity, so restore the
     # stored destination policy. Manual cadence must still leave no scheduled credential.
     update_destination(stored)
-    apply_policy({"kind": "manual"})
+    apply_policy({"kind": "manual"}, retain_last=7)
 
 
 def supersede_component(key: str) -> str:
