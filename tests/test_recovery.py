@@ -7,6 +7,7 @@ import pytest
 
 from gimme.control import S3BackupDestination, SSEAES256
 from gimme.recovery import (
+    BotoS3Adapter,
     ComponentDump,
     ObjectMetadata,
     RecoveryError,
@@ -119,6 +120,38 @@ def test_preflight_leaves_no_residual_objects() -> None:
     assert adapter.objects == {}
     [(_, version_id)] = adapter.deletes
     assert version_id == "v1", "must delete the exact version the probe wrote, not the latest"
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "expected"),
+    [
+        ("InvalidRequest", "backup_destination_cleanup_object_protected"),
+        ("ObjectLocked", "backup_destination_cleanup_object_protected"),
+        ("AccessDenied", "backup_destination_cleanup_access_denied"),
+    ],
+)
+def test_boto_delete_classifies_protection_without_exposing_provider_detail(
+    monkeypatch, provider_code: str, expected: str,
+) -> None:
+    class ProviderFailure(Exception):
+        response = {
+            "Error": {
+                "Code": provider_code,
+                "Message": "private bucket, key, endpoint, and credential detail",
+            }
+        }
+
+    class Client:
+        def delete_object(self, **kwargs) -> None:
+            raise ProviderFailure
+
+    adapter = BotoS3Adapter()
+    monkeypatch.setattr(adapter, "_client", lambda destination, credentials: Client())
+
+    with pytest.raises(RecoveryError, match=f"^{expected}$") as raised:
+        adapter.delete_object(destination(), None, "private-key", "private-version")
+
+    assert "private" not in str(raised.value)
 
 
 def test_safety_recovery_point_identity_has_a_separate_deterministic_domain() -> None:

@@ -117,7 +117,10 @@ def _provider_error(exc: Exception, operation: str) -> RecoveryError:
             "SlowDown": "throttled",
         }
         if isinstance(provider_code, str):
-            code = mapping.get(provider_code, "unavailable")
+            if operation == "cleanup" and provider_code in {"InvalidRequest", "ObjectLocked"}:
+                code = "object_protected"
+            else:
+                code = mapping.get(provider_code, "unavailable")
     return RecoveryError(f"backup_destination_{operation}_{code}")
 
 
