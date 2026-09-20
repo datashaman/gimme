@@ -4,7 +4,6 @@ import fcntl
 import os
 import re
 import shutil  # noqa: F401 -- preserved monkeypatch seam for Recovery capacity tests
-import socket
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -18,10 +17,8 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from gimme import recovery as recovery_module
-from gimme import recovery_schedule as recovery_schedule_module
 from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
-from gimme import valkey_contract
 from gimme import valkey_recovery
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSNetwork, AWSProviderAccount, AWSRDSPostgresResource,
@@ -29,27 +26,24 @@ from gimme.control import (
     ControlState, DeploymentConfig, DeploymentRegistration,
     ManualRecoveryCadence, Resource, ResourceConfig, S3BackupDestination, SecretReference,
     SecretStore, StateStore, TargetConfig,
-    legacy_app, legacy_server, new_placement, runs_horizon, target_sites,
+    legacy_app, legacy_server, new_placement, target_sites,
 )
 from gimme.control_plans import (
-    deployment_removal_plan, deployment_resource_plan,
-    exact_plan, migration_plan, registration_update_plan,
+    deployment_removal_plan, exact_plan, migration_plan, registration_update_plan,
     resource_cleanup_plan, target_stack_plan,
     resource_forget_plan, valkey_destroy_plan,
     valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
+from gimme.deployment_resource_orchestration import DeploymentResourceOrchestrator
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.journal import OperationJournal
 from gimme.recovery import ComponentDump, preflight_backup_destination
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.resources_postgres import ResourceError
-from gimme.secrets import (
-    BotoAWSSecretAdapter, SecretError, load_applied_secret_manifest,
-    plan_secret_references, protected_secret_file, resolve_planned_secret_references,
-    save_applied_secret_manifest, validate_aws_account, validate_aws_store,
-)
+from gimme.secrets import BotoAWSSecretAdapter, validate_aws_account, validate_aws_store
+from gimme.secrets import SecretError as SecretError  # noqa: F401 -- compatibility export
 
 ROOT = Path(__file__).resolve().parents[2]
 store = StateStore.from_environment(ROOT)
@@ -121,6 +115,24 @@ def _managed_resource_orchestrator() -> ManagedResourceOrchestrator:
         assert_plan=_assert_plan,
         runner=runner,
         context=_context,
+    )
+
+
+def _deployment_resource_orchestrator() -> DeploymentResourceOrchestrator:
+    """Compose Deployment Resource orchestration from the current adapters."""
+    return DeploymentResourceOrchestrator(
+        store=store,
+        runner=runner,
+        aws_secrets=aws_secrets,
+        context=_context,
+        run_deployment=_run_deployment,
+        deployment_resource_lock=_deployment_resource_lock,
+        assert_plan=_assert_plan,
+        recovery_schedule_runtime_issues=_recovery_schedule_runtime_issues,
+        recovery_schedule_authority=_recovery_schedule_authority,
+        backup_destination_credentials=_backup_destination_credentials,
+        valkey_capture_credential=_valkey_capture_credential,
+        restoring_ok=_restoring_ok.get,
     )
 
 
@@ -489,90 +501,18 @@ def _restore_valkey_component(
 
 
 def _dns_issues(deployment: DeploymentConfig, target: TargetConfig) -> list[str]:
-    if target.network.mode != "public_dns":
-        return []
-    try:
-        actual = {item[4][0] for item in socket.getaddrinfo(
-            deployment.placement.site_host, 443, type=socket.SOCK_STREAM
-        )}
-    except socket.gaierror:
-        return ["domain does not resolve"]
-    return [] if actual & set(target.network.expected_addresses) else [
-        "domain does not resolve to a declared target address"
-    ]
+    return _deployment_resource_orchestrator().dns_issues(deployment, target)
 
 
 def _valkey_runtime(
     name: str, state: ControlState, deployment: DeploymentConfig
 ) -> tuple[dict[str, str], dict[str, SecretReference], dict[str, object] | None, list[str]]:
-    """The laravel-cluster-v1 values, credential references, and probe input for a Deployment
-    bound to a managed Valkey, or why it is not ready to receive them. Nothing when the
-    binding is Target-local."""
-    binding = deployment.resources.valkey
-    resource = None if binding is None else state.resources.get(binding.resource)
-    if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
-        return {}, {}, None, []
-    try:
-        observed = resources_valkey_module.load_observed(store.root, binding.resource)
-    except ResourceError:
-        observed = None  # a corrupt cache must not break unrelated tasks; it is not ready
-    if observed is None or observed["phase"] not in (
-        ("ready", "restoring") if _restoring_ok.get() else ("ready",)
-    ):
-        return {}, {}, None, ["valkey_resource_not_ready"]
-    if name not in cast(dict[str, object], observed["allocations"]):
-        return {}, {}, None, ["valkey_binding_missing"]
-    host, port = observed["endpoint"], observed["port"]
-    if not isinstance(host, str) or not isinstance(port, int):
-        return {}, {}, None, ["valkey_endpoint_missing"]
-    return (
-        valkey_contract.contract_variables(name, binding.uses, host, port),
-        valkey_contract.credential_references(
-            resource.workload_secret_store, binding.resource, name
-        ),
-        valkey_contract.probe_config(
-            name, binding.uses, host, port, runs_horizon(deployment.workers)
-        ),
-        [],
-    )
+    return _deployment_resource_orchestrator().valkey_runtime(name, state, deployment)
 
 
 def _secret_plan(name: str, state: ControlState, deployment: DeploymentConfig
                  ) -> tuple[list[dict[str, str]], list[str]]:
-    try:
-        planned = plan_secret_references(
-            state, store.secrets_path,
-            {**deployment.secrets, **_valkey_runtime(name, state, deployment)[1]}, aws_secrets,
-            load_applied_secret_manifest(store.root, name),
-        )
-        issues = ["secret_reference_missing" for item in planned if item["status"] == "missing"]
-        return planned, issues
-    except SecretError as exc:
-        return [], [str(exc)]
-
-
-def _contract_summary(
-    name: str, state: ControlState, deployment: DeploymentConfig
-) -> dict[str, object] | None:
-    """What the contract will inject, without the endpoint or any credential."""
-    binding = deployment.resources.valkey
-    resource = None if binding is None else state.resources.get(binding.resource)
-    if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
-        return None
-    return {
-        "contract": valkey_contract.CONTRACT, "resource": binding.resource,
-        "uses": list(binding.uses),
-        "variables_digest": StateStore.digest(_valkey_runtime(name, state, deployment)[0]),
-        "namespaces": resources_valkey_module.namespace_prefixes(name, list(binding.uses)),
-        "adapters": {
-            key: ("redis" if use in binding.uses else valkey_contract.LOCAL_DRIVERS[key])
-            for use, key in valkey_contract.ADAPTER_KEYS.items()
-        },
-        "credential_keys": [valkey_contract.USERNAME_KEY, valkey_contract.PASSWORD_KEY],
-        "probes": valkey_contract.probe_names(
-            list(binding.uses), runs_horizon(deployment.workers)
-        ),
-    }
+    return _deployment_resource_orchestrator().secret_plan(name, state, deployment)
 
 
 def _resolved_stack_plan(name: str) -> dict[str, Any]:
@@ -602,13 +542,7 @@ def _resolved_stack_plan(name: str) -> dict[str, Any]:
 
 
 def _managed_database_issues(state: ControlState, deployment: DeploymentConfig) -> list[str]:
-    binding = deployment.resources.database
-    if binding is not None and isinstance(state.resources[binding], AWSRDSPostgresResource):
-        return [
-            f"database is bound to managed resource {binding}; runtime wiring of managed "
-            "database credentials is not implemented yet"
-        ]
-    return []
+    return _deployment_resource_orchestrator().managed_database_issues(state, deployment)
 
 
 def _recovery_schedule_runtime_issues(
@@ -632,29 +566,7 @@ def _recovery_schedule_authority(
 
 
 def _resource_plan(name: str) -> dict[str, Any]:
-    state, deployment, target, application = _context(name)
-    secret_versions, secret_issues = _secret_plan(name, state, deployment)
-    issues = (
-        secret_issues
-        + _dns_issues(deployment, target)
-        + _managed_database_issues(state, deployment)
-        + _recovery_schedule_runtime_issues(deployment, target)
-        + _valkey_runtime(name, state, deployment)[3]
-    )
-    schedule = None
-    authority = _recovery_schedule_authority(name, state, deployment)
-    if authority is not None:
-        schedule = recovery_schedule_module.schedule_plan(authority)
-    plan = deployment_resource_plan(
-        name, deployment, target, application,
-        missing_secrets=issues, secret_versions=secret_versions,
-        valkey_contract=_contract_summary(name, state, deployment),
-        recovery_schedule=schedule,
-    )
-    if issues:
-        plan["readiness_issues"] = issues
-        plan["plan_id"] = StateStore.digest({k: v for k, v in plan.items() if k != "plan_id"})
-    return plan
+    return _deployment_resource_orchestrator().resource_plan(name)
 
 
 def _migration_targets() -> dict[str, TargetConfig]:
@@ -2057,91 +1969,18 @@ def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
 @_journal_plan("deployment_resources", "name")
 def plan_deployment_resources(name: Name) -> dict[str, object]:
     """Plan routing, database, cache, runtime values, secrets, and processes."""
-    return _resource_plan(name)
+    return _deployment_resource_orchestrator().plan_deployment_resources(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("deployment_resources", "name")
 def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile one deployment's route and target-local runtime resources."""
-    with _deployment_resource_lock(name):
-        expected = _resource_plan(name)
-        _assert_plan(expected, plan_id)
-        return _apply_resources(name, expected)
+    return _deployment_resource_orchestrator().apply_deployment_resources(name, plan_id)
 
 
 def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
-    if not expected["ready"]:
-        raise ValueError("deployment resources are not ready; inspect readiness_issues")
-    state, deployment, target, _ = _context(name)
-    resolved = resolve_planned_secret_references(
-        state, store.secrets_path,
-        {**deployment.secrets, **_valkey_runtime(name, state, deployment)[1]},
-        cast(list[dict[str, str]], expected["secret_versions"]), aws_secrets,
-    )
-    try:
-        with _deployment_resource_lock(name):
-            runner.run("gimme:reconcile:sites", legacy_server(target), stack=target.stack,
-                       sites=target_sites(state, deployment.target),
-                       network_mode=target.network.mode,
-                       mise_version=target.runtimes.mise_version, timeout=1800)
-            with protected_secret_file(resolved) as secret_file:
-                _run_deployment("gimme:provision:app", name, secret_file=secret_file,
-                                secret_manifest=cast(
-                                    list[dict[str, str]], expected["secret_versions"]
-                                ),
-                                timeout=1800)
-            save_applied_secret_manifest(
-                store.root, name, cast(list[dict[str, str]], expected["secret_versions"])
-            )
-    except Exception:
-        # Remote activation includes transactional rollback, but neither successful nor
-        # failed Deployer output is a safe MCP surface after plaintext resolution.
-        raise SecretError("deployment_secret_activation_failed") from None
-    authority = _recovery_schedule_authority(
-        name, state, deployment,
-        cleanup=deployment.recovery is not None
-        and deployment.recovery.cadence.kind == "manual",
-    )
-    if authority is not None:
-        destination = state.backup_destinations[deployment.recovery.destination]
-        try:
-            destination_credentials = None
-            if authority["calendar"] is not None:
-                _planned, destination_credentials = _backup_destination_credentials(
-                    state, destination
-                )
-            aws_values = (
-                {} if destination_credentials is None else {
-                    "access_key_id": destination_credentials[0],
-                    "secret_access_key": destination_credentials[1],
-                }
-            )
-            if destination_credentials is not None and len(destination_credentials) == 3:
-                aws_values["session_token"] = destination_credentials[2]
-            valkey_values: dict[str, str] = {}
-            binding = deployment.resources.valkey
-            if (
-                authority["calendar"] is not None
-                and deployment.recovery.valkey and binding is not None
-            ):
-                resource = state.resources[binding.resource]
-                valkey_values = _valkey_capture_credential(
-                    state, binding.resource, resource
-                )
-            with ExitStack() as protected:
-                aws_file = protected.enter_context(protected_secret_file(aws_values))
-                valkey_file = protected.enter_context(
-                    protected_secret_file(valkey_values)
-                )
-                _run_deployment(
-                    "gimme:recovery:schedule-reconcile", name,
-                    secret_file=aws_file, recovery_schedule_authority=authority,
-                    recovery_schedule_valkey_file=valkey_file, timeout=1800,
-                )
-        except Exception:
-            raise SecretError("recovery_schedule_activation_failed") from None
-    return {"changed": True, "deployment": name}
+    return _deployment_resource_orchestrator().apply_resources(name, expected)
 
 
 @mcp.tool(annotations=READ)
