@@ -43,7 +43,9 @@ def test_authority_is_bound_to_the_bootstrapped_deployment_database(tmp_path) ->
     path = authority_file(tmp_path, "gimme_another_app")
 
     with pytest.raises(RuntimeError, match="authority identity invalid"):
-        helper["load_state"]("example-app", "restore-1", path.stat().st_uid)
+        helper["load_state"](
+            "example-app", "restore-1", path.stat().st_uid, "shadow_verified"
+        )
 
 
 def test_swap_terminates_only_live_connections_and_renames_verified_oids(
@@ -51,7 +53,9 @@ def test_swap_terminates_only_live_connections_and_renames_verified_oids(
 ) -> None:
     helper = helper_namespace(tmp_path)
     state_path = authority_file(tmp_path)
-    state = helper["load_state"]("example-app", "restore-1", state_path.stat().st_uid)
+    state = helper["load_state"](
+        "example-app", "restore-1", state_path.stat().st_uid, "shadow_verified"
+    )
     database = "gimme_example_app"
     shadow, previous = helper["derived_identities"](database, "restore-1")
     oids = {database: 101, shadow: 202}
@@ -81,7 +85,9 @@ def test_failed_shadow_rename_restores_the_original_database_name(
 ) -> None:
     helper = helper_namespace(tmp_path)
     state_path = authority_file(tmp_path)
-    state = helper["load_state"]("example-app", "restore-1", state_path.stat().st_uid)
+    state = helper["load_state"](
+        "example-app", "restore-1", state_path.stat().st_uid, "shadow_verified"
+    )
     database = "gimme_example_app"
     shadow, previous = helper["derived_identities"](database, "restore-1")
     oids = {database: 101, shadow: 202}
@@ -99,6 +105,39 @@ def test_failed_shadow_rename_restores_the_original_database_name(
         helper["swap"](state)
 
     assert oids == {database: 101, shadow: 202}
+
+
+def test_cleanup_drops_only_the_oid_bound_previous_database(tmp_path, monkeypatch) -> None:
+    helper = helper_namespace(tmp_path)
+    state_path = authority_file(tmp_path)
+    state_value = json.loads(state_path.read_text())
+    state_value["phase"] = "data_replaced"
+    state_path.write_text(json.dumps(state_value))
+    state_path.chmod(0o600)
+    state = helper["load_state"](
+        "example-app", "restore-1", state_path.stat().st_uid, "data_replaced"
+    )
+    database = "gimme_example_app"
+    _shadow, previous = helper["derived_identities"](database, "restore-1")
+    oids = {database: 202, previous: 101}
+    statements = []
+    monkeypatch.setitem(helper, "database_oid", lambda name: oids.get(name))
+
+    def query(statement, variables):
+        statements.append((statement, variables))
+        return ""
+
+    def drop(name):
+        oids.pop(name)
+
+    monkeypatch.setitem(helper, "query", query)
+    monkeypatch.setitem(helper, "drop_database", drop)
+
+    helper["cleanup"](state)
+
+    assert "pg_terminate_backend" in statements[0][0]
+    assert statements[0][1] == {"database": previous}
+    assert oids == {database: 202}
 
 
 def test_query_uses_only_fixed_runuser_and_psql_executables(tmp_path, monkeypatch) -> None:

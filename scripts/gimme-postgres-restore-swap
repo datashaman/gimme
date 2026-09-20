@@ -31,7 +31,9 @@ def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
-def load_state(instance: str, request_id: str, owner: int) -> dict[str, Any]:
+def load_state(
+    instance: str, request_id: str, owner: int, expected_phase: str
+) -> dict[str, Any]:
     path = RESTORE_ROOT / instance / f"{request_id}.json"
     if path.is_symlink():
         fail("restore authority must not be a symlink")
@@ -57,7 +59,7 @@ def load_state(instance: str, request_id: str, owner: int) -> dict[str, Any]:
         or value.get("database") != ALLOWED_DATABASES.get(instance)
         or DATABASE.fullmatch(str(value.get("database"))) is None
         or value.get("role") != value.get("database")
-        or value.get("phase") != "shadow_verified"
+        or value.get("phase") != expected_phase
         or not isinstance(value.get("live_oid"), int)
         or isinstance(value.get("live_oid"), bool)
         or value["live_oid"] <= 0
@@ -104,6 +106,13 @@ def rename_database(current: str, replacement: str) -> None:
     )
 
 
+def drop_database(database: str) -> None:
+    query(
+        "SELECT format('DROP DATABASE %I', :'database') \\gexec\n",
+        {"database": database},
+    )
+
+
 def derived_identities(database: str, request_id: str) -> tuple[str, str]:
     digest = hashlib.sha256(
         f"gimme-postgres-restore-v1\0{database}\0{request_id}".encode()
@@ -141,10 +150,33 @@ def swap(state: dict[str, Any]) -> None:
         fail("restore swap verification failed")
 
 
+def cleanup(state: dict[str, Any]) -> None:
+    database = state["database"]
+    shadow, previous = derived_identities(database, state["request_id"])
+    live_oid, shadow_oid = state["live_oid"], state["shadow_oid"]
+    observed = {
+        "live": database_oid(database),
+        "shadow": database_oid(shadow),
+        "previous": database_oid(previous),
+    }
+    if observed == {"live": shadow_oid, "shadow": None, "previous": None}:
+        return
+    if observed != {"live": shadow_oid, "shadow": None, "previous": live_oid}:
+        fail("restore cleanup state ambiguous")
+    query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
+        {"database": previous},
+    )
+    drop_database(previous)
+    if database_oid(database) != shadow_oid or database_oid(previous) is not None:
+        fail("restore cleanup verification failed")
+
+
 def main() -> None:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4 or sys.argv[1] not in {"swap", "cleanup"}:
         fail("restore swap arguments invalid")
-    instance, request_id = sys.argv[1:]
+    action, instance, request_id = sys.argv[1:]
     sudo_user = os.environ.get("SUDO_USER", "")
     if (
         not isinstance(ALLOWED_DATABASES, dict)
@@ -162,8 +194,11 @@ def main() -> None:
     ):
         fail("restore swap identity invalid")
     owner = pwd.getpwnam(sudo_user).pw_uid
-    swap(load_state(instance, request_id, owner))
-    print("GIMME_POSTGRES_PRIVILEGED_SWAP|ready")
+    expected_phase = "shadow_verified" if action == "swap" else "data_replaced"
+    {"swap": swap, "cleanup": cleanup}[action](
+        load_state(instance, request_id, owner, expected_phase)
+    )
+    print(f"GIMME_POSTGRES_PRIVILEGED_RESTORE|{action}_ready")
 
 
 if __name__ == "__main__":

@@ -640,7 +640,7 @@ BASH;
         'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-recovery-maintenance enter probe probe ' .
         '>/dev/null 2>&1 && ' .
-        'sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap probe probe ' .
+        'sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap swap probe probe ' .
         '>/dev/null 2>&1'
     );
     writeln('privileged_helper=' . ($helperReady ? 'ready' : 'bootstrap_required'));

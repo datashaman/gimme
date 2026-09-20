@@ -292,7 +292,7 @@ def test_inspection_uses_content_bound_helper_readiness() -> None:
     assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack" in inspect
     assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes" in inspect
     assert "grep -Fqx {$policyLine} /usr/local/sbin/gimme-postgres-restore-swap" in inspect
-    assert "sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap probe probe" in inspect
+    assert "sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap swap probe probe" in inspect
 
 
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(

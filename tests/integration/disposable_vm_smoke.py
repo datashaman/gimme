@@ -58,7 +58,7 @@ def deployment(
         "app_env": app_env,
         "app_debug": False,
         "domain": None,
-        "health": None,
+        "health": "inherit",
         "workers": None,
         "scheduler": None,
         "variables": {},

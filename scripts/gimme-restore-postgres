@@ -31,6 +31,7 @@ EXECUTABLES = {
 }
 PUBLIC_FAILURE_CODES = {
     "restore privileged swap failed": "privileged_swap_failed",
+    "restore privileged cleanup failed": "privileged_cleanup_failed",
     "restore invocation does not match state": "invocation_mismatch",
 }
 
@@ -182,19 +183,19 @@ def database_oid(name: str) -> int | None:
     return int(output)
 
 
-def privileged_swap(state: dict[str, Any]) -> None:
+def privileged_action(action: str, state: dict[str, Any]) -> None:
     try:
         subprocess.run(  # nosec B603
             [
                 "/usr/bin/sudo", "-n",
                 "/usr/local/sbin/gimme-postgres-restore-swap",
-                state["deployment"], state["request_id"],
+                action, state["deployment"], state["request_id"],
             ],
             check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=300,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RestoreFailure("restore privileged swap failed") from exc
+        raise RestoreFailure(f"restore privileged {action} failed") from exc
 
 
 def prepare(state_path: Path, artifact: Path) -> None:
@@ -263,7 +264,7 @@ def swap(state_path: Path) -> None:
         {"live": None, "shadow": shadow_oid, "previous": live_oid},
     ):
         raise RestoreFailure("restore swap state ambiguous")
-    privileged_swap(state)
+    privileged_action("swap", state)
     if database_oid(database) != shadow_oid or database_oid(previous) != live_oid:
         raise RestoreFailure("restore swap verification failed")
     state["phase"] = "data_replaced"
@@ -282,7 +283,9 @@ def cleanup(state_path: Path, artifact: Path) -> None:
     _shadow, previous = derived_identities(database, state["request_id"])
     if database_oid(database) != state["shadow_oid"] or database_oid(previous) != state["live_oid"]:
         raise RestoreFailure("restore cleanup state ambiguous")
-    run(["dropdb", previous])
+    privileged_action("cleanup", state)
+    if database_oid(database) != state["shadow_oid"] or database_oid(previous) is not None:
+        raise RestoreFailure("restore cleanup verification failed")
     state["phase"] = "completed"
     atomic_write(state_path, state)
     artifact.unlink(missing_ok=True)
