@@ -14,6 +14,7 @@ import pytest
 from botocore.exceptions import ClientError
 from pydantic import ValidationError
 
+import gimme.artifact_build_orchestration as artifact_build_module
 from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
 from gimme.control import ControlState, SecretReference
 from gimme.deployer import CommandResult
@@ -72,6 +73,7 @@ class PlanningRunner:
             "php_extensions": ["curl", "json"],
             "system": "linux",
             "machine": "x86_64",
+            "frontend": None,
         }
         self.publication = "absent"
         self.calls = []
@@ -80,13 +82,31 @@ class PlanningRunner:
         self.calls.append((task, kwargs))
         request = kwargs.get("artifact_request")
         if task == "gimme:artifact:run" and request["operation"] == "inspect":
+            frontend = request["frontend"]
+            capability = self.capability
+            frontend_lock = None
+            if frontend is not None:
+                manager = frontend["package_manager"]
+                lockfile = {
+                    "npm": "package-lock.json", "pnpm": "pnpm-lock.yaml",
+                    "yarn": "yarn.lock", "bun": "bun.lock",
+                }[manager]
+                frontend_lock = {"filename": lockfile, "sha256": "9" * 64, "bytes": 1024}
+                capability = {**capability, "frontend": {
+                    "manager": manager,
+                    "manager_version": request["runtimes"][manager]["version"],
+                    "node_version": (
+                        None if manager == "bun" else request["runtimes"]["node"]["version"]
+                    ),
+                }}
             value = {
                 "status": "ready",
                 "commit": request["commit"],
                 "repository_fingerprint": "repo_" + "c" * 64,
                 "composer_lock_sha256": self.lock_digest,
                 "composer_lock_bytes": 2048,
-                "capability": self.capability,
+                "frontend_lock": frontend_lock,
+                "capability": capability,
             }
         elif task == "gimme:artifact:run" and request["operation"] == "publication":
             value = {"status": self.publication, "build_id": request["build_id"]}
@@ -131,17 +151,21 @@ def test_build_plan_binds_every_reviewed_identity_input(tmp_path: Path) -> None:
         "commit": "a" * 40,
         "composer_lock_sha256": "b" * 64,
         "composer_lock_bytes": 2048,
+        "frontend_lock": None,
         "build_policy": {
             "target": "buildbox",
             "artifact_store": "primary",
             "packaging": "laravel_v1",
-            "secrets": {},
+            "build_secrets_used": False,
+            "build_secret_count": 0,
+            "build_secret_names": [],
         },
         "runtimes": {
             "composer": {"provider": "system", "version": "2.8.4"},
             "php": {"provider": "system", "version": "8.4.1"},
         },
         "php_extensions": backend_state().applications["example"].php_extensions,
+        "frontend": None,
         "capability": runner.capability,
         "packaging_version": "laravel_v1",
         "execution_fingerprint": plan["execution_fingerprint"],
@@ -185,33 +209,141 @@ def test_changed_lock_makes_apply_plan_stale_before_build(tmp_path: Path) -> Non
     )
 
 
-def test_frontend_and_build_secrets_fail_before_remote_work(tmp_path: Path) -> None:
+def test_unsupported_frontend_output_fails_before_remote_work(tmp_path: Path) -> None:
     runner = PlanningRunner()
     frontend = backend_state().model_dump(mode="json")
     frontend["applications"]["example"]["frontend"] = {
-        "package_manager": "npm", "build_script": "build", "output_dir": "public/build"
+        "package_manager": "npm", "build_script": "build", "output_dir": "dist"
     }
     frontend["deployments"]["example-local"]["runtimes"].update({
         "node": {"provider": "system", "version": "22.12.0"},
         "npm": {"provider": "bundled", "version": "10.9.0"},
     })
-    with pytest.raises(ValueError, match="artifact_frontend_not_supported"):
+    with pytest.raises(ValueError, match="artifact_frontend_output_not_supported"):
         orchestrator(tmp_path, runner, ControlState.model_validate(frontend)).plan_build_artifact(
             "example-local"
         )
     assert runner.calls == []
 
-    secret = backend_state().model_dump(mode="json")
-    secret["applications"]["example"]["build"]["secrets"] = {
+
+@pytest.mark.parametrize(
+    ("manager", "manager_version", "install"),
+    [
+        ("npm", "10.9.0", ["npm", "ci", "--no-audit", "--no-fund"]),
+        ("pnpm", "9.15.0", ["pnpm", "install", "--frozen-lockfile"]),
+        (
+            "yarn", "1.22.22",
+            ["yarn", "install", "--frozen-lockfile", "--non-interactive"],
+        ),
+        ("yarn", "4.5.3", ["yarn", "install", "--immutable"]),
+        ("bun", "1.1.38", ["bun", "install", "--frozen-lockfile"]),
+    ],
+)
+def test_frontend_commands_are_fixed(
+    manager: str, manager_version: str, install: list[str]
+) -> None:
+    assert artifact_program.frontend_commands(manager, manager_version, "build:prod") == (
+        install,
+        [manager, "run", "build:prod"],
+    )
+
+
+def test_frontend_plan_binds_lockfile_and_runtime_capability(tmp_path: Path) -> None:
+    document = backend_state().model_dump(mode="json")
+    document["applications"]["example"]["frontend"] = {
+        "package_manager": "npm", "build_script": "build", "output_dir": "public/build",
+    }
+    document["deployments"]["example-local"]["runtimes"].update({
+        "node": {"provider": "system", "version": "22.12.0"},
+        "npm": {"provider": "bundled", "version": "10.9.0"},
+    })
+    plan = orchestrator(
+        tmp_path, PlanningRunner(), ControlState.model_validate(document)
+    ).plan_build_artifact("example-local")
+
+    assert plan["identity"]["frontend_lock"] == {
+        "filename": "package-lock.json", "sha256": "9" * 64, "bytes": 1024,
+    }
+    assert plan["identity"]["capability"]["frontend"] == {
+        "manager": "npm", "manager_version": "10.9.0", "node_version": "22.12.0",
+    }
+
+
+def test_secret_reference_value_does_not_change_build_id(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        artifact_build_module,
+        "plan_secret_references",
+        lambda *_arguments: [{"status": "current", "version_fingerprint": "ver_" + "a" * 64}],
+    )
+
+    def state(field: str) -> ControlState:
+        document = backend_state().model_dump(mode="json")
+        document["applications"]["example"]["frontend"] = {
+            "package_manager": "npm", "build_script": "build",
+            "output_dir": "public/build",
+        }
+        document["applications"]["example"]["build"]["secrets"] = {
+            "NPM_TOKEN": {
+                "store": "local-sops", "secret": "example/build", "field": field,
+            }
+        }
+        document["deployments"]["example-local"]["runtimes"].update({
+            "node": {"provider": "system", "version": "22.12.0"},
+            "npm": {"provider": "bundled", "version": "10.9.0"},
+        })
+        return ControlState.model_validate(document)
+
+    first = orchestrator(tmp_path, PlanningRunner(), state("FIRST")).plan_build_artifact(
+        "example-local"
+    )
+    second = orchestrator(tmp_path, PlanningRunner(), state("SECOND")).plan_build_artifact(
+        "example-local"
+    )
+    assert first["build_id"] == second["build_id"]
+    assert first["identity"]["build_policy"] == {
+        "target": "buildbox", "artifact_store": "primary", "packaging": "laravel_v1",
+        "build_secrets_used": True, "build_secret_count": 1,
+        "build_secret_names": ["NPM_TOKEN"],
+    }
+
+
+def test_build_secrets_are_resolved_only_after_plan_acceptance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    document = backend_state().model_dump(mode="json")
+    document["applications"]["example"]["frontend"] = {
+        "package_manager": "npm", "build_script": "build", "output_dir": "public/build",
+    }
+    document["applications"]["example"]["build"]["secrets"] = {
         "NPM_TOKEN": {
-            "store": "local-sops", "secret": "example/build", "field": "NPM_TOKEN"
+            "store": "local-sops", "secret": "example/build", "field": "TOKEN",
         }
     }
-    with pytest.raises(ValueError, match="artifact_build_secrets_not_supported"):
-        orchestrator(tmp_path, runner, ControlState.model_validate(secret)).plan_build_artifact(
-            "example-local"
-        )
-    assert runner.calls == []
+    document["deployments"]["example-local"]["runtimes"].update({
+        "node": {"provider": "system", "version": "22.12.0"},
+        "npm": {"provider": "bundled", "version": "10.9.0"},
+    })
+    selected = ControlState.model_validate(document)
+    planned = [{"status": "current", "version_fingerprint": "ver_" + "a" * 64}]
+    resolutions: list[dict[str, SecretReference]] = []
+    monkeypatch.setattr(
+        artifact_build_module, "plan_secret_references", lambda *_arguments: planned
+    )
+
+    def resolve(_state, _path, references, observed):
+        assert observed == planned
+        resolutions.append(references)
+        return {"NPM_TOKEN": "protected-value"}
+
+    monkeypatch.setattr(artifact_build_module, "resolve_planned_secret_references", resolve)
+    runner = PlanningRunner()
+    operations = orchestrator(tmp_path, runner, selected)
+    plan = operations.plan_build_artifact("example-local")
+    assert resolutions == []
+
+    result = operations.build_artifact("example-local", plan["plan_id"])
+    assert result["status"] == "published"
+    assert len(resolutions) == 1
 
 
 def test_build_secret_shape_never_accepts_plaintext() -> None:
@@ -258,6 +390,66 @@ def test_deterministic_archive_and_tree_digest(tmp_path: Path) -> None:
     (tmp_path / "verify-two").mkdir()
     artifact_program.verify_archive(first, digest, tmp_path / "verify-one")
     artifact_program.verify_archive(second, digest, tmp_path / "verify-two")
+
+
+def test_frontend_lockfile_must_be_exact_and_uncontested(tmp_path: Path) -> None:
+    (tmp_path / "package-lock.json").write_text("lock")
+    request = {
+        "frontend": {
+            "package_manager": "npm", "build_script": "build",
+            "output_dir": "public/build",
+        }
+    }
+    policy = artifact_program.frontend_policy(request, tmp_path)
+    assert policy["lockfile"] == "package-lock.json"
+    (tmp_path / "yarn.lock").write_text("conflict")
+    with pytest.raises(artifact_program.ArtifactFailure, match="frontend_lockfile_invalid"):
+        artifact_program.frontend_policy(request, tmp_path)
+
+
+def test_frontend_output_rejects_dependency_and_credential_material(tmp_path: Path) -> None:
+    (tmp_path / "vendor").mkdir()
+    output = tmp_path / "public" / "build" / "node_modules"
+    output.mkdir(parents=True)
+    (output / "dependency.js").write_text("unexpected")
+    with pytest.raises(artifact_program.ArtifactFailure, match="frontend_output_invalid"):
+        artifact_program.collect_tree(
+            tmp_path, [], {"output_dir": "public/build"}
+        )
+
+
+def test_secret_scan_rejects_selected_tree_and_final_archive(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    leaked = root / "compiled.js"
+    leaked.write_text("window.token = 'exact-secret-value';")
+    entries = [("compiled.js", leaked)]
+    with pytest.raises(artifact_program.ArtifactFailure, match="secret_leak_detected"):
+        artifact_program.scan_secret_values(entries, {"TOKEN": "exact-secret-value"})
+
+    archive = tmp_path / "artifact.tar.gz"
+    artifact_program.create_archive(entries, archive)
+    with pytest.raises(artifact_program.ArtifactFailure, match="secret_leak_detected"):
+        artifact_program.scan_archive_secrets(archive, {"TOKEN": "exact-secret-value"})
+
+    leaked.write_text("safe")
+    excluded = root / "node_modules" / "dependency"
+    excluded.parent.mkdir()
+    excluded.write_text("exact-secret-value")
+    with pytest.raises(artifact_program.ArtifactFailure, match="secret_leak_detected"):
+        artifact_program.scan_workspace_secrets(root, {"TOKEN": "exact-secret-value"})
+
+
+def test_artifact_credential_file_is_removed_immediately_after_read(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps({
+        "store": {},
+        "build": {"NPM_TOKEN": "protected-value"},
+    }))
+    path.chmod(0o600)
+
+    assert artifact_program.credentials(str(path)) == ({}, {"NPM_TOKEN": "protected-value"})
+    assert not path.exists()
 
 
 def test_malicious_links_and_archive_members_are_rejected(tmp_path: Path) -> None:
@@ -314,7 +506,7 @@ class FakeS3:
         return {"Contents": [{"Key": key} for key in keys], "IsTruncated": False}
 
 
-def real_repository(tmp_path: Path) -> tuple[Path, str]:
+def real_repository(tmp_path: Path, *, frontend: bool = False) -> tuple[Path, str]:
     repository = tmp_path / "repository"
     repository.mkdir()
     (repository / "composer.json").write_text(json.dumps({
@@ -332,6 +524,21 @@ def real_repository(tmp_path: Path) -> tuple[Path, str]:
     )
     (repository / "artisan").write_text("#!/usr/bin/env php\n<?php\n")
     os.chmod(repository / "artisan", 0o755)
+    if frontend:
+        (repository / "package.json").write_text(json.dumps({
+            "name": "example-frontend",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "mkdir -p public/build && printf compiled > public/build/app.js"
+            },
+        }))
+        subprocess.run(
+            ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit"],
+            cwd=repository,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(
@@ -347,14 +554,16 @@ def real_repository(tmp_path: Path) -> tuple[Path, str]:
     return repository, commit
 
 
-def local_runtime_request(repository: Path, commit: str) -> dict[str, object]:
+def local_runtime_request(
+    repository: Path, commit: str, *, frontend: bool = False
+) -> dict[str, object]:
     php = subprocess.run(
         ["php", "-r", "echo PHP_VERSION;"], check=True, text=True, capture_output=True
     ).stdout
     composer = subprocess.run(
         ["composer", "--version", "--no-ansi"], check=True, text=True, capture_output=True
     ).stdout.split()[2]
-    return {
+    request = {
         "repository": str(repository),
         "commit": commit,
         "runtimes": {
@@ -362,7 +571,24 @@ def local_runtime_request(repository: Path, commit: str) -> dict[str, object]:
             "composer": {"provider": "system", "version": composer},
         },
         "php_extensions": [],
+        "frontend": None,
     }
+    if frontend:
+        node = subprocess.run(
+            ["node", "--version"], check=True, text=True, capture_output=True
+        ).stdout.strip().removeprefix("v")
+        npm = subprocess.run(
+            ["npm", "--version"], check=True, text=True, capture_output=True
+        ).stdout.strip()
+        request["runtimes"].update({
+            "node": {"provider": "system", "version": node},
+            "npm": {"provider": "bundled", "version": npm},
+        })
+        request["frontend"] = {
+            "package_manager": "npm", "build_script": "build",
+            "output_dir": "public/build",
+        }
+    return request
 
 
 def test_real_backend_build_is_reproducible_idempotent_and_cleans_workspace(
@@ -381,8 +607,10 @@ def test_real_backend_build_is_reproducible_idempotent_and_cleans_workspace(
         **request,
         "application": "example",
         "composer_lock_sha256": inspection["composer_lock_sha256"],
+        "frontend_lock": None,
         "capability": inspection["capability"],
         "build_id": "build_v1_" + "a" * 64,
+        "build_secret_names": [],
         "store": {
             "bucket": "gimme-artifacts",
             "region": "us-east-1",
@@ -429,6 +657,40 @@ def test_real_backend_build_is_reproducible_idempotent_and_cleans_workspace(
     assert list(root.iterdir()) == []
 
 
+def test_real_npm_build_includes_only_fixed_compiled_output(tmp_path: Path, monkeypatch) -> None:
+    repository, commit = real_repository(tmp_path, frontend=True)
+    apps_root = tmp_path / "apps"
+    apps_root.mkdir(mode=0o700)
+    request = local_runtime_request(repository, commit, frontend=True)
+    root = artifact_program.checked_root(str(apps_root))
+    inspection = artifact_program.inspect_source(request, root)
+    fake = FakeS3()
+    monkeypatch.setattr(artifact_program, "s3_client", lambda *_: fake)
+    build_request = {
+        **request,
+        "application": "example",
+        "composer_lock_sha256": inspection["composer_lock_sha256"],
+        "frontend_lock": inspection["frontend_lock"],
+        "capability": inspection["capability"],
+        "build_id": "build_v1_" + "b" * 64,
+        "build_secret_names": [],
+        "store": {
+            "bucket": "gimme-artifacts", "region": "us-east-1", "endpoint": None,
+            "addressing": "virtual_hosted", "encryption": {"method": "aes256"},
+        },
+    }
+
+    result = artifact_program.build(build_request, "-", root)
+    assert result["status"] == "published"
+    package_key, _, _ = artifact_program.object_keys("example", build_request["build_id"])
+    body = fake.objects[package_key][fake.objects[package_key]["current"]]
+    with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as archive:
+        names = {member.name for member in archive.getmembers()}
+    assert "public/build/app.js" in names
+    assert not any(name == "node_modules" or name.startswith("node_modules/") for name in names)
+    assert list(root.iterdir()) == []
+
+
 def test_stale_lock_fails_and_cleans_workspace_before_dependency_execution(
     tmp_path: Path,
 ) -> None:
@@ -443,8 +705,10 @@ def test_stale_lock_fails_and_cleans_workspace_before_dependency_execution(
         **request,
         "application": "example",
         "composer_lock_sha256": "0" * 64,
+        "frontend_lock": None,
         "capability": inspection["capability"],
         "build_id": "build_v1_" + "a" * 64,
+        "build_secret_names": [],
         "store": {
             "bucket": "gimme-artifacts",
             "region": "us-east-1",
@@ -472,7 +736,7 @@ def test_inventory_reports_fixed_degradation_without_storage_identities(
         ServerSideEncryption="AES256",
     )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "application": "example",
         "build_id": build_id,
         "commit": "b" * 40,
@@ -482,6 +746,8 @@ def test_inventory_reports_fixed_degradation_without_storage_identities(
         "bytes": len(package_body),
         "package_version": package["VersionId"],
         "published_at": "2026-09-20T12:00:00+00:00",
+        "build_secrets_used": False,
+        "build_secret_count": 0,
     }
     fake.put_object(
         Bucket="gimme-artifacts", Key=manifest_key, Body=json.dumps(manifest).encode(),
@@ -513,7 +779,7 @@ def test_inventory_reports_fixed_degradation_without_storage_identities(
     fake.objects[manifest_key][current] = b"not-json"
     assert artifact_program.inventory(request, "-")["artifacts"][0]["status"] == "malformed"
 
-    unsupported = {**manifest, "schema_version": 2}
+    unsupported = {**manifest, "schema_version": 1}
     fake.objects[manifest_key][current] = json.dumps(unsupported).encode()
     assert artifact_program.inventory(request, "-")["artifacts"][0]["status"] == "unsupported"
 
@@ -561,7 +827,7 @@ def test_interrupted_build_cleans_workspace(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(
         artifact_program,
         "runtime_capability",
-        lambda _request: (_ for _ in ()).throw(KeyboardInterrupt),
+        lambda *_arguments: (_ for _ in ()).throw(KeyboardInterrupt),
     )
     request = {
         "repository": "https://example.test/repository.git",
@@ -571,10 +837,13 @@ def test_interrupted_build_cleans_workspace(tmp_path: Path, monkeypatch) -> None
             "composer": {"provider": "system", "version": "2.8.4"},
         },
         "php_extensions": [],
+        "frontend": None,
         "application": "example",
         "composer_lock_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "frontend_lock": None,
         "capability": {},
         "build_id": "build_v1_" + "a" * 64,
+        "build_secret_names": [],
         "store": {
             "bucket": "gimme-artifacts",
             "region": "us-east-1",

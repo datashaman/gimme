@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Extended Application Artifact publication to npm, pnpm, Yarn 1/2+, and Bun frontends with
+  exact lock/runtime identity, fixed frozen commands, protected build-only SOPS secrets,
+  exact-value leak scanning, and secret-independent reproducibility enforcement.
 - Added the first end-to-end Application Artifact publication path for backend-only Laravel
   Applications. Reviewed source, lockfile, runtime, extension, platform, policy, and execution
   inputs form a versioned build identity; the Build Target performs frozen Composer installation,
