@@ -15,6 +15,7 @@ from gimme.recovery import (
     component_key,
     create_recovery_point,
     delete_recovery_point_versions,
+    enforce_recovery_retention,
     find_recovery_point,
     list_recovery_points,
     list_restore_records,
@@ -24,6 +25,7 @@ from gimme.recovery import (
     preflight_backup_destination,
     recovery_point_deletion_targets,
     recovery_point_id,
+    retention_candidates,
     restore_event_key,
     safety_recovery_point_id,
     safety_recovery_point_protected,
@@ -74,6 +76,75 @@ class FakeS3:
 
     def list_keys(self, destination, credentials, prefix) -> list[str]:
         return [key for key in self.objects if key.startswith(prefix)]
+
+
+def test_retention_candidates_are_verified_unprotected_oldest_first() -> None:
+    replacement = "rp_" + "4" * 20
+    points = [
+        {"recovery_point_id": "rp_" + "3" * 20, "state": "verified",
+         "created_at": "2026-01-03T00:00:00+00:00"},
+        {"recovery_point_id": replacement, "state": "verified",
+         "created_at": "2026-01-04T00:00:00+00:00"},
+        {"recovery_point_id": "rp_" + "1" * 20, "state": "verified",
+         "created_at": "2026-01-01T00:00:00+00:00"},
+        {"recovery_point_id": "rp_" + "2" * 20, "state": "verified",
+         "created_at": "2026-01-01T00:00:00+00:00"},
+        {"recovery_point_id": "rp_" + "0" * 20, "state": "deletion_failed",
+         "created_at": "2025-01-01T00:00:00+00:00"},
+    ]
+
+    assert retention_candidates(
+        points, 1, replacement, {"rp_" + "1" * 20}
+    ) == ["rp_" + "2" * 20, "rp_" + "3" * 20]
+
+
+def test_retention_never_selects_the_verified_replacement() -> None:
+    replacement = "rp_" + "1" * 20
+    points = [
+        {"recovery_point_id": replacement, "state": "verified",
+         "created_at": "2026-01-01T00:00:00+00:00"},
+        {"recovery_point_id": "rp_" + "2" * 20, "state": "verified",
+         "created_at": "2026-01-02T00:00:00+00:00"},
+    ]
+
+    assert retention_candidates(points, 1, replacement, set()) == ["rp_" + "2" * 20]
+
+
+def test_retention_deletes_exact_versions_and_stops_at_first_failure(tmp_path: Path) -> None:
+    class FailingDeleteS3(FakeS3):
+        blocked_point = ""
+
+        def delete_object(self, destination, credentials, key, version_id=None) -> None:
+            if self.blocked_point and self.blocked_point in key:
+                raise RuntimeError("protected provider detail")
+            super().delete_object(destination, credentials, key, version_id)
+
+    adapter = FailingDeleteS3()
+    point_ids = [
+        recovery_point_id("checkout", "primary", f"req-{index}")
+        for index in range(3)
+    ]
+    for index, point_id in enumerate(point_ids):
+        create_recovery_point(
+            "primary", destination(), None, adapter, "checkout", point_id,
+            dump(tmp_path, content=f"dump-{index}".encode()),
+        )
+    adapter.blocked_point = point_ids[1]
+
+    result = enforce_recovery_retention(
+        "primary", destination(), None, adapter, "checkout", 1, point_ids[2]
+    )
+
+    assert result == {
+        "outcome": "backup_succeeded_retention_failed",
+        "error_code": "retention_failed", "deleted": 1, "remaining": 2,
+    }
+    inventory = list_recovery_points(
+        "primary", destination(), None, adapter, "checkout"
+    )
+    assert [point["recovery_point_id"] for point in inventory["recovery_points"]] == [
+        point_ids[2], point_ids[1],
+    ]
 
 
 class FailingPutS3(FakeS3):

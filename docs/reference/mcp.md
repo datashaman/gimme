@@ -292,18 +292,22 @@ reads manifests directly from the bound destination — authoritative even if th
 Target is gone — and rejects (without failing the whole call) any manifest whose
 referenced component object no longer matches its declared checksum.
 
-Manual deletion is separate from automatic retention. `retain_last` is an automatic
-pruning floor after a verified replacement exists; it does not prevent an operator from
-manually reducing inventory below that number. Deleting the final verified point requires
-both exact confirmations returned by the plan.
+Manual deletion is separate from automatic retention. `retain_last` is the automatic-pruning
+ceiling for verified, unprotected points after a verified replacement exists; it does not
+prevent an operator from manually reducing inventory below that number. On-demand success,
+including an idempotently verified retry, deletes eligible points oldest-first through the
+same exact-version primitive. Protected Safety points and active Restore sources do not count
+toward the ceiling and are never candidates. Pruning stops on its first failure without
+invalidating the replacement. Deleting the final verified point manually requires both exact
+confirmations returned by the plan.
 
 A Deployment Recovery Policy normalizes `retain_last` to 7 by default (accepted range 1–365)
 and accepts exactly one UTC cadence shape: `{kind: manual}`, `{kind: hourly, minute: 0}`,
 `{kind: daily, hour: 2, minute: 0}`, or
 `{kind: weekly, weekday: sun, hour: 2, minute: 0}`. The shown clock fields are defaults;
 hour is 0–23 and minute is 0–59. Arbitrary time zones, seconds, cron expressions, and extra
-calendar fields are rejected. Scheduled runner, timer reconciliation, schedule status, and
-retention execution are separate follow-on slices.
+calendar fields are rejected. Scheduled runner, timer reconciliation, and schedule status are
+separate follow-on slices; scheduled execution will invoke the same retention path.
 
 Deletion accepts only a registered Deployment and Recovery Point ID. The private manifest
 supplies every object key and exact S3 version; callers cannot provide a key, prefix, path,

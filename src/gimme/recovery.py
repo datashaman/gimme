@@ -1243,6 +1243,94 @@ def list_recovery_points(
     }
 
 
+def retention_candidates(
+    recovery_points: list[dict[str, object]], retain_last: int,
+    replacement_point_id: str, protected_point_ids: set[str],
+) -> list[str]:
+    """Select verified, unprotected points for oldest-first automatic deletion."""
+    if (
+        not isinstance(retain_last, int) or isinstance(retain_last, bool)
+        or not 1 <= retain_last <= 365
+    ):
+        raise RecoveryError("recovery_retention_policy_invalid")
+    eligible = [
+        point for point in recovery_points
+        if point.get("state") == "verified"
+        and point.get("recovery_point_id") not in protected_point_ids
+    ]
+    if not any(
+        point.get("recovery_point_id") == replacement_point_id for point in eligible
+    ):
+        raise RecoveryError("recovery_retention_replacement_unverified")
+    eligible.sort(key=lambda point: (
+        str(point["created_at"]), str(point["recovery_point_id"]),
+    ))
+    delete_count = max(0, len(eligible) - retain_last)
+    candidates = [
+        str(point["recovery_point_id"])
+        for point in eligible
+        if point["recovery_point_id"] != replacement_point_id
+    ]
+    if len(candidates) < delete_count:
+        raise RecoveryError("recovery_retention_replacement_required")
+    return candidates[:delete_count]
+
+
+def enforce_recovery_retention(
+    destination_name: str, destination: S3BackupDestination, credentials: Credentials,
+    adapter: S3Adapter, deployment: str, retain_last: int, replacement_point_id: str,
+) -> dict[str, object]:
+    """Prune eligible points through the sole exact-version deletion primitive."""
+    try:
+        inventory = list_recovery_points(
+            destination_name, destination, credentials, adapter, deployment
+        )
+        points = inventory["recovery_points"]
+        if not isinstance(points, list):
+            raise RecoveryError("recovery_retention_inventory_invalid")
+        protected = {
+            str(point["recovery_point_id"])
+            for point in points
+            if safety_recovery_point_protected(
+                destination, credentials, adapter, deployment, point
+            ) or recovery_point_source_protected(
+                destination, credentials, adapter, deployment,
+                str(point["recovery_point_id"]),
+            )
+        }
+        candidates = retention_candidates(
+            points, retain_last, replacement_point_id, protected
+        )
+        eligible_count = sum(
+            point.get("state") == "verified"
+            and point.get("recovery_point_id") not in protected
+            for point in points
+        )
+    except Exception:
+        return {
+            "outcome": "backup_succeeded_retention_failed",
+            "error_code": "retention_failed", "deleted": 0, "remaining": 0,
+        }
+
+    deleted = 0
+    for point_id in candidates:
+        try:
+            delete_recovery_point_versions(
+                destination_name, destination, credentials, adapter, deployment, point_id
+            )
+        except Exception:
+            return {
+                "outcome": "backup_succeeded_retention_failed",
+                "error_code": "retention_failed", "deleted": deleted,
+                "remaining": eligible_count - deleted,
+            }
+        deleted += 1
+    return {
+        "outcome": "succeeded", "error_code": None, "deleted": deleted,
+        "remaining": eligible_count - deleted,
+    }
+
+
 def recovery_point_deletion_targets(
     destination_name: str, destination: S3BackupDestination, credentials: Credentials,
     adapter: S3Adapter, deployment: str, point_id: str,
