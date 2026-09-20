@@ -1500,6 +1500,8 @@ def _deployment_restore_plan(
         "resource": resource_name, "provider": "target_local",
         "kind": "postgres", "version": resource.version,
     }
+    if selected_components == ["valkey"] and valkey_destination is not None:
+        expected_destination = valkey_destination
     request_conflict = existing_restore is not None and (
         existing_restore["source_recovery_point_id"] != recovery_point_id
         or existing_restore["destination"] != expected_destination
@@ -1581,14 +1583,12 @@ def apply_restore_deployment(
             raise RecoveryError("restore_source_missing")
         selected_components = cast(list[str], expected["selected_components"])
         untouched_components = cast(list[str], expected["untouched_components"])
-        component = next(
-            (
-                item for item in manifest["components"]  # type: ignore[union-attr]
-                if item["kind"] == "postgres"
-            ),
-            None,
-        )
-        if component is None:
+        source_components = {
+            str(item["kind"]): item
+            for item in manifest["components"]  # type: ignore[union-attr]
+            if item["kind"] in selected_components
+        }
+        if set(source_components) != set(selected_components):
             raise RecoveryError("restore_component_missing")
         resource_name = deployment.resources.database
         resource = state.resources[resource_name] if resource_name is not None else None
@@ -1609,12 +1609,16 @@ def apply_restore_deployment(
         )
         if existing is not None:
             safety_id = cast(str | None, existing["safety_recovery_point_id"])
+        destinations = cast(list[dict[str, object]], expected["destinations"])
+        if len(destinations) != len(selected_components):
+            raise RecoveryError("restore_destination_incompatible")
+        primary_destination = destinations[0]
         identity = {
             "source_recovery_point_id": recovery_point_id,
-            "destination_provider": "target_local",
-            "destination_resource": resource_name,
-            "destination_kind": "postgres",
-            "destination_version": resource.version,
+            "destination_provider": str(primary_destination["provider"]),
+            "destination_resource": str(primary_destination["resource"]),
+            "destination_kind": str(primary_destination["kind"]),
+            "destination_version": str(primary_destination["version"]),
             "safety_recovery_point_id": safety_id,
             "selected_components": selected_components,
             "untouched_components": untouched_components,
@@ -1655,42 +1659,90 @@ def apply_restore_deployment(
                 )
                 advance("safety_verified")
         with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
-            local_source = Path(directory) / "postgres.dump"
+            selected_kind = selected_components[0]
+            component = source_components[selected_kind]
+            local_source = Path(directory) / (
+                "postgres.dump" if selected_kind == "postgres" else "valkey.archive"
+            )
             if current in {
                 "safety_verified", "safety_not_required", "artifact_verified"
             }:
                 component = recovery_module.materialize_recovery_component(
                     destination_name, destination, credentials, backup_s3, name,
-                    recovery_point_id, "postgres", local_source,
+                    recovery_point_id, selected_kind, local_source,
                 )
             if current in {"safety_verified", "safety_not_required"}:
                 advance("artifact_verified")
             if current == "artifact_verified":
+                if selected_kind == "postgres":
+                    try:
+                        _run_deployment(
+                            "gimme:recovery:postgres", name,
+                            backup_local_path=local_source,
+                            postgres_restore_action="prepare",
+                            postgres_restore_request_id=request_id,
+                            postgres_restore_sha256=str(component["sha256"]),
+                            postgres_restore_bytes=int(component["bytes"]),
+                            timeout=3600,
+                        )
+                    except Exception:
+                        raise RecoveryError("restore_shadow_prepare_failed") from None
+                else:
+                    binding = deployment.resources.valkey
+                    valkey_name = binding.resource if binding is not None else None
+                    valkey_resource = (
+                        state.resources.get(valkey_name) if valkey_name else None
+                    )
+                    if not isinstance(
+                        valkey_resource,
+                        (ResourceConfig, AWSElastiCacheValkeyResource),
+                    ) or valkey_name is None:
+                        raise RecoveryError("restore_destination_incompatible")
+                    credential = _valkey_capture_credential(
+                        state, valkey_name, valkey_resource
+                    )
+                    try:
+                        with protected_secret_file(credential) as secret_file:
+                            result = _run_deployment(
+                                "gimme:recovery:valkey", name,
+                                backup_local_path=local_source,
+                                secret_file=secret_file,
+                                valkey_restore_request_id=request_id,
+                                valkey_restore_sha256=str(component["sha256"]),
+                                valkey_restore_bytes=int(component["bytes"]),
+                                valkey_restore_records=int(component["records"]),
+                                timeout=3600,
+                            )
+                    except Exception:
+                        raise RecoveryError("valkey_restore_failed") from None
+                    markers = []
+                    for raw in result.output.splitlines():
+                        line = raw.split("] ", 1)[-1].strip()
+                        match = re.fullmatch(
+                            r"GIMME_VALKEY_RESTORE\|([0-9]{1,6})\|([0-9]{1,6})",
+                            line,
+                        )
+                        if match is not None:
+                            markers.append((int(match[1]), int(match[2])))
+                    if (
+                        len(markers) != 1
+                        or sum(markers[0]) != int(component["records"])
+                    ):
+                        raise RecoveryError("valkey_verification_failed")
+                advance("shadow_verified")
+        if current == "shadow_verified":
+            if selected_components == ["postgres"]:
                 try:
                     _run_deployment(
                         "gimme:recovery:postgres", name,
-                        backup_local_path=local_source,
-                        postgres_restore_action="prepare",
+                        postgres_restore_action="swap",
                         postgres_restore_request_id=request_id,
                         postgres_restore_sha256=str(component["sha256"]),
                         postgres_restore_bytes=int(component["bytes"]),
-                        timeout=3600,
+                        timeout=300,
                     )
                 except Exception:
-                    raise RecoveryError("restore_shadow_prepare_failed") from None
-                advance("shadow_verified")
-        if current == "shadow_verified":
-            try:
-                _run_deployment(
-                    "gimme:recovery:postgres", name,
-                    postgres_restore_action="swap",
-                    postgres_restore_request_id=request_id,
-                    postgres_restore_sha256=str(component["sha256"]),
-                    postgres_restore_bytes=int(component["bytes"]),
-                    timeout=300,
-                )
-            except Exception:
-                raise RecoveryError("restore_swap_failed") from None
+                    raise RecoveryError("restore_swap_failed") from None
             advance("data_replaced")
         return {
             "changed": changed,
@@ -1798,32 +1850,33 @@ def apply_verify_restore(
         elif current == "verification_succeeded":
             verify_runtime()
         if current == "verification_succeeded":
-            manifest = recovery_module.find_recovery_point(
-                destination_name, destination, credentials, backup_s3, name,
-                str(restore["source_recovery_point_id"]),
-            )
-            if manifest is None:
-                raise RecoveryError("restore_source_missing")
-            component = next(
-                (
-                    item for item in manifest["components"]  # type: ignore[union-attr]
-                    if item["kind"] == "postgres"
-                ),
-                None,
-            )
-            if component is None:
-                raise RecoveryError("restore_component_missing")
-            try:
-                _run_deployment(
-                    "gimme:recovery:postgres", name,
-                    postgres_restore_action="cleanup",
-                    postgres_restore_request_id=request_id,
-                    postgres_restore_sha256=str(component["sha256"]),
-                    postgres_restore_bytes=int(component["bytes"]),
-                    timeout=300,
+            if "postgres" in cast(list[str], restore["selected_components"]):
+                manifest = recovery_module.find_recovery_point(
+                    destination_name, destination, credentials, backup_s3, name,
+                    str(restore["source_recovery_point_id"]),
                 )
-            except Exception:
-                raise RecoveryError("restore_cleanup_failed") from None
+                if manifest is None:
+                    raise RecoveryError("restore_source_missing")
+                component = next(
+                    (
+                        item for item in manifest["components"]  # type: ignore[union-attr]
+                        if item["kind"] == "postgres"
+                    ),
+                    None,
+                )
+                if component is None:
+                    raise RecoveryError("restore_component_missing")
+                try:
+                    _run_deployment(
+                        "gimme:recovery:postgres", name,
+                        postgres_restore_action="cleanup",
+                        postgres_restore_request_id=request_id,
+                        postgres_restore_sha256=str(component["sha256"]),
+                        postgres_restore_bytes=int(component["bytes"]),
+                        timeout=300,
+                    )
+                except Exception:
+                    raise RecoveryError("restore_cleanup_failed") from None
             advance("cleanup_completed")
         if current == "cleanup_completed":
             verify_runtime()

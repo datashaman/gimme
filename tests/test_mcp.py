@@ -827,9 +827,7 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
         "resource": "devbox-valkey", "provider": "target_local",
         "kind": "valkey", "version": "8.0.2",
     }]
-    assert incompatible["readiness_issues"] == [
-        "valkey_restore_unsupported", "valkey_destination_incompatible",
-    ]
+    assert incompatible["readiness_issues"] == ["valkey_destination_incompatible"]
     assert inspected == [
         "gimme:recovery:inspect-postgres",
         "gimme:recovery:inspect-postgres",
@@ -1486,6 +1484,85 @@ def test_valkey_only_restore_safety_captures_exact_selected_component(
     assert safety["restore_request_id"] == request_id
     assert [item["kind"] for item in safety["components"]] == ["valkey"]
     assert safety["components"][0]["resource_version"] == "8.0.1"
+
+
+def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_mutation(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    postgres = tmp_path / "source.pg"
+    valkey = tmp_path / "source.valkey"
+    postgres.write_bytes(b"pg")
+    valkey_body = b'{"format":"gimme-valkey-v1"}\n'
+    valkey.write_bytes(valkey_body)
+    point = recovery_point_id("example-app", "primary", "valkey-source")
+    recovery_module.create_recovery_point(
+        "primary", state.backup_destinations["primary"], None, adapter,
+        "example-app", point, [
+            recovery_module.ComponentDump(
+                kind="postgres", local_path=postgres,
+                sha256=hashlib.sha256(b"pg").hexdigest(), bytes=2,
+                resource_version="17.2",
+            ),
+            recovery_module.ComponentDump(
+                kind="valkey", local_path=valkey,
+                sha256=hashlib.sha256(valkey_body).hexdigest(),
+                bytes=len(valkey_body), resource_version="8.0.1",
+                format="gimme-valkey-v1", records=0,
+            ),
+        ],
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append((task, kwargs.get("recovery_action")))
+        if task == "gimme:backup:capture-valkey":
+            kwargs["backup_local_path"].write_bytes(valkey_body)
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_VALKEY_BACKUP|"
+                f"{hashlib.sha256(valkey_body).hexdigest()}|{len(valkey_body)}|0|"
+                "2026-09-20T02:00:00+00:00",
+            )
+        if task == "gimme:recovery:valkey":
+            assert kwargs["backup_local_path"].read_bytes() == valkey_body
+            assert kwargs["valkey_restore_records"] == 0
+            return CommandResult(["dep"], 0, "GIMME_VALKEY_RESTORE|0|0")
+        if task == "gimme:recovery:verify-application":
+            return CommandResult(["dep"], 0, "GIMME_RESTORE_VERIFY|ready")
+        return CommandResult(["dep"], 0, "maintenance")
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-valkey", ["valkey"]
+    )
+    assert plan["ready"] is True
+
+    applied = server_module.apply_restore_deployment(
+        "example-app", point, "restore-valkey", str(plan["plan_id"]),
+        str(plan["confirmation"]), ["valkey"],
+    )
+    assert applied["state"] == "data_replaced"
+    assert not any("postgres" in task for task, _action in calls)
+
+    verify = server_module.plan_verify_restore("example-app", "restore-valkey")
+    completed = server_module.apply_verify_restore(
+        "example-app", "restore-valkey", str(verify["plan_id"])
+    )
+    assert completed["state"] == "completed"
+    assert not any("postgres" in task for task, _action in calls)
+    record = recovery_module.load_restore_record(
+        state.backup_destinations["primary"], None, adapter,
+        "example-app", "restore-valkey",
+    )
+    assert record["selected_components"] == ["valkey"]
+    assert record["destination"] == {
+        "resource": "devbox-valkey", "provider": "target_local",
+        "kind": "valkey", "version": "8.0.1",
+    }
 
 
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:
