@@ -317,6 +317,7 @@ def test_recovery_schedule_reconciliation_uses_fixed_protected_transfer() -> Non
     )[0]
 
     assert "recovery_schedule_state_write_command(" in task
+    assert "invoke('gimme:recovery:runtime-status')" in task
     assert '"{$appsRoot}/.gimme/recovery-schedules"' in task
     assert '"{$directory}/{$deployment}.json"' in task
     assert '"{$directory}/{$deployment}.credentials"' in task
@@ -325,10 +326,25 @@ def test_recovery_schedule_reconciliation_uses_fixed_protected_transfer() -> Non
     assert "sudo -n /usr/local/sbin/gimme-provision-recovery-schedule" in task
     assert "finally" in task
     assert "rm -f" in task
-    assert task.index("recovery_schedule_state_write_command(") < task.index("try {")
+    assert task.index("invoke('gimme:recovery:runtime-status')") < task.index(
+        "recovery_schedule_state_write_command("
+    ) < task.index("try {")
     assert task.index("try {") < task.index("upload($localCredential") < task.index(
         "sudo -n /usr/local/sbin/gimme-provision-recovery-schedule"
     ) < task.index("finally")
+
+
+def test_recovery_schedule_runtime_probe_is_fixed_and_bounded() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:runtime-status'", 1)[1].split(
+        "task('gimme:recovery:schedule-reconcile'", 1
+    )[0]
+
+    assert "import boto3; print(boto3.__version__" in task
+    assert "/usr/bin/python3 -c" in task
+    assert "GIMME_RECOVERY_RUNTIME|boto3|" in task
+    assert "^[0-9]+(?:\\.[0-9]+){1,3}$" in task
+    assert "GIMME_RECOVERY_SCHEDULE_JSON" not in task
 
 
 def test_recovery_schedule_state_writer_is_bounded_and_secret_free() -> None:

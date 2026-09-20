@@ -1996,6 +1996,18 @@ task('gimme:recovery:schedule-status', function () use ($app): void {
     );
 });
 
+task('gimme:recovery:runtime-status', function (): void {
+    $version = trim(run(
+        "/usr/bin/python3 -c " . escapeshellarg(
+            'import boto3; print(boto3.__version__, end="")'
+        ) . ' 2>/dev/null'
+    ));
+    if (!preg_match('/^[0-9]+(?:\.[0-9]+){1,3}$/', $version)) {
+        throw new \RuntimeException('Recovery Schedule boto3 runtime is unavailable');
+    }
+    writeln("GIMME_RECOVERY_RUNTIME|boto3|{$version}");
+});
+
 task('gimme:recovery:schedule-reconcile', function () use (
     $app,
     $appsRoot,
@@ -2009,6 +2021,20 @@ task('gimme:recovery:schedule-reconcile', function () use (
     $deployment = required_env('GIMME_DEPLOYMENT');
     if (!preg_match('/^[a-z][a-z0-9-]{0,63}$/', $deployment)) {
         throw new \RuntimeException('Unsafe Recovery Schedule Deployment identity');
+    }
+    $authority = json_decode(
+        required_env('GIMME_RECOVERY_SCHEDULE_JSON'),
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+    $cadenceKind = is_array($authority) && is_array($authority['cadence'] ?? null)
+        ? ($authority['cadence']['kind'] ?? null)
+        : null;
+    if (!in_array($cadenceKind, ['manual', 'hourly', 'daily', 'weekly'], true)) {
+        throw new \RuntimeException('Invalid Recovery Schedule cadence authority');
+    }
+    if ($cadenceKind !== 'manual') {
+        invoke('gimme:recovery:runtime-status');
     }
     $policy = privileged_helper_policy(
         configured_packages(),
