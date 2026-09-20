@@ -377,8 +377,17 @@ def _validate_restore_event(document: object) -> dict[str, object]:
         or set(destination) != {"resource", "provider", "kind", "version"}
         or not isinstance(destination.get("resource"), str)
         or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", str(destination.get("resource"))) is None
-        or destination.get("provider") != "target_local"
-        or destination.get("kind") != "postgres"
+        or destination.get("kind") not in {"postgres", "valkey"}
+        or (
+            destination.get("kind") == "postgres"
+            and destination.get("provider") != "target_local"
+        )
+        or (
+            destination.get("kind") == "valkey"
+            and destination.get("provider") not in {
+                "target_local", "aws_elasticache_valkey"
+            }
+        )
         or RESOURCE_VERSION.fullmatch(str(destination.get("version"))) is None
         or (
             document.get("safety_recovery_point_id") is not None
@@ -416,6 +425,7 @@ def _validate_restore_event(document: object) -> dict[str, object]:
         or set(selected) | set(untouched) not in (
             {"postgres"}, {"valkey"}, {"postgres", "valkey"}
         )
+        or destination["kind"] not in selected
         or document.get("partial") != bool(untouched)
     ):
         raise RecoveryError("restore_record_invalid")

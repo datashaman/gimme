@@ -319,8 +319,11 @@ and its stronger confirmation states that consistency with untouched components 
 broken. Plans expose only bounded destination Resource provenance for selected components. Valkey
 planning requires the registered destination to have a supported provider and `valkey` kind, then
 compares its exact version with the source component version.
-The current state-machine slice supports PostgreSQL selection; selecting Valkey returns the fixed
-`valkey_restore_unsupported` readiness issue until Valkey activation is connected.
+The state machine supports explicit PostgreSQL-only and Valkey-only selection. A multi-component
+full Restore still returns `valkey_restore_unsupported` until paired activation ordering is
+connected. Valkey-only Restore captures a Valkey-only Safety Recovery Point, validates the source
+archive before mutation, replaces and verifies only the registered prefix, and performs no
+PostgreSQL mutation or cleanup.
 Valkey-only planning resolves PostgreSQL binding provenance but does not run PostgreSQL catalog
 inspection or inspect its data.
 

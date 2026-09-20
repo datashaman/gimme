@@ -313,7 +313,8 @@ def deployment_restore_plan(
     issues = [
         *(
             ["valkey_restore_unsupported"]
-            if selected_components != ["postgres"] or postgres is None else []
+            if len(selected_components) != 1
+            or selected_components == ["postgres"] and postgres is None else []
         ),
         *(
             ["valkey_destination_incompatible"]
@@ -380,8 +381,15 @@ def deployment_restore_plan(
                 ["create and verify a protected Safety Recovery Point"]
                 if not destination_empty else []
             ),
-            "verify the exact PostgreSQL artifact before loading a shadow database",
-            "swap only the deployment database after shadow verification",
+            *(
+                ["verify the exact PostgreSQL artifact before loading a shadow database",
+                 "swap only the deployment database after shadow verification"]
+                if "postgres" in selected_components else []
+            ),
+            *(
+                ["verify and replace only the registered Valkey prefix"]
+                if "valkey" in selected_components else []
+            ),
             *(
                 ["leave unselected components untouched and accept intentionally mixed state"]
                 if partial else []
