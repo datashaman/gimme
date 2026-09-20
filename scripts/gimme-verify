@@ -24,6 +24,7 @@ uv run ruff check --stdin-filename gimme-capture-valkey - < scripts/gimme-captur
 uv run ruff check --stdin-filename gimme-restore-valkey - < scripts/gimme-restore-valkey
 uv run ruff check --stdin-filename gimme-restore-postgres - < scripts/gimme-restore-postgres
 uv run bandit -q -r src
+uv run bandit -q deploy/artifact.py
 uv run bandit -q scripts/gimme-provision-stack scripts/gimme-provision-processes \
   scripts/gimme-provision-recovery-schedule \
   scripts/gimme-recovery-runner \

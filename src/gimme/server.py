@@ -42,6 +42,7 @@ from gimme.control_plane_registration_orchestration import (
     ControlPlaneRegistrationOrchestrator,
 )
 from gimme.artifact_store_orchestration import ArtifactStoreOrchestrator
+from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
 from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
@@ -133,6 +134,16 @@ def _artifact_store_orchestrator() -> ArtifactStoreOrchestrator:
         runner=runner,
         assert_plan=_assert_plan,
         legacy_server=legacy_server,
+    )
+
+
+def _artifact_build_orchestrator() -> ArtifactBuildOrchestrator:
+    return ArtifactBuildOrchestrator(
+        store=store,
+        runner=runner,
+        assert_plan=_assert_plan,
+        legacy_server=legacy_server,
+        legacy_app=legacy_app,
     )
 
 
@@ -1203,6 +1214,26 @@ def verify_artifact_store_reader(
     return _artifact_store_orchestrator().verify(
         name, target, "reader", plan_id, reader_version
     )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("build_artifact", "name")
+def plan_build_artifact(name: Name) -> dict[str, object]:
+    """Plan one deterministic backend-only Laravel artifact publication."""
+    return _artifact_build_orchestrator().plan_build_artifact(name)
+
+
+@mcp.tool(annotations=WRITE)
+@_journal_apply("build_artifact", "name")
+def build_artifact(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Build, verify, upload, and publish the exact reviewed Application Artifact."""
+    return _artifact_build_orchestrator().build_artifact(name, plan_id)
+
+
+@mcp.tool(annotations=READ)
+def list_artifacts(application: Name) -> dict[str, object]:
+    """List bounded secret-safe Artifact integrity status, newest first."""
+    return _artifact_build_orchestrator().list_artifacts(application)
 
 
 def _recovery_context(

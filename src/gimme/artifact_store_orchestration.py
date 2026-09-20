@@ -20,7 +20,7 @@ VERSION_ID = re.compile(r"^[A-Za-z0-9._+=/-]{1,1024}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _references(auth: AmbientArtifactAuth | SopsArtifactAuth):
+def artifact_auth_references(auth: AmbientArtifactAuth | SopsArtifactAuth):
     if isinstance(auth, AmbientArtifactAuth):
         return None
     values = {
@@ -32,7 +32,7 @@ def _references(auth: AmbientArtifactAuth | SopsArtifactAuth):
     return values
 
 
-def _target_policy(name: str, store: S3ArtifactStore) -> dict[str, object]:
+def target_store_policy(name: str, store: S3ArtifactStore) -> dict[str, object]:
     return {
         "name": name,
         "bucket": store.bucket,
@@ -107,7 +107,7 @@ class ArtifactStoreOrchestrator:
         ):
             raise ValueError("reader verification requires one bounded exact object version")
         auth = definition.publisher_auth if role == "publisher" else definition.reader_auth
-        references = _references(auth)
+        references = artifact_auth_references(auth)
         planned = None if references is None else plan_secret_references(
             state, self.store.secrets_path, references
         )
@@ -155,7 +155,7 @@ class ArtifactStoreOrchestrator:
         )
         self.assert_plan(expected, plan_id)
         auth = definition.publisher_auth if role == "publisher" else definition.reader_auth
-        references = _references(auth)
+        references = artifact_auth_references(auth)
         planned = expected["credential_versions"]
         credentials = {} if references is None else resolve_planned_secret_references(
             state, self.store.secrets_path, references, planned
@@ -166,7 +166,7 @@ class ArtifactStoreOrchestrator:
                 "gimme:artifact-store:verify",
                 self.legacy_server(selected_target),
                 stack=selected_target.stack,
-                artifact_store=_target_policy(name, definition),
+                artifact_store=target_store_policy(name, definition),
                 artifact_probe_role=role,
                 artifact_reader_version=reader_version,
                 secret_file=credential_file,

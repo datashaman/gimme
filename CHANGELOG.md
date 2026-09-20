@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the first end-to-end Application Artifact publication path for backend-only Laravel
+  Applications. Reviewed source, lockfile, runtime, extension, platform, policy, and execution
+  inputs form a versioned build identity; the Build Target performs frozen Composer installation,
+  deterministic safe packaging, encrypted upload/readback, manifest-last first-writer publication,
+  reproducibility enforcement, cleanup, and bounded secret-safe integrity inventory.
 - Added schema-v6 immutable Artifact foundations. Desired state now has bounded versioned Artifact
   Stores, separate publisher/reader authority, explicit Deployment release modes, Application
   build policy, and a hard operator-led migration. Target-side capability probes keep object bytes

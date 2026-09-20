@@ -768,6 +768,16 @@ class ApplicationBuildPolicy(BaseModel):
     target: str = Field(pattern=TARGET_NAME.pattern)
     artifact_store: str = Field(pattern=ARTIFACT_STORE_NAME.pattern)
     packaging: Literal["laravel_v1"]
+    secrets: dict[str, SecretReference] = Field(default_factory=dict, max_length=32)
+
+    @field_validator("secrets")
+    @classmethod
+    def safe_secret_names(
+        cls, value: dict[str, SecretReference]
+    ) -> dict[str, SecretReference]:
+        if any(ENV_KEY.fullmatch(name) is None for name in value):
+            raise ValueError("build secret names must be bounded environment names")
+        return value
 
 
 class ApplicationConfig(BaseModel):
@@ -1055,6 +1065,13 @@ class ControlState(BaseModel):
                 if application.build.artifact_store not in self.artifact_stores:
                     raise ValueError(
                         f"application {name} references an unknown artifact store"
+                    )
+                if any(
+                    reference.store != "local-sops"
+                    for reference in application.build.secrets.values()
+                ):
+                    raise ValueError(
+                        f"application {name} build secrets must use local-sops references"
                     )
         for name, network in self.aws_networks.items():
             if AWS_NETWORK_NAME.fullmatch(name) is None:

@@ -858,6 +858,50 @@ task('gimme:artifact-store:verify', function () use ($appsRoot): void {
     }
 });
 
+task('gimme:artifact:run', function () use ($appsRoot): void {
+    $requestJson = required_env('GIMME_ARTIFACT_REQUEST_JSON');
+    $request = json_decode($requestJson, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($request) || !in_array(
+        $request['operation'] ?? null,
+        ['inspect', 'publication', 'build', 'inventory'],
+        true,
+    )) {
+        throw new \RuntimeException('Artifact request has an unexpected shape');
+    }
+    $directory = "{$appsRoot}/.gimme/artifact-operations";
+    $remoteProgram = "{$directory}/program-" . bin2hex(random_bytes(8)) . '.py';
+    $remoteCredential = "{$directory}/credentials-" . bin2hex(random_bytes(8)) . '.json';
+    $localCredential = getenv('GIMME_SECRET_FILE') ?: '';
+    $credentialArgument = '-';
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    try {
+        upload(__DIR__ . '/deploy/artifact.py', $remoteProgram);
+        run('chmod 0600 ' . escapeshellarg($remoteProgram));
+        if ($localCredential !== '') {
+            if (!is_file($localCredential) || is_link($localCredential)) {
+                throw new \RuntimeException('Unsafe Artifact credential transfer');
+            }
+            upload($localCredential, $remoteCredential);
+            run('chmod 0600 ' . escapeshellarg($remoteCredential));
+            $credentialArgument = $remoteCredential;
+        }
+        $output = run(
+            'python3 ' . escapeshellarg($remoteProgram) . ' ' .
+            escapeshellarg(base64_encode($requestJson)) . ' ' .
+            escapeshellarg($credentialArgument) . ' ' . escapeshellarg($appsRoot),
+            timeout: 3600,
+        );
+        if (!preg_match('/^GIMME_ARTIFACT_RESULT\|[A-Za-z0-9+\/=]{1,22000}$/', $output)) {
+            throw new \RuntimeException('Invalid Artifact operation result');
+        }
+        writeln($output);
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteProgram) . ' ' .
+            escapeshellarg($remoteCredential));
+        run('rmdir ' . escapeshellarg($directory) . ' 2>/dev/null || true');
+    }
+});
+
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
     if (configured_package_manager() !== 'apt') {
         throw new \RuntimeException('Configured package manager is not supported');
