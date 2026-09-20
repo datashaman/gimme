@@ -14,6 +14,7 @@ def write_execution_tree(root: Path) -> None:
         "scripts/gimme-provision-stack": "stack-helper-v1\n",
         "scripts/gimme-provision-processes": "process-helper-v1\n",
         "scripts/gimme-provision-recovery-schedule": "schedule-helper-v1\n",
+        "scripts/gimme-recovery-runner": "schedule-runner-v1\n",
         "scripts/gimme-recovery-maintenance": "recovery-helper-v1\n",
         "scripts/gimme-postgres-restore-swap": "postgres-swap-helper-v1\n",
         "scripts/gimme-capture-valkey": "valkey-capture-v1\n",

@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added, but deliberately did not install, the standalone Recovery Schedule runner core. It
+  duplicates no capture or S3 behavior: this slice only fixes logical-slot derivation, the exact
+  controller-compatible scheduled request identity, atomic bounded attempt status, and a
+  Deployment-scoped lock with a hard five-minute timeout. Its CLI remains non-operational until
+  the following common capture executable is ready, so merged resource apply still cannot enable
+  a timer that would silently skip a backup.
 - Added the fixed Deployer transfer boundary for Recovery Schedule reconciliation. The runner
   accepts canonical secret-free authority JSON through a dedicated environment field; the remote
   task writes a caller-owned mode-0600 desired-state document below the configured applications
