@@ -287,6 +287,7 @@ def deployment_restore_plan(
     source_components: list[dict[str, object]], destination_resource: str,
     destination_version: str, destination_empty: bool,
     selected_components: list[str],
+    valkey_destination: dict[str, str] | None = None,
     restore_state: str | None = None, request_conflict: bool = False,
     destination_changed: bool = False,
 ) -> dict[str, Any]:
@@ -302,10 +303,24 @@ def deployment_restore_plan(
     )
     source_version = "" if postgres is None else str(postgres.get("resource_version", ""))
     source_bytes = -1 if postgres is None else postgres.get("bytes", -1)
+    valkey = next(
+        (component for component in source_components if component.get("kind") == "valkey"),
+        None,
+    )
+    valkey_source_version = "" if valkey is None else str(
+        valkey.get("resource_version", "")
+    )
     issues = [
         *(
             ["valkey_restore_unsupported"]
             if selected_components != ["postgres"] or postgres is None else []
+        ),
+        *(
+            ["valkey_destination_incompatible"]
+            if "valkey" in selected_components and (
+                valkey is None or valkey_destination is None
+                or valkey_source_version != valkey_destination.get("version")
+            ) else []
         ),
         *(
             ["source_version_incompatible"]
@@ -339,6 +354,15 @@ def deployment_restore_plan(
             "kind": "postgres", "version": destination_version,
             "empty": destination_empty,
         },
+        "destinations": [
+            *([{
+                "resource": destination_resource, "provider": "target_local",
+                "kind": "postgres", "version": destination_version,
+                "empty": destination_empty,
+            }] if "postgres" in selected_components else []),
+            *([valkey_destination] if "valkey" in selected_components
+               and valkey_destination is not None else []),
+        ],
         "ready": not issues,
         "readiness_issues": issues,
         "restore_state": restore_state,

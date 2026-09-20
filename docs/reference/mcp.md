@@ -316,8 +316,11 @@ Storage identities, database identities, paths, SQL, endpoints, and credentials 
 in manifest order. An explicit selector is a non-empty, duplicate-free subset of `postgres`
 and `valkey`, also normalized into manifest order. Selecting a strict subset is visibly partial
 and its stronger confirmation states that consistency with untouched components is intentionally
-broken. The current execution slice supports PostgreSQL selection; selecting Valkey returns the
-fixed `valkey_restore_unsupported` readiness issue until the next stacked slice lands.
+broken. Plans expose only bounded destination Resource provenance for selected components. Valkey
+planning requires the registered destination to have a supported provider and `valkey` kind, then
+compares its exact version with the source component version.
+The current execution slice supports PostgreSQL selection; selecting Valkey returns the fixed
+`valkey_restore_unsupported` readiness issue until the transport/execution slice lands.
 
 For PostgreSQL selection, planning compares the source and current target-local PostgreSQL
 versions exactly and runs one fixed catalog inspection to
