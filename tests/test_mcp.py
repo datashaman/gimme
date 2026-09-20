@@ -48,6 +48,7 @@ import gimme.server as server_module
 import gimme.control_plans as control_plans_module
 import gimme.recovery as recovery_module
 import gimme.recovery_schedule as recovery_schedule_module
+from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.server import mcp
 
 
@@ -418,6 +419,106 @@ async def test_hard_v4_tool_surface() -> None:
     reference = (Path(__file__).parents[1] / "docs" / "reference" / "mcp.md").read_text()
     assert all(f"`{name}`" in reference for name in names)
     assert all(f"`{template.uriTemplate}`" in reference for template in templates)
+
+
+async def test_recovery_tool_schemas_remain_stable_across_module_extraction() -> None:
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    expected = {
+        "get_recovery_schedule_status": ({"name"}, {"name"}, True),
+        "plan_create_recovery_point": ({"name", "request_id"}, {"name", "request_id"}, True),
+        "create_recovery_point": (
+            {"name", "request_id", "plan_id"},
+            {"name", "request_id", "plan_id"},
+            False,
+        ),
+        "list_recovery_points": ({"name"}, {"name"}, True),
+        "list_restores": ({"name"}, {"name"}, True),
+        "plan_restore_deployment": (
+            {"name", "recovery_point_id", "request_id", "components"},
+            {"name", "recovery_point_id", "request_id"},
+            True,
+        ),
+        "apply_restore_deployment": (
+            {
+                "name", "recovery_point_id", "request_id", "plan_id",
+                "confirmation", "components",
+            },
+            {"name", "recovery_point_id", "request_id", "plan_id", "confirmation"},
+            False,
+        ),
+        "plan_verify_restore": ({"name", "request_id"}, {"name", "request_id"}, True),
+        "apply_verify_restore": (
+            {"name", "request_id", "plan_id"},
+            {"name", "request_id", "plan_id"},
+            False,
+        ),
+        "plan_delete_recovery_point": (
+            {"name", "recovery_point_id"},
+            {"name", "recovery_point_id"},
+            True,
+        ),
+        "delete_recovery_point": (
+            {
+                "name", "recovery_point_id", "plan_id", "confirmation",
+                "last_recovery_point_confirmation",
+            },
+            {"name", "recovery_point_id", "plan_id", "confirmation"},
+            False,
+        ),
+    }
+    for name, (properties, required, read_only) in expected.items():
+        tool = tools[name]
+        assert set(tool.inputSchema["properties"]) == properties
+        assert set(tool.inputSchema["required"]) == required
+        assert tool.inputSchema["additionalProperties"] is False
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is read_only
+
+
+def test_recovery_orchestrator_owns_component_selection() -> None:
+    def unused(*args, **kwargs):
+        return None
+
+    orchestrator = RecoveryOrchestrator(
+        backup_s3=None,
+        elasticache_valkey=None,
+        context=unused,
+        managed_database_issues=unused,
+        backup_destination_credentials=unused,
+        deployment_resource_lock=unused,
+        assert_plan=unused,
+        run_deployment=unused,
+        valkey_runtime=unused,
+        bounded_marker_values=unused,
+        journal=unused,
+    )
+
+    manifest = [{"kind": "postgres"}, {"kind": "valkey"}]
+    assert orchestrator._normalize_restore_components(manifest, None) == [
+        "postgres", "valkey",
+    ]
+    assert orchestrator._normalize_restore_components(manifest, ["valkey"]) == ["valkey"]
+    with pytest.raises(RecoveryError, match="restore_component_missing"):
+        orchestrator._normalize_restore_components([{"kind": "postgres"}], ["valkey"])
+
+
+def test_recovery_mcp_adapter_delegates_to_current_orchestrator(monkeypatch) -> None:
+    seen = []
+
+    class FakeRecoveryOrchestrator:
+        def list_restores(self, name):
+            seen.append(name)
+            return {"deployment": name, "restores": []}
+
+    monkeypatch.setattr(server_module, "_recovery_orchestrator", FakeRecoveryOrchestrator)
+
+    assert server_module.list_restores("example-app") == {
+        "deployment": "example-app",
+        "restores": [],
+    }
+    assert seen == ["example-app"]
 
 
 def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch) -> None:
