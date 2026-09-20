@@ -175,13 +175,14 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
         "LoadCredential=aws:/etc/gimme/recovery-schedules/example-app.credentials"
         in stored_service
     )
-    assert "NoNewPrivileges=true" in service
+    assert "NoNewPrivileges=true" not in service
     assert "ProtectSystem=strict" in service
     assert (
         "ReadWritePaths=/srv/gimme/apps/deployments/example-app/shared "
-        "/srv/gimme/apps/.gimme/recovery-requests" in service
+        "/srv/gimme/apps/.gimme/recovery-requests /var/lib/gimme/recovery /etc/caddy"
+        in service
     )
-    assert "CapabilityBoundingSet=" in service
+    assert "CapabilityBoundingSet=" not in service
     assert "OnCalendar=*-*-* *:15:00 UTC" in timer
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec" not in timer
@@ -243,6 +244,7 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
         "TRANSFER_ROOT": transfer,
         "AUTHORITY_ROOT": tmp_path / "etc" / "recovery-schedules",
         "STATUS_ROOT": tmp_path / "var" / "recovery-schedules",
+        "MAINTENANCE_ROOT": tmp_path / "var" / "recovery",
         "SYSTEMD_ROOT": tmp_path / "systemd",
         "RUNNER": RootOwnedRunner(),
         "ROOT_UID": os.getuid(),
@@ -275,6 +277,9 @@ def test_reconcile_installs_exact_units_and_is_idempotent(tmp_path, monkeypatch)
     requests = helper["EXPECTED_APPS_ROOT"] / ".gimme" / "recovery-requests"
     assert requests.is_dir()
     assert requests.stat().st_mode & 0o777 == 0o700
+    maintenance = helper["MAINTENANCE_ROOT"]
+    assert maintenance.is_dir()
+    assert maintenance.stat().st_mode & 0o777 == 0o700
 
     calls.clear()
     active.update({
