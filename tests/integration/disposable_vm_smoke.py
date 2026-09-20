@@ -1323,6 +1323,17 @@ def verify_postgres_restore(gimme) -> None:
         raise AssertionError("managed worker remained active after the matrix")
 
 
+def reconcile_replacement_helper_policy(gimme) -> None:
+    """Replacement Target identity changes require a fresh terminal bootstrap policy."""
+    before = str(gimme.inspect_target(TARGET)["output"])
+    if "privileged_helper=bootstrap_required" not in before:
+        raise AssertionError("replacement Target did not invalidate the prior helper policy")
+    subprocess.run(["gimme-bootstrap-target", TARGET], check=True)
+    after = str(gimme.inspect_target(TARGET)["output"])
+    if "privileged_helper=ready" not in after:
+        raise AssertionError("replacement Target helper policy was not reconciled")
+
+
 def verify_backup_destination() -> None:
     """Register a real S3-compatible destination, bind recovery, and prove the tracer."""
     require_disposable_host()
@@ -1407,6 +1418,7 @@ def verify_backup_destination() -> None:
             raise AssertionError(f"{service} was not running after recovery capture")
 
     verify_valkey_restore(gimme, str(point_id), seeded)
+    reconcile_replacement_helper_policy(gimme)
     verify_postgres_restore(gimme)
 
     postgres_key = (
