@@ -33,7 +33,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-server
           sudo systemctl enable --now ssh
-          printf '127.0.0.1 gimme-ci.local\n' | sudo tee -a /etc/hosts >/dev/null
+          printf '127.0.0.1 gimme-ci.local gimme-ci-replacement.local\n' \
+            | sudo tee -a /etc/hosts >/dev/null
           install -d -m 0700 "$HOME/.ssh"
           ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/gimme-ci"
           install -m 0600 "$HOME/.ssh/gimme-ci.pub" "$RUNNER_TEMP/gimme-ci.pub"
@@ -41,7 +42,7 @@ jobs:
           chmod 0600 "$HOME/.ssh/authorized_keys"
           ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
           {
-            echo 'Host 127.0.0.1 gimme-ci.local'
+            echo 'Host 127.0.0.1 gimme-ci.local gimme-ci-replacement.local'
             echo '  HostName 127.0.0.1'
             echo "  User $USER"
             echo "  IdentityFile $HOME/.ssh/gimme-ci"
