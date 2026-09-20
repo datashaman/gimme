@@ -5,9 +5,10 @@ verified Recovery Point. Restore is intentionally two-stage: data replacement al
 stops behind a fixed public 503 response, then a separate content-addressed verification
 apply is the only path back online.
 
-Current Restore support is PostgreSQL-only. The selected Recovery Point must contain
-exactly one PostgreSQL component, the Deployment's Recovery Policy must not select Valkey,
-and the source and destination Resource versions must match exactly.
+Current execution support is PostgreSQL-only. A PostgreSQL-only Recovery Point is selected
+fully by default. For a PostgreSQL-and-Valkey point, pass `components: ["postgres"]` to make
+an explicit partial Restore. Its confirmation warns that consistency with untouched Valkey
+state is intentionally broken. The source and destination PostgreSQL versions must match exactly.
 
 ## Before starting
 
@@ -26,10 +27,12 @@ or delete the source or Safety Recovery Point while a Restore is unresolved.
 ## Restore normally
 
 1. Call `plan_restore_deployment` with the Deployment, Recovery Point ID, and request ID.
+   Omit `components` only when every component should be selected; until Valkey execution lands,
+   multi-component points require the explicit PostgreSQL selector above.
 2. Check `ready`, `readiness_issues`, source/destination provenance and exact versions,
    whether the destination is empty, and the returned confirmation text.
-3. Call `apply_restore_deployment` with the same identities, exact `plan_id`, and exact
-   confirmation.
+3. Call `apply_restore_deployment` with the same identities and component selector, exact
+   `plan_id`, and exact confirmation.
 4. Inspect the request with `list_restores` or
    `gimme://deployments/{name}/restores/{request_id}`. A successful first stage reports
    `data_replaced` and `recovery_required: true`; the public route must still return 503.

@@ -418,10 +418,16 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
     )
 
     assert started["sequence"] == 0
+    assert started["schema_version"] == 3
+    assert started["selected_components"] == ["postgres"]
+    assert started["untouched_components"] == []
+    assert started["partial"] is False
     assert entered["sequence"] == 1
-    assert load_restore_record(
+    record = load_restore_record(
         destination(), None, adapter, "checkout", "restore-1"
-    )["state"] == "maintenance_entered"
+    )
+    assert record["state"] == "maintenance_entered"
+    assert record["selected_components"] == ["postgres"]
     records = list_restore_records(destination(), None, adapter, "checkout")
     assert [item["request_id"] for item in records] == ["restore-2", "restore-1"]
     assert all("object" not in key and "database" not in key for key in records[0])
@@ -443,6 +449,15 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
             source_recovery_point_id=point, destination_provider="target_local",
             destination_resource="checkout-postgres",
             destination_kind="postgres", destination_version="16.6",
+        )
+    with pytest.raises(RecoveryError, match="^restore_request_conflict$"):
+        append_restore_event(
+            destination(), None, adapter, "checkout", "restore-1", "maintenance_entered",
+            source_recovery_point_id=point, destination_provider="target_local",
+            destination_resource="checkout-postgres",
+            destination_kind="postgres", destination_version="17.2",
+            selected_components=["postgres"], untouched_components=["valkey"],
+            partial=True,
         )
 
 

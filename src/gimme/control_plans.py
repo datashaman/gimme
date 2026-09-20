@@ -286,10 +286,16 @@ def deployment_restore_plan(
     deployment_name: str, recovery_point_id: str, request_id: str,
     source_components: list[dict[str, object]], destination_resource: str,
     destination_version: str, destination_empty: bool,
-    policy_selects_valkey: bool,
+    selected_components: list[str],
     restore_state: str | None = None, request_conflict: bool = False,
     destination_changed: bool = False,
 ) -> dict[str, Any]:
+    available_components = [str(component.get("kind")) for component in source_components]
+    untouched_components = [
+        component for component in available_components
+        if component not in selected_components
+    ]
+    partial = bool(untouched_components)
     postgres = next(
         (component for component in source_components if component.get("kind") == "postgres"),
         None,
@@ -298,19 +304,21 @@ def deployment_restore_plan(
     source_bytes = -1 if postgres is None else postgres.get("bytes", -1)
     issues = [
         *(
-            ["multi_component_restore_unsupported"]
-            if policy_selects_valkey or len(source_components) != 1 or postgres is None else []
+            ["valkey_restore_unsupported"]
+            if selected_components != ["postgres"] or postgres is None else []
         ),
         *(
             ["source_version_incompatible"]
-            if source_version != destination_version else []
+            if "postgres" in selected_components
+            and source_version != destination_version else []
         ),
         *(
             ["source_artifact_too_large"]
-            if not isinstance(source_bytes, int)
+            if "postgres" in selected_components and (
+                not isinstance(source_bytes, int)
             or isinstance(source_bytes, bool)
             or not 0 <= source_bytes <= 512 * 1024 * 1024
-            else []
+            ) else []
         ),
         *(["restore_request_conflict"] if request_conflict else []),
         *(["restore_destination_changed"] if destination_changed else []),
@@ -319,6 +327,9 @@ def deployment_restore_plan(
         "kind": "deployment_restore",
         "deployment": deployment_name,
         "request_id": request_id,
+        "selected_components": selected_components,
+        "untouched_components": untouched_components,
+        "partial": partial,
         "source": {
             "recovery_point_id": recovery_point_id,
             "provider": "target_local", "kind": "postgres", "version": source_version,
@@ -331,7 +342,14 @@ def deployment_restore_plan(
         "ready": not issues,
         "readiness_issues": issues,
         "restore_state": restore_state,
-        "confirmation": f"RESTORE DEPLOYMENT {deployment_name} FROM {recovery_point_id}",
+        "confirmation": (
+            f"PARTIAL RESTORE DEPLOYMENT {deployment_name} FROM {recovery_point_id} "
+            f"COMPONENTS {','.join(selected_components)} BREAK CONSISTENCY WITH "
+            f"{','.join(untouched_components)}"
+            if partial else
+            f"RESTORE DEPLOYMENT {deployment_name} FROM {recovery_point_id} "
+            f"COMPONENTS {','.join(selected_components)}"
+        ),
         "effects": [
             "enter request-owned maintenance and stop only managed writers",
             *(
@@ -339,7 +357,11 @@ def deployment_restore_plan(
                 if not destination_empty else []
             ),
             "verify the exact PostgreSQL artifact before loading a shadow database",
-            "swap only the deployment database after shadow and private health verification",
+            "swap only the deployment database after shadow verification",
+            *(
+                ["leave unselected components untouched and accept intentionally mixed state"]
+                if partial else []
+            ),
             "restore processes and routing only after post-swap verification",
         ],
     })
@@ -358,6 +380,9 @@ def restore_verification_plan(
         "deployment": deployment_name,
         "request_id": request_id,
         "source_recovery_point_id": restore["source_recovery_point_id"],
+        "selected_components": restore["selected_components"],
+        "untouched_components": restore["untouched_components"],
+        "partial": restore["partial"],
         "state": state,
         "ready": ready,
         "readiness_issues": [] if ready else ["restore_data_not_replaced"],
