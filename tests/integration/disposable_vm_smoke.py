@@ -634,7 +634,7 @@ def set_restore_probe(value: str) -> None:
     if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
         raise AssertionError("invalid fixed integration database identity")
     statement = (
-        f"SET ROLE {database}; "
+        f"SET client_min_messages = warning; SET ROLE {database}; "
         "CREATE TABLE IF NOT EXISTS gimme_restore_probe "
         "(id integer PRIMARY KEY, value text NOT NULL); "
         f"INSERT INTO gimme_restore_probe VALUES (1, '{value}') "
@@ -1158,7 +1158,6 @@ def verify_postgres_restore(gimme) -> None:
             raise AssertionError("missing managed-process executable unexpectedly verified")
     finally:
         ssh("mv", blocked_artisan, artisan)
-        ssh("sudo", "-n", "systemctl", "reset-failed", worker_unit)
     if gimme.restore_record_resource(
         RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
     )["state"] != "verification_failed":

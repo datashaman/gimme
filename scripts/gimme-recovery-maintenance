@@ -241,6 +241,9 @@ def resume_processes(instance: str, request_id: str, owner: int, sudo_user: str)
     if not set(marker["active_units"]).issubset(authority["units"]):
         fail("maintenance process policy changed")
     for unit in sorted(marker["active_units"]):
+        # Verification retries can legitimately cross systemd's start-rate threshold after a
+        # process or health failure. Clear only this derived managed unit before restarting it.
+        run(["systemctl", "reset-failed", unit])
         run(["systemctl", "start", unit])
         if not succeeds(["systemctl", "is-active", "--quiet", unit]):
             fail("managed process did not restart")

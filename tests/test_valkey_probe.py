@@ -156,7 +156,7 @@ def environment(server: Server, uses: list[str], host: str = "localhost") -> dic
     }
 
 
-def lockfile(tmp_path: Path, framework: str = "v13.5.0", horizon: str = "v5.46.0") -> Path:
+def lockfile(tmp_path: Path, framework: str = "v12.0.0", horizon: str = "v5.46.0") -> Path:
     path = tmp_path / "composer.lock"
     path.write_text(json.dumps({"packages": [
         {"name": "laravel/framework", "version": framework},
@@ -320,7 +320,7 @@ def test_probe_reports_a_use_the_acl_does_not_permit(tmp_path: Path, server: Ser
 
 @needs_server
 @pytest.mark.parametrize(("framework", "horizon"), [
-    ("v13.4.9", "v5.46.0"), ("v13.5.0", "v5.45.9"), ("dev-main", "v5.46.0"),
+    ("v11.99.9", "v5.46.0"), ("v12.0.0", "v5.45.9"), ("dev-main", "v5.46.0"),
 ])
 def test_probe_blocks_an_incompatible_horizon_before_touching_valkey(
     tmp_path: Path, shared: Server, framework: str, horizon: str
@@ -338,7 +338,7 @@ def test_probe_blocks_an_incompatible_horizon_before_touching_valkey(
 def test_probe_accepts_newer_versions_and_requires_locked_packages(
     tmp_path: Path, shared: Server
 ) -> None:
-    newer = lockfile(tmp_path, "v14.0.1", "v6.0.0")
+    newer = lockfile(tmp_path, "v12.69.2", "v5.49.0")
     assert run_probe(shared, tmp_path, ["cache", "queue"], lock=newer)[0] == 0
 
     empty = tmp_path / "empty.lock"
@@ -353,6 +353,12 @@ def test_probe_accepts_newer_versions_and_requires_locked_packages(
     assert outcome(run_probe(shared, tmp_path, ["cache", "queue"], lock=broken)[1]).endswith(
         "horizon_lock_unreadable"
     )
+
+
+def test_locked_real_laravel_fixture_meets_the_horizon_probe_floor() -> None:
+    lock = ROOT / "tests" / "integration" / "laravel-valkey" / "composer.lock"
+
+    PROBE["check_horizon"](lock)  # type: ignore[operator]
 
 
 @needs_server

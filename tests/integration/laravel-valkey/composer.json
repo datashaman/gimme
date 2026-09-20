@@ -1,0 +1,19 @@
+{
+  "name": "datashaman/gimme-laravel-valkey-integration",
+  "description": "Locked real-Laravel fixture for the laravel-cluster-v1 contract",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": "^8.3",
+    "laravel/framework": "^12.69.2",
+    "laravel/horizon": "^5.49.0",
+    "predis/predis": "^3.6.1"
+  },
+  "config": {
+    "allow-plugins": false,
+    "platform": {
+      "php": "8.3.0"
+    },
+    "sort-packages": true
+  }
+}

@@ -15,9 +15,11 @@ pre-switchover probes, retention-by-default removal, forgetting a retained tombs
 destruction with a separate destructive role, snapshot inventory, restore from a snapshot (or
 recreation of an empty group) after a group is lost, and per-Deployment credential rotation.
 
-The disposable Laravel test suite the ADR calls for (cache, session, queue, and
-Horizon driven through a real Laravel application, and ACL denials seen from it) does not
-exist yet; the probes below use the Redis protocol directly.
+The disposable integration workflow also drives cache, session, queue, and Horizon through a
+locked real Laravel application against a TLS, cluster-mode, ACL-enforcing local Valkey/Redis
+server. It proves the derived namespaces and observes cross-namespace and command denials through
+Laravel's Redis connection. The fixed pre-switchover probes below remain independent and speak the
+Redis protocol directly.
 
 The AWS calls have only been exercised against botocore stubs. Nothing here has run against a
 live account, so the IAM statements (destructive role included) and the ACL access strings below
@@ -340,7 +342,7 @@ the candidate health check. It reads only the shared `.env` and the candidate's 
 takes no path or command from a caller, and stops at the first failure. The order is:
 
 1. `environment`: the `.env` matches the planned contract and holds a credential.
-2. `horizon-compatibility` (only when the Deployment runs Horizon): the locked `laravel/framework` is 13.5.0 or later and
+2. `horizon-compatibility` (only when the Deployment runs Horizon): the locked `laravel/framework` is 12.0.0 or later and
    `laravel/horizon` 5.46.0 or later.
 3. `tls`: the server certificate verifies against the Target's system trust store, with hostname
    checking. There is no way to disable it or to supply a certificate.
@@ -361,10 +363,10 @@ deleted on failure. Output is only `GIMME_VALKEY_PROBE|<check>|ready|failed|<cod
 values, and server messages are never printed. A failed probe fails the deploy before the
 symlink switches, so the current release stays live.
 
-What this does not prove: the probes speak the Redis protocol directly, not through Laravel's
-Redis adapters, and they have only run against a local TLS, cluster-mode, ACL-enforcing Redis,
-not against ElastiCache. Whether real Laravel and Horizon traffic stays inside the `laravel-v1`
-command profile is unverified.
+The independent disposable suite proves real Laravel and Horizon traffic stays inside the
+`laravel-v1` command profile on local TLS cluster-mode Valkey/Redis. Neither suite substitutes for
+the live-account validation below: ElastiCache endpoint discovery and AWS's implementation of the
+ACL remain unverified.
 
 ## Destroy a Resource
 
