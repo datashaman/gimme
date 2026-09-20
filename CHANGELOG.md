@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the dependency-light shared Target capture core that will be invoked by both scheduled
+  and on-demand execution. It derives the existing Recovery Point identity, captures PostgreSQL
+  through one fixed argv vector, hashes protected local output, uploads and re-reads exact object
+  versions, publishes the existing immutable schema-v3 manifest last, converges matching retries,
+  and removes only exact versions after pre-publication failure. It is not installed or activated
+  until its S3 adapter and Valkey path are complete.
 - Added a fixed Target runtime probe before non-manual Recovery Schedule reconciliation. It
   imports only boto3 through the fixed `python3` executable, emits one strictly parsed bounded
   version marker, and runs before desired-state transfer or privileged mutation. Manual cleanup
