@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Completed the Recovery Point deletion verification matrix. Provider protection and access
+  failures now map to fixed secret-safe outcomes, deterministic tests cover the complete S3
+  failure taxonomy and concurrent cross-Deployment isolation, and the disposable MinIO workflow
+  proves ordinary and final-point deletion, unresolved and completed Safety behavior, partial
+  retry, idempotency, exact-version removal without delete markers, and Object Lock rejection.
+  MinIO's test bucket now enables Object Lock at creation. No schema or privilege change.
 - Added recovery of a managed `aws_elasticache_valkey` Resource: snapshot inventory, restore, and
   credential rotation (slice 7 of #14, the last). `list_resource_snapshots` lists a group's
   snapshots by name and status. `plan_restore_resource` / `apply_restore_resource` create a lost

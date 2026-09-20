@@ -117,7 +117,10 @@ def _provider_error(exc: Exception, operation: str) -> RecoveryError:
             "SlowDown": "throttled",
         }
         if isinstance(provider_code, str):
-            code = mapping.get(provider_code, "unavailable")
+            if operation == "cleanup" and provider_code in {"InvalidRequest", "ObjectLocked"}:
+                code = "object_protected"
+            else:
+                code = mapping.get(provider_code, "unavailable")
     return RecoveryError(f"backup_destination_{operation}_{code}")
 
 
@@ -1274,8 +1277,12 @@ def delete_recovery_point_versions(
     )
     deleted = 0
     def deletion_error(exc: Exception) -> RecoveryError:
-        if isinstance(exc, RecoveryError) and "access_denied" in str(exc):
-            return RecoveryError("recovery_point_deletion_denied")
+        if isinstance(exc, RecoveryError):
+            code = str(exc)
+            if code == "backup_destination_cleanup_object_protected":
+                return RecoveryError("recovery_point_object_protected")
+            if code == "backup_destination_cleanup_access_denied":
+                return RecoveryError("recovery_point_deletion_denied")
         return RecoveryError("recovery_point_deletion_failed")
 
     try:
