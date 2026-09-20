@@ -229,7 +229,10 @@ prepares a separately health-checked candidate at guaranteed `100/0` stable/cand
 Inspect it with `inspect_rollout` or `gimme://deployments/{name}/rollout`. Preparation reserves one
 temporary Target slot, is retryable after interruption, never runs migrations or candidate
 background processes, and blocks ordinary deploy/promotion/rollback/update/removal until the
-Rollout is completed or reversed by the later rollout workflow.
+Rollout is completed or reversed. Shift reviewed traffic with `plan_rollout_weights` /
+`apply_rollout_weights`; weights assign new cookie-accepting cohorts and are not an instantaneous
+global request percentage. Existing signed cohorts stay sticky while their backend is nonzero and
+healthy, and failed transitions restore the prior route before desired weights can change.
 
 See [Build once and deploy an Application Artifact](docs/how-to/use-application-artifacts.md)
 for migration, IAM separation, publishing, multi-Target deployment, promotion, rollback,

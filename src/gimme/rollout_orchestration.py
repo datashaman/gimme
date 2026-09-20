@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -29,6 +30,21 @@ def public_rollout(rollout: Rollout) -> dict[str, object]:
     return rollout.model_dump(mode="json")
 
 
+def _target_result(output: str) -> dict[str, object]:
+    prefix = "GIMME_ROLLOUT_STATE|"
+    lines = [line.split("] ", 1)[-1].strip() for line in output.splitlines()]
+    values = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    if len(values) != 1 or len(values[0]) > 8192:
+        raise RuntimeError("rollout_target_state_invalid")
+    try:
+        value = json.loads(base64.b64decode(values[0], validate=True))
+    except (ValueError, json.JSONDecodeError):
+        raise RuntimeError("rollout_target_state_invalid") from None
+    if not isinstance(value, dict):
+        raise RuntimeError("rollout_target_state_invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class RolloutOrchestrator:
     store: Any
@@ -36,12 +52,328 @@ class RolloutOrchestrator:
     run_deployment: Callable[..., Any]
     assert_plan: Callable[[dict[str, object], str], None]
 
+    @staticmethod
+    def _policy(state: ControlState, deployment: Any, application: Any) -> dict[str, object]:
+        bindings = deployment.resources.model_dump(mode="json")
+        resource_names = {
+            name
+            for name in (
+                deployment.resources.database,
+                None if deployment.resources.valkey is None
+                else deployment.resources.valkey.resource,
+            )
+            if name is not None
+        }
+        return {
+            "deployment": deployment.model_dump(mode="json"),
+            "application": application.model_dump(mode="json"),
+            "target": state.targets[deployment.target].model_dump(mode="json"),
+            "resource_bindings": bindings,
+            "resources": {
+                resource_name: state.resources[resource_name].model_dump(mode="json")
+                for resource_name in sorted(resource_names)
+            },
+        }
+
     def inspect(self, name: str) -> dict[str, object]:
         state = self.store.load()
         try:
-            return public_rollout(state.rollouts[name])
+            rollout = state.rollouts[name]
         except KeyError as exc:
             raise KeyError(f"deployment '{name}' has no rollout") from exc
+        value = public_rollout(rollout)
+        try:
+            observed = self._observed(name, rollout)
+        except RuntimeError:
+            return {
+                **value,
+                "drift": "target_unavailable",
+                "stable_health": "unknown",
+                "candidate_health": "unknown",
+            }
+        if observed["configured"]:
+            value.update({
+                "stable_eligible": observed["stable_eligible"],
+                "candidate_eligible": observed["candidate_eligible"],
+                "stable_health": observed["stable_health"],
+                "candidate_health": observed["candidate_health"],
+                "drift": (
+                    "none"
+                    if observed["route_fingerprint"] == rollout.route_fingerprint
+                    and observed["stable_weight"] == rollout.stable_weight
+                    and observed["candidate_weight"] == rollout.candidate_weight
+                    else "backend_unavailable"
+                ),
+            })
+        return value
+
+    def _observed(self, name: str, rollout: Rollout) -> dict[str, object]:
+        try:
+            result = self.run_deployment("gimme:rollout:inspect", name, timeout=60)
+        except Exception:
+            raise RuntimeError("rollout_target_unavailable") from None
+        return self._validate_observed(rollout, _target_result(result.output))
+
+    @staticmethod
+    def _validate_observed(
+        rollout: Rollout, observed: dict[str, object]
+    ) -> dict[str, object]:
+        if observed == {"configured": False}:
+            return observed
+        expected = {
+            "configured", "generation", "affinity_generation", "stable_weight",
+            "candidate_weight", "stable_eligible", "candidate_eligible",
+            "stable_health", "candidate_health", "stable_identity",
+            "candidate_identity", "route_fingerprint", "phase", "outcome",
+        }
+        if (
+            set(observed) != expected
+            or observed.get("configured") is not True
+            or observed.get("generation") != rollout.generation
+            or not isinstance(observed.get("affinity_generation"), int)
+            or isinstance(observed.get("affinity_generation"), bool)
+            or not 1 <= observed["affinity_generation"] <= 2_147_483_647
+            or any(
+                not isinstance(observed.get(field), int)
+                or isinstance(observed.get(field), bool)
+                or not 0 <= observed[field] <= 100
+                for field in ("stable_weight", "candidate_weight")
+            )
+            or observed["stable_weight"] + observed["candidate_weight"] != 100
+            or any(
+                not isinstance(observed.get(field), bool)
+                for field in ("stable_eligible", "candidate_eligible")
+            )
+            or observed.get("stable_health") not in {"ready", "unavailable", "unknown"}
+            or observed.get("candidate_health") not in {"ready", "unavailable", "unknown"}
+            or observed.get("phase") != "active"
+            or any(
+                not isinstance(observed.get(field), str)
+                or re.fullmatch(r"rollout_[0-9a-f]{64}", observed[field]) is None
+                for field in ("stable_identity", "candidate_identity")
+            )
+            or observed.get("stable_identity")
+            != _fingerprint(rollout.stable.model_dump(mode="json"))
+            or observed.get("candidate_identity")
+            != _fingerprint(rollout.candidate.model_dump(mode="json"))
+            or not isinstance(observed.get("route_fingerprint"), str)
+            or re.fullmatch(r"rollout_[0-9a-f]{64}", observed["route_fingerprint"]) is None
+            or observed.get("outcome") not in {"ready", "route_restored"}
+        ):
+            raise RuntimeError("rollout_target_state_invalid")
+        return observed
+
+    @staticmethod
+    def _health(deployment: Any, application: Any) -> list[dict[str, object]]:
+        primary = (
+            application.default_health
+            if deployment.health == "inherit"
+            else deployment.health
+        )
+        probes = [
+            *([primary] if primary is not None else []),
+            *application.health_probes,
+            *deployment.health_probes,
+        ]
+        selected = [
+            {
+                "path": probe.path,
+                "expected_status": probe.expected_status,
+                "timeout_seconds": probe.timeout_seconds,
+                "attempts": probe.attempts,
+                "delay_seconds": probe.delay_seconds,
+            }
+            for probe in probes
+            if "candidate" in probe.phases or "live" in probe.phases
+        ]
+        return selected or [{
+            "path": "/", "expected_status": 200, "timeout_seconds": 5,
+            "attempts": 3, "delay_seconds": 1,
+        }]
+
+    def _routing_policy(
+        self, context: dict[str, object], stable_weight: int, candidate_weight: int,
+        route_fingerprint: str,
+    ) -> dict[str, object]:
+        deployment = context["deployment"]
+        application = context["state"].applications[deployment.application]
+        target = context["state"].targets[deployment.target]
+        php = deployment.runtimes.get("php")
+        if php is None:
+            raise ValueError("rollout routing requires a PHP runtime")
+        version = ".".join(php.version.split(".")[:2])
+        return {
+            "generation": context["desired"].generation,
+            "affinity_generation": context["desired"].affinity_generation,
+            "stable_weight": stable_weight,
+            "candidate_weight": candidate_weight,
+            "route_fingerprint": route_fingerprint,
+            "framework": application.framework,
+            "site_host": deployment.placement.site_host,
+            "network_mode": target.network.mode,
+            "deploy_path": f"{target.apps_root}/{deployment.placement.relative_path}",
+            "php_version": version,
+            "health": self._health(deployment, application),
+            "stable_identity": _fingerprint(context["desired"].stable.model_dump(mode="json")),
+            "candidate_identity": _fingerprint(
+                context["desired"].candidate.model_dump(mode="json")
+            ),
+        }
+
+    def _weights_context(
+        self, name: str, stable_weight: int, candidate_weight: int
+    ) -> dict[str, object]:
+        if (
+            isinstance(stable_weight, bool)
+            or isinstance(candidate_weight, bool)
+            or not 0 <= stable_weight <= 100
+            or not 0 <= candidate_weight <= 100
+            or stable_weight + candidate_weight != 100
+        ):
+            raise ValueError("rollout weights must be integers from 0 to 100 totaling 100")
+        context = self._context(name)
+        current = context["state"].rollouts.get(name)
+        if current is None or current.phase != "active":
+            raise ValueError("rollout weight changes require one active generation")
+        if candidate_weight > 0 and (
+            not current.backend_ready or current.candidate_health != "ready"
+        ):
+            raise ValueError("candidate traffic requires a ready candidate backend")
+        affinity_generation = current.affinity_generation or current.generation
+        route_fingerprint = _fingerprint({
+            "generation": current.generation,
+            "affinity_generation": affinity_generation,
+            "stable": current.stable.model_dump(mode="json"),
+            "candidate": current.candidate.model_dump(mode="json"),
+            "weights": [stable_weight, candidate_weight],
+            "contract": current.contract_fingerprint,
+        })
+        observed = self._observed(name, current)
+        target_already_applied = False
+        if observed["configured"]:
+            stable_identity = _fingerprint(current.stable.model_dump(mode="json"))
+            candidate_identity = _fingerprint(current.candidate.model_dump(mode="json"))
+            matches_current = (
+                observed["route_fingerprint"] == current.route_fingerprint
+                and observed["stable_weight"] == current.stable_weight
+                and observed["candidate_weight"] == current.candidate_weight
+                and observed["affinity_generation"]
+                == (current.affinity_generation or affinity_generation)
+                and observed["stable_identity"] == stable_identity
+                and observed["candidate_identity"] == candidate_identity
+            )
+            target_already_applied = (
+                observed["route_fingerprint"] == route_fingerprint
+                and observed["stable_weight"] == stable_weight
+                and observed["candidate_weight"] == candidate_weight
+                and observed["affinity_generation"] == affinity_generation
+                and observed["stable_identity"] == stable_identity
+                and observed["candidate_identity"] == candidate_identity
+            )
+            if not matches_current and not target_already_applied:
+                raise ValueError("rollout route is drifted")
+        elif current.affinity_generation != 0:
+            raise ValueError("rollout route is missing")
+        desired = current.model_copy(update={"affinity_generation": affinity_generation})
+        context.update({
+            "current": current,
+            "desired": desired,
+            "observed": observed,
+            "stable_weight": stable_weight,
+            "candidate_weight": candidate_weight,
+            "route_fingerprint": route_fingerprint,
+            "target_already_applied": target_already_applied,
+        })
+        return context
+
+    @staticmethod
+    def _weights_plan(name: str, context: dict[str, object]) -> dict[str, object]:
+        current: Rollout = context["current"]
+        return exact_plan({
+            "kind": "rollout_weights",
+            "deployment": name,
+            "generation": current.generation,
+            "affinity_generation": context["desired"].affinity_generation,
+            "current_weights": {
+                "stable": current.stable_weight,
+                "candidate": current.candidate_weight,
+            },
+            "proposed_weights": {
+                "stable": context["stable_weight"],
+                "candidate": context["candidate_weight"],
+            },
+            "current_route_fingerprint": current.route_fingerprint,
+            "proposed_route_fingerprint": context["route_fingerprint"],
+            "retry": context["target_already_applied"],
+            "policy_fingerprint": current.policy_fingerprint,
+            "contract_fingerprint": current.contract_fingerprint,
+            "evidence_fingerprint": current.evidence_fingerprint,
+            "effects": [
+                "preflight stable and candidate backends directly",
+                "atomically install signed sticky weighted routing",
+                "verify direct backends and the public live route",
+                "restore and verify the exact prior route on failure",
+                "persist desired weights only after target verification",
+            ],
+        })
+
+    def plan_weights(
+        self, name: str, stable_weight: int, candidate_weight: int
+    ) -> dict[str, object]:
+        return self._weights_plan(
+            name, self._weights_context(name, stable_weight, candidate_weight)
+        )
+
+    def apply_weights(
+        self, name: str, stable_weight: int, candidate_weight: int, plan_id: str
+    ) -> dict[str, object]:
+        context = self._weights_context(name, stable_weight, candidate_weight)
+        expected = self._weights_plan(name, context)
+        self.assert_plan(expected, plan_id)
+        current: Rollout = context["current"]
+        policy = self._routing_policy(
+            context, stable_weight, candidate_weight, context["route_fingerprint"]
+        )
+        try:
+            result = self.run_deployment(
+                "gimme:rollout:weights", name, rollout_policy=policy, timeout=1800
+            )
+            observed = self._validate_observed(current, _target_result(result.output))
+        except Exception:
+            raise RuntimeError("rollout_weight_transition_failed") from None
+        if (
+            observed.get("outcome") != "ready"
+            or observed.get("affinity_generation")
+            != context["desired"].affinity_generation
+            or observed.get("route_fingerprint") != context["route_fingerprint"]
+            or observed.get("stable_weight") != stable_weight
+            or observed.get("candidate_weight") != candidate_weight
+            or observed.get("stable_eligible") is not (stable_weight > 0)
+            or observed.get("candidate_eligible") is not (candidate_weight > 0)
+            or observed.get("stable_health") != "ready"
+            or observed.get("candidate_health") != "ready"
+        ):
+            raise RuntimeError("rollout_weight_transition_failed")
+
+        def persist(state: ControlState) -> ControlState:
+            rollout = state.rollouts.get(name)
+            if rollout != current:
+                raise ValueError("rollout changed during route installation")
+            updated = rollout.model_copy(update={
+                "stable_weight": stable_weight,
+                "candidate_weight": candidate_weight,
+                "affinity_generation": context["desired"].affinity_generation,
+                "route_fingerprint": context["route_fingerprint"],
+                "stable_eligible": observed.get("stable_eligible") is True,
+                "candidate_eligible": observed.get("candidate_eligible") is True,
+                "stable_health": observed.get("stable_health", "unknown"),
+                "candidate_health": observed.get("candidate_health", "unknown"),
+                "drift": "none",
+                "outcome": "ready",
+            })
+            return state.model_copy(update={"rollouts": {**state.rollouts, name: updated}})
+
+        return public_rollout(self.store.update(persist).rollouts[name])
 
     def _runtime_fingerprint(
         self, name: str, deployment: Any, application: Any, identity: dict[str, object]
@@ -87,6 +419,8 @@ class RolloutOrchestrator:
             capacity = fleet_state(state)["targets"][deployment.target]
             if capacity["overcommitted"] or capacity["free_slots"] < 1:
                 raise ValueError("rollout requires one free Target slot")
+        elif fleet_state(state)["targets"][deployment.target]["overcommitted"]:
+            raise ValueError("rollout Target capacity is overcommitted")
 
         stable_metadata = self.artifact_deployment.live_release(name)
         stable_expected = self.artifact_deployment.expected_from_release(
@@ -109,12 +443,7 @@ class RolloutOrchestrator:
         runtime_fingerprint = self._runtime_fingerprint(
             name, deployment, application, candidate_context["identity"]
         )
-        policy = {
-            "deployment": deployment.model_dump(mode="json"),
-            "application": application.model_dump(mode="json"),
-            "target": deployment.target,
-            "resource_bindings": deployment.resources.model_dump(mode="json"),
-        }
+        policy = self._policy(state, deployment, application)
         policy_fingerprint = _fingerprint(policy)
         contract_fingerprint = _fingerprint({
             "release_contract": contract,
@@ -144,6 +473,12 @@ class RolloutOrchestrator:
             policy_fingerprint=policy_fingerprint,
             contract_fingerprint=contract_fingerprint,
             evidence_fingerprint=evidence_fingerprint,
+            route_fingerprint=_fingerprint({
+                "generation": generation,
+                "stable": stable.model_dump(mode="json"),
+                "weights": [100, 0],
+                "affinity_generation": 0,
+            }),
         )
         if existing is not None and (
             existing.stable != desired.stable
@@ -204,14 +539,14 @@ class RolloutOrchestrator:
             if deployment is None:
                 raise ValueError("rollout deployment changed; request a fresh plan")
             application = state.applications.get(deployment.application)
-            policy = {
-                "deployment": deployment.model_dump(mode="json"),
-                "application": (
-                    None if application is None else application.model_dump(mode="json")
-                ),
-                "target": deployment.target,
-                "resource_bindings": deployment.resources.model_dump(mode="json"),
-            }
+            if application is None:
+                raise ValueError("rollout application changed; request a fresh plan")
+            try:
+                policy = self._policy(state, deployment, application)
+            except KeyError:
+                raise ValueError(
+                    "rollout dependencies changed; request a fresh plan"
+                ) from None
             if _fingerprint(policy) != desired.policy_fingerprint:
                 raise ValueError("rollout policy changed; request a fresh plan")
             capacity = fleet_state(state)["targets"][desired.target]
@@ -252,6 +587,7 @@ class RolloutOrchestrator:
                 raise ValueError("rollout generation changed during preparation")
             updated = rollout.model_copy(update={
                 "phase": "active", "backend_ready": True, "outcome": "ready",
+                "candidate_eligible": True, "candidate_health": "ready",
             })
             return state.model_copy(update={"rollouts": {**state.rollouts, name: updated}})
 

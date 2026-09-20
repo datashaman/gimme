@@ -297,6 +297,31 @@ def test_rollout_generation_is_a_bounded_dedicated_environment_value(
         deployer.run("gimme:rollout:prepare", server(), rollout_generation=0)
 
 
+def test_rollout_policy_crosses_as_canonical_bounded_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    policy = {"stable_weight": 90, "candidate_weight": 10}
+    deployer = runner(tmp_path)
+    deployer.run("gimme:rollout:weights", server(), rollout_policy=policy)
+
+    assert captured["GIMME_ROLLOUT_POLICY_JSON"] == (
+        '{"candidate_weight":10,"stable_weight":90}'
+    )
+    with pytest.raises(ValueError, match="rollout_policy is too large"):
+        deployer.run(
+            "gimme:rollout:weights",
+            server(),
+            rollout_policy={"value": "x" * (64 * 1024)},
+        )
+
+
 def test_recovery_schedule_authority_crosses_as_canonical_json(
     tmp_path: Path, monkeypatch
 ) -> None:

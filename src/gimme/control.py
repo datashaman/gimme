@@ -1084,7 +1084,7 @@ class RolloutArtifact(BaseModel):
 
 
 class Rollout(BaseModel):
-    """Resumable desired state for one isolated zero-traffic generation."""
+    """Resumable desired state for one isolated sticky-traffic generation."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1094,8 +1094,8 @@ class Rollout(BaseModel):
     phase: Literal["preparing", "active", "degraded"]
     stable: RolloutArtifact
     candidate: RolloutArtifact
-    stable_weight: Literal[100] = 100
-    candidate_weight: Literal[0] = 0
+    stable_weight: int = Field(default=100, ge=0, le=100)
+    candidate_weight: int = Field(default=0, ge=0, le=100)
     temporary_slots: Literal[1] = 1
     backend_ready: bool = False
     background_owner: Literal["stable"] = "stable"
@@ -1104,6 +1104,12 @@ class Rollout(BaseModel):
     policy_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
     contract_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
     evidence_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
+    route_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
+    affinity_generation: int = Field(default=0, ge=0, le=2_147_483_647)
+    stable_eligible: bool = True
+    candidate_eligible: bool = False
+    stable_health: Literal["ready", "unavailable", "unknown"] = "ready"
+    candidate_health: Literal["ready", "unavailable", "unknown"] = "unknown"
 
     @model_validator(mode="after")
     def distinct_artifacts(self) -> "Rollout":
@@ -1111,6 +1117,8 @@ class Rollout(BaseModel):
             raise ValueError("rollout artifacts must belong to the same application")
         if self.stable.build_id == self.candidate.build_id:
             raise ValueError("rollout candidate must differ from stable")
+        if self.stable_weight + self.candidate_weight != 100:
+            raise ValueError("rollout weights must total 100")
         if self.phase == "active" and not self.backend_ready:
             raise ValueError("active rollout requires a ready candidate backend")
         if self.phase == "active" and self.outcome != "ready":

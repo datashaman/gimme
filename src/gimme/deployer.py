@@ -136,6 +136,7 @@ class DeployerRunner:
         artifact_request: dict[str, object] | None = None,
         rollback_release: str | None = None,
         rollout_generation: int | None = None,
+        rollout_policy: dict[str, object] | None = None,
         backup_local_path: Path | None = None,
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
@@ -285,6 +286,13 @@ class DeployerRunner:
             ):
                 raise ValueError("rollout_generation is invalid")
             environment["GIMME_ROLLOUT_GENERATION"] = str(rollout_generation)
+        if rollout_policy is not None:
+            encoded_policy = json.dumps(
+                rollout_policy, sort_keys=True, separators=(",", ":")
+            )
+            if len(encoded_policy.encode()) > 64 * 1024:
+                raise ValueError("rollout_policy is too large")
+            environment["GIMME_ROLLOUT_POLICY_JSON"] = encoded_policy
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if any(value is not None for value in (

@@ -91,6 +91,7 @@ SnapshotName = Annotated[
 CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
 RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
+RolloutWeight = Annotated[int, Field(ge=0, le=100)]
 ObjectVersion = Annotated[
     str, Field(pattern=r"^[A-Za-z0-9._+=/-]{1,1024}$", min_length=1, max_length=1024)
 ]
@@ -580,6 +581,7 @@ def _run_deployment(
     artifact_secret_file: Path | None = None,
     rollback_release: str | None = None,
     rollout_generation: int | None = None,
+    rollout_policy: dict[str, object] | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -622,6 +624,7 @@ def _run_deployment(
         artifact_secret_file=artifact_secret_file,
         rollback_release=rollback_release,
         rollout_generation=rollout_generation,
+        rollout_policy=rollout_policy,
         secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
@@ -2022,6 +2025,7 @@ def inspect_target(name: Name) -> dict[str, object]:
 @_journal_plan("target_stack", "name")
 def plan_target_stack(name: Name) -> dict[str, object]:
     """Preflight packages and helpers and return the exact target stack plan."""
+    _require_no_rollout_dependency("target", name)
     return _target_runtime_orchestrator().plan_target_stack(name)
 
 
@@ -2029,6 +2033,7 @@ def plan_target_stack(name: Name) -> dict[str, object]:
 @_journal_apply("target_stack", "name")
 def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile a target stack through its bootstrapped privileged helper."""
+    _require_no_rollout_dependency("target", name)
     return _target_runtime_orchestrator().apply_target_stack(name, plan_id)
 
 
@@ -2165,6 +2170,32 @@ def start_rollout(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Persist preparation, materialize an isolated backend, and health-check it."""
     with _deployment_resource_lock(name):
         return _rollout_orchestrator().start(name, plan_id)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("rollout_weights", "name")
+def plan_rollout_weights(
+    name: Name, stable_weight: RolloutWeight, candidate_weight: RolloutWeight
+) -> dict[str, object]:
+    """Plan one health-gated signed-affinity Rollout weight transition."""
+    return _rollout_orchestrator().plan_weights(
+        name, stable_weight, candidate_weight
+    )
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("rollout_weights", "name")
+def apply_rollout_weights(
+    name: Name,
+    stable_weight: RolloutWeight,
+    candidate_weight: RolloutWeight,
+    plan_id: PlanId,
+) -> dict[str, object]:
+    """Install and verify routing before persisting reviewed desired weights."""
+    with _deployment_resource_lock(name):
+        return _rollout_orchestrator().apply_weights(
+            name, stable_weight, candidate_weight, plan_id
+        )
 
 
 @mcp.tool(annotations=READ)
