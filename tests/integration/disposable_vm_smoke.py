@@ -601,6 +601,7 @@ namespace Smoke {
 }
 """,
         "current/bootstrap/app.php": "<?php return new \\Smoke\\App();\n",
+        "current/bootstrap/cache/.gitignore": "",
         "current/public/index.php": "<?php http_response_code(200); echo 'ready';\n",
     }
     ssh_python(textwrap.dedent(
