@@ -386,6 +386,37 @@ def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypat
     assert observed["kwargs"]["valkey_credential_path"] == valkey
 
 
+def test_runner_main_records_bounded_startup_failure(tmp_path, monkeypatch) -> None:
+    runner = runner_namespace()
+    credentials = tmp_path / "credentials"
+    state = tmp_path / "state"
+    credentials.mkdir()
+    state.mkdir()
+    authority = runner_authority()
+    authority_path = credentials / "authority"
+    authority_path.write_text(json.dumps(authority))
+    authority_path.chmod(0o600)
+    valkey = credentials / "valkey"
+    valkey.write_text('{"username":"admin","password":"secret"}')
+    valkey.chmod(0o600)
+    runner["load_target_capture"] = lambda: (_ for _ in ()).throw(
+        runner["RunnerFailure"]("policy_stale")
+    )
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
+    monkeypatch.setenv("STATE_DIRECTORY", str(state))
+    monkeypatch.setattr(
+        runner["sys"], "argv", ["gimme-recovery-runner", "scheduled", "example-app"]
+    )
+
+    assert runner["main"]() == 1
+    status = json.loads((state / "status.json").read_text())
+    assert status["deployment"] == "example-app"
+    assert status["outcome"] == "policy_stale"
+    assert status["error_code"] == "policy_stale"
+    assert status["last_logical_slot"] is not None
+    assert set(status) == runner["STATUS_KEYS"]
+
+
 def test_runner_main_emits_one_bounded_on_demand_result(tmp_path, monkeypatch, capsys) -> None:
     runner = runner_namespace()
     credentials = tmp_path / "credentials"

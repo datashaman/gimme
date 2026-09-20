@@ -209,6 +209,25 @@ def attempt_status(
     }
 
 
+def startup_failure_status(
+    deployment: str, authority: dict[str, Any] | None, outcome: str,
+    observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist a bounded result when activation fails before execute_scheduled starts."""
+    now = utc(observed_at or datetime.now(UTC))
+    slot = None
+    if isinstance(authority, dict) and isinstance(authority.get("cadence"), dict):
+        try:
+            slot = latest_slot(authority["cadence"], now)
+        except RunnerFailure:
+            pass
+    status = attempt_status(deployment, slot or now, now, outcome, finished_at=now,
+                            error_code=outcome)
+    if slot is None:
+        status["last_logical_slot"] = None
+    return status
+
+
 def load_credential(
     path: Path | None, keys: set[str] | tuple[set[str], ...]
 ) -> dict[str, str] | None:
@@ -626,6 +645,7 @@ def main() -> int:
         return 1
     credentials = Path(credentials_value)
     state = Path(state_value)
+    authority = None
     try:
         authority = load_document(credentials / "authority", 64 * 1024)
         if authority.get("deployment") != deployment:
@@ -678,9 +698,31 @@ def main() -> int:
         return 0 if result["outcome"] in {
             "succeeded", "backup_succeeded_retention_failed", "deployment_busy",
         } else 1
-    except RunnerFailure:
+    except RunnerFailure as error:
+        if operation == "scheduled":
+            outcome = str(error)
+            if outcome not in {
+                "policy_stale", "credentials_unavailable", "credentials_expired",
+                "destination_unavailable", "capture_failed", "verification_failed",
+            }:
+                outcome = "policy_stale"
+            try:
+                atomic_status(
+                    state / "status.json",
+                    startup_failure_status(deployment, authority, outcome),
+                )
+            except Exception:
+                pass
         return 1
     except Exception:
+        if operation == "scheduled":
+            try:
+                atomic_status(
+                    state / "status.json",
+                    startup_failure_status(deployment, authority, "capture_failed"),
+                )
+            except Exception:
+                pass
         return 1
 
 
