@@ -1609,9 +1609,16 @@ def verify_backup_workflows(gimme) -> None:
     verify_postgres_restore(gimme)
     verify_recovery_point_deletion(gimme)
 
+    superseded_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-superseded-source"
+    )
+    superseded = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-superseded-source", str(superseded_plan["plan_id"])
+    )
+    point_id = str(superseded["recovery_point"]["recovery_point_id"])
     postgres_key = (
         "gimme/recovery-points/"
-        f"{RECOVERY_DEPLOYMENT}/{result['recovery_point']['recovery_point_id']}/postgres.dump"
+        f"{RECOVERY_DEPLOYMENT}/{point_id}/postgres.dump"
     )
     bound_version = supersede_component(postgres_key)
     superseded_inventory = gimme.list_recovery_points(RECOVERY_DEPLOYMENT)
