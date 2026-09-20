@@ -6,7 +6,7 @@ from pathlib import Path
 
 from gimme import recovery
 from gimme.target_capture import (
-    BotoObjectStore, Component, ObjectMetadata, capture_postgres, publish,
+    BotoObjectStore, Component, ObjectMetadata, capture_postgres, capture_valkey, publish,
     recovery_point_id,
 )
 
@@ -179,3 +179,28 @@ def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() ->
     store.delete("fixed-key", "version-1")
     assert Boto.observed["endpoint_url"] == "https://minio.example.test:9000"
     assert Boto.observed["aws_access_key_id"] == "access-canary"
+
+
+def test_valkey_capture_reuses_fixed_binary_and_validates_marker(tmp_path) -> None:
+    observed = {}
+
+    def execute(argv, **kwargs):
+        observed["argv"] = argv
+        Path(argv[1]).write_bytes(b"archive")
+        sha256 = hashlib.sha256(b"archive").hexdigest()
+        return subprocess.CompletedProcess(
+            argv, 0, f"GIMME_VALKEY_BACKUP|{sha256}|7|2|2026-09-20T10:00:00+00:00\n", ""
+        )
+
+    component = capture_valkey(
+        "gimme:example-app:", "127.0.0.1", 6379, False, "8.0", tmp_path,
+        execute=execute,
+    )
+
+    assert observed["argv"][0] == "/usr/local/libexec/gimme-capture-valkey"
+    assert observed["argv"][2:] == [
+        "gimme:example-app:", "127.0.0.1", "6379", "no", "-",
+    ]
+    assert component.kind == "valkey"
+    assert component.records == 2
+    component.path.unlink()

@@ -18,6 +18,8 @@ POINT = re.compile(r"^rp_[a-f0-9]{20}$")
 REQUEST = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 DATABASE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+PREFIX = re.compile(r"^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$")
+HOST = re.compile(r"^[a-zA-Z0-9.-]{1,255}$")
 VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,63}$")
 VERSION_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
@@ -26,6 +28,7 @@ MAX_COMPONENT_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024
 MINIMUM_FREE_BYTES = 64 * 1024 * 1024
 PG_DUMP = "/usr/bin/pg_dump"
+VALKEY_CAPTURE = "/usr/local/libexec/gimme-capture-valkey"
 
 
 class CaptureFailure(RuntimeError):
@@ -295,6 +298,89 @@ def capture_postgres(
         return Component(
             kind="postgres", path=path, bytes=size, sha256=sha256,
             resource_version=resource_version, format="pg-custom-v1",
+        )
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def capture_valkey(
+    prefix: str,
+    host: str,
+    port: int,
+    tls: bool,
+    resource_version: str,
+    directory: Path,
+    credential_path: Path | None = None,
+    *,
+    execute=subprocess.run,
+) -> Component:
+    if (
+        PREFIX.fullmatch(prefix) is None
+        or HOST.fullmatch(host) is None
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65535
+        or not isinstance(tls, bool)
+        or VERSION.fullmatch(resource_version) is None
+    ):
+        raise CaptureFailure("recovery_valkey_provenance_invalid")
+    if credential_path is not None and (
+        not credential_path.is_file()
+        or credential_path.is_symlink()
+        or credential_path.stat().st_mode & 0o077
+    ):
+        raise CaptureFailure("credentials_unavailable")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    if shutil.disk_usage(directory).free < MINIMUM_FREE_BYTES:
+        raise CaptureFailure("recovery_capacity_insufficient")
+    descriptor, name = tempfile.mkstemp(prefix=".valkey-", suffix=".archive", dir=directory)
+    os.close(descriptor)
+    path = Path(name)
+    os.chmod(path, 0o600)
+    try:
+        try:
+            result = execute(  # nosec B603
+                [
+                    VALKEY_CAPTURE, str(path), prefix, host, str(port),
+                    "yes" if tls else "no",
+                    "-" if credential_path is None else str(credential_path),
+                ],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=1800, check=False,
+            )
+        except Exception:
+            raise CaptureFailure("recovery_capture_failed") from None
+        marker = result.stdout.strip().split("|") if result.returncode == 0 else []
+        if (
+            len(marker) != 5
+            or marker[0] != "GIMME_VALKEY_BACKUP"
+            or SHA256.fullmatch(marker[1]) is None
+            or not marker[2].isdigit()
+            or not marker[3].isdigit()
+        ):
+            raise CaptureFailure("recovery_dump_metadata_invalid")
+        size, records = int(marker[2]), int(marker[3])
+        try:
+            captured = datetime.fromisoformat(marker[4])
+        except ValueError:
+            raise CaptureFailure("recovery_dump_metadata_invalid") from None
+        if (
+            captured.tzinfo is None
+            or not 0 <= size <= MAX_COMPONENT_BYTES
+            or not 0 <= records <= 100_000
+            or path.stat().st_size != size
+        ):
+            raise CaptureFailure("recovery_dump_metadata_invalid")
+        with path.open("rb") as source:
+            sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+        if sha256 != marker[1]:
+            raise CaptureFailure("recovery_dump_metadata_invalid")
+        return Component(
+            kind="valkey", path=path, bytes=size, sha256=sha256,
+            resource_version=resource_version, format="gimme-valkey-v1", records=records,
+            captured_at=captured.astimezone(UTC).isoformat(),
         )
     except BaseException:
         path.unlink(missing_ok=True)

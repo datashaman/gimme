@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Extended the shared Target capture core to Valkey without adding another protocol
+  implementation. It invokes only the fixed installed `gimme-capture-valkey` program with
+  validated derived prefix, endpoint, TLS, version, and protected credential identity; then
+  independently verifies the bounded marker, archive size, record count, timestamp, and SHA-256
+  before returning the same `gimme-valkey-v1` component used by existing manifests.
 - Added the shared Target capture core's narrow boto3 adapter. It builds one client from the
   validated registered destination and ambient-or-stored credential mode, forces registered
   addressing and encryption, and exposes only exact-key/exact-version put, head, read, and cleanup
