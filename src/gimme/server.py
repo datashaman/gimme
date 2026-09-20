@@ -1562,7 +1562,9 @@ def _deployment_restore_plan(
     )
     destination_changed = (
         existing_restore is not None
-        and existing_restore["state"] in {"started", "maintenance_entered"}
+        and existing_restore["state"] in {
+            "started", "maintenance_entered", "safety_failed",
+        }
         and original_empty != observed_empty
     )
     selected_destinations = [
@@ -1723,7 +1725,7 @@ def apply_restore_deployment(
 
         if current is None:
             advance("started")
-        if current == "started":
+        if current in {"started", "safety_failed"}:
             try:
                 _run_deployment(
                     "gimme:recovery:maintenance", name,
@@ -1738,10 +1740,29 @@ def apply_restore_deployment(
             if safety_id is None:
                 advance("safety_not_required")
             else:
-                _capture_restore_safety(
-                    name, request_id, safety_id, selected_components,
-                    state, deployment, destination_name, destination, credentials,
-                )
+                try:
+                    _capture_restore_safety(
+                        name, request_id, safety_id, selected_components,
+                        state, deployment, destination_name, destination, credentials,
+                    )
+                except Exception:
+                    runtime_restored = True
+                    try:
+                        _run_deployment(
+                            "gimme:recovery:maintenance", name,
+                            recovery_action="exit", recovery_request_id=request_id,
+                            recovery_quiesce_wait=(
+                                deployment.recovery.quiesce_wait_seconds
+                            ),
+                            timeout=900,
+                        )
+                    except Exception:
+                        runtime_restored = False
+                    advance("safety_failed")
+                    raise RecoveryError(
+                        "safety_failed" if runtime_restored
+                        else "recovery_runtime_restore_failed"
+                    ) from None
                 advance("safety_verified")
         with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
             local_sources = {

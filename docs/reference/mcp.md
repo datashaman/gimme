@@ -344,6 +344,10 @@ maintenance, Safety Recovery Point protection (when the destination was non-empt
 artifact verification, shadow verification, and atomic data replacement. A failed or successful
 data swap remains behind the fixed maintenance route; the separate verification apply is the only
 path back online.
+If required Safety capture fails, Restore performs no source mutation, attempts to restore the
+original runtime, and appends `safety_failed`. A matching retry re-enters request-owned maintenance
+and repeats the complete Safety capture. Failure to restore the runtime instead returns the fixed
+`recovery_runtime_restore_failed` code while retaining that recovery-required record state.
 
 `apply_verify_restore` boots each configured live-health request directly through the current
 Laravel application while the public Caddy route continues to return 503. It resumes only the

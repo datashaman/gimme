@@ -79,14 +79,18 @@ The destination-authoritative Restore record tells you which call to retry:
 
 | Current state | Action |
 | --- | --- |
-| `started` through `shadow_verified` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
+| `started` through `maintenance_entered` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
+| `safety_failed` | The original runtime was restored without source mutation. Request a fresh plan with the same request ID and retry; if the prior error was `recovery_runtime_restore_failed`, repair the runtime first |
+| `safety_verified` through `shadow_verified` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
 | `data_replaced` | Run `plan_verify_restore`, then `apply_verify_restore` |
 | `verification_failed` | Correct the application, database, process, or health-check fault; request a fresh verification plan and retry it |
 | `verification_succeeded` or `cleanup_completed` | Retry a fresh verification plan; cleanup and maintenance exit are idempotent |
 | `completed` | No recovery action is required |
 
-Every failure before completion leaves the public route in maintenance. There is no MCP
-force-online bypass. A lost response is safe to retry: target state, immutable Restore events,
+After Safety capture succeeds, every failure before completion leaves the public route in
+maintenance. A Safety capture failure happens before source mutation, attempts to restore the
+original runtime, and records `safety_failed`. There is no MCP force-online bypass. A lost
+response is safe to retry: target state, immutable Restore events,
 PostgreSQL OIDs, replayed-and-reverified Valkey state, and the protected maintenance-exit receipt
 distinguish completed work from work that must still run. A Valkey retry clears and replays the
 selected prefix from the verified archive; it never guesses which individual keys completed.
