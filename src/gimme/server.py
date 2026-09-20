@@ -518,6 +518,61 @@ def _capture_valkey_dump(
     )
 
 
+def _capture_restore_safety(
+    name: str, request_id: str, safety_id: str,
+    selected_components: list[str], state: ControlState,
+    deployment: DeploymentConfig, destination_name: str,
+    destination: S3BackupDestination,
+    credentials: tuple[str, str] | None,
+) -> dict[str, object]:
+    """Capture and verify exactly the selected destination components."""
+    dumps: list[ComponentDump] = []
+    expected_versions: dict[str, str] = {}
+    with tempfile.TemporaryDirectory(prefix="gimme-restore-safety-") as directory:
+        root = Path(directory)
+        if "postgres" in selected_components:
+            resource_name = deployment.resources.database
+            resource = state.resources.get(resource_name) if resource_name else None
+            if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
+                raise RecoveryError("restore_destination_incompatible")
+            expected_versions["postgres"] = resource.version
+            dumps.append(_capture_postgres_dump(
+                name, root / "postgres.dump", resource.version
+            ))
+        if "valkey" in selected_components:
+            binding = deployment.resources.valkey
+            resource_name = binding.resource if binding is not None else None
+            resource = state.resources.get(resource_name) if resource_name else None
+            if not isinstance(
+                resource, (ResourceConfig, AWSElastiCacheValkeyResource)
+            ) or resource_name is None:
+                raise RecoveryError("restore_destination_incompatible")
+            version = _valkey_resource_version(resource)
+            expected_versions["valkey"] = version
+            credential = _valkey_capture_credential(state, resource_name, resource)
+            with protected_secret_file(credential) as secret_file:
+                dumps.append(_capture_valkey_dump(
+                    name, root / "valkey.archive", version, secret_file
+                ))
+        safety = recovery_module.create_recovery_point(
+            destination_name, destination, credentials, backup_s3,
+            name, safety_id, dumps, safety_restore_request_id=request_id,
+        )
+    components = cast(list[dict[str, object]], safety["components"])
+    observed = {
+        str(component["kind"]): str(component["resource_version"])
+        for component in components
+    }
+    if (
+        safety["safety"] is not True
+        or safety["restore_request_id"] != request_id
+        or observed != expected_versions
+        or len(components) != len(selected_components)
+    ):
+        raise RecoveryError("restore_safety_conflict")
+    return safety
+
+
 def _revision(name: str) -> str:
     deployment = store.deployment(name)
     if deployment.source.kind == "commit":
@@ -1594,30 +1649,10 @@ def apply_restore_deployment(
             if safety_id is None:
                 advance("safety_not_required")
             else:
-                with tempfile.TemporaryDirectory(
-                    prefix="gimme-restore-safety-"
-                ) as directory:
-                    local_safety = Path(directory) / "postgres.dump"
-                    safety_dump = _capture_postgres_dump(
-                        name, local_safety, resource.version
-                    )
-                    safety = recovery_module.create_recovery_point(
-                        destination_name, destination, credentials, backup_s3,
-                        name, safety_id, safety_dump,
-                        safety_restore_request_id=request_id,
-                    )
-                if (
-                    safety["safety"] is not True
-                    or safety["restore_request_id"] != request_id
-                    or len(cast(list[object], safety["components"])) != 1
-                    or cast(list[dict[str, object]], safety["components"])[0][
-                        "kind"
-                    ] != "postgres"
-                    or cast(list[dict[str, object]], safety["components"])[0][
-                        "resource_version"
-                    ] != resource.version
-                ):
-                    raise RecoveryError("restore_safety_conflict")
+                _capture_restore_safety(
+                    name, request_id, safety_id, selected_components,
+                    state, deployment, destination_name, destination, credentials,
+                )
                 advance("safety_verified")
         with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
             local_source = Path(directory) / "postgres.dump"
