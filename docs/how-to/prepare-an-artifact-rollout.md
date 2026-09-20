@@ -3,6 +3,15 @@
 Use this workflow for an artifact-mode staging or production Deployment after its current release
 is healthy and the desired source resolves to a different published artifact.
 
+## Prerequisites and capacity
+
+The Target needs the current privileged helpers, Caddy, the declared system PHP runtime, and one
+free `deployment_slots` entry. Stable must be a verified live artifact and candidate must be a
+different verified publication with matching Application, framework, runtime/extensions,
+Deployment environment, Resource bindings, process declarations, and public-health contract. Run
+backward-compatible expand migrations before starting; Rollout operations never migrate shared
+data.
+
 1. Read `gimme://fleet`. The Deployment's Target needs one free slot; preparation holds that slot
    until the Rollout is completed or reversed.
 2. Call `plan_start_rollout` with the Deployment name. Review the stable and candidate identities,
@@ -68,3 +77,34 @@ Ordinary deploy, runtime/resource reconciliation, promotion, rollback, Deploymen
 and changes to referenced Target, Application, Resource, or Artifact Store policy are blocked while
 the Rollout is active or recoverable. This preparation slice does not expose backend addresses,
 ports, paths, sockets, object versions, command output, response bodies, cookies, or secrets.
+
+## Failure recovery
+
+- For `preparing` or `degraded`, restore Target reachability and request a fresh plan. A matching
+  retry reuses the generation and reservation.
+- A failed weight apply leaves desired weights unchanged and restores the prior route. Fix the
+  bounded health or Target condition, then request a fresh weight plan.
+- A failed completion or reversal keeps the temporary slot. Restore the Target and retry the same
+  reviewed outcome; a matching terminal Target record safely finishes interrupted local state.
+- Never repair a Rollout by editing desired JSON, Caddy fragments, Target policy, symlinks, or
+  process units. Generation ambiguity deliberately fails closed.
+
+## Cost and operational scope
+
+A Rollout uses one additional web runtime, a PHP-FPM pool where applicable, loopback Caddy
+backends, logs, and one temporary Target slot. It creates no cloud infrastructure, database, or
+cache and runs no candidate workers. The deterministic local proof is bill-free:
+
+```bash
+uv run python tests/integration/rollout_local_scenario.py
+```
+
+It emits bounded aggregate counts only—no cookies, client samples, addresses, paths, or protected
+data. Real traffic ratios can differ because existing cookie cohorts stay sticky.
+
+## Non-goals
+
+Rollouts do not provide cross-Target HA, more than two revisions, source/preview splitting,
+database migration orchestration, candidate background processing, automatic decisions, request
+analytics, CDN integration, or non-cookie affinity. MCP never accepts custom Caddy, upstream,
+socket, port, path, cookie, or signing-key input.

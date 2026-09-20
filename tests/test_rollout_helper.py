@@ -191,6 +191,16 @@ def test_successful_route_is_not_world_readable(tmp_path: Path, monkeypatch) -> 
     helper.main_weights("example-local")
 
     assert public.stat().st_mode & 0o777 == 0o640
+    target_state = tmp_path / "root-state" / "example-local.json"
+    assert target_state.stat().st_mode & 0o777 == 0o600
+    document = json.loads(target_state.read_text())
+    assert set(document) == {
+        "configured", "generation", "phase", "affinity_generation",
+        "stable_weight", "candidate_weight", "stable_eligible",
+        "candidate_eligible", "stable_health", "candidate_health",
+        "stable_identity", "candidate_identity", "route_fingerprint", "outcome",
+    }
+    assert "key" not in json.dumps(document).lower()
 
 
 @pytest.mark.parametrize("failure_probe", [1, 2])
@@ -347,6 +357,32 @@ def test_completion_cleanup_failure_rolls_back_candidate_pool_and_route(
     assert candidate.is_dir()
     assert pool.read_text() == "prior pool\n"
     assert commands
+
+
+def test_completion_process_handoff_failure_restores_stable_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    helper, deploy, current, public, prior, _, _, _ = finalization_harness(
+        tmp_path, monkeypatch
+    )
+    calls = 0
+
+    def reconcile(_instance):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("process handoff failed")
+
+    monkeypatch.setattr(helper, "reconcile_processes", reconcile)
+    monkeypatch.setattr(helper, "probe", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="rollout finalization failed"):
+        helper.main_finalize("example-local")
+
+    assert calls == 2
+    assert current.readlink() == Path("releases/1")
+    assert public.read_text() == prior
+    assert not (deploy / "releases" / str(8_000_000_017)).exists()
 
 
 def test_completion_rollback_failure_is_fixed_and_redacted(

@@ -308,6 +308,9 @@ the stable `current` release and serialize under the Deployment lock. Ordinary D
 runtime, Resource, secret, and process reconciliation remains blocked unless it can preserve both
 revisions transactionally.
 
+The complete parent-criterion mapping and bill-free deterministic operator scenario are recorded in
+[Artifact Rollout acceptance evidence](rollout-acceptance-evidence.md).
+
 Artifact rollback uses `plan_rollback_deployment` and `rollback_deployment` with the exact plan ID
 and displayed confirmation. It revalidates retained readonly metadata, the canonical tree,
 runtime compatibility, candidate/live health, and process refresh without contacting Git or the
