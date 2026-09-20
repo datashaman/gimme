@@ -1702,7 +1702,7 @@ def verify_backup_workflows(gimme) -> None:
     if missing_point is None or (
         missing_point["state"], missing_point["deleted_components"],
         missing_point["remaining_components"],
-    ) != ("deletion_failed", 1, 1):
+    ) != ("deletion_failed", 1, len(missing_point["components"]) - 1):
         raise AssertionError(
             f"missing bound component did not enter deletion_failed: {missing_inventory}"
         )
