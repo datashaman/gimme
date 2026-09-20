@@ -340,6 +340,21 @@ def test_scheduled_execution_records_fixed_capture_stage_without_raw_error(tmp_p
     assert result["error_code"] == "valkey_capture_failed"
 
 
+def test_shared_policy_maps_destination_startup_without_provider_text(tmp_path) -> None:
+    runner = runner_namespace()
+
+    class Core:
+        class BotoObjectStore:
+            def __init__(self, _destination, _credentials):
+                raise RuntimeError("destination_unavailable")
+
+    with pytest.raises(runner["RunnerFailure"], match="^destination_unavailable$"):
+        runner["execute_capture_policy"](
+            runner_authority(), "scheduled-abc", Core, tmp_path,
+            valkey_credential_path=tmp_path / "valkey",
+        )
+
+
 def test_on_demand_uses_shared_capture_policy_and_deployment_lock(tmp_path) -> None:
     runner = runner_namespace()
     calls = []

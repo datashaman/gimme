@@ -376,6 +376,19 @@ def maintenance(
             request_path.unlink(missing_ok=True)
 
 
+def mapped_capture_failure(error: Exception, default: str) -> RunnerFailure:
+    safe = str(error)
+    mapped = {
+        "credentials_unavailable": "credentials_unavailable",
+        "credentials_expired": "credentials_expired",
+        "destination_unavailable": "destination_unavailable",
+        "recovery_component_verification_failed": "verification_failed",
+        "recovery_manifest_tampered": "verification_failed",
+        "recovery_manifest_invalid": "verification_failed",
+    }
+    return RunnerFailure(mapped.get(safe, default))
+
+
 def capture_recovery(
     authority: dict[str, Any], scheduled_request: str, directory: Path,
     target_capture: Any, *, aws_credentials: dict[str, str] | None = None,
@@ -458,16 +471,7 @@ def capture_recovery(
     except RunnerFailure:
         raise
     except Exception as error:
-        safe = str(error)
-        mapped = {
-            "credentials_unavailable": "credentials_unavailable",
-            "credentials_expired": "credentials_expired",
-            "destination_unavailable": "destination_unavailable",
-            "recovery_component_verification_failed": "verification_failed",
-            "recovery_manifest_tampered": "verification_failed",
-            "recovery_manifest_invalid": "verification_failed",
-        }
-        raise RunnerFailure(mapped.get(safe, f"{stage}_failed")) from None
+        raise mapped_capture_failure(error, f"{stage}_failed") from None
     finally:
         for component in locals().get("components", []):
             try:
@@ -515,13 +519,16 @@ def execute_capture_policy(
     if REQUEST.fullmatch(capture_request) is None:
         raise RunnerFailure("policy_stale")
     destination = authority["destination"]
-    store = target_capture.BotoObjectStore(destination, aws_credentials)
-    point_id = target_capture.recovery_point_id(
-        deployment, str(destination["name"]), capture_request
-    )
-    manifest = target_capture.find_recovery_point(
-        store, deployment, str(destination["name"]), point_id
-    )
+    try:
+        store = target_capture.BotoObjectStore(destination, aws_credentials)
+        point_id = target_capture.recovery_point_id(
+            deployment, str(destination["name"]), capture_request
+        )
+        manifest = target_capture.find_recovery_point(
+            store, deployment, str(destination["name"]), point_id
+        )
+    except Exception as error:
+        raise mapped_capture_failure(error, "capture_failed") from None
     changed = manifest is None
     if manifest is None:
         maintenance_active = False
