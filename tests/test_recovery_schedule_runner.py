@@ -4,7 +4,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gimme.control import RecoveryPolicy
-from gimme.recovery_schedule import scheduled_request_id
+from gimme.recovery_schedule import (
+    policy_fingerprint, scheduled_request_id, stable_delay_seconds,
+)
 import pytest
 
 
@@ -64,11 +66,16 @@ def test_status_is_atomic_bounded_and_secret_safe(tmp_path) -> None:
 
 
 def runner_authority() -> dict[str, object]:
+    policy = RecoveryPolicy(
+        destination="primary", valkey=True,
+        cadence={"kind": "hourly", "minute": 15},
+    )
     return {
         "schema_version": 2, "deployment": "example-app", "target": "devbox",
-        "policy_fingerprint": "a" * 64,
+        "policy_fingerprint": policy_fingerprint(policy),
         "cadence": {"kind": "hourly", "minute": 15},
-        "calendar": "*-*-* *:15:00 UTC", "stable_delay_seconds": 10,
+        "calendar": "*-*-* *:15:00 UTC",
+        "stable_delay_seconds": stable_delay_seconds("example-app"),
         "retain_last": 7, "quiesce_wait_seconds": 30,
         "components": ["postgres", "valkey"],
         "placement": {
@@ -176,3 +183,92 @@ def test_runner_capture_failure_never_returns_provider_or_secret_text(tmp_path) 
         )
     assert str(failure.value) == "capture_failed"
     assert "secret-canary" not in str(failure.value)
+
+
+def test_scheduled_execution_records_verified_point_and_retention(tmp_path) -> None:
+    runner = runner_namespace()
+    authority = runner_authority()
+    closed = []
+    runner["acquire_lock"] = lambda _path: SimpleNamespace(
+        close=lambda: closed.append(True)
+    )
+    runner["capture_recovery"] = lambda *args, **kwargs: {
+        "recovery_point_id": "rp_" + "a" * 20
+    }
+
+    class Core:
+        class BotoObjectStore:
+            def __init__(self, _destination, _credentials):
+                pass
+
+        @staticmethod
+        def enforce_retention(_store, _deployment, _destination, retain, replacement):
+            assert retain == 7 and replacement == "rp_" + "a" * 20
+            return {"outcome": "succeeded", "error_code": None, "deleted": 2,
+                    "remaining": 7}
+
+    status_path = tmp_path / "status.json"
+    result = runner["execute_scheduled"](
+        authority, Core, status_path, tmp_path / "lock", tmp_path / "capture",
+        valkey_credential_path=tmp_path / "valkey.json",
+        observed_at=datetime(2026, 9, 20, 10, 20, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "succeeded"
+    assert result["recovery_point_id"] == "rp_" + "a" * 20
+    assert result["retention_deleted"] == 2
+    assert json.loads(status_path.read_text()) == result
+    assert closed == [True]
+
+
+def test_scheduled_execution_records_busy_without_capture(tmp_path) -> None:
+    runner = runner_namespace()
+    runner["acquire_lock"] = lambda _path: None
+    runner["capture_recovery"] = lambda *args, **kwargs: pytest.fail(
+        "busy activation must not capture"
+    )
+    status_path = tmp_path / "status.json"
+
+    result = runner["execute_scheduled"](
+        runner_authority(), SimpleNamespace(), status_path, tmp_path / "lock",
+        tmp_path / "capture", observed_at=datetime(2026, 9, 20, 10, 20, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "deployment_busy"
+    assert result["recovery_point_id"] is None
+    assert json.loads(status_path.read_text()) == result
+
+
+def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypatch) -> None:
+    runner = runner_namespace()
+    credentials = tmp_path / "credentials"
+    state = tmp_path / "state"
+    credentials.mkdir()
+    state.mkdir()
+    authority = runner_authority()
+    authority_path = credentials / "authority"
+    authority_path.write_text(json.dumps(authority))
+    authority_path.chmod(0o600)
+    valkey = credentials / "valkey"
+    valkey.write_text('{"username":"admin","password":"secret"}')
+    valkey.chmod(0o600)
+    observed = {}
+    runner["load_target_capture"] = lambda: "shared-core"
+
+    def execute(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return {"outcome": "succeeded"}
+
+    runner["execute_scheduled"] = execute
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
+    monkeypatch.setenv("STATE_DIRECTORY", str(state))
+    monkeypatch.setattr(
+        runner["sys"], "argv", ["gimme-recovery-runner", "scheduled", "example-app"]
+    )
+
+    assert runner["main"]() == 0
+    assert observed["args"][0] == authority
+    assert observed["args"][1] == "shared-core"
+    assert observed["kwargs"]["aws_credentials"] is None
+    assert observed["kwargs"]["valkey_credential_path"] == valkey

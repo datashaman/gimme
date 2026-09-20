@@ -24,6 +24,10 @@ VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,63}$")
 VERSION_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
 SHA256 = re.compile(r"^[a-f0-9]{64}$")
 FORMAT = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
+RESTORE_EVENT = re.compile(
+    r"^gimme/restores/([a-z][a-z0-9-]{0,63})/"
+    r"([a-z0-9][a-z0-9-]{0,63})/([0-9]{6})\.json$"
+)
 MAX_COMPONENT_BYTES = 512 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024
 MINIMUM_FREE_BYTES = 64 * 1024 * 1024
@@ -63,6 +67,7 @@ class ObjectStore(Protocol):
         max_bytes: int = MAX_COMPONENT_BYTES,
     ) -> bytes: ...
     def delete(self, key: str, version_id: str) -> None: ...
+    def list(self, prefix: str) -> list[str]: ...
 
 
 def _provider_failure(error: Exception, operation: str) -> CaptureFailure:
@@ -219,6 +224,24 @@ class BotoObjectStore:
             )
         except Exception as error:
             raise _provider_failure(error, "cleanup") from None
+
+    def list(self, prefix: str) -> list[str]:
+        try:
+            paginator = self.client.get_paginator("list_objects_v2")
+            keys = [
+                str(item["Key"])
+                for page in paginator.paginate(
+                    Bucket=self.destination["bucket"], Prefix=prefix,
+                )
+                for item in page.get("Contents", [])
+            ]
+            if len(keys) > 10_000:
+                raise CaptureFailure("recovery_inventory_limit")
+            return keys
+        except CaptureFailure:
+            raise
+        except Exception as error:
+            raise _provider_failure(error, "list") from None
 
 
 def recovery_point_id(deployment: str, destination: str, request_id: str) -> str:
@@ -387,9 +410,9 @@ def capture_valkey(
         raise
 
 
-def _existing_manifest(
+def _existing_manifest_record(
     store: ObjectStore, deployment: str, destination: str, point_id: str,
-) -> dict[str, object] | None:
+) -> tuple[dict[str, object], ObjectMetadata] | None:
     key = manifest_key(deployment, point_id)
     metadata = store.head(key)
     if metadata is None:
@@ -411,8 +434,18 @@ def _existing_manifest(
         or document.get("deployment") != deployment
         or document.get("destination") != destination
         or document.get("recovery_point_id") != point_id
-        or document.get("safety") is not False
-        or document.get("restore_request_id") is not None
+        or not isinstance(document.get("safety"), bool)
+        or (
+            document.get("safety") is True
+            and (
+                not isinstance(document.get("restore_request_id"), str)
+                or REQUEST.fullmatch(document["restore_request_id"]) is None
+            )
+        )
+        or (
+            document.get("safety") is False
+            and document.get("restore_request_id") is not None
+        )
         or not isinstance(document.get("components"), list)
         or not document["components"]
     ):
@@ -448,7 +481,14 @@ def _existing_manifest(
             ).hexdigest() != component["sha256"]
         ):
             raise CaptureFailure("recovery_component_verification_failed")
-    return document
+    return document, metadata
+
+
+def _existing_manifest(
+    store: ObjectStore, deployment: str, destination: str, point_id: str,
+) -> dict[str, object] | None:
+    record = _existing_manifest_record(store, deployment, destination, point_id)
+    return None if record is None else record[0]
 
 
 def publish(
@@ -462,6 +502,8 @@ def publish(
 ) -> dict[str, object]:
     existing = _existing_manifest(store, deployment, destination, point_id)
     if existing is not None:
+        if existing["safety"] is not False:
+            raise CaptureFailure("recovery_manifest_conflict")
         return existing
     if (
         not components
@@ -530,3 +572,230 @@ def publish(
             with suppress(Exception):
                 store.delete(key, version_id)
         raise
+
+
+def verified_inventory(
+    store: ObjectStore, deployment: str, destination: str,
+) -> list[dict[str, object]]:
+    """Load only fully verified manifests from authoritative object inventory."""
+    prefix = f"gimme/recovery-points/{deployment}/"
+    manifests: list[dict[str, object]] = []
+    keys = store.list(prefix)
+    if len(keys) > 10_000:
+        raise CaptureFailure("recovery_inventory_limit")
+    for key in sorted(keys):
+        if not key.endswith("/manifest.json"):
+            continue
+        point_id = key[len(prefix):].split("/", 1)[0]
+        if POINT.fullmatch(point_id) is None or key != manifest_key(deployment, point_id):
+            continue
+        try:
+            manifest = _existing_manifest(store, deployment, destination, point_id)
+        except CaptureFailure:
+            continue
+        if manifest is not None:
+            manifests.append(manifest)
+    return manifests
+
+
+def retention_candidates(
+    manifests: list[dict[str, object]], retain_last: int, replacement_point_id: str,
+    protected_point_ids: set[str] | None = None,
+) -> list[str]:
+    """Select verified ordinary points oldest-first, never selecting the replacement."""
+    if (
+        isinstance(retain_last, bool) or not isinstance(retain_last, int)
+        or not 1 <= retain_last <= 365 or POINT.fullmatch(replacement_point_id) is None
+    ):
+        raise CaptureFailure("recovery_retention_policy_invalid")
+    protected = protected_point_ids or set()
+    eligible = [
+        item for item in manifests
+        if str(item.get("recovery_point_id")) not in protected
+    ]
+    if not any(item.get("recovery_point_id") == replacement_point_id for item in eligible):
+        raise CaptureFailure("recovery_retention_replacement_unverified")
+    eligible.sort(key=lambda item: (
+        str(item.get("created_at")), str(item.get("recovery_point_id")),
+    ))
+    count = max(0, len(eligible) - retain_last)
+    candidates = [
+        str(item["recovery_point_id"]) for item in eligible
+        if item.get("recovery_point_id") != replacement_point_id
+    ]
+    if len(candidates) < count:
+        raise CaptureFailure("recovery_retention_replacement_required")
+    return candidates[:count]
+
+
+def restore_protected_points(
+    store: ObjectStore, deployment: str, manifests: list[dict[str, object]],
+) -> set[str]:
+    """Derive fail-closed source and Safety protection from strict restore event streams."""
+    protected = {
+        str(item["recovery_point_id"]) for item in manifests if item.get("safety") is True
+    }
+    prefix = f"gimme/restores/{deployment}/"
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    keys = store.list(prefix)
+    if len(keys) > 10_000:
+        raise CaptureFailure("restore_record_limit")
+    for key in keys:
+        match = RESTORE_EVENT.fullmatch(key)
+        if match is None or match.group(1) != deployment:
+            raise CaptureFailure("restore_record_invalid")
+        grouped.setdefault(match.group(2), []).append((int(match.group(3)), key))
+    if len(grouped) > 100:
+        raise CaptureFailure("restore_record_limit")
+    common = {
+        "schema_version", "deployment", "request_id", "sequence", "state", "created_at",
+        "source_recovery_point_id", "destination", "safety_recovery_point_id",
+    }
+    additions = {
+        2: set(),
+        3: {"selected_components", "untouched_components", "partial"},
+        4: {
+            "selected_components", "untouched_components", "partial", "destinations",
+            "request_fingerprint",
+        },
+        5: {
+            "selected_components", "untouched_components", "partial", "destinations",
+            "request_fingerprint", "safety_components",
+        },
+    }
+    terminal = "completed"
+    states = {
+        "started", "maintenance_entered", "safety_verified", "safety_not_required",
+        "safety_failed", "artifact_failed", "artifact_verified", "shadow_failed",
+        "shadow_verified", "data_replaced", "verification_failed",
+        "verification_succeeded", "cleanup_completed", terminal,
+    }
+    transitions = {
+        None: {"started"}, "started": {"maintenance_entered"},
+        "maintenance_entered": {"safety_verified", "safety_not_required", "safety_failed"},
+        "safety_failed": {"maintenance_entered"},
+        "safety_verified": {"artifact_failed", "artifact_verified"},
+        "safety_not_required": {"artifact_failed", "artifact_verified"},
+        "artifact_failed": {"safety_verified", "safety_not_required"},
+        "artifact_verified": {"artifact_failed", "shadow_failed", "shadow_verified"},
+        "shadow_failed": {"artifact_verified"}, "shadow_verified": {"data_replaced"},
+        "data_replaced": {"verification_failed", "verification_succeeded"},
+        "verification_failed": {"verification_failed", "verification_succeeded"},
+        "verification_succeeded": {"verification_failed", "cleanup_completed"},
+        "cleanup_completed": {"verification_failed", terminal}, terminal: set(),
+    }
+    for request, items in grouped.items():
+        items.sort()
+        if len(items) > 100 or [item[0] for item in items] != list(range(len(items))):
+            raise CaptureFailure("restore_record_invalid")
+        events = []
+        previous = None
+        source_point = None
+        for sequence, key in items:
+            metadata = store.head(key)
+            if (
+                metadata is None or metadata.version_id is None
+                or metadata.bytes > MAX_MANIFEST_BYTES
+            ):
+                raise CaptureFailure("restore_record_invalid")
+            body = store.get(key, metadata.version_id, MAX_MANIFEST_BYTES)
+            if hashlib.sha256(body).hexdigest() != metadata.sha256:
+                raise CaptureFailure("restore_record_invalid")
+            try:
+                event = json.loads(body)
+            except (UnicodeError, json.JSONDecodeError):
+                raise CaptureFailure("restore_record_invalid") from None
+            schema = event.get("schema_version") if isinstance(event, dict) else None
+            if (
+                schema not in additions or set(event) != common | additions[schema]
+                or event.get("deployment") != deployment
+                or event.get("request_id") != request or event.get("sequence") != sequence
+                or event.get("state") not in states
+                or event.get("state") not in transitions[previous]
+                or POINT.fullmatch(str(event.get("source_recovery_point_id"))) is None
+                or (
+                    source_point is not None
+                    and event.get("source_recovery_point_id") != source_point
+                )
+                or (
+                    event.get("safety_recovery_point_id") is not None
+                    and POINT.fullmatch(str(event["safety_recovery_point_id"])) is None
+                )
+            ):
+                raise CaptureFailure("restore_record_invalid")
+            events.append(event)
+            previous = event["state"]
+            source_point = event["source_recovery_point_id"]
+        latest = events[-1]
+        safety_ids = {
+            str(event["safety_recovery_point_id"])
+            for event in events if event["safety_recovery_point_id"] is not None
+        }
+        if latest["state"] == terminal:
+            protected.difference_update(safety_ids)
+        else:
+            protected.add(str(latest["source_recovery_point_id"]))
+            protected.update(safety_ids)
+    return protected
+
+
+def delete_recovery_point_versions(
+    store: ObjectStore, deployment: str, destination: str, point_id: str,
+) -> int:
+    """Delete only exact versions from one verified manifest, with the manifest last."""
+    record = _existing_manifest_record(store, deployment, destination, point_id)
+    if record is None:
+        raise CaptureFailure("recovery_manifest_missing")
+    manifest, manifest_metadata = record
+    deleted = 0
+    for component in sorted(
+        manifest["components"], key=lambda item: (str(item["kind"]), str(item["key"]))
+    ):
+        key, version_id = str(component["key"]), str(component["version_id"])
+        store.delete(key, version_id)
+        if store.head(key, version_id) is not None:
+            raise CaptureFailure("recovery_point_deletion_failed")
+        deleted += 1
+    key = manifest_key(deployment, point_id)
+    if manifest_metadata.version_id is None:
+        raise CaptureFailure("recovery_manifest_version_missing")
+    store.delete(key, manifest_metadata.version_id)
+    if store.head(key, manifest_metadata.version_id) is not None:
+        raise CaptureFailure("recovery_point_deletion_failed")
+    return deleted
+
+
+def enforce_retention(
+    store: ObjectStore, deployment: str, destination: str, retain_last: int,
+    replacement_point_id: str,
+) -> dict[str, object]:
+    """Delete verified ordinary points oldest-first and stop at the first failure."""
+    try:
+        manifests = verified_inventory(store, deployment, destination)
+        protected = restore_protected_points(store, deployment, manifests)
+        candidates = retention_candidates(
+            manifests, retain_last, replacement_point_id, protected
+        )
+        eligible_count = sum(
+            str(item.get("recovery_point_id")) not in protected for item in manifests
+        )
+    except Exception:
+        return {
+            "outcome": "backup_succeeded_retention_failed", "error_code": "retention_failed",
+            "deleted": 0, "remaining": 0,
+        }
+    deleted = 0
+    for point_id in candidates:
+        try:
+            delete_recovery_point_versions(store, deployment, destination, point_id)
+        except Exception:
+            return {
+                "outcome": "backup_succeeded_retention_failed",
+                "error_code": "retention_failed", "deleted": deleted,
+                "remaining": eligible_count - deleted,
+            }
+        deleted += 1
+    return {
+        "outcome": "succeeded", "error_code": None, "deleted": deleted,
+        "remaining": eligible_count - deleted,
+    }

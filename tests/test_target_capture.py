@@ -7,7 +7,8 @@ from pathlib import Path
 from gimme import recovery
 from gimme.target_capture import (
     BotoObjectStore, Component, ObjectMetadata, capture_postgres, capture_valkey, publish,
-    recovery_point_id,
+    delete_recovery_point_versions, enforce_retention, recovery_point_id, retention_candidates,
+    restore_protected_points, verified_inventory,
 )
 
 
@@ -33,7 +34,13 @@ class Store:
 
     def delete(self, key, version_id):
         self.deleted.append((key, version_id))
+        latest = self.objects.get((key, None))
         self.objects.pop((key, version_id), None)
+        if latest is not None and latest[1].version_id == version_id:
+            self.objects.pop((key, None), None)
+
+    def list(self, prefix):
+        return sorted({key for key, _version in self.objects if key.startswith(prefix)})
 
 
 def test_identity_matches_existing_recovery_contract() -> None:
@@ -124,6 +131,87 @@ def test_lost_manifest_response_preserves_published_components(tmp_path) -> None
     assert publish(store, "example-app", "primary", point_id, [component])[
         "recovery_point_id"
     ] == point_id
+
+
+def test_target_retention_selects_verified_ordinary_points_and_deletes_exact_versions(
+    tmp_path,
+) -> None:
+    store = Store()
+    point_ids = []
+    for index in range(3):
+        path = tmp_path / f"postgres-{index}.dump"
+        body = f"dump-{index}".encode()
+        path.write_bytes(body)
+        point_id = recovery_point_id("example-app", "primary", f"scheduled-{index}")
+        point_ids.append(point_id)
+        publish(
+            store, "example-app", "primary", point_id,
+            [Component(
+                "postgres", path, len(body), hashlib.sha256(body).hexdigest(), "17.2",
+                "pg-custom-v1",
+            )],
+            observed_at=datetime(2026, 9, 20, 10, index, tzinfo=UTC),
+        )
+
+    inventory = verified_inventory(store, "example-app", "primary")
+    assert retention_candidates(inventory, 2, point_ids[2]) == [point_ids[0]]
+    manifest = next(
+        item for item in inventory if item["recovery_point_id"] == point_ids[0]
+    )
+    component = manifest["components"][0]
+
+    assert delete_recovery_point_versions(
+        store, "example-app", "primary", point_ids[0]
+    ) == 1
+    assert (component["key"], component["version_id"]) in store.deleted
+    assert verified_inventory(store, "example-app", "primary") == [
+        item for item in inventory if item["recovery_point_id"] != point_ids[0]
+    ]
+    assert enforce_retention(
+        store, "example-app", "primary", 1, point_ids[2]
+    ) == {"outcome": "succeeded", "error_code": None, "deleted": 1, "remaining": 1}
+
+
+def test_target_retention_stops_on_exact_version_failure_and_never_selects_safety() -> None:
+    replacement = "rp_" + "3" * 20
+    manifests = [
+        {"recovery_point_id": "rp_" + "1" * 20, "created_at": "2026-01-01", "safety": True},
+        {"recovery_point_id": "rp_" + "2" * 20, "created_at": "2026-01-02", "safety": False},
+        {"recovery_point_id": replacement, "created_at": "2026-01-03", "safety": False},
+    ]
+    assert retention_candidates(
+        manifests, 1, replacement, {"rp_" + "1" * 20}
+    ) == ["rp_" + "2" * 20]
+
+
+def test_target_restore_events_protect_incomplete_source_and_release_completed_safety() -> None:
+    store = Store()
+    source = "rp_" + "1" * 20
+    safety = "rp_" + "2" * 20
+    manifests = [{"recovery_point_id": safety, "safety": True}]
+
+    def event(sequence, state):
+        document = {
+            "schema_version": 2, "deployment": "example-app", "request_id": "restore-1",
+            "sequence": sequence, "state": state,
+            "created_at": f"2026-09-20T10:0{sequence}:00+00:00",
+            "source_recovery_point_id": source, "destination": "primary",
+            "safety_recovery_point_id": safety,
+        }
+        body = json.dumps(document, sort_keys=True).encode()
+        store.put(
+            f"gimme/restores/example-app/restore-1/{sequence:06d}.json",
+            body, hashlib.sha256(body).hexdigest(),
+        )
+
+    event(0, "started")
+    assert restore_protected_points(store, "example-app", manifests) == {source, safety}
+    for sequence, state in enumerate((
+        "maintenance_entered", "safety_verified", "artifact_verified", "shadow_verified",
+        "data_replaced", "verification_succeeded", "cleanup_completed", "completed",
+    ), 1):
+        event(sequence, state)
+    assert restore_protected_points(store, "example-app", manifests) == set()
 
 
 def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() -> None:
