@@ -44,6 +44,10 @@ OUTCOMES = {
     "credentials_unavailable", "credentials_expired", "destination_unavailable",
     "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
 }
+ERROR_CODES = OUTCOMES | {
+    "maintenance_failed", "postgres_capture_failed", "valkey_capture_failed",
+    "publish_failed",
+}
 AUTHORITY_KEYS = {
     "schema_version", "deployment", "target", "policy_fingerprint", "cadence",
     "calendar", "stable_delay_seconds", "retain_last", "quiesce_wait_seconds",
@@ -109,7 +113,7 @@ def validate_status(document: dict[str, Any]) -> dict[str, Any]:
         set(document) != STATUS_KEYS
         or document.get("schema_version") != 1
         or document["outcome"] not in OUTCOMES | {None}
-        or document["error_code"] not in OUTCOMES | {None}
+        or document["error_code"] not in ERROR_CODES | {None}
         or NAME.fullmatch(str(document["deployment"])) is None
         or any(
             value is not None and (
@@ -189,7 +193,7 @@ def attempt_status(
 ) -> dict[str, Any]:
     if (
         outcome not in OUTCOMES | {None}
-        or error_code not in OUTCOMES | {None}
+        or error_code not in ERROR_CODES | {None}
         or NAME.fullmatch(deployment) is None
     ):
         raise RunnerFailure("status_unavailable")
@@ -361,12 +365,12 @@ def maintenance(
             stderr=subprocess.DEVNULL, timeout=900, check=False,
         )
         if result.returncode != 0:
-            raise RunnerFailure("capture_failed")
+            raise RunnerFailure("maintenance_failed")
         succeeded = True
     except RunnerFailure:
         raise
     except Exception:
-        raise RunnerFailure("capture_failed") from None
+        raise RunnerFailure("maintenance_failed") from None
     finally:
         if action == "exit" and succeeded:
             request_path.unlink(missing_ok=True)
@@ -415,11 +419,13 @@ def capture_recovery(
         or (destination["auth_mode"] == "stored") != (aws_credentials is not None)
     ):
         raise RunnerFailure("policy_stale")
+    stage = "capture"
     try:
         store = object_store or target_capture.BotoObjectStore(destination, aws_credentials)
         point_id = target_capture.recovery_point_id(
             deployment, destination["name"], scheduled_request
         )
+        stage = "postgres_capture"
         components = [target_capture.capture_postgres(
             placement["database_identifier"], postgres["version"], directory,
         )]
@@ -438,11 +444,13 @@ def capture_recovery(
                 or valkey.get("kind") != "valkey"
             ):
                 raise RunnerFailure("policy_stale")
+            stage = "valkey_capture"
             components.append(target_capture.capture_valkey(
                 execution["prefix"], execution["host"], execution["port"],
                 execution["tls"], valkey["version"], directory,
                 valkey_credential_path,
             ))
+        stage = "publish"
         return target_capture.publish(
             store, deployment, destination["name"], point_id, components,
             observed_at=observed_at, before_publish=before_publish,
@@ -459,7 +467,7 @@ def capture_recovery(
             "recovery_manifest_tampered": "verification_failed",
             "recovery_manifest_invalid": "verification_failed",
         }
-        raise RunnerFailure(mapped.get(safe, "capture_failed")) from None
+        raise RunnerFailure(mapped.get(safe, f"{stage}_failed")) from None
     finally:
         for component in locals().get("components", []):
             try:
@@ -598,9 +606,10 @@ def execute_scheduled(
             "credentials_unavailable", "credentials_expired", "destination_unavailable",
             "policy_stale", "verification_failed",
         } else "capture_failed"
+        error_code = code if code in ERROR_CODES else outcome
         status.update({
             "finished_at": datetime.now(UTC).isoformat(), "outcome": outcome,
-            "error_code": outcome,
+            "error_code": error_code,
         })
     except Exception:
         status.update({

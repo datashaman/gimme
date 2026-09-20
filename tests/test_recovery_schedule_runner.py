@@ -280,7 +280,7 @@ def test_runner_maintenance_uses_only_fixed_helper_and_protected_request(
     assert "shell" not in calls[0][1]
 
     runner["maintenance"]("enter", authority, "scheduled-abc", execute=execute)
-    with pytest.raises(runner["RunnerFailure"], match="^capture_failed$"):
+    with pytest.raises(runner["RunnerFailure"], match="^maintenance_failed$"):
         runner["maintenance"](
             "exit", authority, "scheduled-abc",
             execute=lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
@@ -321,6 +321,23 @@ def test_scheduled_execution_records_expired_session_credentials(tmp_path) -> No
 
     assert result["outcome"] == "credentials_expired"
     assert result["error_code"] == "credentials_expired"
+
+
+def test_scheduled_execution_records_fixed_capture_stage_without_raw_error(tmp_path) -> None:
+    runner = runner_namespace()
+    runner["acquire_lock"] = lambda _path: SimpleNamespace(close=lambda: None)
+    runner["execute_capture_policy"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        runner["RunnerFailure"]("valkey_capture_failed")
+    )
+
+    result = runner["execute_scheduled"](
+        runner_authority(), SimpleNamespace(), tmp_path / "status.json",
+        tmp_path / "lock", tmp_path / "capture",
+        observed_at=datetime(2026, 9, 20, 10, 20, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "capture_failed"
+    assert result["error_code"] == "valkey_capture_failed"
 
 
 def test_on_demand_uses_shared_capture_policy_and_deployment_lock(tmp_path) -> None:
