@@ -455,6 +455,28 @@ def test_target_runtime_orchestration_preserves_fixed_task_order(
     ]
 
 
+def test_managed_valkey_recovery_mcp_adapter_uses_current_orchestrator(
+    monkeypatch,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    class FakeManagedValkeyRecoveryOrchestrator:
+        def plan_restore_resource(self, name, snapshot):
+            seen.append((name, snapshot))
+            return {"kind": "valkey_restore", "plan_id": "plan_" + "0" * 20}
+
+    monkeypatch.setattr(
+        server_module,
+        "_managed_valkey_recovery_orchestrator",
+        FakeManagedValkeyRecoveryOrchestrator,
+    )
+
+    result = server_module.plan_restore_resource("shared-cache", "snapshot-1")
+
+    assert result["kind"] == "valkey_restore"
+    assert seen == [("shared-cache", "snapshot-1")]
+
+
 async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
