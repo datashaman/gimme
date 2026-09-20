@@ -34,14 +34,15 @@ from gimme.control import (
 from gimme.control_plans import (
     deployment_release_plan, deployment_removal_plan, deployment_resource_plan,
     exact_plan, migration_plan, registration_update_plan,
-    resource_binding_plan, resource_cleanup_plan, resource_provision_plan, target_stack_plan,
+    resource_binding_plan, resource_cleanup_plan, target_stack_plan,
     resource_forget_plan, valkey_binding_plan, valkey_destroy_plan,
-    valkey_provision_plan, valkey_restore_plan, valkey_rotation_plan,
+    valkey_restore_plan, valkey_rotation_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.journal import OperationJournal
 from gimme.recovery import ComponentDump, preflight_backup_destination
 from gimme.recovery_orchestration import RecoveryOrchestrator
+from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.resources_postgres import ResourceError
 from gimme.secrets import (
     BotoAWSSecretAdapter, SecretError, load_applied_secret_manifest,
@@ -106,6 +107,17 @@ def _recovery_orchestrator() -> RecoveryOrchestrator:
         valkey_runtime=_valkey_runtime,
         bounded_marker_values=_bounded_marker_values,
         journal=_journal,
+    )
+
+
+def _managed_resource_orchestrator() -> ManagedResourceOrchestrator:
+    """Compose managed Resource orchestration from the current adapters."""
+    return ManagedResourceOrchestrator(
+        store=store,
+        rds_postgres=rds_postgres,
+        elasticache_valkey=elasticache_valkey,
+        deployment_resource_locks=_deployment_resource_locks,
+        assert_plan=_assert_plan,
     )
 
 
@@ -1491,9 +1503,7 @@ def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[s
 def _refuse_unverifiable_tls_region(state: ControlState, resource: AWSRDSPostgresResource) -> None:
     # Only the AWS commercial-region trust bundle is pinned, so a us-gov-* or cn-* instance could be
     # created but never bound. Refuse before anything is created.
-    network = state.aws_networks.get(resource.aws_network)
-    if network is not None and network.region.startswith(("us-gov-", "cn-")):
-        raise ResourceError("aws_rds_tls_region_unsupported")
+    return _managed_resource_orchestrator()._refuse_unverifiable_tls_region(state, resource)
 
 
 def _refuse_unavailable_node_type(
@@ -1501,52 +1511,23 @@ def _refuse_unavailable_node_type(
 ) -> None:
     # The one AWS read registration makes: a node type the account cannot buy in the region
     # would only fail later, at create.
-    network = state.aws_networks[resource.aws_network]
-    options = elasticache_valkey.live_options(
-        state.provider_accounts[network.provider_account], network
-    )
-    if resource.node_type not in options.node_types:
-        raise ResourceError("aws_elasticache_node_type_unavailable")
+    return _managed_resource_orchestrator()._refuse_unavailable_node_type(state, resource)
 
 
 def _managed_resource(name: str) -> tuple[ControlState, AWSRDSPostgresResource]:
-    state = store.load()
-    resource = state.resources.get(name)
-    if resource is None:
-        raise KeyError(f"resource '{name}' is not registered")
-    if not isinstance(resource, AWSRDSPostgresResource):
-        raise ValueError(f"resource '{name}' is not a managed AWS RDS PostgreSQL resource")
-    _refuse_unverifiable_tls_region(state, resource)
-    return state, resource
+    return _managed_resource_orchestrator()._managed_resource(name)
 
 
 def _managed_valkey(name: str) -> tuple[ControlState, AWSElastiCacheValkeyResource] | None:
-    state = store.load()
-    resource = state.resources.get(name)
-    return (state, resource) if isinstance(resource, AWSElastiCacheValkeyResource) else None
+    return _managed_resource_orchestrator()._managed_valkey(name)
 
 
 def _resource_provision_plan(name: str) -> dict[str, object]:
-    if (valkey := _managed_valkey(name)) is not None:
-        observed = resources_valkey_module.load_observed(store.root, name)
-        return valkey_provision_plan(name, valkey[1], observed)
-    _state, resource = _managed_resource(name)
-    observed = resources_postgres_module.load_observed(store.root, name)
-    return resource_provision_plan(name, resource, observed)
+    return _managed_resource_orchestrator()._resource_provision_plan(name)
 
 
 def _resource_deployment_names(name: str) -> list[str]:
-    return sorted(
-        deployment_name
-        for deployment_name, deployment in store.load().deployments.items()
-        if (
-            deployment.resources.database == name
-            or (
-                deployment.resources.valkey is not None
-                and deployment.resources.valkey.resource == name
-            )
-        )
-    )
+    return _managed_resource_orchestrator()._resource_deployment_names(name)
 
 
 @mcp.tool(annotations=READ)
@@ -1554,7 +1535,7 @@ def _resource_deployment_names(name: str) -> list[str]:
 def plan_apply_resource(name: Name) -> dict[str, object]:
     """Plan provisioning or reconciling one managed AWS RDS PostgreSQL instance or
     ElastiCache Valkey replication group."""
-    return _resource_provision_plan(name)
+    return _managed_resource_orchestrator().plan_apply_resource(name)
 
 
 @mcp.tool(annotations=WRITE)
@@ -1563,142 +1544,20 @@ def apply_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Create the RDS instance, or converge an existing one onto desired state with one
     immediate modification, polling at most 30 seconds before returning a bounded pending
     phase. Never returns a decrypted credential."""
-    with _deployment_resource_locks(*_resource_deployment_names(name)):
-        expected = _resource_provision_plan(name)
-        _assert_plan(expected, plan_id)
-        if (valkey := _managed_valkey(name)) is not None:
-            state, cache = valkey
-            network = state.aws_networks[cache.aws_network]
-            workload_store = cast(
-                AWSSecretsManagerStore, state.secret_stores[cache.workload_secret_store]
-            )
-            return {"changed": True, **resources_valkey_module.apply_provision(
-                elasticache_valkey, store.root,
-                state.provider_accounts[network.provider_account],
-                network, cache, name, workload_store, cache.workload_secret_store,
-            )}
-        state, resource = _managed_resource(name)
-        network = state.aws_networks[resource.aws_network]
-        account = state.provider_accounts[network.provider_account]
-        result = resources_postgres_module.apply_provision(
-            rds_postgres, store.root, account, network, resource, name
-        )
-        return {"changed": True, **result}
+    return _managed_resource_orchestrator().apply_resource(name, plan_id)
 
 
 @mcp.tool(annotations=READ)
 def inspect_resource(name: Name) -> dict[str, object]:
     """Read-only, secret-free provider identity, health, and version for one resource."""
-    state = store.load()
-    resource = state.resources.get(name)
-    if resource is None:
-        raise KeyError(f"resource '{name}' is not registered")
-    if isinstance(resource, AWSElastiCacheValkeyResource):
-        return _inspect_valkey(state, name, resource)
-    if not isinstance(resource, AWSRDSPostgresResource):
-        return {
-            "resource": name, "provider": resource.provider, "target": resource.target,
-            "kind": resource.kind, "version": resource.version,
-        }
-    observed = resources_postgres_module.load_observed(store.root, name)
-    network = state.aws_networks[resource.aws_network]
-    account = state.provider_accounts[network.provider_account]
-    live: resources_postgres_module.InstanceObservation | None = None
-    refresh_error: str | None = None
-    try:
-        live = rds_postgres.describe_instance(
-            account, network, resources_postgres_module.derive_instance_identifier(name)
-        )
-    except ResourceError as exc:
-        refresh_error = str(exc)
-    result: dict[str, object] = {
-        "resource": name, "provider": "aws_rds_postgres",
-        "phase": "absent" if observed is None else observed["phase"],
-        "source": "cache" if live is None else "live",
-    }
-    if refresh_error is not None:
-        result["refresh_error"] = refresh_error
-    if live is not None:
-        result.update(
-            phase="ready" if live.status == "available" and not live.converging else "pending",
-            status=live.status, engine_version=live.engine_version, identity=live.identity,
-            endpoint=live.endpoint, port=live.port,
-            drift=resources_postgres_module.instance_drift(resource, live),
-        )
-    elif observed is not None:
-        result.update(
-            status=observed["status"], engine_version=observed["engine_version"],
-            identity=observed["identity"], endpoint=observed["endpoint"], port=observed["port"],
-        )
-    if observed is not None:
-        result["allocations"] = {
-            deployment_name: {
-                "database": allocation["database_identifier"], "status": allocation["status"],
-            }
-            for deployment_name, allocation in cast(
-                dict[str, dict[str, object]], observed["allocations"]
-            ).items()
-        }
-    return result
+    return _managed_resource_orchestrator().inspect_resource(name)
 
 
 def _inspect_valkey(
     state: ControlState, name: str, resource: AWSElastiCacheValkeyResource
 ) -> dict[str, object]:
     """Bounded and secret-free: no endpoint, address, ARN, user, or secret identifier."""
-    observed = resources_valkey_module.load_observed(store.root, name)
-    network = state.aws_networks[resource.aws_network]
-    group_id = resources_valkey_module.derive_group_id(name)
-    live: resources_valkey_module.GroupObservation | None = None
-    refresh_error: str | None = None
-    try:
-        live = elasticache_valkey.describe_group(
-            state.provider_accounts[network.provider_account], network, group_id
-        )
-    except ResourceError as exc:
-        refresh_error = str(exc)
-    result: dict[str, object] = {
-        "resource": name, "provider": resource.provider, "kind": resource.kind,
-        "phase": "absent" if observed is None else observed["phase"],
-        "source": "cache" if live is None else "live",
-    }
-    if refresh_error is not None:
-        result["refresh_error"] = refresh_error
-    operation = resources_valkey_module.busy_operation(store.root, name)
-    if operation is not None:
-        result["operation"] = operation
-        progress = resources_valkey_module.operation_progress(store.root, name, operation)
-        if progress:
-            result["progress"] = progress
-    if live is not None:
-        issues = resources_valkey_module.structural_issues(resource, live, group_id)
-        result.update(
-            phase="restoring" if operation == "restoring"
-            else progress.get("phase", "destroying") if operation == "destroying"
-            else "pending" if operation == "provisioning"
-            else resources_valkey_module.group_phase(live, issues), status=live.status,
-            engine_version=live.engine_version,
-            effective_durability=live.effective_durability, issues=issues,
-            drift=resources_valkey_module.group_drift(resource, live),
-        )
-    elif observed is not None:
-        result.update(
-            phase=progress.get("phase", "destroying") if operation == "destroying"
-            else "pending" if operation == "provisioning"
-            else result["phase"],
-            status=observed["status"], engine_version=observed["engine_version"],
-            effective_durability=observed["effective_durability"], issues=observed["issues"],
-        )
-    elif operation == "provisioning":
-        result["phase"] = "pending"
-    if observed is not None:
-        result["allocations"] = {
-            deployment_name: {"status": allocation["status"]}
-            for deployment_name, allocation in cast(
-                dict[str, dict[str, object]], observed["allocations"]
-            ).items()
-        }
-    return result
+    return _managed_resource_orchestrator()._inspect_valkey(state, name, resource)
 
 
 def _managed_valkey_binding(
