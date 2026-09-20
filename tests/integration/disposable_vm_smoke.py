@@ -290,6 +290,96 @@ def seed_recovery_valkey_state() -> dict[str, object]:
     return json.loads(output)
 
 
+def observe_recovery_valkey_state() -> dict[str, object]:
+    """Read fixed integration keys without accepting a caller-supplied key or prefix."""
+    return json.loads(ssh_python_output(textwrap.dedent(
+        """
+        import base64
+        import json
+        import socket
+
+        connection = socket.create_connection(("127.0.0.1", 6379), timeout=10)
+        reader = connection.makefile("rb")
+
+        def call(*arguments):
+            parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+            connection.sendall(
+                b"*%d\\r\\n" % len(parts)
+                + b"".join(b"$%d\\r\\n%s\\r\\n" % (len(item), item) for item in parts)
+            )
+            line = reader.readline()
+            kind, value = line[:1], line[1:-2]
+            if kind == b"+":
+                return value
+            if kind == b":":
+                return int(value)
+            if kind == b"$":
+                size = int(value)
+                if size < 0:
+                    return None
+                return reader.read(size + 2)[:-2]
+            raise RuntimeError("unexpected Valkey response")
+
+        selected = (
+            b"gimme:smoke-default:\\x00binary",
+            b"gimme:smoke-default:persistent",
+            b"gimme:smoke-default:expiring",
+            b"gimme:smoke-default:unexpected",
+        )
+        observed = {}
+        for key in selected:
+            payload = call("DUMP", key)
+            if payload is not None:
+                observed[base64.b64encode(key).decode()] = {
+                    "dump": base64.b64encode(payload).decode(),
+                    "expiry": call("PEXPIRETIME", key),
+                }
+        unrelated = b"gimme:smoke-preview:unrelated"
+        unrelated_dump = call("DUMP", unrelated)
+        print(json.dumps({
+            "selected": observed,
+            "unrelated_dump": (
+                None if unrelated_dump is None
+                else base64.b64encode(unrelated_dump).decode()
+            ),
+        }))
+        """
+    )))
+
+
+def mutate_recovery_valkey_state(*, empty: bool = False) -> None:
+    """Mutate only the fixed selected integration prefix."""
+    ssh_python(textwrap.dedent(
+        f"""
+        import socket
+
+        connection = socket.create_connection(("127.0.0.1", 6379), timeout=10)
+        reader = connection.makefile("rb")
+
+        def call(*arguments):
+            parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+            connection.sendall(
+                b"*%d\\r\\n" % len(parts)
+                + b"".join(b"$%d\\r\\n%s\\r\\n" % (len(item), item) for item in parts)
+            )
+            line = reader.readline()
+            if line[:1] not in (b"+", b":"):
+                raise RuntimeError("unexpected Valkey response")
+
+        keys = (
+            b"gimme:smoke-default:\\x00binary",
+            b"gimme:smoke-default:persistent",
+            b"gimme:smoke-default:expiring",
+            b"gimme:smoke-default:unexpected",
+        )
+        call("UNLINK", *keys)
+        if not {empty!r}:
+            call("SET", b"gimme:smoke-default:persistent", b"mutated")
+            call("SET", b"gimme:smoke-default:unexpected", b"must-be-cleared")
+        """
+    ))
+
+
 def observed_version(output: str, pattern: str, name: str) -> str:
     match = re.search(pattern, output)
     if match is None:
@@ -550,6 +640,116 @@ def restore_probe_value() -> str:
     ))
 
 
+def complete_restore(gimme, request_id: str) -> None:
+    verification = gimme.plan_verify_restore(RECOVERY_DEPLOYMENT, request_id)
+    completed = gimme.apply_verify_restore(
+        RECOVERY_DEPLOYMENT, request_id, str(verification["plan_id"])
+    )
+    if completed["state"] != "completed":
+        raise AssertionError(f"Restore did not complete: {completed}")
+    if deployment_route_status(tls=True) != "200":
+        raise AssertionError("completed Restore did not return public routing online")
+
+
+def assert_restore_maintenance() -> None:
+    if deployment_route_status(tls=True) != "503":
+        raise AssertionError("data-replaced Restore exposed routing before verification")
+
+
+def assert_recovery_valkey_state(
+    expected: dict[str, object], unrelated_dump: object,
+) -> None:
+    observed = observe_recovery_valkey_state()
+    if observed["selected"] != expected:
+        raise AssertionError("Valkey Restore did not reproduce exact payloads and expiries")
+    if observed["unrelated_dump"] != unrelated_dump:
+        raise AssertionError("Valkey Restore changed the other Deployment prefix")
+
+
+def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object]) -> None:
+    """Exercise both partial variants, full Restore, empty prefix, and isolation."""
+    install_restore_fixture()
+    set_restore_probe("before")
+    unrelated_dump = observe_recovery_valkey_state()["unrelated_dump"]
+
+    mutate_recovery_valkey_state()
+    valkey_plan = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, first_point_id, "ci-valkey-partial", ["valkey"]
+    )
+    if not valkey_plan["ready"] or not valkey_plan["partial"]:
+        raise AssertionError(f"Valkey partial Restore was not ready: {valkey_plan}")
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, first_point_id, "ci-valkey-partial",
+        str(valkey_plan["plan_id"]), str(valkey_plan["confirmation"]), ["valkey"],
+    )
+    assert_restore_maintenance()
+    if restore_probe_value() != "before":
+        raise AssertionError("Valkey-only Restore changed PostgreSQL")
+    assert_recovery_valkey_state(seeded["expected"], unrelated_dump)
+    valkey_record = gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, "ci-valkey-partial"
+    )
+    safety_id = str(valkey_record["safety_recovery_point_id"])
+    safety = next(
+        item for item in gimme.list_recovery_points(RECOVERY_DEPLOYMENT)["recovery_points"]
+        if item["recovery_point_id"] == safety_id
+    )
+    if [item["kind"] for item in safety["components"]] != ["valkey"]:
+        raise AssertionError(f"Valkey-only Safety captured another component: {safety}")
+    complete_restore(gimme, "ci-valkey-partial")
+
+    set_restore_probe("before")
+    paired_seed = seed_recovery_valkey_state()
+    capture = gimme.plan_create_recovery_point(RECOVERY_DEPLOYMENT, "ci-paired-source")
+    created = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-paired-source", str(capture["plan_id"])
+    )
+    paired_point_id = str(created["recovery_point"]["recovery_point_id"])
+
+    set_restore_probe("after")
+    mutate_recovery_valkey_state()
+    mutated_valkey = observe_recovery_valkey_state()["selected"]
+    postgres_plan = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-postgres-partial", ["postgres"]
+    )
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-postgres-partial",
+        str(postgres_plan["plan_id"]), str(postgres_plan["confirmation"]), ["postgres"],
+    )
+    assert_restore_maintenance()
+    if restore_probe_value() != "before":
+        raise AssertionError("PostgreSQL-only Restore did not restore PostgreSQL")
+    if observe_recovery_valkey_state()["selected"] != mutated_valkey:
+        raise AssertionError("PostgreSQL-only Restore changed Valkey")
+    complete_restore(gimme, "ci-postgres-partial")
+
+    set_restore_probe("after")
+    full_plan = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-full-restore"
+    )
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-full-restore",
+        str(full_plan["plan_id"]), str(full_plan["confirmation"]),
+    )
+    assert_restore_maintenance()
+    if restore_probe_value() != "before":
+        raise AssertionError("full Restore did not restore PostgreSQL")
+    assert_recovery_valkey_state(paired_seed["expected"], unrelated_dump)
+    complete_restore(gimme, "ci-full-restore")
+
+    mutate_recovery_valkey_state(empty=True)
+    empty_plan = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-empty-valkey", ["valkey"]
+    )
+    gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, paired_point_id, "ci-empty-valkey",
+        str(empty_plan["plan_id"]), str(empty_plan["confirmation"]), ["valkey"],
+    )
+    assert_restore_maintenance()
+    assert_recovery_valkey_state(paired_seed["expected"], unrelated_dump)
+    complete_restore(gimme, "ci-empty-valkey")
+
+
 def verify_postgres_restore(gimme) -> None:
     """Exercise non-empty, failed verification/retry, and empty-replacement Restore."""
     from gimme.control import DeploymentRegistration, RecoveryPolicy
@@ -780,6 +980,7 @@ def verify_backup_destination() -> None:
         if "Active: active" not in str(gimme.target_service_status(TARGET, service)["output"]):
             raise AssertionError(f"{service} was not running after recovery capture")
 
+    verify_valkey_restore(gimme, str(point_id), seeded)
     verify_postgres_restore(gimme)
 
     postgres_key = (
