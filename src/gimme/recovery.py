@@ -351,15 +351,21 @@ def restore_event_key(deployment: str, request_id: str, sequence: int) -> str:
 
 
 def _validate_restore_event(document: object) -> dict[str, object]:
-    if not isinstance(document, dict) or set(document) != {
+    common_keys = {
         "schema_version", "deployment", "request_id", "sequence", "state", "created_at",
         "source_recovery_point_id", "destination", "safety_recovery_point_id",
-    }:
+    }
+    if not isinstance(document, dict) or (
+        document.get("schema_version") == 2 and set(document) != common_keys
+    ) or (
+        document.get("schema_version") == 3 and set(document) != common_keys | {
+            "selected_components", "untouched_components", "partial",
+        }
+    ) or document.get("schema_version") not in {2, 3}:
         raise RecoveryError("restore_record_invalid")
     destination = document.get("destination")
     if (
-        document.get("schema_version") != 2
-        or not isinstance(document.get("deployment"), str)
+        not isinstance(document.get("deployment"), str)
         or not isinstance(document.get("request_id"), str)
         or REQUEST_ID.fullmatch(str(document["request_id"])) is None
         or not isinstance(document.get("sequence"), int)
@@ -387,6 +393,31 @@ def _validate_restore_event(document: object) -> dict[str, object]:
     except ValueError:
         raise RecoveryError("restore_record_invalid") from None
     if created_at.tzinfo is None:
+        raise RecoveryError("restore_record_invalid")
+    if document["schema_version"] == 2:
+        document = {
+            **document,
+            "selected_components": ["postgres"],
+            "untouched_components": [],
+            "partial": False,
+        }
+    selected = document.get("selected_components")
+    untouched = document.get("untouched_components")
+    if (
+        not isinstance(selected, list)
+        or not 1 <= len(selected) <= 2
+        or len(selected) != len(set(selected))
+        or not set(selected) <= {"postgres", "valkey"}
+        or not isinstance(untouched, list)
+        or len(untouched) > 1
+        or len(untouched) != len(set(untouched))
+        or not set(untouched) <= {"postgres", "valkey"}
+        or set(selected) & set(untouched)
+        or set(selected) | set(untouched) not in (
+            {"postgres"}, {"valkey"}, {"postgres", "valkey"}
+        )
+        or document.get("partial") != bool(untouched)
+    ):
         raise RecoveryError("restore_record_invalid")
     return document
 
@@ -439,6 +470,9 @@ def append_restore_event(
     source_recovery_point_id: str, destination_provider: str,
     destination_resource: str, destination_kind: str, destination_version: str,
     safety_recovery_point_id: str | None = None,
+    selected_components: list[str] | None = None,
+    untouched_components: list[str] | None = None,
+    partial: bool = False,
 ) -> dict[str, object]:
     """Append and round-trip one immutable, secret-safe Restore transition."""
     events = _restore_events(destination, credentials, adapter, deployment, request_id)
@@ -452,6 +486,13 @@ def append_restore_event(
             "version": destination_version,
         },
         "safety_recovery_point_id": safety_recovery_point_id,
+        "selected_components": (
+            ["postgres"] if selected_components is None else selected_components
+        ),
+        "untouched_components": (
+            [] if untouched_components is None else untouched_components
+        ),
+        "partial": partial,
     }
     if previous is not None and any(previous[key] != value for key, value in identity.items()):
         raise RecoveryError("restore_request_conflict")
@@ -460,7 +501,7 @@ def append_restore_event(
         raise RecoveryError("restore_transition_invalid")
     sequence = len(events)
     event = _validate_restore_event({
-        "schema_version": 2, "deployment": deployment, "request_id": request_id,
+        "schema_version": 3, "deployment": deployment, "request_id": request_id,
         "sequence": sequence, "state": state, "created_at": datetime.now(UTC).isoformat(),
         **identity,
     })
@@ -499,6 +540,9 @@ def load_restore_record(
              if event["safety_recovery_point_id"] is not None),
             None,
         ),
+        "selected_components": latest["selected_components"],
+        "untouched_components": latest["untouched_components"],
+        "partial": latest["partial"],
     }
 
 

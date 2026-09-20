@@ -81,6 +81,8 @@ CorrelationId = Annotated[str, Field(pattern=r"^corr_[a-f0-9]{32}$")]
 OperationName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)]
 RequestId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$", max_length=64)]
 RecoveryPointId = Annotated[str, Field(pattern=r"^rp_[a-f0-9]{20}$")]
+RestoreComponent = Literal["postgres", "valkey"]
+RestoreComponents = Annotated[list[RestoreComponent], Field(min_length=1, max_length=2)]
 P = ParamSpec("P")
 R = TypeVar("R", bound=dict[str, object])
 _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", default=False)
@@ -1314,8 +1316,33 @@ def restore_record_resource(name: str, request_id: str) -> dict[str, object]:
     )
 
 
+def _normalize_restore_components(
+    manifest_components: list[dict[str, object]],
+    requested: list[str] | None,
+) -> list[str]:
+    available = [str(component.get("kind")) for component in manifest_components]
+    if (
+        not available
+        or len(available) != len(set(available))
+        or not set(available) <= {"postgres", "valkey"}
+    ):
+        raise RecoveryError("restore_component_manifest_invalid")
+    if requested is None:
+        return available
+    if (
+        not 1 <= len(requested) <= 2
+        or len(requested) != len(set(requested))
+        or not set(requested) <= {"postgres", "valkey"}
+    ):
+        raise RecoveryError("restore_component_selection_invalid")
+    if not set(requested) <= set(available):
+        raise RecoveryError("restore_component_missing")
+    return [component for component in available if component in requested]
+
+
 def _deployment_restore_plan(
     name: str, recovery_point_id: str, request_id: str,
+    components: list[str] | None = None,
 ) -> dict[str, object]:
     state, deployment, destination_name, destination = _recovery_context(name)
     _, credentials = _backup_destination_credentials(state, destination)
@@ -1324,6 +1351,15 @@ def _deployment_restore_plan(
     )
     if manifest is None:
         raise RecoveryError("restore_source_missing")
+    manifest_components = cast(list[dict[str, object]], manifest["components"])
+    selected_components = _normalize_restore_components(
+        manifest_components, components
+    )
+    available_components = [str(item["kind"]) for item in manifest_components]
+    untouched_components = [
+        component for component in available_components
+        if component not in selected_components
+    ]
     resource_name = deployment.resources.database
     resource = state.resources[resource_name] if resource_name is not None else None
     if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
@@ -1351,6 +1387,9 @@ def _deployment_restore_plan(
     request_conflict = existing_restore is not None and (
         existing_restore["source_recovery_point_id"] != recovery_point_id
         or existing_restore["destination"] != expected_destination
+        or existing_restore["selected_components"] != selected_components
+        or existing_restore["untouched_components"] != untouched_components
+        or existing_restore["partial"] != bool(untouched_components)
         or existing_restore["safety_recovery_point_id"] not in {
             None,
             recovery_module.safety_recovery_point_id(
@@ -1371,9 +1410,9 @@ def _deployment_restore_plan(
     )
     return deployment_restore_plan(
         name, recovery_point_id, request_id,
-        cast(list[dict[str, object]], manifest["components"]),
+        manifest_components,
         resource_name, resource.version, original_empty,
-        deployment.recovery.valkey,
+        selected_components,
         None if existing_restore is None else str(existing_restore["state"]),
         request_conflict,
         destination_changed,
@@ -1384,9 +1423,10 @@ def _deployment_restore_plan(
 @_journal_plan("restore_deployment", "name")
 def plan_restore_deployment(
     name: Name, recovery_point_id: RecoveryPointId, request_id: RequestId,
+    components: RestoreComponents | None = None,
 ) -> dict[str, object]:
-    """Plan a confirmed PostgreSQL-only Restore without mutating target or destination."""
-    return _deployment_restore_plan(name, recovery_point_id, request_id)
+    """Plan full Restore by default or an explicit bounded component subset."""
+    return _deployment_restore_plan(name, recovery_point_id, request_id, components)
 
 
 @mcp.tool(annotations=WRITE)
@@ -1397,6 +1437,7 @@ def apply_restore_deployment(
     request_id: RequestId,
     plan_id: PlanId,
     confirmation: str,
+    components: RestoreComponents | None = None,
 ) -> dict[str, object]:
     """Prepare and atomically activate one reviewed PostgreSQL Restore.
 
@@ -1404,7 +1445,9 @@ def apply_restore_deployment(
     completion step.
     """
     with _deployment_resource_lock(name):
-        expected = _deployment_restore_plan(name, recovery_point_id, request_id)
+        expected = _deployment_restore_plan(
+            name, recovery_point_id, request_id, components
+        )
         _assert_plan(expected, plan_id)
         if not expected["ready"]:
             raise RecoveryError("restore_not_ready")
@@ -1418,6 +1461,8 @@ def apply_restore_deployment(
         )
         if manifest is None:
             raise RecoveryError("restore_source_missing")
+        selected_components = cast(list[str], expected["selected_components"])
+        untouched_components = cast(list[str], expected["untouched_components"])
         component = next(
             (
                 item for item in manifest["components"]  # type: ignore[union-attr]
@@ -1453,6 +1498,9 @@ def apply_restore_deployment(
             "destination_kind": "postgres",
             "destination_version": resource.version,
             "safety_recovery_point_id": safety_id,
+            "selected_components": selected_components,
+            "untouched_components": untouched_components,
+            "partial": bool(expected["partial"]),
         }
         current = None if existing is None else str(existing["state"])
         changed = False
@@ -1597,6 +1645,9 @@ def apply_verify_restore(
             "safety_recovery_point_id": cast(
                 str | None, restore["safety_recovery_point_id"]
             ),
+            "selected_components": cast(list[str], restore["selected_components"]),
+            "untouched_components": cast(list[str], restore["untouched_components"]),
+            "partial": bool(restore["partial"]),
         }
         current = str(restore["state"])
         changed = False

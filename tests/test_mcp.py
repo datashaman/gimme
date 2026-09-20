@@ -731,12 +731,17 @@ def test_restore_plan_is_read_only_content_addressed_and_exactly_confirmed(
         "resource": "devbox-postgres", "provider": "target_local",
         "kind": "postgres", "version": "17.2", "empty": False,
     }
-    assert plan["confirmation"] == f"RESTORE DEPLOYMENT example-app FROM {point}"
+    assert plan["selected_components"] == ["postgres"]
+    assert plan["untouched_components"] == []
+    assert plan["partial"] is False
+    assert plan["confirmation"] == (
+        f"RESTORE DEPLOYMENT example-app FROM {point} COMPONENTS postgres"
+    )
     assert "database_identifier" not in str(plan)
     assert "gimme/recovery-points" not in str(plan)
 
 
-def test_restore_plan_reports_multi_component_and_version_incompatibility(
+def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     tmp_path, monkeypatch
 ) -> None:
     selected = use_recovery_store(tmp_path, monkeypatch)
@@ -753,7 +758,7 @@ def test_restore_plan_reports_multi_component_and_version_incompatibility(
             recovery_module.ComponentDump(
                 kind="postgres", local_path=postgres,
                 sha256=hashlib.sha256(b"pg").hexdigest(), bytes=2,
-                resource_version="16.6",
+                resource_version="17.2",
             ),
             recovery_module.ComponentDump(
                 kind="valkey", local_path=valkey,
@@ -772,9 +777,44 @@ def test_restore_plan_reports_multi_component_and_version_incompatibility(
     plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
 
     assert plan["ready"] is False
-    assert plan["readiness_issues"] == [
-        "multi_component_restore_unsupported", "source_version_incompatible",
+    assert plan["readiness_issues"] == ["valkey_restore_unsupported"]
+    assert plan["selected_components"] == ["postgres", "valkey"]
+    assert plan["untouched_components"] == []
+    assert plan["partial"] is False
+
+    partial = server_module.plan_restore_deployment(
+        "example-app", point, "restore-2", ["postgres"]
+    )
+
+    assert partial["ready"] is True
+    assert partial["selected_components"] == ["postgres"]
+    assert partial["untouched_components"] == ["valkey"]
+    assert partial["partial"] is True
+    assert partial["confirmation"] == (
+        f"PARTIAL RESTORE DEPLOYMENT example-app FROM {point} COMPONENTS postgres "
+        "BREAK CONSISTENCY WITH valkey"
+    )
+
+
+def test_restore_component_selector_is_bounded_normalized_and_explicitly_partial() -> None:
+    manifest = [{"kind": "postgres"}, {"kind": "valkey"}]
+
+    assert server_module._normalize_restore_components(manifest, None) == [
+        "postgres", "valkey",
     ]
+    assert server_module._normalize_restore_components(
+        manifest, ["valkey", "postgres"]
+    ) == ["postgres", "valkey"]
+    assert server_module._normalize_restore_components(manifest, ["postgres"]) == [
+        "postgres"
+    ]
+    for invalid in ([], ["postgres", "postgres"], ["filesystem"]):
+        with pytest.raises(RecoveryError, match="restore_component_selection_invalid"):
+            server_module._normalize_restore_components(manifest, invalid)
+    with pytest.raises(RecoveryError, match="restore_component_missing"):
+        server_module._normalize_restore_components(
+            [{"kind": "postgres"}], ["valkey"]
+        )
 
 
 def test_restore_markers_survive_deployer_prefixes_and_ansi_colours() -> None:
@@ -840,14 +880,24 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
     source_bytes = b"source-postgres-dump"
     source = tmp_path / "source.dump"
     source.write_bytes(source_bytes)
+    valkey = tmp_path / "valkey.dump"
+    valkey.write_bytes(b"valkey-archive")
     point = recovery_point_id("example-app", "primary", "source-1")
     recovery_module.create_recovery_point(
         "primary", selected.load().backup_destinations["primary"], None, adapter,
-        "example-app", point, recovery_module.ComponentDump(
-            kind="postgres", local_path=source,
-            sha256=hashlib.sha256(source_bytes).hexdigest(),
-            bytes=len(source_bytes), resource_version="17.2",
-        ),
+        "example-app", point, [
+            recovery_module.ComponentDump(
+                kind="postgres", local_path=source,
+                sha256=hashlib.sha256(source_bytes).hexdigest(),
+                bytes=len(source_bytes), resource_version="17.2",
+            ),
+            recovery_module.ComponentDump(
+                kind="valkey", local_path=valkey,
+                sha256=hashlib.sha256(b"valkey-archive").hexdigest(),
+                bytes=len(b"valkey-archive"), resource_version="8.0.1",
+                format="gimme-valkey-v1", records=0,
+            ),
+        ],
     )
     calls: list[tuple[str, str | None]] = []
 
@@ -867,11 +917,13 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
         return CommandResult(["dep"], 0, "ok")
 
     monkeypatch.setattr(server_module.runner, "run", fake_run)
-    plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
+    plan = server_module.plan_restore_deployment(
+        "example-app", point, "restore-1", ["postgres"]
+    )
 
     result = server_module.apply_restore_deployment(
         "example-app", point, "restore-1", str(plan["plan_id"]),
-        str(plan["confirmation"]),
+        str(plan["confirmation"]), ["postgres"],
     )
 
     assert result == {
@@ -897,6 +949,9 @@ def test_apply_restore_captures_safety_prepares_and_swaps_under_maintenance(
     record = server_module.restore_record_resource("example-app", "restore-1")
     assert record["state"] == "data_replaced"
     assert record["events"] == 6
+    assert record["selected_components"] == ["postgres"]
+    assert record["untouched_components"] == ["valkey"]
+    assert record["partial"] is True
     safety_id = record["safety_recovery_point_id"]
     safety = recovery_module.find_recovery_point(
         "primary", selected.load().backup_destinations["primary"], None, adapter,

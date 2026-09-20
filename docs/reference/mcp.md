@@ -266,8 +266,8 @@ On-demand Recovery Points are created and listed with:
 | `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
-| `plan_restore_deployment` | Destination + remote read | Verify a PostgreSQL-only source, exact destination compatibility, and database emptiness; return exact effects and confirmation without mutation |
-| `apply_restore_deployment` | Remote + destination write | Enter request-owned maintenance, protect non-empty current data with a Safety Recovery Point, verify and prepare the exact source artifact in a shadow database, then atomically swap the database while remaining in maintenance for verification |
+| `plan_restore_deployment` | Destination + remote read | Default to every manifest component or normalize an explicit `postgres`/`valkey` selector; return full/partial semantics, exact effects, compatibility, and confirmation without mutation |
+| `apply_restore_deployment` | Remote + destination write | Apply the exact reviewed selector; PostgreSQL selection enters request-owned maintenance, protects non-empty current data, verifies a shadow database, then swaps while remaining in maintenance |
 | `plan_verify_restore` | Destination read | Plan private application and managed-process verification for a data-replaced Restore |
 | `apply_verify_restore` | Remote + destination write | Resume managed processes behind maintenance, verify database connectivity and configured live-health probes privately, re-quiesce on failure, and restore routing only after retry-safe cleanup and final verification |
 
@@ -307,18 +307,26 @@ while any Restore using them is incomplete. Object Lock or legal hold is never b
 
 Restore transitions are append-only, immutable objects in the bound Backup Destination.
 `list_restores` and `gimme://deployments/{name}/restores/{request_id}` expose only the
-Deployment and request identities, source Recovery Point identity, destination provider/kind/
-version, current bounded state, timestamps, event count, and Safety Recovery Point identity.
+Deployment and request identities, source Recovery Point identity, selected and untouched
+component kinds, full/partial semantics, destination provider/kind/version, current bounded
+state, timestamps, event count, and Safety Recovery Point identity.
 Storage identities, database identities, paths, SQL, endpoints, and credentials remain private.
 
-`plan_restore_deployment` is read-only. It validates the exact source manifest under the
-owning Deployment, requires a PostgreSQL-only source and policy, compares the source and
-current target-local PostgreSQL versions exactly, and runs one fixed catalog inspection to
+`plan_restore_deployment` is read-only. An omitted component selector chooses every component
+in manifest order. An explicit selector is a non-empty, duplicate-free subset of `postgres`
+and `valkey`, also normalized into manifest order. Selecting a strict subset is visibly partial
+and its stronger confirmation states that consistency with untouched components is intentionally
+broken. The current execution slice supports PostgreSQL selection; selecting Valkey returns the
+fixed `valkey_restore_unsupported` readiness issue until the next stacked slice lands.
+
+For PostgreSQL selection, planning compares the source and current target-local PostgreSQL
+versions exactly and runs one fixed catalog inspection to
 classify the current database as `empty` or `nonempty`. Tables, partitioned tables, views,
 materialized views, sequences, foreign tables, routines, user-defined composite/domain/enum/
 range types, and non-baseline extensions all make the database non-empty; an ambiguous or
-failed inspection fails closed. The plan contains no database name and returns the exact
-`RESTORE DEPLOYMENT <deployment> FROM <recovery-point>` confirmation.
+failed inspection fails closed. The plan contains no database name. Its exact confirmation names
+the selected components; partial confirmation also names untouched components and the deliberate
+consistency break.
 `apply_restore_deployment` advances the destination-authoritative Restore record through
 maintenance, Safety Recovery Point protection (when the destination was non-empty), exact
 artifact verification, shadow verification, and atomic data replacement. A failed or successful
