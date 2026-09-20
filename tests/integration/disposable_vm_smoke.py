@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import sys
 import textwrap
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -537,6 +540,14 @@ def install_restore_fixture() -> None:
         "current/artisan": """#!/usr/bin/env php
 <?php
 $env = parse_ini_file(__DIR__ . '/../shared/.env', false, INI_SCANNER_RAW);
+$root = dirname(__DIR__);
+if (in_array('queue:work', $argv, true)) {
+    if (is_file($root . '/shared/force-process-failure')) { exit(1); }
+    while (true) { sleep(1); }
+}
+foreach (['optimize', 'optimize:clear', 'queue:restart'] as $command) {
+    if (in_array($command, $argv, true)) { exit(0); }
+}
 $connection = pg_connect(sprintf(
     'host=%s port=%s dbname=%s user=%s password=%s',
     $env['DB_HOST'], $env['DB_PORT'], $env['DB_DATABASE'],
@@ -590,6 +601,7 @@ namespace Smoke {
 }
 """,
         "current/bootstrap/app.php": "<?php return new \\Smoke\\App();\n",
+        "current/bootstrap/cache/.gitignore": "",
         "current/public/index.php": "<?php http_response_code(200); echo 'ready';\n",
     }
     ssh_python(textwrap.dedent(
@@ -654,6 +666,107 @@ def restore_probe_value() -> str:
         print(result.stdout.strip())
         """
     ))
+
+
+def postgres_blocker(database: str, *, wait_for_database: bool = False) -> subprocess.Popen:
+    """Hold one identifiable real PostgreSQL session until the caller terminates it."""
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
+        raise AssertionError("invalid fixed integration database identity")
+    program = textwrap.dedent(
+        f"""
+        import os
+        import subprocess
+        import time
+
+        database = {database!r}
+        if {wait_for_database!r}:
+            for _ in range(3000):
+                observed = subprocess.run(
+                    ["psql", "-Atq", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+                     "-c", f"SELECT 1 FROM pg_database WHERE datname = '{{database}}'"],
+                    text=True, capture_output=True,
+                )
+                if observed.returncode == 0 and observed.stdout.strip() == "1":
+                    break
+                time.sleep(0.01)
+            else:
+                raise SystemExit(2)
+        subprocess.run(
+            ["psql", "-d", database, "-c", "SELECT pg_sleep(300)"],
+            env={{**os.environ, "PGAPPNAME": "gimme-integration-blocker"}},
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        """
+    )
+    process = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", HOSTNAME, "python3", "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if process.stdin is None:
+        raise AssertionError("could not open PostgreSQL blocker input")
+    process.stdin.write(program.encode())
+    process.stdin.close()
+    return process
+
+
+def postgres_admin(statement: str, *, as_postgres: bool = False) -> str:
+    """Run one internally fixed statement without OpenSSH shell re-tokenization."""
+    return ssh_python_output(textwrap.dedent(
+        f"""
+        import subprocess
+        command = ["psql", "-Atq", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+                   "-c", {statement!r}]
+        if {as_postgres!r}:
+            command = ["sudo", "-n", "-u", "postgres", *command]
+        result = subprocess.run(
+            command,
+            check=True, text=True, stdout=subprocess.PIPE,
+        )
+        print(result.stdout.strip())
+        """
+    ))
+
+
+def wait_for_postgres_blocker(database: str, *, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    statement = (
+        "SELECT count(*) FROM pg_stat_activity "
+        f"WHERE datname = '{database}' "
+        "AND application_name = 'gimme-integration-blocker'"
+    )
+    while time.monotonic() < deadline:
+        if postgres_admin(statement) == "1":
+            return
+        time.sleep(0.05)
+    raise AssertionError("PostgreSQL blocker did not connect")
+
+
+def stop_postgres_blocker(process: subprocess.Popen, database: str) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+    statement = (
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+        f"WHERE datname = '{database}' "
+        "AND application_name = 'gimme-integration-blocker'"
+    )
+    postgres_admin(statement)
+
+
+def set_database_connections(database: str, allowed: bool) -> None:
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
+        raise AssertionError("invalid fixed integration database identity")
+    action = "true" if allowed else "false"
+    postgres_admin(
+        f'ALTER DATABASE "{database}" ALLOW_CONNECTIONS {action}',
+        as_postgres=True,
+    )
 
 
 def complete_restore(gimme, request_id: str) -> None:
@@ -894,20 +1007,35 @@ def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object])
 
 def verify_postgres_restore(gimme) -> None:
     """Exercise non-empty, failed verification/retry, and empty-replacement Restore."""
+    from gimme.config import QueueWorkerConfig
     from gimme.control import DeploymentRegistration, RecoveryPolicy
     from gimme.recovery import RecoveryError
 
     current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
     proposed = DeploymentRegistration.from_deployment(current).model_copy(
-        update={"recovery": RecoveryPolicy(
-            destination=BACKUP_DESTINATION, valkey=False, quiesce_wait_seconds=1,
-        )}
+        update={
+            "recovery": RecoveryPolicy(
+                destination=BACKUP_DESTINATION, valkey=False, quiesce_wait_seconds=1,
+            ),
+            "workers": QueueWorkerConfig(processes=1),
+        }
     )
     policy_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, proposed)
     gimme.update_deployment(
         RECOVERY_DEPLOYMENT, proposed, str(policy_plan["plan_id"])
     )
     install_restore_fixture()
+    resources_plan = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
+    if not resources_plan["ready"]:
+        raise AssertionError(f"worker resources were not ready: {resources_plan}")
+    gimme.apply_deployment_resources(
+        RECOVERY_DEPLOYMENT, str(resources_plan["plan_id"])
+    )
+    worker_unit = f"gimme-worker-{RECOVERY_DEPLOYMENT}@1.service"
+    if ssh("systemctl", "show", "--property=ActiveState", "--value", worker_unit) != (
+        "active"
+    ):
+        raise AssertionError("managed worker was not active before Restore")
     set_restore_probe("before")
 
     state = gimme.store.load()
@@ -945,6 +1073,42 @@ def verify_postgres_restore(gimme) -> None:
         RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
     )
     point_id = str(created["recovery_point"]["recovery_point_id"])
+    database = gimme.store.deployment(
+        RECOVERY_DEPLOYMENT
+    ).placement.database_identifier
+
+    with patch.object(
+        gimme.shutil, "disk_usage", return_value=SimpleNamespace(free=0)
+    ):
+        insufficient = gimme.plan_restore_deployment(
+            RECOVERY_DEPLOYMENT, point_id, "ci-capacity-reject"
+        )
+    if insufficient["readiness_issues"] != ["restore_capacity_insufficient"]:
+        raise AssertionError(
+            f"insufficient controller capacity was not rejected: {insufficient}"
+        )
+    if deployment_route_status(tls=True) != "200":
+        raise AssertionError("capacity rejection entered maintenance")
+
+    other = gimme.store.deployment("smoke-preview")
+    other_with_recovery = DeploymentRegistration.from_deployment(other).model_copy(
+        update={"recovery": RecoveryPolicy(
+            destination=BACKUP_DESTINATION, valkey=False, quiesce_wait_seconds=1,
+        )}
+    )
+    other_plan = gimme.plan_update_deployment("smoke-preview", other_with_recovery)
+    gimme.update_deployment(
+        "smoke-preview", other_with_recovery, str(other_plan["plan_id"])
+    )
+    try:
+        gimme.plan_restore_deployment(
+            "smoke-preview", point_id, "ci-owner-reject"
+        )
+    except RecoveryError as exc:
+        if str(exc) != "restore_source_missing":
+            raise AssertionError(f"cross-Deployment source was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("cross-Deployment Recovery Point was accepted")
 
     set_restore_probe("after")
     restore = gimme.plan_restore_deployment(
@@ -952,10 +1116,15 @@ def verify_postgres_restore(gimme) -> None:
     )
     if not restore["ready"] or restore["destination"]["empty"]:
         raise AssertionError(f"non-empty Restore did not require Safety capture: {restore}")
-    applied = gimme.apply_restore_deployment(
-        RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
-        str(restore["plan_id"]), str(restore["confirmation"]),
-    )
+    live_blocker = postgres_blocker(database)
+    wait_for_postgres_blocker(database)
+    try:
+        applied = gimme.apply_restore_deployment(
+            RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
+            str(restore["plan_id"]), str(restore["confirmation"]),
+        )
+    finally:
+        stop_postgres_blocker(live_blocker, database)
     if applied["state"] != "data_replaced" or restore_probe_value() != "before":
         raise AssertionError(f"PostgreSQL data was not replaced: {applied}")
     record = gimme.restore_record_resource(
@@ -970,21 +1139,49 @@ def verify_postgres_restore(gimme) -> None:
     if not safety_plan["safety_protected"]:
         raise AssertionError("unresolved Safety Recovery Point was not protected")
 
-    gate = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/shared/force-health-failure"
-    ssh("touch", gate)
-    verification = gimme.plan_verify_restore(
+    artisan = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/current/artisan"
+    blocked_artisan = f"{artisan}.process-failure"
+    ssh("mv", artisan, blocked_artisan)
+    process_verification = gimme.plan_verify_restore(
         RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
     )
     try:
-        gimme.apply_verify_restore(
-            RECOVERY_DEPLOYMENT, "ci-nonempty-restore",
-            str(verification["plan_id"]),
+        try:
+            gimme.apply_verify_restore(
+                RECOVERY_DEPLOYMENT, "ci-nonempty-restore",
+                str(process_verification["plan_id"]),
+            )
+        except RecoveryError as exc:
+            if str(exc) != "restore_verification_failed":
+                raise AssertionError(f"process failure was not bounded: {exc}") from exc
+        else:
+            raise AssertionError("missing managed-process executable unexpectedly verified")
+    finally:
+        ssh("mv", blocked_artisan, artisan)
+        ssh("sudo", "-n", "systemctl", "reset-failed", worker_unit)
+    if gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
+    )["state"] != "verification_failed":
+        raise AssertionError("managed-process failure was not recorded")
+    assert_restore_maintenance()
+
+    try:
+        set_database_connections(database, False)
+        verification = gimme.plan_verify_restore(
+            RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
         )
-    except RecoveryError as exc:
-        if str(exc) != "restore_verification_failed":
-            raise AssertionError(f"Restore failure was not bounded: {exc}") from exc
-    else:
-        raise AssertionError("forced private health failure unexpectedly passed")
+        try:
+            gimme.apply_verify_restore(
+                RECOVERY_DEPLOYMENT, "ci-nonempty-restore",
+                str(verification["plan_id"]),
+            )
+        except RecoveryError as exc:
+            if str(exc) != "restore_verification_failed":
+                raise AssertionError(f"database failure was not bounded: {exc}") from exc
+        else:
+            raise AssertionError("disabled database connections unexpectedly verified")
+    finally:
+        set_database_connections(database, True)
     if gimme.restore_record_resource(
         RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
     )["state"] != "verification_failed":
@@ -992,6 +1189,21 @@ def verify_postgres_restore(gimme) -> None:
     maintenance_status = deployment_route_status(tls=True)
     if maintenance_status != "503":
         raise AssertionError("failed verification exposed restored data")
+    gate = f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/shared/force-health-failure"
+    ssh("touch", gate)
+    health_retry = gimme.plan_verify_restore(
+        RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
+    )
+    try:
+        gimme.apply_verify_restore(
+            RECOVERY_DEPLOYMENT, "ci-nonempty-restore",
+            str(health_retry["plan_id"]),
+        )
+    except RecoveryError as exc:
+        if str(exc) != "restore_verification_failed":
+            raise AssertionError(f"private health failure was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("forced private health failure unexpectedly passed")
     ssh("rm", "-f", gate)
     retry = gimme.plan_verify_restore(RECOVERY_DEPLOYMENT, "ci-nonempty-restore")
     completed = gimme.apply_verify_restore(
@@ -1007,9 +1219,48 @@ def verify_postgres_restore(gimme) -> None:
     )["safety_protected"]:
         raise AssertionError("completed Restore did not release its Safety point")
 
-    database = gimme.store.deployment(
-        RECOVERY_DEPLOYMENT
-    ).placement.database_identifier
+    set_restore_probe("after")
+    compensation_request = "ci-swap-compensation"
+    compensation = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, compensation_request
+    )
+    shadow_digest = hashlib.sha256(
+        f"gimme-postgres-restore-v1\0{database}\0{compensation_request}".encode()
+    ).hexdigest()[:24]
+    shadow_database = f"gimme_shadow_{shadow_digest}"
+    shadow_blocker = postgres_blocker(shadow_database, wait_for_database=True)
+    try:
+        try:
+            gimme.apply_restore_deployment(
+                RECOVERY_DEPLOYMENT, point_id, compensation_request,
+                str(compensation["plan_id"]), str(compensation["confirmation"]),
+            )
+        except RecoveryError as exc:
+            if str(exc) != "restore_swap_failed":
+                raise AssertionError(f"swap failure was not bounded: {exc}") from exc
+        else:
+            raise AssertionError("shadow connection did not force swap compensation")
+        wait_for_postgres_blocker(shadow_database, timeout=5)
+    finally:
+        stop_postgres_blocker(shadow_blocker, shadow_database)
+    if restore_probe_value() != "after":
+        raise AssertionError("failed swap did not compensate the original database name")
+    if gimme.restore_record_resource(
+        RECOVERY_DEPLOYMENT, compensation_request
+    )["state"] != "shadow_verified":
+        raise AssertionError("failed swap did not remain resumable at shadow verification")
+    assert_restore_maintenance()
+    compensation_retry = gimme.plan_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, compensation_request
+    )
+    resumed = gimme.apply_restore_deployment(
+        RECOVERY_DEPLOYMENT, point_id, compensation_request,
+        str(compensation_retry["plan_id"]), str(compensation_retry["confirmation"]),
+    )
+    if resumed["state"] != "data_replaced" or restore_probe_value() != "before":
+        raise AssertionError("compensated swap did not resume safely")
+    complete_restore(gimme, compensation_request)
+
     ssh("sudo", "-n", "-u", "postgres", "dropdb", database)
     ssh("sudo", "-n", "-u", "postgres", "createdb", "--owner", database, database)
     replacement = gimme.plan_restore_deployment(
@@ -1037,6 +1288,69 @@ def verify_postgres_restore(gimme) -> None:
     replacement_status = deployment_route_status(tls=True)
     if replacement_status != "200":
         raise AssertionError("empty replacement Restore did not recover the application")
+
+    corrupt_capture = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-corrupt-source"
+    )
+    corrupt_created = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-corrupt-source", str(corrupt_capture["plan_id"])
+    )
+    corrupt_point = str(corrupt_created["recovery_point"]["recovery_point_id"])
+    corrupt_key = (
+        f"gimme/recovery-points/{RECOVERY_DEPLOYMENT}/{corrupt_point}/postgres.dump"
+    )
+    versions = minio_client().list_object_versions(
+        Bucket=BACKUP_BUCKET, Prefix=corrupt_key
+    ).get("Versions", [])
+    bound = next(
+        (item for item in versions if item["Key"] == corrupt_key and item["IsLatest"]),
+        None,
+    )
+    if bound is None:
+        raise AssertionError("corruption fixture component version is missing")
+    minio_client().delete_object(
+        Bucket=BACKUP_BUCKET, Key=corrupt_key, VersionId=str(bound["VersionId"])
+    )
+    try:
+        gimme.plan_restore_deployment(
+            RECOVERY_DEPLOYMENT, corrupt_point, "ci-corrupt-reject"
+        )
+    except RecoveryError as exc:
+        if str(exc) != "recovery_manifest_tampered":
+            raise AssertionError(f"corrupt source failure was not bounded: {exc}") from exc
+    else:
+        raise AssertionError("missing bound source version was accepted")
+    if deployment_route_status(tls=True) != "200":
+        raise AssertionError("source corruption rejection entered maintenance")
+
+    without_worker = DeploymentRegistration.from_deployment(
+        gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    ).model_copy(update={"workers": None})
+    without_worker_plan = gimme.plan_update_deployment(
+        RECOVERY_DEPLOYMENT, without_worker
+    )
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, without_worker, str(without_worker_plan["plan_id"])
+    )
+    cleanup_plan = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
+    gimme.apply_deployment_resources(
+        RECOVERY_DEPLOYMENT, str(cleanup_plan["plan_id"])
+    )
+    if ssh("systemctl", "show", "--property=ActiveState", "--value", worker_unit) == (
+        "active"
+    ):
+        raise AssertionError("managed worker remained active after the matrix")
+
+
+def reconcile_replacement_helper_policy(gimme) -> None:
+    """Replacement Target identity changes require a fresh terminal bootstrap policy."""
+    before = str(gimme.inspect_target(TARGET)["output"])
+    if "privileged_helper=bootstrap_required" not in before:
+        raise AssertionError("replacement Target did not invalidate the prior helper policy")
+    subprocess.run(["gimme-bootstrap-target", TARGET], check=True)
+    after = str(gimme.inspect_target(TARGET)["output"])
+    if "privileged_helper=ready" not in after:
+        raise AssertionError("replacement Target helper policy was not reconciled")
 
 
 def verify_backup_destination() -> None:
@@ -1123,6 +1437,7 @@ def verify_backup_destination() -> None:
             raise AssertionError(f"{service} was not running after recovery capture")
 
     verify_valkey_restore(gimme, str(point_id), seeded)
+    reconcile_replacement_helper_policy(gimme)
     verify_postgres_restore(gimme)
 
     postgres_key = (
