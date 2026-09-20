@@ -1609,6 +1609,67 @@ def verify_backup_workflows(gimme) -> None:
     verify_postgres_restore(gimme)
     verify_recovery_point_deletion(gimme)
 
+    # Force automatic retention to fail on the oldest candidate's first exact version.
+    # The replacement must remain verified, and a later successful capture must retry pruning.
+    from gimme.control import DeploymentRegistration
+
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    constrained = DeploymentRegistration.from_deployment(current).model_copy(update={
+        "recovery": current.recovery.model_copy(update={"retain_last": 1})
+    })
+    constrained_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, constrained)
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, constrained, str(constrained_plan["plan_id"])
+    )
+    baseline_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-retention-baseline"
+    )
+    baseline = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-retention-baseline", str(baseline_plan["plan_id"])
+    )
+    if baseline["retention"]["outcome"] != "succeeded":
+        raise AssertionError(f"retention baseline did not converge: {baseline}")
+    held_key, held_version = recovery_point_object_versions(
+        RECOVERY_DEPLOYMENT, str(baseline["recovery_point"]["recovery_point_id"])
+    )[0]
+    client = minio_client()
+    client.put_object_legal_hold(
+        Bucket=BACKUP_BUCKET, Key=held_key, VersionId=held_version,
+        LegalHold={"Status": "ON"},
+    )
+    partial_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-retention-partial"
+    )
+    try:
+        partial = gimme.create_recovery_point(
+            RECOVERY_DEPLOYMENT, "ci-retention-partial", str(partial_plan["plan_id"])
+        )
+        if partial["retention"]["outcome"] != "backup_succeeded_retention_failed":
+            raise AssertionError(f"automatic retention did not stop safely: {partial}")
+    finally:
+        client.put_object_legal_hold(
+            Bucket=BACKUP_BUCKET, Key=held_key, VersionId=held_version,
+            LegalHold={"Status": "OFF"},
+        )
+    retry_plan = gimme.plan_create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-retention-retry"
+    )
+    retry = gimme.create_recovery_point(
+        RECOVERY_DEPLOYMENT, "ci-retention-retry", str(retry_plan["plan_id"])
+    )
+    if retry["retention"]["outcome"] != "succeeded" or (
+        retry["retention"]["deleted"] < 1
+    ):
+        raise AssertionError(f"later capture did not resume automatic retention: {retry}")
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    restored = DeploymentRegistration.from_deployment(current).model_copy(update={
+        "recovery": current.recovery.model_copy(update={"retain_last": 7})
+    })
+    restored_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, restored)
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, restored, str(restored_plan["plan_id"])
+    )
+
     superseded_plan = gimme.plan_create_recovery_point(
         RECOVERY_DEPLOYMENT, "ci-superseded-source"
     )
@@ -1645,6 +1706,35 @@ def verify_backup_workflows(gimme) -> None:
         raise AssertionError(
             f"missing bound component did not enter deletion_failed: {missing_inventory}"
         )
+
+    # Finish with a real scheduled Deployment removal and prove it removes its authority.
+    current = gimme.store.deployment(RECOVERY_DEPLOYMENT)
+    scheduled = DeploymentRegistration.from_deployment(current).model_copy(update={
+        "recovery": current.recovery.model_copy(update={
+            "cadence": {"kind": "hourly", "minute": 41}
+        })
+    })
+    scheduled_plan = gimme.plan_update_deployment(RECOVERY_DEPLOYMENT, scheduled)
+    gimme.update_deployment(
+        RECOVERY_DEPLOYMENT, scheduled, str(scheduled_plan["plan_id"])
+    )
+    resources = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
+    gimme.apply_deployment_resources(RECOVERY_DEPLOYMENT, str(resources["plan_id"]))
+    removal = gimme.plan_remove_deployment(RECOVERY_DEPLOYMENT)
+    gimme.remove_deployment(
+        RECOVERY_DEPLOYMENT, str(removal["plan_id"]), str(removal["confirmation"])
+    )
+    unit = f"gimme-recovery-{RECOVERY_DEPLOYMENT}.timer"
+    if ssh("sudo", "systemctl", "show", unit, "-p", "LoadState", "--value") != (
+        "not-found"
+    ):
+        raise AssertionError("Deployment removal retained its Recovery Schedule timer")
+    authority = ssh(
+        "sudo", "find", "/etc/gimme/recovery-schedules", "-maxdepth", "1",
+        "-name", f"{RECOVERY_DEPLOYMENT}*", "-print",
+    )
+    if authority:
+        raise AssertionError(f"Deployment removal retained schedule authority: {authority}")
 
     for path in (STATE_PATH, STATE_DIRECTORY / "operations.jsonl"):
         if path.exists() and "gimme-ci-secret" in path.read_text():
@@ -1767,6 +1857,59 @@ def verify_recovery_schedule_matrix(gimme, ambient_definition) -> None:
     past = datetime.now(UTC) - timedelta(hours=1)
     apply_policy({"kind": "daily", "hour": past.hour, "minute": past.minute})
     ssh("sudo", "systemctl", "stop", f"{unit}.service")
+
+    # Hold the real Deployment operation lock through the runner's fixed five-minute bound.
+    # This proves the installed service records a busy attempt without capture or stale queueing.
+    lock_path = (
+        f"{APPS_ROOT}/deployments/{RECOVERY_DEPLOYMENT}/shared/.gimme-resource.lock"
+    )
+    holder = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", HOSTNAME, "python3", "-"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    assert holder.stdin is not None and holder.stdout is not None
+    holder.stdin.write(textwrap.dedent(
+        f"""
+        import fcntl
+        import time
+
+        with open({lock_path!r}, "a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            print("READY", flush=True)
+            time.sleep(305)
+        """
+    ))
+    holder.stdin.close()
+    if holder.stdout.readline().strip() != "READY":
+        raise AssertionError("disposable lock holder did not acquire the Deployment lock")
+    busy_started = time.monotonic()
+    ssh("sudo", "systemctl", "start", f"{unit}.service")
+    busy_elapsed = time.monotonic() - busy_started
+    holder.wait(timeout=15)
+    busy = gimme.get_recovery_schedule_status(RECOVERY_DEPLOYMENT)
+    if busy.get("outcome") != "deployment_busy" or not 295 <= busy_elapsed <= 315:
+        raise AssertionError(
+            f"scheduled lock timeout was not bounded without capture: {busy_elapsed}, {busy}"
+        )
+
+    # A real PostgreSQL outage must remain a fixed, secret-safe capture failure and restore
+    # maintenance before the same deterministic slot is retried successfully.
+    ssh("sudo", "systemctl", "stop", "postgresql")
+    try:
+        try:
+            ssh("sudo", "systemctl", "start", f"{unit}.service")
+        except subprocess.CalledProcessError:
+            pass
+        failed = gimme.get_recovery_schedule_status(RECOVERY_DEPLOYMENT)
+        if (
+            failed.get("outcome") != "capture_failed"
+            or failed.get("error_code") != "postgres_capture_failed"
+        ):
+            raise AssertionError(f"scheduled capture failure was not bounded: {failed}")
+    finally:
+        ssh("sudo", "systemctl", "start", "postgresql")
+
     try:
         ssh("sudo", "systemctl", "start", f"{unit}.service")
     except subprocess.CalledProcessError:
