@@ -1316,7 +1316,7 @@ def verify_postgres_restore(gimme) -> None:
             RECOVERY_DEPLOYMENT, corrupt_point, "ci-corrupt-reject"
         )
     except RecoveryError as exc:
-        if str(exc) != "restore_source_missing":
+        if str(exc) != "recovery_manifest_tampered":
             raise AssertionError(f"corrupt source failure was not bounded: {exc}") from exc
     else:
         raise AssertionError("missing bound source version was accepted")
