@@ -1422,14 +1422,17 @@ def _deployment_restore_plan(
     resource = state.resources[resource_name] if resource_name is not None else None
     if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
         raise RecoveryError("restore_destination_incompatible")
-    observation = _run_deployment(
-        "gimme:recovery:inspect-postgres", name, timeout=60
-    )
-    states = _bounded_marker_values(
-        observation.output, "GIMME_POSTGRES_RESTORE_PREFLIGHT|", {"empty", "nonempty"}
-    )
-    if len(states) != 1 or not states <= {"empty", "nonempty"}:
-        raise RecoveryError("restore_destination_inspection_failed")
+    states: set[str] = set()
+    if "postgres" in selected_components:
+        observation = _run_deployment(
+            "gimme:recovery:inspect-postgres", name, timeout=60
+        )
+        states = _bounded_marker_values(
+            observation.output, "GIMME_POSTGRES_RESTORE_PREFLIGHT|",
+            {"empty", "nonempty"},
+        )
+        if len(states) != 1 or not states <= {"empty", "nonempty"}:
+            raise RecoveryError("restore_destination_inspection_failed")
     try:
         existing_restore = recovery_module.load_restore_record(
             destination, credentials, backup_s3, name, request_id
@@ -1455,7 +1458,8 @@ def _deployment_restore_plan(
             ),
         }
     )
-    observed_empty = states == {"empty"}
+    # Ambiguous or uninspected selected destinations require Safety capture.
+    observed_empty = "postgres" in selected_components and states == {"empty"}
     original_empty = (
         observed_empty
         if existing_restore is None

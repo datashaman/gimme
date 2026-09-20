@@ -767,12 +767,15 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
             ),
         ],
     )
-    monkeypatch.setattr(
-        server_module.runner, "run",
-        lambda *args, **kwargs: CommandResult(
+    inspected: list[str] = []
+
+    def inspect(task, *args, **kwargs):
+        inspected.append(task)
+        return CommandResult(
             ["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty"
-        ),
-    )
+        )
+
+    monkeypatch.setattr(server_module.runner, "run", inspect)
 
     plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
 
@@ -827,6 +830,10 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     assert incompatible["readiness_issues"] == [
         "valkey_restore_unsupported", "valkey_destination_incompatible",
     ]
+    assert inspected == [
+        "gimme:recovery:inspect-postgres",
+        "gimme:recovery:inspect-postgres",
+    ], "Valkey-only planning must not inspect unselected PostgreSQL data"
 
 
 def test_restore_component_selector_is_bounded_normalized_and_explicitly_partial() -> None:
