@@ -1669,7 +1669,7 @@ if [ ! -f "\$env_path" ]; then
     else
         psql -d postgres -v ON_ERROR_STOP=1 -c "ALTER ROLE {$role} PASSWORD '\$password'"
     fi
-    psql -d postgres -v ON_ERROR_STOP=1 -c "GRANT {$role} TO CURRENT_USER WITH SET TRUE, INHERIT FALSE"
+    psql -d postgres -v ON_ERROR_STOP=1 -c "GRANT {$role} TO CURRENT_USER WITH ADMIN TRUE, SET TRUE, INHERIT FALSE"
     if ! psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{$database}'" | grep -qx 1; then
         createdb --owner="{$role}" "{$database}"
     fi

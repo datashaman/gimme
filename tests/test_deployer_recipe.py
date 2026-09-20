@@ -223,7 +223,7 @@ def test_app_role_can_become_database_owner() -> None:
         0
     ]
 
-    grant = "GRANT {$role} TO CURRENT_USER WITH SET TRUE, INHERIT FALSE"
+    grant = "GRANT {$role} TO CURRENT_USER WITH ADMIN TRUE, SET TRUE, INHERIT FALSE"
     assert grant in task
     assert task.index(grant) < task.index('createdb --owner="{$role}"')
 
