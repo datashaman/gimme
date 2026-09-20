@@ -172,6 +172,7 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
         "Environment=AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null"
         in service
     )
+    assert "AWS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" in service
     assert "LoadCredential=authority:/etc/gimme/recovery-schedules/example-app.json" in service
     assert "LoadCredential=aws:" not in service
     assert "LoadCredential=valkey:" not in service
