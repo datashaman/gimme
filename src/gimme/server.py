@@ -38,11 +38,14 @@ from gimme.deployer import CommandResult, DeployerRunner
 from gimme.deployment_resource_orchestration import DeploymentResourceOrchestrator
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.journal import OperationJournal
-from gimme.recovery import ComponentDump, preflight_backup_destination
+from gimme.control_plane_registration_orchestration import (
+    ControlPlaneRegistrationOrchestrator,
+)
+from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.resources_postgres import ResourceError
-from gimme.secrets import BotoAWSSecretAdapter, validate_aws_account, validate_aws_store
+from gimme.secrets import BotoAWSSecretAdapter
 from gimme.secrets import SecretError as SecretError  # noqa: F401 -- compatibility export
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +118,20 @@ def _managed_resource_orchestrator() -> ManagedResourceOrchestrator:
         assert_plan=_assert_plan,
         runner=runner,
         context=_context,
+    )
+
+
+def _control_plane_registration_orchestrator(
+) -> ControlPlaneRegistrationOrchestrator:
+    """Compose control-plane registration from the current adapters."""
+    return ControlPlaneRegistrationOrchestrator(
+        store=store,
+        aws_secrets=aws_secrets,
+        backup_s3=backup_s3,
+        assert_plan=_assert_plan,
+        replace=_replace,
+        delete=_delete,
+        backup_destination_credentials=_backup_destination_credentials,
     )
 
 
@@ -800,28 +817,18 @@ def list_operations(limit: int = 50, operation: OperationName | None = None,
 
 def _account_registration_plan(name: str, definition: AWSProviderAccount,
                                *, update: bool) -> dict[str, object]:
-    state = store.load()
-    exists = name in state.provider_accounts
-    if update != exists:
-        message = "provider account already exists" if exists else "provider account missing"
-        raise ValueError(message)
-    validate_aws_account(definition, aws_secrets)
-    proposed = _replace(state, "provider_accounts", name, definition)
-    return exact_plan({
-        "kind": "provider_account_update" if update else "provider_account_registration",
-        "name": name,
-        "current": (state.provider_accounts[name].model_dump(mode="json") if exists else None),
-        "proposed": proposed.provider_accounts[name].model_dump(mode="json"),
-        "identity_verified": True,
-        "effects": ["replace local desired state only", "make no AWS changes"],
-    })
+    return _control_plane_registration_orchestrator().account_registration_plan(
+        name, definition, update=update
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("register_provider_account", "name")
 def plan_register_provider_account(name: Name, definition: AWSProviderAccount) -> dict[str, object]:
     """Verify both exact AWS roles and plan a Provider Account registration."""
-    return _account_registration_plan(name, definition, update=False)
+    return _control_plane_registration_orchestrator().plan_register_provider_account(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -829,17 +836,18 @@ def plan_register_provider_account(name: Name, definition: AWSProviderAccount) -
 def register_provider_account(name: Name, definition: AWSProviderAccount,
                               plan_id: PlanId) -> dict[str, object]:
     """Register one verified AWS Provider Account without storing credentials."""
-    expected = _account_registration_plan(name, definition, update=False)
-    _assert_plan(expected, plan_id)
-    store.save(_replace(store.load(), "provider_accounts", name, definition))
-    return {"changed": True, "provider_account": name}
+    return _control_plane_registration_orchestrator().register_provider_account(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("update_provider_account", "name")
 def plan_update_provider_account(name: Name, definition: AWSProviderAccount) -> dict[str, object]:
     """Reverify and plan an exact Provider Account policy update."""
-    return _account_registration_plan(name, definition, update=True)
+    return _control_plane_registration_orchestrator().plan_update_provider_account(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -847,70 +855,41 @@ def plan_update_provider_account(name: Name, definition: AWSProviderAccount) -> 
 def update_provider_account(name: Name, definition: AWSProviderAccount,
                             plan_id: PlanId) -> dict[str, object]:
     """Apply one reviewed Provider Account policy update."""
-    expected = _account_registration_plan(name, definition, update=True)
-    _assert_plan(expected, plan_id)
-    store.save(_replace(store.load(), "provider_accounts", name, definition))
-    return {"changed": True, "provider_account": name}
+    return _control_plane_registration_orchestrator().update_provider_account(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("remove_provider_account", "name")
 def plan_remove_provider_account(name: Name) -> dict[str, object]:
     """Plan local removal when no Secret Store or Resource references the account."""
-    state = store.load()
-    if name not in state.provider_accounts:
-        raise KeyError("provider account is not registered")
-    stores = sorted(store_name for store_name, value in state.secret_stores.items()
-                    if isinstance(value, AWSSecretsManagerStore)
-                    and value.provider_account == name)
-    if stores:
-        raise ValueError("provider account is still referenced by a secret store")
-    return exact_plan({"kind": "provider_account_removal", "name": name,
-                       "effects": ["remove local desired state only", "make no AWS changes"]})
+    return _control_plane_registration_orchestrator().plan_remove_provider_account(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("remove_provider_account", "name")
 def remove_provider_account(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Apply a reviewed local-only Provider Account removal."""
-    expected = plan_remove_provider_account(name)
-    _assert_plan(expected, plan_id)
-    store.save(_delete(store.load(), "provider_accounts", name))
-    return {"changed": True, "provider_account": name}
+    return _control_plane_registration_orchestrator().remove_provider_account(
+        name, plan_id
+    )
 
 
 def _secret_store_registration_plan(name: str, definition: SecretStore,
                                     *, update: bool) -> dict[str, object]:
-    if name == "local-sops":
-        raise ValueError("the built-in local-sops store cannot be registered or updated")
-    state = store.load()
-    exists = name in state.secret_stores
-    if update != exists:
-        raise ValueError("secret store already exists" if exists else "secret store missing")
-    if not isinstance(definition, AWSSecretsManagerStore):
-        raise ValueError("only AWS Secrets Manager stores can be registered")
-    account = state.provider_accounts.get(definition.provider_account)
-    if account is None:
-        raise ValueError("secret store references an unknown provider account")
-    validate_aws_store(definition, aws_secrets)
-    aws_secrets.verify_role(account, account.inspection_role_arn)
-    proposed = _replace(state, "secret_stores", name, definition)
-    return exact_plan({
-        "kind": "secret_store_update" if update else "secret_store_registration",
-        "name": name,
-        "current": (state.secret_stores[name].model_dump(mode="json") if exists else None),
-        "proposed": proposed.secret_stores[name].model_dump(mode="json"),
-        "ownership_tag": f"gimme:secret-store={name}",
-        "identity_verified": True,
-        "effects": ["replace local desired state only", "make no AWS changes"],
-    })
+    return _control_plane_registration_orchestrator().secret_store_registration_plan(
+        name, definition, update=update
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("register_secret_store", "name")
 def plan_register_secret_store(name: Name, definition: SecretStore) -> dict[str, object]:
     """Verify bounded store policy and plan an AWS Secret Store registration."""
-    return _secret_store_registration_plan(name, definition, update=False)
+    return _control_plane_registration_orchestrator().plan_register_secret_store(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -918,17 +897,18 @@ def plan_register_secret_store(name: Name, definition: SecretStore) -> dict[str,
 def register_secret_store(name: Name, definition: SecretStore,
                           plan_id: PlanId) -> dict[str, object]:
     """Register one reviewed Secret Store without listing or mutating AWS secrets."""
-    expected = _secret_store_registration_plan(name, definition, update=False)
-    _assert_plan(expected, plan_id)
-    store.save(_replace(store.load(), "secret_stores", name, definition))
-    return {"changed": True, "secret_store": name}
+    return _control_plane_registration_orchestrator().register_secret_store(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("update_secret_store", "name")
 def plan_update_secret_store(name: Name, definition: SecretStore) -> dict[str, object]:
     """Plan an exact bounded Secret Store policy update."""
-    return _secret_store_registration_plan(name, definition, update=True)
+    return _control_plane_registration_orchestrator().plan_update_secret_store(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -936,36 +916,23 @@ def plan_update_secret_store(name: Name, definition: SecretStore) -> dict[str, o
 def update_secret_store(name: Name, definition: SecretStore,
                         plan_id: PlanId) -> dict[str, object]:
     """Apply one reviewed Secret Store policy update."""
-    expected = _secret_store_registration_plan(name, definition, update=True)
-    _assert_plan(expected, plan_id)
-    store.save(_replace(store.load(), "secret_stores", name, definition))
-    return {"changed": True, "secret_store": name}
+    return _control_plane_registration_orchestrator().update_secret_store(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("remove_secret_store", "name")
 def plan_remove_secret_store(name: Name) -> dict[str, object]:
     """Plan local Secret Store removal when no Deployment references it."""
-    if name == "local-sops":
-        raise ValueError("the built-in local-sops store cannot be removed")
-    state = store.load()
-    if name not in state.secret_stores:
-        raise KeyError("secret store is not registered")
-    if any(reference.store == name for deployment in state.deployments.values()
-           for reference in deployment.secrets.values()):
-        raise ValueError("secret store is still referenced by a deployment")
-    return exact_plan({"kind": "secret_store_removal", "name": name,
-                       "effects": ["remove local desired state only", "make no AWS changes"]})
+    return _control_plane_registration_orchestrator().plan_remove_secret_store(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("remove_secret_store", "name")
 def remove_secret_store(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Apply a reviewed local-only Secret Store removal."""
-    expected = plan_remove_secret_store(name)
-    _assert_plan(expected, plan_id)
-    store.save(_delete(store.load(), "secret_stores", name))
-    return {"changed": True, "secret_store": name}
+    return _control_plane_registration_orchestrator().remove_secret_store(name, plan_id)
 
 
 def _backup_destination_credentials(
@@ -984,41 +951,17 @@ def _backup_destination_credentials(
 def _backup_destination_registration_plan(
     name: str, definition: S3BackupDestination, *, update: bool
 ) -> dict[str, object]:
-    """Diff the proposed destination locally. Never calls the destination: a plan tool
-    must not touch remote state, and definition.endpoint is caller-supplied."""
-    state = store.load()
-    exists = name in state.backup_destinations
-    if update != exists:
-        message = (
-            "backup destination already exists" if exists else "backup destination missing"
-        )
-        raise ValueError(message)
-    proposed = _replace(state, "backup_destinations", name, definition)
-    return exact_plan(
-        {
-            "kind": "backup_destination_update" if update else "backup_destination_registration",
-            "name": name,
-            "current": (
-                state.backup_destinations[name].model_dump(mode="json") if exists else None
-            ),
-            "proposed": proposed.backup_destinations[name].model_dump(mode="json"),
-            "preflight_verified": False,
-            "preflight": "deferred to apply; plan performs no live destination calls",
-            "effects": ["replace local desired state only", "make no destination changes"],
-        }
+    return _control_plane_registration_orchestrator().backup_destination_registration_plan(
+        name, definition, update=update
     )
 
 
 def _backup_destination_apply(
     name: str, definition: S3BackupDestination, plan_id: str, *, update: bool
 ) -> dict[str, object]:
-    expected = _backup_destination_registration_plan(name, definition, update=update)
-    _assert_plan(expected, plan_id)
-    state = store.load()
-    _, credentials = _backup_destination_credentials(state, definition)
-    preflight_backup_destination(definition, credentials, backup_s3)
-    store.save(_replace(store.load(), "backup_destinations", name, definition))
-    return {"changed": True, "backup_destination": name}
+    return _control_plane_registration_orchestrator().backup_destination_apply(
+        name, definition, plan_id, update=update
+    )
 
 
 @mcp.tool(annotations=READ)
@@ -1027,7 +970,9 @@ def plan_register_backup_destination(
     name: Name, definition: S3BackupDestination
 ) -> dict[str, object]:
     """Diff a proposed Backup Destination registration; preflight runs at apply."""
-    return _backup_destination_registration_plan(name, definition, update=False)
+    return _control_plane_registration_orchestrator().plan_register_backup_destination(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -1036,7 +981,9 @@ def register_backup_destination(
     name: Name, definition: S3BackupDestination, plan_id: PlanId
 ) -> dict[str, object]:
     """Preflight-verify and register one Backup Destination without storing credentials."""
-    return _backup_destination_apply(name, definition, plan_id, update=False)
+    return _control_plane_registration_orchestrator().register_backup_destination(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
@@ -1045,7 +992,9 @@ def plan_update_backup_destination(
     name: Name, definition: S3BackupDestination
 ) -> dict[str, object]:
     """Diff a proposed Backup Destination policy update; preflight runs at apply."""
-    return _backup_destination_registration_plan(name, definition, update=True)
+    return _control_plane_registration_orchestrator().plan_update_backup_destination(
+        name, definition
+    )
 
 
 @mcp.tool(annotations=WRITE)
@@ -1054,38 +1003,25 @@ def update_backup_destination(
     name: Name, definition: S3BackupDestination, plan_id: PlanId
 ) -> dict[str, object]:
     """Preflight-verify and apply one reviewed Backup Destination policy update."""
-    return _backup_destination_apply(name, definition, plan_id, update=True)
+    return _control_plane_registration_orchestrator().update_backup_destination(
+        name, definition, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("remove_backup_destination", "name")
 def plan_remove_backup_destination(name: Name) -> dict[str, object]:
     """Plan local Backup Destination removal when no Deployment references it."""
-    state = store.load()
-    if name not in state.backup_destinations:
-        raise KeyError("backup destination is not registered")
-    if any(
-        deployment.recovery is not None and deployment.recovery.destination == name
-        for deployment in state.deployments.values()
-    ):
-        raise ValueError("backup destination is still referenced by a deployment")
-    return exact_plan(
-        {
-            "kind": "backup_destination_removal",
-            "name": name,
-            "effects": ["remove local desired state only", "make no destination changes"],
-        }
-    )
+    return _control_plane_registration_orchestrator().plan_remove_backup_destination(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("remove_backup_destination", "name")
 def remove_backup_destination(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Apply a reviewed local-only Backup Destination removal."""
-    expected = plan_remove_backup_destination(name)
-    _assert_plan(expected, plan_id)
-    store.save(_delete(store.load(), "backup_destinations", name))
-    return {"changed": True, "backup_destination": name}
+    return _control_plane_registration_orchestrator().remove_backup_destination(
+        name, plan_id
+    )
 
 
 @mcp.tool(annotations=READ)
