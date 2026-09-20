@@ -1158,6 +1158,7 @@ def verify_postgres_restore(gimme) -> None:
             raise AssertionError("missing managed-process executable unexpectedly verified")
     finally:
         ssh("mv", blocked_artisan, artisan)
+        ssh("sudo", "-n", "systemctl", "reset-failed", worker_unit)
     if gimme.restore_record_resource(
         RECOVERY_DEPLOYMENT, "ci-nonempty-restore"
     )["state"] != "verification_failed":
