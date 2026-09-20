@@ -9,6 +9,7 @@ def write_execution_tree(root: Path) -> None:
     files = {
         "src/gimme/server.py": "server-v1\n",
         "deploy.php": "recipe-v1\n",
+        "deploy/artifact.py": "artifact-v1\n",
         "deploy/aws-rds-global-bundle.pem": "bundle-v1\n",
         "deploy/configuration.php": "configuration-v1\n",
         "scripts/gimme-provision-stack": "stack-helper-v1\n",

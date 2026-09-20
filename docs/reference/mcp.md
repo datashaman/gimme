@@ -138,11 +138,37 @@ store. There are no profile, credential-file, object-key, or path inputs.
 | `verify_artifact_store_publisher` | Remote write | Run that probe and return bounded evidence plus the exact version of a fixed Gimme reader-capability object |
 | `plan_verify_artifact_store_reader` | Read | Content-address an exact read of that fixed object version on a Deployment Target |
 | `verify_artifact_store_reader` | Remote read | Prove the reader identity can read and checksum the exact version without any write/delete operation or publisher fallback |
+| `plan_build_artifact` | Remote read | Resolve and inspect one exact Deployment source, bind lock/runtime/platform/build inputs into `build_id`, and report authoritative publication status |
+| `build_artifact` | Remote write | Build a reviewed backend-only Laravel archive on the Build Target, verify and upload it, and publish provenance last |
+| `list_artifacts` | Remote read | List at most 100 newest secret-safe publications with fixed integrity/degradation status |
 
 Probe bytes are generated and consumed on the Target and never transit MCP. Referenced
 credentials use protected temporary files on both controller and Target and are removed in
 `finally` cleanup. Results contain only fixed status fields, SHA-256 values, and the opaque
 reader object version; provider errors and credentials are not returned.
+
+Backend-only `laravel_v1` publication is the first build implementation. Planning rejects
+Applications with frontend configuration or build secrets before remote work. It resolves an
+exact commit, inspects the bounded `composer.lock`, and binds repository fingerprint, commit,
+lock digest and size, normalized build policy, Deployment runtime pins, required extensions,
+observed platform capability, packaging version, and execution fingerprint into a versioned
+`build_id`.
+
+Apply repeats those checks, uses an owner-only derived workspace, and runs fixed frozen production
+Composer semantics without scripts. It rejects submodules, Git LFS pointers, alternate object
+databases, repository substitution, unsafe paths/links/modes/ownership, special files, oversized
+input, and insufficient space. The deterministic archive contains tracked immutable source and
+production `vendor` metadata while excluding Git data, frontend dependencies, environment and
+mutable/cache paths, and filesystem ownership. Safe extraction and a canonical immutable-tree
+digest are verified before encrypted upload; archive bytes are read back and checksummed on the
+Target, and the private provenance manifest is written last with first-writer-wins semantics.
+
+An identical repeat returns `idempotent`; different verified bytes for an existing `build_id`
+return `non_reproducible_build` without another authoritative manifest. Inventory never returns
+bucket keys, object versions, raw manifests, commands, paths, output, or credentials. It reports
+only bounded artifact identity, digest, publication time, and one of `ready`, `malformed`,
+`foreign`, `missing`, `unsupported`, or `checksum_invalid`. This slice does not build frontends,
+resolve build secrets, deploy artifacts, or delete store objects.
 
 ## Managed AWS RDS PostgreSQL resources
 

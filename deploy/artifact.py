@@ -1,0 +1,925 @@
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import stat
+# Commands below use fixed executable vectors and validated values.
+import subprocess  # nosec B404
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+except ImportError:
+    print("GIMME_ARTIFACT_ERROR|artifact_runtime_dependency_missing", file=sys.stderr)
+    raise SystemExit(1) from None
+
+
+BUILD_ID = re.compile(r"^build_v1_[0-9a-f]{64}$")
+COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}(?:[-+][A-Za-z0-9.-]+)?$")
+VERSION_ID = re.compile(r"^[A-Za-z0-9._+=/-]{1,1024}$")
+PUBLISHED_AT = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00$")
+MAX_LOCK_BYTES = 4 * 1024 * 1024
+MAX_FILE_BYTES = 256 * 1024 * 1024
+MAX_TREE_BYTES = 1024 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_FILES = 100_000
+MAX_MANIFEST_BYTES = 64 * 1024
+MIN_FREE_BYTES = 1024 * 1024 * 1024
+active_process: subprocess.Popen[bytes] | None = None
+
+
+class ArtifactFailure(RuntimeError):
+    pass
+
+
+def fail(code: str) -> None:
+    raise ArtifactFailure(code)
+
+
+def safe_exception_hook(_kind, error, _traceback) -> None:
+    code = str(error) if isinstance(error, ArtifactFailure) else "artifact_operation_failed"
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None:
+        code = "artifact_operation_failed"
+    print(f"GIMME_ARTIFACT_ERROR|{code}", file=sys.stderr)
+
+
+sys.excepthook = safe_exception_hook
+
+
+def interrupted(_signal, _frame) -> None:
+    if active_process is not None:
+        with suppress_os_error():
+            os.killpg(active_process.pid, signal.SIGTERM)
+    raise KeyboardInterrupt
+
+
+class suppress_os_error:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, _error, _traceback):
+        return kind is not None and issubclass(kind, OSError)
+
+
+def emit(value: dict[str, object]) -> None:
+    encoded = base64.b64encode(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+    print("GIMME_ARTIFACT_RESULT|" + encoded)
+
+
+def safe_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    selected = {
+        name: os.environ[name]
+        for name in ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "PATH", "SSH_AUTH_SOCK")
+        if name in os.environ
+    }
+    selected.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    selected.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=accept-new",
+    })
+    if extra:
+        selected.update(extra)
+    return selected
+
+
+def command(
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+    timeout: int = 300,
+) -> bytes:
+    global active_process
+    try:
+        active_process = subprocess.Popen(  # nosec B603
+            arguments,
+            cwd=cwd,
+            env=safe_environment(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            output, _ = active_process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(active_process.pid, signal.SIGKILL)
+            active_process.communicate()
+            fail("build_command_timeout")
+        if active_process.returncode != 0:
+            fail("build_command_failed")
+        return output
+    finally:
+        active_process = None
+
+
+def validate_request(value: object, expected: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected:
+        fail("artifact_request_invalid")
+    return value
+
+
+def parse_request(argument: str) -> dict[str, object]:
+    try:
+        decoded = base64.b64decode(argument, validate=True)
+        value = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        fail("artifact_request_invalid")
+    if not isinstance(value, dict):
+        fail("artifact_request_invalid")
+    return value
+
+
+def checked_root(argument: str) -> Path:
+    root = Path(argument)
+    if (
+        not root.is_absolute()
+        or ".." in root.parts
+        or not root.is_dir()
+        or root.is_symlink()
+        or root.stat().st_uid != os.getuid()
+    ):
+        fail("artifact_workspace_root_invalid")
+    workspace_root = root / ".gimme" / "artifact-builds"
+    workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(workspace_root, 0o700)
+    if workspace_root.stat().st_uid != os.getuid():
+        fail("artifact_workspace_root_invalid")
+    return workspace_root
+
+
+def repository_environment(workspace_root: Path) -> dict[str, str]:
+    return {"GIT_CEILING_DIRECTORIES": str(workspace_root.parent)}
+
+
+def clone_exact(request: dict[str, object], workspace_root: Path) -> tuple[Path, list[str]]:
+    repository = request.get("repository")
+    commit = request.get("commit")
+    if (
+        not isinstance(repository, str)
+        or not isinstance(commit, str)
+        or COMMIT.fullmatch(commit) is None
+    ):
+        fail("source_policy_invalid")
+    if shutil.disk_usage(workspace_root).free < MIN_FREE_BYTES:
+        fail("build_space_insufficient")
+    workspace = Path(tempfile.mkdtemp(prefix="build-", dir=workspace_root))
+    os.chmod(workspace, 0o700)
+    try:
+        tracked = checkout_exact(request, workspace_root, workspace)
+    except BaseException:
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise
+    return workspace, tracked
+
+
+def checkout_exact(
+    request: dict[str, object], workspace_root: Path, workspace: Path
+) -> list[str]:
+    repository = request["repository"]
+    commit = request["commit"]
+    source = workspace / "source"
+    source.mkdir(mode=0o700)
+    environment = repository_environment(workspace_root)
+    command(["git", "init", "--quiet", str(source)], environment=environment, timeout=60)
+    command(["git", "-C", str(source), "remote", "add", "origin", repository],
+            environment=environment, timeout=60)
+    command([
+        "git", "-C", str(source), "fetch", "--quiet", "--depth=1", "--no-tags",
+        "origin", commit,
+    ], environment=environment, timeout=300)
+    command(["git", "-C", str(source), "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+            environment=environment, timeout=60)
+    actual = command(["git", "-C", str(source), "rev-parse", "HEAD"],
+                     environment=environment, timeout=30).decode().strip()
+    remote = command(["git", "-C", str(source), "remote", "get-url", "origin"],
+                     environment=environment, timeout=30).decode().strip()
+    if actual != commit or remote != repository:
+        fail("repository_substitution_detected")
+    if (source / ".git" / "objects" / "info" / "alternates").exists():
+        fail("alternate_object_database_forbidden")
+    raw_paths = command(["git", "-C", str(source), "ls-files", "-z"],
+                        environment=environment, timeout=60)
+    try:
+        tracked = [item.decode() for item in raw_paths.split(b"\0") if item]
+    except UnicodeDecodeError:
+        fail("tracked_path_invalid")
+    if not tracked or len(tracked) > MAX_FILES or len(tracked) != len(set(tracked)):
+        fail("tracked_tree_invalid")
+    for relative in tracked:
+        path = PurePosixPath(relative)
+        if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+            fail("tracked_path_invalid")
+        full = source / relative
+        details = full.lstat()
+        if details.st_uid != os.getuid() or (
+            not stat.S_ISLNK(details.st_mode) and details.st_mode & 0o022
+        ):
+            fail("unsafe_source_ownership_or_mode")
+        if stat.S_ISREG(details.st_mode):
+            if details.st_size > MAX_FILE_BYTES:
+                fail("source_file_too_large")
+            with full.open("rb") as handle:
+                if handle.read(128).startswith(b"version https://git-lfs.github.com/spec/v1"):
+                    fail("git_lfs_forbidden")
+        elif stat.S_ISLNK(details.st_mode):
+            safe_link(relative, os.readlink(full))
+        else:
+            fail("source_special_file_forbidden")
+    if ".gitmodules" in tracked:
+        fail("git_submodules_forbidden")
+    return tracked
+
+
+def safe_link(relative: str, target: str) -> None:
+    if not target or target.startswith("/"):
+        fail("unsafe_symlink")
+    resolved = PurePosixPath(relative).parent.joinpath(target)
+    depth = 0
+    for part in resolved.parts:
+        if part == "..":
+            depth -= 1
+        elif part not in {"", "."}:
+            depth += 1
+        if depth < 0:
+            fail("unsafe_symlink")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def runtime_capability(request: dict[str, object]) -> dict[str, object]:
+    runtimes = request.get("runtimes")
+    extensions = request.get("php_extensions")
+    if not isinstance(runtimes, dict) or set(runtimes) < {"php", "composer"}:
+        fail("build_runtime_policy_invalid")
+    for name, pin in runtimes.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(pin, dict)
+            or set(pin) != {"provider", "version"}
+            or pin["provider"] != "system"
+            or not isinstance(pin["version"], str)
+            or VERSION.fullmatch(pin["version"]) is None
+        ):
+            fail("build_runtime_policy_invalid")
+    if not isinstance(extensions, list) or any(
+        not isinstance(item, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,47}", item) is None
+        for item in extensions
+    ):
+        fail("build_extension_policy_invalid")
+    php = command(["php", "-r", "echo PHP_VERSION;"], timeout=30).decode().strip()
+    composer_line = command(["composer", "--version", "--no-ansi"], timeout=30).decode().strip()
+    match = re.search(r"Composer version ([0-9][A-Za-z0-9.+-]*)", composer_line)
+    composer = "" if match is None else match.group(1)
+    available = sorted(
+        line.strip().lower().replace("pdo_pgsql", "pdo_pgsql")
+        for line in command(["php", "-m"], timeout=30).decode().splitlines()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", line.strip())
+    )
+    if php != runtimes["php"]["version"] or composer != runtimes["composer"]["version"]:
+        fail("build_runtime_mismatch")
+    missing = sorted(set(extensions) - set(available))
+    if missing:
+        fail("build_extension_missing")
+    return {
+        "php": php,
+        "composer": composer,
+        "php_extensions": available,
+        "system": platform.system().lower(),
+        "machine": platform.machine().lower(),
+    }
+
+
+def inspect_source(request: dict[str, object], workspace_root: Path) -> dict[str, object]:
+    workspace = None
+    try:
+        workspace, tracked = clone_exact(request, workspace_root)
+        source = workspace / "source"
+        if "composer.lock" not in tracked:
+            fail("composer_lock_missing")
+        lock = source / "composer.lock"
+        if not lock.is_file() or lock.is_symlink() or lock.stat().st_size > MAX_LOCK_BYTES:
+            fail("composer_lock_invalid")
+        capability = runtime_capability(request)
+        return {
+            "status": "ready",
+            "commit": request["commit"],
+            "repository_fingerprint": "repo_" + hashlib.sha256(
+                str(request["repository"]).encode()
+            ).hexdigest(),
+            "composer_lock_sha256": file_sha256(lock),
+            "composer_lock_bytes": lock.stat().st_size,
+            "capability": capability,
+        }
+    finally:
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def credentials(argument: str) -> dict[str, str]:
+    if argument == "-":
+        return {}
+    path = Path(argument)
+    details = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(details.st_mode):
+        fail("credential_document_invalid")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        fail("credential_document_invalid")
+    allowed = {"access_key_id", "secret_access_key", "session_token"}
+    if (
+        not isinstance(value, dict)
+        or not {"access_key_id", "secret_access_key"} <= set(value) <= allowed
+        or any(not isinstance(item, str) or not item or len(item) > 4096 for item in value.values())
+    ):
+        fail("credential_document_invalid")
+    return value
+
+
+def s3_client(store: dict[str, object], values: dict[str, str]):
+    options: dict[str, object] = {
+        "region_name": store["region"],
+        "config": Config(
+            signature_version="s3v4",
+            s3={"addressing_style": (
+                "virtual" if store["addressing"] == "virtual_hosted" else "path"
+            )},
+            retries={"max_attempts": 3, "mode": "standard"},
+        ),
+    }
+    if store["endpoint"] is not None:
+        options["endpoint_url"] = "https://" + str(store["endpoint"])
+    if values:
+        options["aws_access_key_id"] = values["access_key_id"]
+        options["aws_secret_access_key"] = values["secret_access_key"]
+        if "session_token" in values:
+            options["aws_session_token"] = values["session_token"]
+    return boto3.client("s3", **options)
+
+
+def store_request(request: dict[str, object]):
+    store = request.get("store")
+    if not isinstance(store, dict) or set(store) != {
+        "bucket", "region", "endpoint", "addressing", "encryption"
+    }:
+        fail("artifact_store_policy_invalid")
+    return store
+
+
+def encryption(store: dict[str, object]) -> tuple[dict[str, str], str]:
+    policy = store["encryption"]
+    if not isinstance(policy, dict) or policy.get("method") not in {"aes256", "kms"}:
+        fail("artifact_store_policy_invalid")
+    if policy["method"] == "aes256" and set(policy) == {"method"}:
+        return {"ServerSideEncryption": "AES256"}, "AES256"
+    if (
+        policy["method"] == "kms"
+        and set(policy) == {"method", "kms_key_arn"}
+        and isinstance(policy["kms_key_arn"], str)
+    ):
+        return {
+            "ServerSideEncryption": "aws:kms",
+            "SSEKMSKeyId": policy["kms_key_arn"],
+        }, "aws:kms"
+    fail("artifact_store_policy_invalid")
+
+
+def encryption_confirmed(
+    response: dict[str, object], store: dict[str, object], expected: str
+) -> bool:
+    if response.get("ServerSideEncryption") != expected:
+        return False
+    policy = store["encryption"]
+    return expected != "aws:kms" or response.get("SSEKMSKeyId") == policy["kms_key_arn"]
+
+
+def object_keys(application: str, build_id: str) -> tuple[str, str, str]:
+    scope = hashlib.sha256(application.encode()).hexdigest()[:20]
+    prefix = f"gimme/artifacts/{scope}/{build_id}"
+    return prefix + "/package.tar.gz", prefix + "/manifest.json", f"gimme/artifacts/{scope}/"
+
+
+def read_bounded_body(body, limit: int) -> bytes:
+    try:
+        value = body.read(limit + 1)
+    finally:
+        body.close()
+    if len(value) > limit:
+        fail("artifact_object_too_large")
+    return value
+
+
+def client_error_missing(error: ClientError) -> bool:
+    response = getattr(error, "response", {})
+    code = str(response.get("Error", {}).get("Code", ""))
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status == 404 or code in {"NoSuchKey", "NoSuchVersion", "NotFound"}
+
+
+def read_manifest(client, bucket: str, key: str) -> dict[str, object] | None:
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as error:
+        if client_error_missing(error):
+            return None
+        raise
+    raw = read_bounded_body(response["Body"], MAX_MANIFEST_BYTES)
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError):
+        fail("artifact_manifest_malformed")
+    if not isinstance(value, dict):
+        fail("artifact_manifest_malformed")
+    return value
+
+
+def valid_manifest(value: dict[str, object], application: str, build_id: str) -> bool:
+    return (
+        set(value) == {
+            "schema_version", "application", "build_id", "commit", "format",
+            "artifact_digest", "tree_digest", "bytes", "package_version", "published_at",
+        }
+        and value.get("schema_version") == 1
+        and value.get("application") == application
+        and value.get("build_id") == build_id
+        and value.get("format") == "laravel_v1"
+        and isinstance(value.get("commit"), str)
+        and COMMIT.fullmatch(value["commit"]) is not None
+        and isinstance(value.get("artifact_digest"), str)
+        and SHA256.fullmatch(value["artifact_digest"]) is not None
+        and isinstance(value.get("tree_digest"), str)
+        and SHA256.fullmatch(value["tree_digest"]) is not None
+        and isinstance(value.get("bytes"), int)
+        and 0 < value["bytes"] <= MAX_ARCHIVE_BYTES
+        and isinstance(value.get("package_version"), str)
+        and VERSION_ID.fullmatch(value["package_version"]) is not None
+        and isinstance(value.get("published_at"), str)
+        and PUBLISHED_AT.fullmatch(value["published_at"]) is not None
+    )
+
+
+def manifest_integrity(client, bucket: str, application: str, manifest: dict[str, object]) -> str:
+    package_key, _, _ = object_keys(application, str(manifest["build_id"]))
+    try:
+        digest, size = stream_digest(
+            client, bucket, package_key, str(manifest["package_version"])
+        )
+    except ClientError as error:
+        return "missing" if client_error_missing(error) else "malformed"
+    return (
+        "ready" if digest == manifest["artifact_digest"] and size == manifest["bytes"]
+        else "checksum_invalid"
+    )
+
+
+def publication_status(request: dict[str, object], credential_argument: str) -> dict[str, object]:
+    application, build_id = request.get("application"), request.get("build_id")
+    if not isinstance(application, str) or NAME.fullmatch(application) is None:
+        fail("artifact_identity_invalid")
+    if not isinstance(build_id, str) or BUILD_ID.fullmatch(build_id) is None:
+        fail("artifact_identity_invalid")
+    store = store_request(request)
+    client = s3_client(store, credentials(credential_argument))
+    _, manifest_key, _ = object_keys(application, build_id)
+    try:
+        manifest = read_manifest(client, str(store["bucket"]), manifest_key)
+    except ArtifactFailure:
+        return {"status": "malformed", "build_id": build_id}
+    if manifest is None:
+        return {"status": "absent", "build_id": build_id}
+    if not valid_manifest(manifest, application, build_id):
+        return {"status": "malformed", "build_id": build_id}
+    integrity = manifest_integrity(client, str(store["bucket"]), application, manifest)
+    if integrity != "ready":
+        return {"status": integrity, "build_id": build_id}
+    return {
+        "status": "published",
+        "build_id": build_id,
+        "artifact_digest": manifest["artifact_digest"],
+        "tree_digest": manifest["tree_digest"],
+        "bytes": manifest["bytes"],
+    }
+
+
+def included_source(relative: str) -> bool:
+    path = PurePosixPath(relative)
+    if relative == ".env" or relative.startswith(".env.") and relative != ".env.example":
+        return False
+    if path.parts and path.parts[0] in {".git", "node_modules", "storage"}:
+        return False
+    if len(path.parts) >= 2 and path.parts[:2] == ("bootstrap", "cache"):
+        return False
+    return True
+
+
+def collect_tree(source: Path, tracked: list[str]) -> list[tuple[str, Path]]:
+    selected = [(relative, source / relative) for relative in tracked if included_source(relative)]
+    vendor = source / "vendor"
+    if not vendor.is_dir() or vendor.is_symlink():
+        fail("composer_vendor_missing")
+    for path in vendor.rglob("*"):
+        relative = path.relative_to(source).as_posix()
+        if "/.git/" in f"/{relative}/" or "/node_modules/" in f"/{relative}/":
+            continue
+        selected.append((relative, path))
+    unique = {name: path for name, path in selected}
+    if len(unique) > MAX_FILES:
+        fail("artifact_tree_too_many_files")
+    return sorted(unique.items())
+
+
+def validate_tree(entries: list[tuple[str, Path]], root: Path) -> None:
+    total = 0
+    for relative, path in entries:
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts or not path.is_relative_to(root):
+            fail("artifact_path_invalid")
+        details = path.lstat()
+        if details.st_uid != os.getuid() or (
+            not stat.S_ISLNK(details.st_mode) and details.st_mode & 0o022
+        ):
+            fail("unsafe_artifact_ownership_or_mode")
+        if stat.S_ISREG(details.st_mode):
+            if details.st_size > MAX_FILE_BYTES:
+                fail("artifact_file_too_large")
+            total += details.st_size
+        elif stat.S_ISLNK(details.st_mode):
+            safe_link(relative, os.readlink(path))
+        elif not stat.S_ISDIR(details.st_mode):
+            fail("artifact_special_file_forbidden")
+        if total > MAX_TREE_BYTES:
+            fail("artifact_tree_too_large")
+
+
+def normalized_mode(details: os.stat_result) -> int:
+    if stat.S_ISDIR(details.st_mode):
+        return 0o755
+    if stat.S_ISLNK(details.st_mode):
+        return 0o777
+    return 0o755 if details.st_mode & 0o111 else 0o644
+
+
+def tree_digest(entries: list[tuple[str, Path]]) -> str:
+    digest = hashlib.sha256(b"gimme-laravel-tree-v1\0")
+    for relative, path in entries:
+        details = path.lstat()
+        if stat.S_ISDIR(details.st_mode):
+            kind, content = "directory", ""
+        elif stat.S_ISLNK(details.st_mode):
+            kind, content = "symlink", os.readlink(path)
+        else:
+            kind, content = "file", file_sha256(path)
+        record = [relative, kind, normalized_mode(details), content]
+        digest.update(json.dumps(record, separators=(",", ":")).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def create_archive(entries: list[tuple[str, Path]], destination: Path) -> None:
+    with destination.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                for relative, path in entries:
+                    details = path.lstat()
+                    info = tarfile.TarInfo(relative)
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    info.mtime = 0
+                    info.mode = normalized_mode(details)
+                    if stat.S_ISDIR(details.st_mode):
+                        info.type = tarfile.DIRTYPE
+                        archive.addfile(info)
+                    elif stat.S_ISLNK(details.st_mode):
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = os.readlink(path)
+                        archive.addfile(info)
+                    else:
+                        info.size = details.st_size
+                        with path.open("rb") as handle:
+                            archive.addfile(info, handle)
+    if destination.stat().st_size > MAX_ARCHIVE_BYTES:
+        fail("artifact_archive_too_large")
+
+
+def verify_archive(archive_path: Path, expected_digest: str, root: Path) -> None:
+    extracted = root / "verified"
+    extracted.mkdir(mode=0o700)
+    entries: list[tuple[str, Path]] = []
+    total = 0
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > MAX_FILES:
+            fail("artifact_archive_too_many_files")
+        names = set()
+        for member in members:
+            pure = PurePosixPath(member.name)
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or member.name in names
+                or not (member.isfile() or member.isdir() or member.issym())
+            ):
+                fail("artifact_archive_unsafe")
+            names.add(member.name)
+            if member.issym():
+                safe_link(member.name, member.linkname)
+            total += member.size
+            if member.size > MAX_FILE_BYTES or total > MAX_TREE_BYTES:
+                fail("artifact_archive_too_large")
+        ordered = sorted(
+            members, key=lambda item: (len(PurePosixPath(item.name).parts), item.name)
+        )
+        for member in ordered:
+            destination = extracted / member.name
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            if member.isdir():
+                destination.mkdir(exist_ok=True, mode=member.mode)
+            elif member.issym():
+                destination.symlink_to(member.linkname)
+            else:
+                source = archive.extractfile(member)
+                if source is None:
+                    fail("artifact_archive_unsafe")
+                with destination.open("xb") as output:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+                os.chmod(destination, member.mode)
+            entries.append((member.name, destination))
+    if tree_digest(sorted(entries)) != expected_digest:
+        fail("artifact_tree_digest_mismatch")
+
+
+def stream_digest(client, bucket: str, key: str, version: str) -> tuple[str, int]:
+    response = client.get_object(Bucket=bucket, Key=key, VersionId=version)
+    digest, size = hashlib.sha256(), 0
+    body = response["Body"]
+    try:
+        for chunk in iter(lambda: body.read(1024 * 1024), b""):
+            size += len(chunk)
+            if size > MAX_ARCHIVE_BYTES:
+                fail("artifact_archive_too_large")
+            digest.update(chunk)
+    finally:
+        body.close()
+    return digest.hexdigest(), size
+
+
+def build(request: dict[str, object], credential_argument: str, workspace_root: Path):
+    application, build_id = request.get("application"), request.get("build_id")
+    if not isinstance(application, str) or NAME.fullmatch(application) is None:
+        fail("artifact_identity_invalid")
+    if not isinstance(build_id, str) or BUILD_ID.fullmatch(build_id) is None:
+        fail("artifact_identity_invalid")
+    expected_lock = request.get("composer_lock_sha256")
+    if not isinstance(expected_lock, str) or SHA256.fullmatch(expected_lock) is None:
+        fail("artifact_identity_invalid")
+    store = store_request(request)
+    workspace = None
+    try:
+        workspace, tracked = clone_exact(request, workspace_root)
+        source = workspace / "source"
+        lock = source / "composer.lock"
+        capability = runtime_capability(request)
+        if file_sha256(lock) != expected_lock or capability != request.get("capability"):
+            fail("build_plan_stale")
+        composer_home = workspace / "composer-home"
+        composer_cache = workspace / "composer-cache"
+        composer_home.mkdir(mode=0o700)
+        composer_cache.mkdir(mode=0o700)
+        command([
+            "composer", "validate", "--no-check-publish", "--strict", "--no-ansi",
+        ], cwd=source, environment={"COMPOSER_HOME": str(composer_home)}, timeout=300)
+        if file_sha256(lock) != expected_lock:
+            fail("composer_lock_changed")
+        command([
+            "composer", "install", "--no-dev", "--prefer-dist", "--no-interaction",
+            "--no-progress", "--no-ansi", "--no-scripts", "--optimize-autoloader",
+            "--classmap-authoritative",
+        ], cwd=source, environment={
+            "COMPOSER_HOME": str(composer_home),
+            "COMPOSER_CACHE_DIR": str(composer_cache),
+            "COMPOSER_ALLOW_SUPERUSER": "0",
+        }, timeout=1800)
+        if file_sha256(lock) != expected_lock:
+            fail("composer_lock_changed")
+        command(["composer", "check-platform-reqs", "--no-dev", "--no-ansi"],
+                cwd=source, environment={"COMPOSER_HOME": str(composer_home)}, timeout=300)
+        if not (source / "vendor" / "composer" / "autoload_real.php").is_file():
+            fail("composer_runtime_metadata_missing")
+        entries = collect_tree(source, tracked)
+        validate_tree(entries, source)
+        immutable_digest = tree_digest(entries)
+        archive_path = workspace / "artifact.tar.gz"
+        create_archive(entries, archive_path)
+        verify_archive(archive_path, immutable_digest, workspace)
+        artifact_digest = file_sha256(archive_path)
+        artifact_bytes = archive_path.stat().st_size
+        values = credentials(credential_argument)
+        client = s3_client(store, values)
+        bucket = str(store["bucket"])
+        package_key, manifest_key, _ = object_keys(application, build_id)
+        existing = read_manifest(client, bucket, manifest_key)
+        if existing is not None:
+            if not valid_manifest(existing, application, build_id):
+                fail("artifact_manifest_malformed")
+            if manifest_integrity(client, bucket, application, existing) != "ready":
+                fail("artifact_publication_degraded")
+            if (
+                existing["artifact_digest"] != artifact_digest
+                or existing["tree_digest"] != immutable_digest
+                or existing["bytes"] != artifact_bytes
+            ):
+                return {"status": "non_reproducible_build", "application": application,
+                        "build_id": build_id}
+            return {
+                "status": "idempotent", "application": application, "build_id": build_id,
+                "artifact_digest": artifact_digest, "tree_digest": immutable_digest,
+                "bytes": artifact_bytes,
+            }
+        encryption_options, expected_encryption = encryption(store)
+        with archive_path.open("rb") as body:
+            uploaded = client.put_object(
+                Bucket=bucket, Key=package_key, Body=body,
+                Metadata={"gimme-sha256": artifact_digest}, **encryption_options,
+            )
+        version = uploaded.get("VersionId")
+        if (
+            not isinstance(version, str)
+            or VERSION_ID.fullmatch(version) is None
+            or not encryption_confirmed(uploaded, store, expected_encryption)
+        ):
+            fail("artifact_upload_unverified")
+        downloaded_digest, downloaded_bytes = stream_digest(client, bucket, package_key, version)
+        if downloaded_digest != artifact_digest or downloaded_bytes != artifact_bytes:
+            fail("artifact_upload_checksum_mismatch")
+        manifest = {
+            "schema_version": 1,
+            "application": application,
+            "build_id": build_id,
+            "commit": request["commit"],
+            "format": "laravel_v1",
+            "artifact_digest": artifact_digest,
+            "tree_digest": immutable_digest,
+            "bytes": artifact_bytes,
+            "package_version": version,
+            "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        manifest_bytes = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode()
+        try:
+            published = client.put_object(
+                Bucket=bucket, Key=manifest_key, Body=manifest_bytes,
+                ContentType="application/json", IfNoneMatch="*", **encryption_options,
+            )
+            if not encryption_confirmed(published, store, expected_encryption):
+                fail("artifact_manifest_encryption_failed")
+            observed = read_manifest(client, bucket, manifest_key)
+            if observed != manifest:
+                fail("artifact_manifest_verification_failed")
+        except ClientError as error:
+            response = getattr(error, "response", {})
+            if response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 412:
+                raise
+            winner = read_manifest(client, bucket, manifest_key)
+            if winner is None or not valid_manifest(winner, application, build_id):
+                fail("artifact_publication_conflict")
+            if (
+                winner["artifact_digest"] != artifact_digest
+                or winner["tree_digest"] != immutable_digest
+                or winner["bytes"] != artifact_bytes
+            ):
+                return {"status": "non_reproducible_build", "application": application,
+                        "build_id": build_id}
+            return {
+                "status": "idempotent", "application": application, "build_id": build_id,
+                "artifact_digest": artifact_digest, "tree_digest": immutable_digest,
+                "bytes": artifact_bytes,
+            }
+        return {
+            "status": "published", "application": application, "build_id": build_id,
+            "artifact_digest": artifact_digest, "tree_digest": immutable_digest,
+            "bytes": artifact_bytes,
+        }
+    finally:
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def inventory(request: dict[str, object], credential_argument: str) -> dict[str, object]:
+    application = request.get("application")
+    if not isinstance(application, str) or NAME.fullmatch(application) is None:
+        fail("artifact_identity_invalid")
+    store = store_request(request)
+    client = s3_client(store, credentials(credential_argument))
+    bucket = str(store["bucket"])
+    _, _, prefix = object_keys(application, "build_v1_" + "0" * 64)
+    publications: list[dict[str, object]] = []
+    token = None
+    while len(publications) < 100:
+        arguments = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 100}
+        if token is not None:
+            arguments["ContinuationToken"] = token
+        page = client.list_objects_v2(**arguments)
+        for item in page.get("Contents", []):
+            key = item.get("Key")
+            if not isinstance(key, str) or not key.endswith("/manifest.json"):
+                continue
+            derived = key.removesuffix("/manifest.json").rsplit("/", 1)[-1]
+            build_id = derived if BUILD_ID.fullmatch(derived) else "unknown"
+            status = "malformed"
+            published_at = ""
+            artifact_digest = None
+            try:
+                manifest = read_manifest(client, bucket, key)
+                if manifest is None or not isinstance(manifest, dict):
+                    status = "malformed"
+                elif manifest.get("application") != application:
+                    status = "foreign"
+                elif manifest.get("schema_version") != 1 or manifest.get("format") != "laravel_v1":
+                    status = "unsupported"
+                elif not valid_manifest(manifest, application, derived):
+                    status = "malformed"
+                else:
+                    status = manifest_integrity(client, bucket, application, manifest)
+                    published_at = str(manifest["published_at"])
+                    artifact_digest = str(manifest["artifact_digest"])
+            except (ArtifactFailure, ClientError):
+                status = "malformed"
+            publications.append({
+                "build_id": build_id,
+                "status": status,
+                "published_at": published_at,
+                "artifact_digest": artifact_digest,
+            })
+            if len(publications) >= 100:
+                break
+        if not page.get("IsTruncated") or len(publications) >= 100:
+            break
+        token = page.get("NextContinuationToken")
+        if not isinstance(token, str):
+            break
+    publications.sort(key=lambda item: (str(item["published_at"]), str(item["build_id"])),
+                      reverse=True)
+    return {"application": application, "artifacts": publications}
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 4:
+        fail("artifact_invocation_invalid")
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    request = parse_request(arguments[1])
+    operation = request.get("operation")
+    workspace_root = checked_root(arguments[3])
+    if operation == "inspect":
+        validate_request(request, {
+            "operation", "repository", "commit", "runtimes", "php_extensions"
+        })
+        result = inspect_source(request, workspace_root)
+    elif operation == "publication":
+        validate_request(request, {"operation", "application", "build_id", "store"})
+        result = publication_status(request, arguments[2])
+    elif operation == "build":
+        validate_request(request, {
+            "operation", "application", "repository", "commit", "runtimes",
+            "php_extensions", "composer_lock_sha256", "capability", "build_id", "store",
+        })
+        result = build(request, arguments[2], workspace_root)
+    elif operation == "inventory":
+        validate_request(request, {"operation", "application", "store"})
+        result = inventory(request, arguments[2])
+    else:
+        fail("artifact_operation_invalid")
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

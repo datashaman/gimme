@@ -131,6 +131,7 @@ class DeployerRunner:
         artifact_store: dict[str, object] | None = None,
         artifact_probe_role: str | None = None,
         artifact_reader_version: str | None = None,
+        artifact_request: dict[str, object] | None = None,
         backup_local_path: Path | None = None,
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
@@ -246,6 +247,16 @@ class DeployerRunner:
             environment["GIMME_ARTIFACT_PROBE_ROLE"] = artifact_probe_role
             if artifact_reader_version is not None:
                 environment["GIMME_ARTIFACT_READER_VERSION"] = artifact_reader_version
+        if artifact_request is not None:
+            operation = artifact_request.get("operation")
+            if operation not in {"inspect", "publication", "build", "inventory"}:
+                raise ValueError("artifact request operation is invalid")
+            encoded_request = json.dumps(
+                artifact_request, sort_keys=True, separators=(",", ":")
+            )
+            if len(encoded_request.encode()) > 128 * 1024:
+                raise ValueError("artifact request is too large")
+            environment["GIMME_ARTIFACT_REQUEST_JSON"] = encoded_request
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if any(value is not None for value in (
