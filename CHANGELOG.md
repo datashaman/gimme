@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added schema-v6 immutable Artifact foundations. Desired state now has bounded versioned Artifact
+  Stores, separate publisher/reader authority, explicit Deployment release modes, Application
+  build policy, and a hard operator-led migration. Target-side capability probes keep object bytes
+  and credentials off MCP while verifying encrypted publisher round trips and exact reader access.
 - Completed the common Recovery Policy execution path: reviewed on-demand requests now invoke
   the same content-bound Target runner, Deployment lock, capture, verification, idempotency, and
   retention implementation as timers. Manual Valkey policies retain capture authority while
