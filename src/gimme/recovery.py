@@ -9,13 +9,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 from uuid import uuid4
 
 from gimme.control import (
     ControlState,
     CredentialReferenceBackupAuth,
     S3BackupDestination,
+    SecretReference,
     SSEKMS,
 )
 
@@ -257,7 +258,9 @@ class BotoS3Adapter:
             raise _provider_error(exc, "list") from None
 
 
-def destination_credentials(destination: S3BackupDestination) -> dict[str, object] | None:
+def destination_credentials(
+    destination: S3BackupDestination,
+) -> dict[str, SecretReference] | None:
     """Return the two SecretReferences a credential-referenced destination needs, or None."""
     if not isinstance(destination.auth, CredentialReferenceBackupAuth):
         return None
@@ -278,7 +281,7 @@ def plan_destination_credentials(
         return None
     from gimme.secrets import plan_secret_references
 
-    return plan_secret_references(state, secrets_path, references)  # type: ignore[arg-type]
+    return plan_secret_references(state, secrets_path, references)
 
 
 def resolve_destination_credentials(
@@ -291,7 +294,7 @@ def resolve_destination_credentials(
     from gimme.secrets import resolve_planned_secret_references
 
     resolved = resolve_planned_secret_references(
-        state, secrets_path, references, planned or []  # type: ignore[arg-type]
+        state, secrets_path, references, planned or []
     )
     base = resolved["access_key_id"], resolved["secret_access_key"]
     return base if "session_token" not in resolved else (*base, resolved["session_token"])
@@ -780,6 +783,7 @@ def recovery_point_source_protected(
 
 def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
     """Project a private manifest without storage identities or checksums."""
+    components = cast(list[dict[str, object]], manifest["components"])
     return {
         "recovery_point_id": manifest["recovery_point_id"],
         "deployment": manifest["deployment"],
@@ -797,7 +801,7 @@ def public_recovery_point(manifest: dict[str, object]) -> dict[str, object]:
                 "resource_kind": item["resource_kind"],
                 "resource_version": item["resource_version"],
             }
-            for item in manifest["components"]  # type: ignore[union-attr]
+            for item in components
         ],
         **{
             key: manifest[key]
@@ -909,8 +913,9 @@ def materialize_recovery_component(
     manifest = _load_manifest(
         destination, credentials, adapter, deployment, destination_name, point_id
     )
+    components = cast(list[dict[str, object]], manifest["components"])
     component = next(
-        (item for item in manifest["components"] if item["kind"] == kind),  # type: ignore[union-attr]
+        (item for item in components if item["kind"] == kind),
         None,
     )
     if component is None:
@@ -1180,7 +1185,8 @@ def _load_manifest_record(
         raise RecoveryError("recovery_manifest_invalid")
     missing = 0
     seen: set[tuple[str, str]] = set()
-    for component in manifest["components"]:  # type: ignore[union-attr]
+    components = cast(list[dict[str, object]], manifest["components"])
+    for component in components:
         component_key_value = str(component["key"])
         version_id = str(component["version_id"])
         if component_key_value != component_key(

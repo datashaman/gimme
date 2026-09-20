@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import BaseModel
+
 from gimme.control import (
     ApplicationConfig,
     AWSElastiCacheValkeyResource,
@@ -69,11 +71,11 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
 def registration_update_plan(
     kind: str,
     name: str,
-    current: object,
-    proposed: object,
+    current: BaseModel,
+    proposed: BaseModel,
 ) -> dict[str, Any]:
-    current_value = current.model_dump(mode="json")  # type: ignore[attr-defined]
-    proposed_value = proposed.model_dump(mode="json")  # type: ignore[attr-defined]
+    current_value = current.model_dump(mode="json")
+    proposed_value = proposed.model_dump(mode="json")
     return exact_plan(
         {
             "kind": kind,

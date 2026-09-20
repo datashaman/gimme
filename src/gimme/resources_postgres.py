@@ -761,8 +761,8 @@ def apply_provision(
                 )
                 modified_fields = sorted(changes)
     observed = settle(observed)
-    # ponytail: at most one reboot per apply, decided from the live status. A second apply
-    # racing RDS's status flip could reboot again; add a journal entry if that ever matters.
+    # Reboot at most once per apply, based on the live status. A second apply racing RDS's
+    # status flip could reboot again; add a journal entry if that ever matters.
     if (
         observed.status == "available" and not observed.converging
         and observed.parameter_group_status == "pending-reboot"
