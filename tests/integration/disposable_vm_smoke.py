@@ -631,15 +631,10 @@ def verify_postgres_restore(gimme) -> None:
                     timeout=300,
                 )
             except Exception as detail:
-                allowed = [
-                    "restore connection termination failed",
-                    "restore live rename failed",
-                    "restore shadow rename failed",
-                    "restore compensation failed",
-                ]
-                reason = next(
-                    (item for item in allowed if item in str(detail)), "restore stage unknown"
+                reasons = re.findall(
+                    r"RestoreFailure: ([a-z ]{1,64})", str(detail)
                 )
+                reason = reasons[-1] if reasons else "restore stage unknown"
                 print(f"[DEBUG-restore-swap] {reason}", flush=True)
         raise
     if applied["state"] != "data_replaced" or restore_probe_value() != "before":
