@@ -39,6 +39,9 @@ REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
 PLACEMENT_PATH = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,255}$")
 DATABASE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 CACHE_PREFIX = re.compile(r"^[a-zA-Z0-9:_-]{1,160}$")
+VALKEY_PREFIX = re.compile(
+    r"^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$"
+)
 HOST = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$")
 MAX_STATE_BYTES = 64 * 1024
 MAX_CREDENTIAL_BYTES = 16 * 1024
@@ -149,8 +152,9 @@ def validate_authority(value: Any, deployment: str) -> dict[str, Any]:
         "schema_version", "deployment", "target", "policy_fingerprint", "cadence",
         "calendar", "stable_delay_seconds", "retain_last", "quiesce_wait_seconds",
         "components", "placement", "resources", "destination", "status_identity",
+        "valkey_execution",
     }, "Recovery Schedule authority")
-    if authority["schema_version"] != 1 or authority["deployment"] != deployment:
+    if authority["schema_version"] != 2 or authority["deployment"] != deployment:
         fail("Recovery Schedule authority identity mismatch")
     require_string(authority["target"], TARGET, "target")
     require_string(authority["policy_fingerprint"], FINGERPRINT, "policy fingerprint")
@@ -201,6 +205,20 @@ def validate_authority(value: Any, deployment: str) -> dict[str, Any]:
         fail("invalid destination auth mode")
     if authority["status_identity"] != deployment:
         fail("Recovery Schedule status identity mismatch")
+    valkey = authority["valkey_execution"]
+    if components == ["postgres"]:
+        if valkey is not None:
+            fail("invalid Recovery Schedule Valkey authority")
+    else:
+        item = require_object(
+            valkey, {"prefix", "host", "port", "tls", "auth_mode"},
+            "Valkey execution authority",
+        )
+        require_string(item["prefix"], VALKEY_PREFIX, "Valkey prefix")
+        require_string(item["host"], HOST, "Valkey host")
+        require_int(item["port"], 1, 65535, "Valkey port")
+        if not isinstance(item["tls"], bool) or item["auth_mode"] not in {"none", "stored"}:
+            fail("invalid Recovery Schedule Valkey authority")
     return authority
 
 

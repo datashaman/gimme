@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Extended the private Recovery Schedule authority with the bounded, secret-free Valkey
+  execution contract needed by the shared Target capture core: derived namespace, observed or
+  loopback endpoint, fixed TLS posture, and credential mode. The privileged helper validates the
+  complete schema independently, while unavailable managed Resources remain ordinary readiness
+  issues instead of making resource planning fail.
 - Extended the shared Target capture core to Valkey without adding another protocol
   implementation. It invokes only the fixed installed `gimme-capture-valkey` program with
   validated derived prefix, endpoint, TLS, version, and protected credential identity; then
