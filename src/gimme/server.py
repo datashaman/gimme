@@ -30,7 +30,7 @@ from gimme.control import (
 )
 from gimme.control_plans import (
     deployment_removal_plan, exact_plan, migration_plan, registration_update_plan,
-    resource_cleanup_plan, target_stack_plan,
+    resource_cleanup_plan,
     resource_forget_plan, valkey_destroy_plan,
     valkey_restore_plan, valkey_rotation_plan,
 )
@@ -47,6 +47,7 @@ from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.resources_postgres import ResourceError
 from gimme.secrets import BotoAWSSecretAdapter
 from gimme.secrets import SecretError as SecretError  # noqa: F401 -- compatibility export
+from gimme.target_runtime_orchestration import TargetRuntimeOrchestrator
 
 ROOT = Path(__file__).resolve().parents[2]
 store = StateStore.from_environment(ROOT)
@@ -132,6 +133,19 @@ def _control_plane_registration_orchestrator(
         replace=_replace,
         delete=_delete,
         backup_destination_credentials=_backup_destination_credentials,
+    )
+
+
+def _target_runtime_orchestrator() -> TargetRuntimeOrchestrator:
+    """Compose Target runtime orchestration from the current adapters."""
+    return TargetRuntimeOrchestrator(
+        store=store,
+        runner=runner,
+        context=_context,
+        run_deployment=_run_deployment,
+        deployment_resource_lock=_deployment_resource_lock,
+        assert_plan=_assert_plan,
+        result=_result,
     )
 
 
@@ -533,29 +547,7 @@ def _secret_plan(name: str, state: ControlState, deployment: DeploymentConfig
 
 
 def _resolved_stack_plan(name: str) -> dict[str, Any]:
-    state = store.load()
-    target = state.targets[name]
-    result = runner.run("gimme:preflight:stack", legacy_server(target), stack=target.stack,
-                        sites=target_sites(state, name), network_mode=target.network.mode,
-                        mise_version=target.runtimes.mise_version,
-                        timeout=60, bootstrap=True)
-    resolution: dict[str, dict[str, str]] = {}
-    busy: list[int] = []
-    helper = "unknown"
-    for raw in result.output.splitlines():
-        line = raw.split("] ", 1)[-1].strip()
-        if line.startswith("GIMME_PACKAGE|"):
-            _, package, installed, candidate = line.split("|", 3)
-            resolution[package] = {"installed": installed, "candidate": candidate}
-        elif line.startswith("GIMME_APT_BUSY|") and not line.endswith("|no"):
-            busy = [int(value) for value in line.split("|", 1)[1].split(",")]
-        elif line.startswith("GIMME_HELPER|"):
-            helper = line.split("|", 1)[1]
-    missing = sorted(set(target.stack.packages) - set(resolution))
-    if missing:
-        raise RuntimeError("preflight omitted configured packages: " + ", ".join(missing))
-    return target_stack_plan(name, target, resolution, package_manager_processes=busy,
-                             privileged_helper=helper, sites=target_sites(state, name))
+    return _target_runtime_orchestrator().resolved_stack_plan(name)
 
 
 def _managed_database_issues(state: ControlState, deployment: DeploymentConfig) -> list[str]:
@@ -1836,69 +1828,35 @@ def update_deployment(name: Name, definition: DeploymentRegistration,
 @mcp.tool(annotations=READ)
 def inspect_target(name: Name) -> dict[str, object]:
     """Inspect a target's OS, services, helpers, TLS, and SSH-agent readiness."""
-    target = store.target(name)
-    return _result(runner.run("gimme:inspect", legacy_server(target), stack=target.stack,
-                              sites=target_sites(store.load(), name),
-                              network_mode=target.network.mode,
-                              mise_version=target.runtimes.mise_version, timeout=60))
+    return _target_runtime_orchestrator().inspect_target(name)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("target_stack", "name")
 def plan_target_stack(name: Name) -> dict[str, object]:
     """Preflight packages and helpers and return the exact target stack plan."""
-    return _resolved_stack_plan(name)
+    return _target_runtime_orchestrator().plan_target_stack(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("target_stack", "name")
 def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile a target stack through its bootstrapped privileged helper."""
-    expected = _resolved_stack_plan(name)
-    _assert_plan(expected, plan_id)
-    if not expected["mcp_apply_ready"]:
-        raise ValueError("target is not ready for MCP apply; run gimme-bootstrap-target")
-    state = store.load()
-    target = state.targets[name]
-    return _result(runner.run("gimme:provision:stack", legacy_server(target),
-                              stack=target.stack, sites=target_sites(state, name),
-                              network_mode=target.network.mode,
-                              mise_version=target.runtimes.mise_version, timeout=1800))
+    return _target_runtime_orchestrator().apply_target_stack(name, plan_id)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("deployment_runtimes", "name")
 def plan_deployment_runtimes(name: Name) -> dict[str, object]:
     """Plan exact runtime and extension reconciliation for one deployment."""
-    state, deployment, target, application = _context(name)
-    return exact_plan({
-        "kind": "deployment_runtimes",
-        "deployment": name,
-        "target": deployment.target,
-        "mise_version": target.runtimes.mise_version,
-        "runtimes": {
-            key: value.model_dump(mode="json")
-            for key, value in deployment.runtimes.items()
-        },
-        "php_extensions": application.php_extensions,
-        "effects": [
-            "install only declared mise-managed runtime versions",
-            "verify exact system and bundled runtime versions",
-            "leave every other installed runtime version available",
-        ],
-    })
+    return _target_runtime_orchestrator().plan_deployment_runtimes(name)
 
 
 @mcp.tool(annotations=WRITE)
 @_journal_apply("deployment_runtimes", "name")
 def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Install mise pins and verify system runtimes for one deployment."""
-    with _deployment_resource_lock(name):
-        expected = plan_deployment_runtimes(name)
-        _assert_plan(expected, plan_id)
-        result = _run_deployment("gimme:provision:runtimes", name, timeout=1800)
-        _run_deployment("gimme:preflight:runtimes", name, timeout=120)
-        return _result(result)
+    return _target_runtime_orchestrator().apply_deployment_runtimes(name, plan_id)
 
 
 @mcp.tool(annotations=READ)
