@@ -668,8 +668,8 @@ def verify_postgres_restore(gimme) -> None:
     database = gimme.store.deployment(
         RECOVERY_DEPLOYMENT
     ).placement.database_identifier
-    ssh("dropdb", database)
-    ssh("createdb", "--owner", database, database)
+    ssh("sudo", "-n", "-u", "postgres", "dropdb", database)
+    ssh("sudo", "-n", "-u", "postgres", "createdb", "--owner", database, database)
     replacement = gimme.plan_restore_deployment(
         RECOVERY_DEPLOYMENT, point_id, "ci-empty-replacement"
     )
