@@ -1167,7 +1167,8 @@ SQL;
         '{ printf %s\\n GIMME_POSTGRES_RESTORE_PREFLIGHT_FAILED >&2; exit 1; }; ' .
         'case "$result" in empty|nonempty) printf %s\\n ' .
         '"GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" ;; *) exit 1 ;; esac';
-    run('bash -c ' . escapeshellarg($command), timeout: 60);
+    $output = trim(run('bash -c ' . escapeshellarg($command), timeout: 60));
+    writeln($output);
 });
 
 task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {

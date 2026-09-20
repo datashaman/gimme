@@ -714,6 +714,7 @@ def test_postgres_restore_preflight_uses_only_fixed_catalog_inspection() -> None
     assert "pg_type" in task
     assert "pg_extension" in task
     assert "GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" in task
+    assert "writeln($output)" in task
     assert "DROP " not in task
     assert "ALTER " not in task
 
