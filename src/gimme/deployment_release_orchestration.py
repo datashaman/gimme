@@ -29,6 +29,13 @@ class DeploymentReleaseOrchestrator:
     replace: Callable[..., Any]
     result: Callable[..., Any]
 
+    @staticmethod
+    def _require_source_release(deployment: DeploymentConfig) -> None:
+        if deployment.release_mode != "source":
+            raise ValueError(
+                "artifact release operations require the artifact deployment workflow"
+            )
+
     def _revision(self, name: str) -> str:
         deployment = self.store.deployment(name)
         if deployment.source.kind == "commit":
@@ -71,6 +78,7 @@ class DeploymentReleaseOrchestrator:
 
     def _release_plan(self, name: str, revision: str | None = None) -> dict[str, Any]:
         state, deployment, target, application = self.context(name)
+        self._require_source_release(deployment)
         _, secret_issues = self.secret_plan(name, state, deployment)
         issues = (
             secret_issues
@@ -134,9 +142,11 @@ class DeploymentReleaseOrchestrator:
             return self.result(applied)
 
     def list_releases(self, name: str) -> dict[str, object]:
+        self._require_source_release(self.store.deployment(name))
         return self.result(self.run_deployment("releases", name))
 
     def rollback_deployment(self, name: str, confirmation: str) -> dict[str, object]:
+        self._require_source_release(self.store.deployment(name))
         expected = f"ROLLBACK {name}"
         if confirmation != expected:
             raise ValueError(f"confirmation must exactly equal '{expected}'")
@@ -146,6 +156,8 @@ class DeploymentReleaseOrchestrator:
     def plan_promotion(self, source: str, destination: str) -> dict[str, object]:
         state, source_deployment, _, _ = self.context(source)
         destination_deployment = state.deployments[destination]
+        self._require_source_release(source_deployment)
+        self._require_source_release(destination_deployment)
         if source_deployment.application != destination_deployment.application:
             raise ValueError("promotion requires deployments of the same application")
         current = self.run_deployment("gimme:current-revision", source, timeout=60)

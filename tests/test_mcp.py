@@ -80,6 +80,7 @@ def sample_state() -> ControlState:
         application="example-app",
         target="devbox",
         stage="local",
+        release_mode="source",
         source=DeploymentSource(kind="branch", ref="main"),
         app_env="local",
         runtimes={
@@ -499,7 +500,7 @@ def test_resource_retirement_mcp_adapter_uses_current_orchestrator(
     assert seen == ["shared-cache"]
 
 
-async def test_hard_v4_tool_surface() -> None:
+async def test_hard_v6_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
         resources = await client.list_resources()
@@ -535,6 +536,17 @@ async def test_hard_v4_tool_surface() -> None:
         "register_secret_store",
         "plan_register_backup_destination",
         "register_backup_destination",
+        "plan_register_artifact_store",
+        "register_artifact_store",
+        "plan_update_artifact_store",
+        "update_artifact_store",
+        "plan_remove_artifact_store",
+        "remove_artifact_store",
+        "plan_verify_artifact_store_publisher",
+        "verify_artifact_store_publisher",
+        "plan_verify_artifact_store_reader",
+        "verify_artifact_store_reader",
+        "list_artifact_stores",
         "plan_create_recovery_point",
         "create_recovery_point",
         "list_recovery_points",
@@ -556,7 +568,8 @@ async def test_hard_v4_tool_surface() -> None:
         "gimme://operations/{correlation_id}",
         "gimme://provider-accounts/{name}",
         "gimme://secret-stores/{name}",
-        "gimme://backup-destinations/{name}",
+            "gimme://backup-destinations/{name}",
+            "gimme://artifact-stores/{name}",
         "gimme://aws-networks/{name}/valkey-options",
         "gimme://deployments/{name}/restores/{request_id}",
         "gimme://deployments/{name}/recovery-schedule",
@@ -754,6 +767,11 @@ def test_deployment_resource_mcp_adapter_uses_current_orchestrator(monkeypatch) 
 def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> None:
     calls: list[str] = []
 
+    class SourceStore:
+        @staticmethod
+        def deployment(name):
+            return sample_state().deployments[name]
+
     @contextmanager
     def lock(name):
         calls.append(f"lock:{name}")
@@ -764,7 +782,7 @@ def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> N
         return CommandResult([name], 0, task)
 
     orchestrator = DeploymentReleaseOrchestrator(
-        store=None,
+        store=SourceStore(),
         context=None,
         run_deployment=run,
         secret_plan=None,
@@ -882,6 +900,7 @@ def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch
         application="example-app",
         target="devbox",
         stage="preview",
+        release_mode="source",
         source=DeploymentSource(kind="branch", ref="feature/demo"),
         app_env="local",
         runtimes=sample_state().deployments["example-app"].runtimes,
@@ -1302,7 +1321,7 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 5
+    assert value["schema_version"] == 6
     assert "deployments" in value
 
 

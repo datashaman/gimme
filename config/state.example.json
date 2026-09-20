@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "provider_accounts": {
     "main": {
       "provider": "aws",
@@ -34,6 +34,18 @@
       "addressing": "virtual_hosted",
       "encryption": {"method": "aes256"},
       "auth": {"mode": "ambient"}
+    }
+  },
+  "artifact_stores": {
+    "primary": {
+      "provider": "s3_compatible",
+      "bucket": "gimme-example-artifacts",
+      "region": "us-east-1",
+      "endpoint": null,
+      "addressing": "virtual_hosted",
+      "encryption": {"method": "aes256"},
+      "publisher_auth": {"mode": "ambient"},
+      "reader_auth": {"mode": "ambient"}
     }
   },
   "targets": {
@@ -109,12 +121,39 @@
       "runtimes": {
         "mise_version": null
       }
+    },
+    "buildbox": {
+      "host_alias": "buildbox",
+      "bootstrap_hostname": "192.0.2.30",
+      "hostname": "buildbox.local",
+      "system_hostname": "buildbox",
+      "remote_user": "deployer",
+      "apps_root": "/srv/gimme/apps",
+      "keep_releases": 5,
+      "network": {
+        "mode": "local_mdns",
+        "mdns_name": "buildbox",
+        "expected_addresses": []
+      },
+      "stack": {
+        "package_manager": "apt",
+        "packages": ["git", "python3", "python3-boto3"],
+        "services": []
+      },
+      "runtimes": {
+        "mise_version": null
+      }
     }
   },
   "applications": {
     "example": {
       "repository": "git@github.com:example/example.git",
       "framework": "laravel",
+      "build": {
+        "target": "buildbox",
+        "artifact_store": "primary",
+        "packaging": "laravel_v1"
+      },
       "frontend": {
         "package_manager": "npm",
         "build_script": "build",
@@ -194,6 +233,7 @@
       "application": "example",
       "target": "devbox",
       "stage": "local",
+      "release_mode": "source",
       "source": {"kind": "branch", "ref": "main"},
       "app_env": "local",
       "app_debug": true,

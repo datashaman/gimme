@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from gimme.config import FrontendBuildConfig, HealthCheckConfig, StackConfig
 from gimme.control import (
+    ApplicationBuildPolicy,
     ApplicationConfig,
     AWSNetwork,
     AWSProviderAccount,
@@ -25,6 +26,7 @@ from gimme.control import (
     ValkeyBinding,
     ResourceConfig,
     RuntimePin,
+    S3ArtifactStore,
     S3BackupDestination,
     SecretReference,
     SSEAES256,
@@ -72,6 +74,7 @@ def deployment(target_config: TargetConfig, **updates: object) -> DeploymentConf
         "application": "example",
         "target": "devbox",
         "stage": "local",
+        "release_mode": "source",
         "source": DeploymentSource(kind="branch", ref="main"),
         "app_env": "local",
         "app_debug": True,
@@ -102,7 +105,7 @@ def test_control_state_references_registered_target_and_application() -> None:
         deployments={"example-local": deployment(devbox)},
     )
 
-    assert state.schema_version == 5
+    assert state.schema_version == 6
     assert state.deployments["example-local"].placement.site_host == (
         "example-local.devbox.local"
     )
@@ -114,6 +117,7 @@ def test_production_policy_is_hard() -> None:
         "application": "example",
         "target": "devbox",
         "stage": "production",
+        "release_mode": "artifact",
         "source": {"kind": "branch", "ref": "main"},
         "app_env": "production",
         "app_debug": False,
@@ -131,8 +135,26 @@ def test_production_policy_is_hard() -> None:
 
     with pytest.raises(ValidationError, match="exact commit"):
         ControlState(
-            targets={"devbox": public},
-            applications={"example": application()},
+            targets={
+                "devbox": public,
+                "builder": target(),
+            },
+            artifact_stores={
+                "primary": S3ArtifactStore(
+                    bucket="gimme-artifacts",
+                    region="us-east-1",
+                    encryption=SSEAES256(),
+                )
+            },
+            applications={
+                "example": application().model_copy(update={
+                    "build": ApplicationBuildPolicy(
+                        target="builder",
+                        artifact_store="primary",
+                        packaging="laravel_v1",
+                    )
+                })
+            },
             resources=resources(),
             deployments={"example-production": DeploymentConfig.model_validate(unsafe)},
         )
@@ -209,7 +231,7 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     store.save(state)
 
     assert store.load() == state
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 5
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 6
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -218,7 +240,7 @@ def test_canonical_state_example_validates_against_current_schema() -> None:
 
     state = ControlState.model_validate_json(example.read_text())
 
-    assert state.schema_version == 5
+    assert state.schema_version == 6
     assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
 
 
@@ -251,7 +273,7 @@ def test_legacy_migration_preserves_remote_placement(tmp_path: Path) -> None:
             "php": "8.4.1", "composer": "2.8.4", "postgres": "17.2",
             "valkey": "8.0.1",
         }
-    })
+    }, {"example": "source", "example-feature": "source"}, {}, {})
 
     assert migrated.deployments["example"].placement.relative_path == "example"
     feature = migrated.deployments["example-feature"].placement
@@ -265,9 +287,12 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
 ) -> None:
     document = json.loads((Path(__file__).parents[1] / "config/state.example.json").read_text())
     document["schema_version"] = 2
+    document.pop("artifact_stores")
     document.pop("resources")
     document.pop("aws_networks", None)
     document["targets"].pop("adminbox", None)
+    document["targets"].pop("buildbox", None)
+    document["applications"]["example"].pop("build")
     document["targets"]["devbox"]["toolchains"] = {
         "node": "22.12.0", "npm": "10.9.0", "pnpm": None, "yarn": None, "bun": None,
     }
@@ -291,9 +316,9 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
             "php": "8.4.1", "composer": "2.8.4", "node": "22.12.0",
             "npm": "10.9.0", "postgres": "17.2", "valkey": "8.0.1",
         }
-    })
+    }, {"example-local": "source"})
 
-    assert migrated.schema_version == 5
+    assert migrated.schema_version == 6
     assert migrated.deployments["example-local"].placement.model_dump(mode="json") == old_placement
     assert migrated.deployments["example-local"].runtimes["node"].provider == "system"
     assert migrated.deployments["example-local"].resources.database == "devbox-postgres"
@@ -302,10 +327,13 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
 def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) -> None:
     document = json.loads((Path(__file__).parents[1] / "config/state.example.json").read_text())
     document["schema_version"] = 3
+    document.pop("artifact_stores")
     document.pop("provider_accounts")
     document.pop("secret_stores")
     document.pop("aws_networks", None)
     document["targets"].pop("adminbox", None)
+    document["targets"].pop("buildbox", None)
+    document["applications"]["example"].pop("build")
     document["resources"].pop("example-rds-postgres", None)
     document["resources"].pop("example-elasticache-valkey", None)
     document["deployments"]["example-local"]["secrets"] = {
@@ -317,9 +345,11 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "state.json").write_text(json.dumps(document))
 
-    migrated = StateStore(tmp_path).state_migration({})
+    migrated = StateStore(tmp_path).state_migration(
+        {}, {"example-local": "source"}
+    )
 
-    assert migrated.schema_version == 5
+    assert migrated.schema_version == 6
     assert migrated.secret_stores["local-sops"].provider == "sops"
     assert migrated.deployments["example-local"].resources.valkey == ValkeyBinding(
         resource="devbox-valkey", uses=["cache"]

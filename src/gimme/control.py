@@ -43,6 +43,7 @@ SECRET_STORE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 SECRET_IDENTITY = re.compile(r"^[A-Za-z0-9_+=.@-]+(?:/[A-Za-z0-9_+=.@-]+)*$")
 SECRET_FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 BACKUP_DESTINATION_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+ARTIFACT_STORE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 S3_BUCKET = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 S3_KMS_KEY_ARN = re.compile(r"^arn:aws:kms:([a-z0-9-]+):([0-9]{12}):key/([0-9a-f-]{36})$")
 AWS_NETWORK_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
@@ -571,6 +572,60 @@ class S3BackupDestination(BaseModel):
         return self
 
 
+class AmbientArtifactAuth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["ambient"] = "ambient"
+
+
+class SopsArtifactAuth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["sops_reference"] = "sops_reference"
+    access_key_id: SecretReference
+    secret_access_key: SecretReference
+    session_token: SecretReference | None = None
+
+
+ArtifactStoreAuth = Annotated[
+    AmbientArtifactAuth | SopsArtifactAuth,
+    Field(discriminator="mode"),
+]
+
+
+class S3ArtifactStore(BaseModel):
+    """A versioned S3-compatible store whose object names are always derived by Gimme."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["s3_compatible"] = "s3_compatible"
+    bucket: str = Field(pattern=S3_BUCKET.pattern)
+    region: str = Field(pattern=AWS_REGION.pattern)
+    endpoint: str | None = Field(default=None, min_length=1, max_length=261)
+    addressing: Literal["virtual_hosted", "path"] = "virtual_hosted"
+    encryption: BackupEncryption
+    publisher_auth: ArtifactStoreAuth = Field(default_factory=AmbientArtifactAuth)
+    reader_auth: ArtifactStoreAuth = Field(default_factory=AmbientArtifactAuth)
+
+    @field_validator("bucket")
+    @classmethod
+    def safe_bucket(cls, value: str) -> str:
+        return S3BackupDestination.safe_bucket(value)
+
+    @field_validator("endpoint")
+    @classmethod
+    def safe_endpoint(cls, value: str | None) -> str | None:
+        return S3BackupDestination.safe_endpoint(value)
+
+    @model_validator(mode="after")
+    def bounded_kms_region(self) -> "S3ArtifactStore":
+        if isinstance(self.encryption, SSEKMS):
+            match = S3_KMS_KEY_ARN.fullmatch(self.encryption.kms_key_arn)
+            if match is not None and match.group(1) != self.region:
+                raise ValueError("customer KMS key must be in the artifact store's own region")
+        return self
+
+
 class ManualRecoveryCadence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -707,11 +762,20 @@ class TargetConfig(BaseModel):
         return self
 
 
+class ApplicationBuildPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: str = Field(pattern=TARGET_NAME.pattern)
+    artifact_store: str = Field(pattern=ARTIFACT_STORE_NAME.pattern)
+    packaging: Literal["laravel_v1"]
+
+
 class ApplicationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repository: str = Field(min_length=1, max_length=500)
     framework: Literal["common", "laravel", "symfony", "wordpress", "static"] = "common"
+    build: ApplicationBuildPolicy | None = None
     frontend: FrontendBuildConfig | None = None
     artisan: ArtisanConfig | None = None
     default_health: HealthCheckConfig | None = None
@@ -743,6 +807,8 @@ class ApplicationConfig(BaseModel):
             environments={"default": EnvironmentConfig()},
         )
         self.artisan = validated.artisan
+        if self.build is not None and self.framework != "laravel":
+            raise ValueError("artifact build policy currently supports Laravel only")
         return self
 
 class DeploymentSource(BaseModel):
@@ -795,6 +861,7 @@ class DeploymentConfig(BaseModel):
     application: str = Field(pattern=APP_NAME.pattern)
     target: str = Field(pattern=TARGET_NAME.pattern)
     stage: Literal["local", "preview", "staging", "production"]
+    release_mode: Literal["source", "artifact"]
     source: DeploymentSource
     app_env: str = "production"
     app_debug: bool = Field(default=False, strict=True)
@@ -860,6 +927,7 @@ class DeploymentRegistration(BaseModel):
     application: str = Field(pattern=APP_NAME.pattern)
     target: str = Field(pattern=TARGET_NAME.pattern)
     stage: Literal["local", "preview", "staging", "production"]
+    release_mode: Literal["source", "artifact"]
     source: DeploymentSource
     app_env: str = "production"
     app_debug: bool = Field(default=False, strict=True)
@@ -910,12 +978,13 @@ class DeploymentRegistration(BaseModel):
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     provider_accounts: dict[str, ProviderAccount] = Field(default_factory=dict)
     secret_stores: dict[str, SecretStore] = Field(
         default_factory=lambda: {"local-sops": SopsSecretStore()}
     )
     backup_destinations: dict[str, S3BackupDestination] = Field(default_factory=dict)
+    artifact_stores: dict[str, S3ArtifactStore] = Field(default_factory=dict)
     targets: dict[str, TargetConfig] = Field(default_factory=dict)
     applications: dict[str, ApplicationConfig] = Field(default_factory=dict)
     aws_networks: dict[str, AWSNetwork] = Field(default_factory=dict)
@@ -955,12 +1024,38 @@ class ControlState(BaseModel):
                         raise ValueError(
                             f"backup destination {name} references an unknown secret store"
                         )
+        for name, artifact_store in self.artifact_stores.items():
+            if ARTIFACT_STORE_NAME.fullmatch(name) is None:
+                raise ValueError(f"invalid artifact store name: {name}")
+            for auth in (artifact_store.publisher_auth, artifact_store.reader_auth):
+                if not isinstance(auth, SopsArtifactAuth):
+                    continue
+                for reference in (
+                    auth.access_key_id,
+                    auth.secret_access_key,
+                    auth.session_token,
+                ):
+                    if reference is not None and reference.store != "local-sops":
+                        raise ValueError(
+                            f"artifact store {name} credentials must use local-sops references"
+                        )
         for name in self.targets:
             if TARGET_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid target name: {name}")
-        for name in self.applications:
+        for name, application in self.applications.items():
             if APP_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid application name: {name}")
+            if application.build is not None:
+                build_target = self.targets.get(application.build.target)
+                if build_target is None or build_target.role != "deployment":
+                    raise ValueError(
+                        f"application {name} build target must be a registered "
+                        "Deployment-capable Target"
+                    )
+                if application.build.artifact_store not in self.artifact_stores:
+                    raise ValueError(
+                        f"application {name} references an unknown artifact store"
+                    )
         for name, network in self.aws_networks.items():
             if AWS_NETWORK_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid AWS Network name: {name}")
@@ -1025,6 +1120,16 @@ class ControlState(BaseModel):
                 self.targets[deployment.target],
                 self.applications[deployment.application],
             )
+            application = self.applications[deployment.application]
+            if deployment.release_mode == "source":
+                if deployment.stage not in {"local", "preview"}:
+                    raise ValueError(
+                        f"deployment {name} source release mode is limited to local and preview"
+                    )
+            elif application.build is None:
+                raise ValueError(
+                    f"deployment {name} artifact release mode requires application build policy"
+                )
             validate_runtime_policy(
                 deployment,
                 self.targets[deployment.target],
@@ -1195,7 +1300,7 @@ class StateStore:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
         document = self.raw_state()
-        if document.get("schema_version") != 5:
+        if document.get("schema_version") != 6:
             raise RuntimeError("state migration required; call plan_state_migration")
         return ControlState.model_validate(document)
 
@@ -1232,7 +1337,11 @@ class StateStore:
             raise KeyError(f"deployment '{name}' is not registered") from exc
 
     def legacy_migration(
-        self, observations: dict[str, dict[str, str]]
+        self,
+        observations: dict[str, dict[str, str]],
+        release_modes: dict[str, Literal["source", "artifact"]],
+        artifact_stores: dict[str, S3ArtifactStore],
+        application_builds: dict[str, ApplicationBuildPolicy],
     ) -> ControlState:
         legacy = ConfigStore(self.legacy_root)
         server = legacy.server()
@@ -1264,6 +1373,7 @@ class StateStore:
             applications[app_name] = ApplicationConfig(
                 repository=app.repository,
                 framework=app.framework,
+                build=application_builds.get(app_name),
                 frontend=app.frontend,
                 artisan=app.artisan,
                 default_health=app.health,
@@ -1280,12 +1390,17 @@ class StateStore:
                 if deployment_name in deployments:
                     digest = hashlib.sha256(f"{app_name}\0{environment}".encode()).hexdigest()[:8]
                     deployment_name = f"{deployment_name[:54]}-{digest}"
+                if deployment_name not in release_modes:
+                    raise ValueError(
+                        "release_modes must name every migrated deployment exactly"
+                    )
                 deploy_path = environment_deploy_path(server, app_name, environment)
                 relative_path = str(Path(deploy_path).relative_to(server.apps_root))
                 deployments[deployment_name] = DeploymentConfig(
                     application=app_name,
                     target=target_name,
                     stage="local" if environment == "default" else "preview",
+                    release_mode=release_modes[deployment_name],
                     source=DeploymentSource(kind="branch", ref=definition.branch),
                     app_env=definition.app_env,
                     app_debug=definition.app_debug,
@@ -1330,7 +1445,12 @@ class StateStore:
                         kind="valkey",
                         version=self._observed(observations[target_name], "valkey"),
                     )
+        if set(release_modes) != set(deployments):
+            raise ValueError("release_modes must name every migrated deployment exactly")
+        if not set(application_builds) <= set(applications):
+            raise ValueError("application_builds contains an unknown application")
         return ControlState(
+            artifact_stores=artifact_stores,
             targets={target_name: target},
             applications=applications,
             resources=resources,
@@ -1338,16 +1458,27 @@ class StateStore:
         )
 
     def state_migration(
-        self, observations: dict[str, dict[str, str]]
+        self,
+        observations: dict[str, dict[str, str]],
+        release_modes: dict[str, Literal["source", "artifact"]],
+        artifact_stores: dict[str, S3ArtifactStore] | None = None,
+        application_builds: dict[str, ApplicationBuildPolicy] | None = None,
     ) -> ControlState:
+        stores = artifact_stores or {}
+        builds = application_builds or {}
         if not self.exists():
-            return self.legacy_migration(observations)
+            return self.legacy_migration(observations, release_modes, stores, builds)
         document = self.raw_state()
+        if document.get("schema_version") == 6:
+            raise ValueError("schema-v6 state already exists")
         if document.get("schema_version") == 5:
-            raise ValueError("schema-v5 state already exists")
+            migrated = json.loads(json.dumps(document))
+            self._migrate_artifact_policy(migrated, release_modes, stores, builds)
+            return ControlState.model_validate(migrated)
         if document.get("schema_version") == 4:
             migrated = json.loads(json.dumps(document))
             self._migrate_valkey_bindings(migrated)
+            self._migrate_artifact_policy(migrated, release_modes, stores, builds)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 3:
             migrated = json.loads(json.dumps(document))
@@ -1377,9 +1508,12 @@ class StateStore:
                     }
                 deployment["secrets"] = converted
             self._migrate_valkey_bindings(migrated)
+            self._migrate_artifact_policy(migrated, release_modes, stores, builds)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") != 2:
-            raise ValueError("only schema-v2, schema-v3, or schema-v4 state can be migrated")
+            raise ValueError(
+                "only schema-v2, schema-v3, schema-v4, or schema-v5 state can be migrated"
+            )
         targets = document.get("targets")
         applications = document.get("applications")
         deployments = document.get("deployments")
@@ -1460,7 +1594,37 @@ class StateStore:
         for target in migrated["targets"].values():
             target.pop("_gimme_old_toolchains", None)
         self._migrate_valkey_bindings(migrated)
+        self._migrate_artifact_policy(migrated, release_modes, stores, builds)
         return ControlState.model_validate(migrated)
+
+    @staticmethod
+    def _migrate_artifact_policy(
+        document: dict[str, object],
+        release_modes: dict[str, Literal["source", "artifact"]],
+        artifact_stores: dict[str, S3ArtifactStore],
+        application_builds: dict[str, ApplicationBuildPolicy],
+    ) -> None:
+        deployments = document.get("deployments")
+        applications = document.get("applications")
+        if not isinstance(deployments, dict) or not isinstance(applications, dict):
+            raise ValueError("migrated applications and deployments are invalid")
+        if set(release_modes) != set(deployments):
+            raise ValueError("release_modes must name every migrated deployment exactly")
+        if not set(application_builds) <= set(applications):
+            raise ValueError("application_builds contains an unknown application")
+        for name, deployment in deployments.items():
+            if not isinstance(deployment, dict):
+                raise ValueError(f"deployment {name} is invalid")
+            deployment["release_mode"] = release_modes[name]
+        for name, build in application_builds.items():
+            application = applications[name]
+            if not isinstance(application, dict):
+                raise ValueError(f"application {name} is invalid")
+            application["build"] = build.model_dump(mode="json")
+        document["artifact_stores"] = {
+            name: store.model_dump(mode="json") for name, store in artifact_stores.items()
+        }
+        document["schema_version"] = 6
 
     @staticmethod
     def _migrate_valkey_bindings(document: dict[str, object]) -> None:

@@ -61,6 +61,7 @@ def deployment(
         "application": "smoke",
         "target": TARGET,
         "stage": "local",
+        "release_mode": "source",
         "source": {"kind": "branch", "ref": branch},
         "app_env": app_env,
         "app_debug": False,
@@ -122,7 +123,7 @@ def setup() -> None:
         "composer",
     ]
     state = {
-        "schema_version": 5,
+        "schema_version": 6,
         "provider_accounts": {},
         "secret_stores": {"local-sops": {"provider": "sops"}},
         "targets": {

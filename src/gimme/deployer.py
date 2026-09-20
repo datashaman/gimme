@@ -128,6 +128,9 @@ class DeployerRunner:
         valkey_probe: dict[str, object] | None = None,
         secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
+        artifact_store: dict[str, object] | None = None,
+        artifact_probe_role: str | None = None,
+        artifact_reader_version: str | None = None,
         backup_local_path: Path | None = None,
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
@@ -226,6 +229,23 @@ class DeployerRunner:
             environment["GIMME_SECRET_FILE"] = str(resolved_secret_file)
         if secret_manifest is not None:
             environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
+        artifact_values = (artifact_store, artifact_probe_role)
+        if any(value is not None for value in artifact_values):
+            if artifact_store is None or artifact_probe_role not in {"publisher", "reader"}:
+                raise ValueError("complete artifact verification context is required")
+            if artifact_probe_role == "publisher" and artifact_reader_version is not None:
+                raise ValueError("publisher verification does not accept a reader version")
+            if artifact_probe_role == "reader" and (
+                artifact_reader_version is None
+                or re.fullmatch(r"[A-Za-z0-9._+=/-]{1,1024}", artifact_reader_version) is None
+            ):
+                raise ValueError("reader verification requires one bounded object version")
+            environment["GIMME_ARTIFACT_STORE_JSON"] = json.dumps(
+                artifact_store, sort_keys=True, separators=(",", ":")
+            )
+            environment["GIMME_ARTIFACT_PROBE_ROLE"] = artifact_probe_role
+            if artifact_reader_version is not None:
+                environment["GIMME_ARTIFACT_READER_VERSION"] = artifact_reader_version
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if any(value is not None for value in (

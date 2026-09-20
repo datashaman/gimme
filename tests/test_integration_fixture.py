@@ -47,7 +47,7 @@ def test_disposable_vm_fixture_writes_current_isolated_state(tmp_path: Path) -> 
     )
 
     state = StateStore(tmp_path).load()
-    assert state.schema_version == 5
+    assert state.schema_version == 6
     assert sorted(state.targets) == ["integration"]
     assert sorted(state.deployments) == ["smoke-default", "smoke-preview"]
     assert state.deployments["smoke-default"].placement != (
