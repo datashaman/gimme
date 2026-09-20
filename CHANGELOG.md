@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Completed the standalone runner's scheduled activation path: it validates the exact
+  fingerprint and stable delay, consumes only named systemd credentials, records atomic bounded
+  attempt status, waits at most five minutes for the Deployment lock, executes the shared capture
+  core, and enforces verified retention oldest-first. The shared Target core now owns bounded S3
+  inventory, strict restore-event protection, completed-Safety eligibility, and a shared
+  manifest-authorized exact-version deletion path, stopping at the first failed candidate while
+  preserving a successfully published replacement.
 - Added the standalone runner's bounded execution core over the shared Target capture module. It
   independently checks the fingerprinted authority shape and credential-mode agreement, creates
   the deterministic Recovery Point identity, captures PostgreSQL and optional Valkey through the

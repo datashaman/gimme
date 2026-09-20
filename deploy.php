@@ -999,6 +999,12 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
         $recoveryRunnerTemplate,
     );
+    $recoveryRunner = str_replace(
+        '__GIMME_TARGET_CAPTURE_SHA256__', hash('sha256', $targetCapture), $recoveryRunner
+    );
+    $recoveryRunner = str_replace(
+        '__GIMME_VALKEY_CAPTURE_SHA256__', hash('sha256', $valkeyCapture), $recoveryRunner
+    );
     $scheduleHelper = str_replace(
         '__GIMME_RUNNER_SHA256__', hash('sha256', $recoveryRunner), $scheduleHelper
     );

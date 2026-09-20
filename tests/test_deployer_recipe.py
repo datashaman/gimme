@@ -615,6 +615,8 @@ def test_target_bootstrap_installs_content_bound_recovery_runtime() -> None:
         assert source in state
     assert "__GIMME_RUNNER_SHA256__" in task
     assert "hash('sha256', $recoveryRunner)" in task
+    assert "hash('sha256', $targetCapture)" in task
+    assert "hash('sha256', $valkeyCapture)" in task
     assert r'mv "\$recovery_runner_tmp" /usr/local/libexec/gimme-recovery-runner' in task
     assert r'mv "\$target_capture_tmp" /usr/local/libexec/gimme_target_capture.py' in task
     assert r'mv "\$valkey_capture_tmp" /usr/local/libexec/gimme-capture-valkey' in task
