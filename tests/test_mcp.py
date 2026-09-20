@@ -48,6 +48,7 @@ from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservatio
 from gimme.secrets import SecretMetadata
 import gimme.server as server_module
 import gimme.control_plans as control_plans_module
+import gimme.deployment_resource_orchestration as deployment_resource_module
 import gimme.recovery as recovery_module
 import gimme.recovery_schedule as recovery_schedule_module
 from gimme.recovery_orchestration import RecoveryOrchestrator
@@ -606,6 +607,45 @@ async def test_deployment_release_tool_schemas_remain_stable_across_module_extra
         assert tool.annotations.readOnlyHint is read_only
 
 
+async def test_deployment_resource_tool_schemas_remain_stable_across_extraction() -> None:
+    async with Client(mcp) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    expected = {
+        "plan_deployment_resources": ({"name"}, {"name"}, True),
+        "apply_deployment_resources": (
+            {"name", "plan_id"}, {"name", "plan_id"}, False,
+        ),
+    }
+    for name, (properties, required, read_only) in expected.items():
+        tool = tools[name]
+        assert set(tool.inputSchema["properties"]) == properties
+        assert set(tool.inputSchema["required"]) == required
+        assert tool.inputSchema["additionalProperties"] is False
+        assert tool.annotations is not None
+        assert tool.annotations.readOnlyHint is read_only
+
+
+def test_deployment_resource_mcp_adapter_uses_current_orchestrator(monkeypatch) -> None:
+    seen = []
+
+    class FakeDeploymentResourceOrchestrator:
+        def plan_deployment_resources(self, name):
+            seen.append(name)
+            return {"kind": "deployment_resources", "plan_id": "plan_" + "0" * 20}
+
+    monkeypatch.setattr(
+        server_module,
+        "_deployment_resource_orchestrator",
+        FakeDeploymentResourceOrchestrator,
+    )
+
+    assert server_module.plan_deployment_resources("example-app")["kind"] == (
+        "deployment_resources"
+    )
+    assert seen == ["example-app"]
+
+
 def test_deployment_release_orchestrator_owns_listing_and_locked_rollback() -> None:
     calls: list[str] = []
 
@@ -908,6 +948,47 @@ def test_external_secret_canary_never_crosses_mcp_or_failure_surfaces(
     ))
     assert canary not in durable
     assert "private/identity" not in durable
+
+
+def test_failed_deployment_resource_activation_does_not_save_manifest(
+    tmp_path, monkeypatch
+) -> None:
+    use_store(tmp_path, monkeypatch)
+    canary = "activation-secret-must-not-escape"
+    temporary_paths: list[Path] = []
+    saved: list[list[dict[str, str]]] = []
+    monkeypatch.setattr(
+        deployment_resource_module,
+        "resolve_planned_secret_references",
+        lambda *args, **kwargs: {"PRIVATE_TOKEN": canary},
+    )
+    monkeypatch.setattr(
+        deployment_resource_module,
+        "save_applied_secret_manifest",
+        lambda root, name, manifest: saved.append(manifest),
+    )
+
+    def fail_run(task, *args, **kwargs):
+        if task == "gimme:provision:app":
+            secret_file = kwargs["secret_file"]
+            temporary_paths.append(secret_file)
+            assert json.loads(secret_file.read_text()) == {"PRIVATE_TOKEN": canary}
+            raise RuntimeError(f"private activation output: {canary}")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_run)
+    plan = server_module.plan_deployment_resources("example-app")
+
+    with pytest.raises(
+        server_module.SecretError, match="^deployment_secret_activation_failed$"
+    ) as failure:
+        server_module.apply_deployment_resources(
+            "example-app", str(plan["plan_id"])
+        )
+
+    assert saved == []
+    assert all(not path.exists() for path in temporary_paths)
+    assert canary not in str(failure.value)
 
 
 def test_deploy_rechecks_revision_and_rendered_plan(tmp_path, monkeypatch) -> None:
@@ -1439,6 +1520,51 @@ def test_resource_apply_reconciles_recovery_schedule_after_application_secrets(
     assert schedule[1]["secret_file"] is None
     assert schedule[1]["recovery_schedule_valkey_file"] is None
     assert [item[0] for item in calls].index("gimme:provision:app") < calls.index(schedule)
+
+
+def test_recovery_schedule_activation_failure_is_bounded_after_manifest_commit(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    deployment = state.deployments["example-app"].model_copy(update={
+        "recovery": RecoveryPolicy(
+            destination="primary", cadence={"kind": "hourly", "minute": 15}
+        )
+    })
+    target = state.targets["devbox"]
+    selected.save(state.model_copy(update={
+        "deployments": {"example-app": deployment},
+        "targets": {"devbox": target.model_copy(update={
+            "stack": target.stack.model_copy(update={
+                "packages": [*target.stack.packages, "python3-boto3"]
+            })
+        })},
+    }))
+    canary = "schedule-secret-must-not-escape"
+    calls: list[str] = []
+
+    def fail_schedule(task, *args, **kwargs):
+        calls.append(task)
+        if task == "gimme:recovery:schedule-reconcile":
+            raise RuntimeError(f"private schedule output: {canary}")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_schedule)
+    plan = server_module.plan_deployment_resources("example-app")
+
+    with pytest.raises(
+        server_module.SecretError, match="^recovery_schedule_activation_failed$"
+    ) as failure:
+        server_module.apply_deployment_resources(
+            "example-app", str(plan["plan_id"])
+        )
+
+    assert calls.index("gimme:provision:app") < calls.index(
+        "gimme:recovery:schedule-reconcile"
+    )
+    assert (selected.root / "applied-secrets" / "example-app.json").is_file()
+    assert canary not in str(failure.value)
 
 
 def test_deployment_removal_disables_schedule_before_deleting_placement(
