@@ -82,6 +82,8 @@ def _provider_failure(error: Exception, operation: str) -> CaptureFailure:
         "UnrecognizedClientException",
     }:
         return CaptureFailure("credentials_unavailable")
+    if operation == "head" and provider_code in {"404", "NoSuchKey", "NotFound"}:
+        return CaptureFailure("destination_missing")
     return CaptureFailure("destination_unavailable")
 
 

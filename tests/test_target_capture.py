@@ -307,6 +307,32 @@ def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() ->
     assert Boto.observed["aws_access_key_id"] == "access-canary"
 
 
+def test_boto_store_maps_exact_head_absence_without_hiding_other_failures() -> None:
+    class Missing(RuntimeError):
+        response = {"Error": {"Code": "NoSuchKey"}}
+
+    class Client:
+        @staticmethod
+        def head_object(**_kwargs):
+            raise Missing("provider detail")
+
+    class Boto:
+        @staticmethod
+        def client(*_args, **_kwargs):
+            return Client()
+
+    selected = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "backups",
+        "region": "us-east-1", "endpoint": None, "addressing": "path",
+        "encryption": {"method": "aes256"}, "auth_mode": "stored",
+    }
+    store = BotoObjectStore(
+        selected, {"access_key_id": "id", "secret_access_key": "key"}, boto_module=Boto,
+    )
+
+    assert store.head("missing") is None
+
+
 def test_valkey_capture_reuses_fixed_binary_and_validates_marker(tmp_path) -> None:
     observed = {}
 
