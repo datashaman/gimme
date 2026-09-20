@@ -29,8 +29,6 @@ from gimme.control import (
 )
 from gimme.control_plans import (
     exact_plan, migration_plan, registration_update_plan,
-    resource_cleanup_plan,
-    resource_forget_plan, valkey_destroy_plan,
 )
 from gimme.deployer import CommandResult, DeployerRunner
 from gimme.deployment_lifecycle_orchestration import DeploymentLifecycleOrchestrator
@@ -46,6 +44,7 @@ from gimme.control_plane_registration_orchestration import (
 from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
+from gimme.resource_retirement_orchestration import ResourceRetirementOrchestrator
 from gimme.resources_postgres import ResourceError
 from gimme.secrets import BotoAWSSecretAdapter
 from gimme.secrets import SecretError as SecretError  # noqa: F401 -- compatibility export
@@ -181,6 +180,16 @@ def _managed_valkey_recovery_orchestrator() -> ManagedValkeyRecoveryOrchestrator
         resource_plan=_resource_plan,
         run_deployment=_run_deployment,
         restoring_ok=_restoring_ok,
+    )
+
+
+def _resource_retirement_orchestrator() -> ResourceRetirementOrchestrator:
+    """Compose Resource retirement from the current adapters."""
+    return ResourceRetirementOrchestrator(
+        store=store,
+        elasticache_valkey=elasticache_valkey,
+        assert_plan=_assert_plan,
+        delete=_delete,
     )
 
 
@@ -1411,26 +1420,14 @@ def bind_resource(name: Name, plan_id: PlanId) -> dict[str, object]:
 
 
 def _resource_cleanup_plan(name: str) -> dict[str, object]:
-    state = store.load()
-    resource = state.resources.get(name)
-    if resource is None:
-        raise KeyError(f"resource '{name}' is not registered")
-    if any(
-        deployment.resources.database == name
-        or getattr(deployment.resources.valkey, "resource", None) == name
-        for deployment in state.deployments.values()
-    ):
-        raise ValueError(f"resource {name} is still referenced by a deployment")
-    if isinstance(resource, AWSElastiCacheValkeyResource):
-        return resource_cleanup_plan(name, managed=True, subject="ElastiCache replication group")
-    return resource_cleanup_plan(name, managed=isinstance(resource, AWSRDSPostgresResource))
+    return _resource_retirement_orchestrator().resource_cleanup_plan(name)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("cleanup_resource", "name")
 def plan_cleanup_resource(name: Name) -> dict[str, object]:
     """Plan non-destructive Resource removal; a managed Resource is retained by default."""
-    return _resource_cleanup_plan(name)
+    return _resource_retirement_orchestrator().plan_cleanup_resource(name)
 
 
 @mcp.tool(annotations=WRITE)
@@ -1438,47 +1435,13 @@ def plan_cleanup_resource(name: Name) -> dict[str, object]:
 def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Remove local Resource registration after exact plan and confirmation checks.
     A managed AWS resource and its data are left intact as a Retained Resource."""
-    expected = _resource_cleanup_plan(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    state = store.load()
-    resource = state.resources[name]
-    retained = isinstance(resource, (AWSRDSPostgresResource, AWSElastiCacheValkeyResource))
-    if isinstance(resource, AWSElastiCacheValkeyResource):
-        resources_valkey_module.retain_group(store.root, name, resource.aws_network)
-    elif isinstance(resource, AWSRDSPostgresResource):
-        resources_postgres_module.retain_resource(store.root, name, resource.aws_network)
-    store.save(_delete(state, "resources", name))
-    return {"changed": True, "resource": name, "retained": retained}
+    return _resource_retirement_orchestrator().apply_cleanup_resource(
+        name, plan_id, confirmation
+    )
 
 
 def _resource_destroy_plan(name: str) -> dict[str, object]:
-    state = store.load()
-    resource = state.resources.get(name)
-    if not isinstance(resource, AWSElastiCacheValkeyResource):
-        raise ValueError(f"resource {name} is not a managed ElastiCache Valkey resource")
-    if any(
-        getattr(deployment.resources.valkey, "resource", None) == name
-        for deployment in state.deployments.values()
-    ):
-        raise ValueError(f"resource {name} is still referenced by a deployment")
-    observed = resources_valkey_module.load_observed(store.root, name)
-    if observed is not None and set(cast(dict[str, object], observed["allocations"])) & set(
-        state.deployments
-    ):
-        raise ResourceError("aws_elasticache_destroy_bindings_remain")
-    account = state.provider_accounts[state.aws_networks[resource.aws_network].provider_account]
-    if account.destructive_role_arn is None:
-        raise ResourceError("aws_elasticache_destroy_role_missing")
-    fingerprint, users = resources_valkey_module.destruction_targets(store.root, name)
-    return valkey_destroy_plan(
-        name, fingerprint,
-        resources_valkey_module.final_snapshot_id(
-            resources_valkey_module.derive_group_id(name), fingerprint
-        ),
-        len(users),
-    )
+    return _resource_retirement_orchestrator().resource_destroy_plan(name)
 
 
 @mcp.tool(annotations=READ)
@@ -1486,7 +1449,7 @@ def _resource_destroy_plan(name: str) -> dict[str, object]:
 def plan_destroy_resource(name: Name) -> dict[str, object]:
     """Plan destroying a managed ElastiCache Valkey Resource and its data, keeping a final
     snapshot. Reads only local state; the destructive role is never assumed while planning."""
-    return _resource_destroy_plan(name)
+    return _resource_retirement_orchestrator().plan_destroy_resource(name)
 
 
 @mcp.tool(annotations=CHANGE)
@@ -1495,32 +1458,9 @@ def apply_destroy_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
     """Irreversibly delete the replication group (with a final snapshot) and what Gimme created
     around it, using the Provider Account's destructive role. A group still deleting after 30
     seconds returns phase 'deleting'; repeat the same call to continue."""
-    expected = _resource_destroy_plan(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    state = store.load()
-    resource = cast(AWSElastiCacheValkeyResource, state.resources[name])
-    network = state.aws_networks[resource.aws_network]
-    observed = resources_valkey_module.load_observed(store.root, name)
-    secret_names = (
-        ["_admin", *sorted(cast(dict[str, object], observed["allocations"]))]
-        if observed else ["_admin"]
+    return _resource_retirement_orchestrator().apply_destroy_resource(
+        name, plan_id, confirmation
     )
-    result = resources_valkey_module.apply_destroy(
-        elasticache_valkey, store.root, state.provider_accounts[network.provider_account],
-        network, name, str(expected["identity_fingerprint"]),
-    )
-    if result["destroyed"]:
-        # Reloaded: the destruction can outlast other edits to desired state.
-        store.save(_delete(store.load(), "resources", name))
-        resources_valkey_module.record_destroyed_group(
-            store.root, name, resource.aws_network, str(expected["identity_fingerprint"])
-        )
-        resources_valkey_module.record_destroyed_secrets(
-            store.root, name, resource.workload_secret_store, secret_names
-        )
-    return {"changed": True, **result}
 
 
 def _valkey_context(name: str) -> tuple[
@@ -1552,34 +1492,14 @@ def list_resource_snapshots(name: Name) -> dict[str, object]:
 
 
 def _final_snapshot_purge_plan(name: str) -> dict[str, object]:
-    state = store.load()
-    if name in state.resources:
-        raise ValueError(f"resource {name} is still registered")
-    receipt = resources_valkey_module.load_destroyed_receipt(store.root, name)
-    if receipt is None:
-        raise KeyError(f"no destroyed Valkey resource named '{name}'")
-    network = state.aws_networks.get(receipt["aws_network"])
-    if network is None:
-        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
-    account = state.provider_accounts[network.provider_account]
-    if account.destructive_role_arn is None:
-        raise ResourceError("aws_elasticache_destroy_role_missing")
-    return exact_plan({
-        "kind": "valkey_final_snapshot_purge", "resource": name,
-        "confirmation": f"PURGE FINAL SNAPSHOT {name}",
-        "snapshot": receipt["final_snapshot"],
-        "destroys": ["the final snapshot retained after this Resource was destroyed"],
-        "retains": ["manual snapshots and Secrets Manager credentials"],
-        "authority": "the Provider Account's destructive role, assumed only during apply",
-        "irreversible": True,
-    })
+    return _resource_retirement_orchestrator().final_snapshot_purge_plan(name)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("purge_final_snapshot", "name")
 def plan_purge_final_snapshot(name: Name) -> dict[str, object]:
     """Plan deleting only the deterministic final snapshot left by a destroyed Valkey Resource."""
-    return _final_snapshot_purge_plan(name)
+    return _resource_retirement_orchestrator().plan_purge_final_snapshot(name)
 
 
 @mcp.tool(annotations=CHANGE)
@@ -1589,51 +1509,20 @@ def apply_purge_final_snapshot(
 ) -> dict[str, object]:
     """Delete the exact final snapshot in a reviewed destruction receipt, never a caller-supplied
     snapshot identifier."""
-    expected = _final_snapshot_purge_plan(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    receipt = resources_valkey_module.load_destroyed_receipt(store.root, name)
-    if receipt is None:
-        raise KeyError(f"no destroyed Valkey resource named '{name}'")
-    state = store.load()
-    network = state.aws_networks[receipt["aws_network"]]
-    account = state.provider_accounts[network.provider_account]
-    deleted = elasticache_valkey.delete_final_snapshot(
-        account, network, receipt["final_snapshot"]
+    return _resource_retirement_orchestrator().apply_purge_final_snapshot(
+        name, plan_id, confirmation
     )
-    resources_valkey_module.clear_destroyed_receipt(store.root, name)
-    return {"changed": deleted, "resource": name, "purged": deleted}
 
 
 def _retained_secret_purge_plan(name: str) -> dict[str, object]:
-    state = store.load()
-    if name in state.resources:
-        raise ValueError(f"resource {name} is still registered")
-    receipt = resources_valkey_module.load_destroyed_secrets(store.root, name)
-    if receipt is None:
-        raise KeyError(f"no destroyed Valkey credentials named '{name}'")
-    store_name, secrets = receipt
-    secret_store = state.secret_stores.get(store_name)
-    if not isinstance(secret_store, AWSSecretsManagerStore):
-        raise ResourceError("aws_elasticache_destroy_receipt_invalid")
-    account = state.provider_accounts[secret_store.provider_account]
-    if account.destructive_role_arn is None:
-        raise ResourceError("aws_elasticache_destroy_role_missing")
-    return exact_plan({
-        "kind": "valkey_retained_secret_purge", "resource": name,
-        "confirmation": f"PURGE RETAINED SECRETS {name}", "credentials": len(secrets),
-        "destroys": ["Gimme-owned Valkey administrative and deployment credentials"],
-        "authority": "the Provider Account's destructive role, assumed only during apply",
-        "irreversible": True,
-    })
+    return _resource_retirement_orchestrator().retained_secret_purge_plan(name)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("purge_retained_secrets", "name")
 def plan_purge_retained_secrets(name: Name) -> dict[str, object]:
     """Plan deleting only exact Gimme-owned credentials recorded after a Valkey destroy."""
-    return _retained_secret_purge_plan(name)
+    return _resource_retirement_orchestrator().plan_purge_retained_secrets(name)
 
 
 @mcp.tool(annotations=CHANGE)
@@ -1643,21 +1532,9 @@ def apply_purge_retained_secrets(
 ) -> dict[str, object]:
     """Force-delete receipt-recorded credentials only after ownership verification and
     confirmation."""
-    expected = _retained_secret_purge_plan(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    store_name, secret_names = cast(
-        tuple[str, list[str]], resources_valkey_module.load_destroyed_secrets(store.root, name)
+    return _resource_retirement_orchestrator().apply_purge_retained_secrets(
+        name, plan_id, confirmation
     )
-    state = store.load()
-    secret_store = cast(AWSSecretsManagerStore, state.secret_stores[store_name])
-    account = state.provider_accounts[secret_store.provider_account]
-    deleted = elasticache_valkey.delete_retained_secrets(
-        account, secret_store, store_name, name, secret_names
-    )
-    resources_valkey_module.clear_destroyed_secrets(store.root, name)
-    return {"changed": deleted > 0, "resource": name, "purged": deleted}
 
 
 def _binds(state: ControlState, deployment: str, name: str) -> bool:
@@ -1740,22 +1617,14 @@ def apply_rotate_resource_credential(name: Name, deployment: Name, plan_id: Plan
 
 
 def _resource_forget_plan(name: str) -> dict[str, object]:
-    if name in store.load().resources:
-        raise ValueError(f"resource {name} is still registered; only a retained one is forgotten")
-    try:
-        retained = resources_postgres_module.load_retained(store.root, name) is not None
-    except ResourceError:
-        retained = True  # a corrupt tombstone can still be forgotten
-    if not retained:
-        raise KeyError(f"no retained resource named '{name}'")
-    return resource_forget_plan(name)
+    return _resource_retirement_orchestrator().resource_forget_plan(name)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("forget_resource", "name")
 def plan_forget_resource(name: Name) -> dict[str, object]:
     """Plan deleting a Retained Resource tombstone. Local only."""
-    return _resource_forget_plan(name)
+    return _resource_retirement_orchestrator().plan_forget_resource(name)
 
 
 @mcp.tool(annotations=WRITE)
@@ -1763,12 +1632,9 @@ def plan_forget_resource(name: Name) -> dict[str, object]:
 def apply_forget_resource(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Delete a Retained Resource tombstone after exact confirmation. The infrastructure it
     named is not touched and cannot be adopted again."""
-    expected = _resource_forget_plan(name)
-    _assert_plan(expected, plan_id)
-    if confirmation != expected["confirmation"]:
-        raise ValueError(f"confirmation must exactly equal '{expected['confirmation']}'")
-    resources_postgres_module.forget_retained(store.root, name)
-    return {"changed": True, "resource": name}
+    return _resource_retirement_orchestrator().apply_forget_resource(
+        name, plan_id, confirmation
+    )
 
 
 @mcp.tool(annotations=WRITE)

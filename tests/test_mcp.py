@@ -477,6 +477,28 @@ def test_managed_valkey_recovery_mcp_adapter_uses_current_orchestrator(
     assert seen == [("shared-cache", "snapshot-1")]
 
 
+def test_resource_retirement_mcp_adapter_uses_current_orchestrator(
+    monkeypatch,
+) -> None:
+    seen: list[str] = []
+
+    class FakeResourceRetirementOrchestrator:
+        def plan_cleanup_resource(self, name):
+            seen.append(name)
+            return {"kind": "resource_cleanup", "plan_id": "plan_" + "0" * 20}
+
+    monkeypatch.setattr(
+        server_module,
+        "_resource_retirement_orchestrator",
+        FakeResourceRetirementOrchestrator,
+    )
+
+    result = server_module.plan_cleanup_resource("shared-cache")
+
+    assert result["kind"] == "resource_cleanup"
+    assert seen == ["shared-cache"]
+
+
 async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
