@@ -404,6 +404,7 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
         "destination_provider": "target_local",
         "destination_kind": "postgres",
         "destination_version": "17.2",
+        "request_fingerprint": "plan_" + "a" * 20,
     }
 
     started = append_restore_event(
@@ -418,10 +419,15 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
     )
 
     assert started["sequence"] == 0
-    assert started["schema_version"] == 3
+    assert started["schema_version"] == 4
     assert started["selected_components"] == ["postgres"]
     assert started["untouched_components"] == []
     assert started["partial"] is False
+    assert started["destinations"] == [{
+        "resource": "checkout-postgres", "provider": "target_local",
+        "kind": "postgres", "version": "17.2",
+    }]
+    assert started["request_fingerprint"] == "plan_" + "a" * 20
     assert entered["sequence"] == 1
     record = load_restore_record(
         destination(), None, adapter, "checkout", "restore-1"
@@ -441,6 +447,7 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
         source_recovery_point_id=point, destination_provider="target_local",
         destination_resource="checkout-postgres",
         destination_kind="postgres", destination_version="17.2",
+        request_fingerprint="plan_" + "a" * 20,
     )
 
     with pytest.raises(RecoveryError, match="^restore_request_conflict$"):
@@ -449,6 +456,7 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
             source_recovery_point_id=point, destination_provider="target_local",
             destination_resource="checkout-postgres",
             destination_kind="postgres", destination_version="16.6",
+            request_fingerprint="plan_" + "a" * 20,
         )
     with pytest.raises(RecoveryError, match="^restore_request_conflict$"):
         append_restore_event(
@@ -458,7 +466,49 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
             destination_kind="postgres", destination_version="17.2",
             selected_components=["postgres"], untouched_components=["valkey"],
             partial=True,
+            request_fingerprint="plan_" + "a" * 20,
         )
+    with pytest.raises(RecoveryError, match="^restore_request_conflict$"):
+        append_restore_event(
+            destination(), None, adapter, "checkout", "restore-1",
+            "maintenance_entered", source_recovery_point_id=point,
+            destination_provider="target_local",
+            destination_resource="checkout-postgres",
+            destination_kind="postgres", destination_version="17.2",
+            request_fingerprint="plan_" + "b" * 20,
+        )
+
+
+def test_legacy_multi_component_restore_identity_remains_resumable() -> None:
+    adapter = FakeS3()
+    identity = {
+        "source_recovery_point_id": recovery_point_id(
+            "checkout", "primary", "legacy-full"
+        ),
+        "destination_provider": "target_local",
+        "destination_resource": "checkout-postgres",
+        "destination_kind": "postgres",
+        "destination_version": "17.2",
+        "selected_components": ["postgres", "valkey"],
+        "untouched_components": [],
+        "partial": False,
+    }
+
+    append_restore_event(
+        destination(), None, adapter, "checkout", "restore-legacy", "started",
+        **identity,
+    )
+    append_restore_event(
+        destination(), None, adapter, "checkout", "restore-legacy",
+        "maintenance_entered", **identity,
+    )
+
+    record = load_restore_record(
+        destination(), None, adapter, "checkout", "restore-legacy"
+    )
+    assert record["state"] == "maintenance_entered"
+    assert record["request_fingerprint"] is None
+    assert record["destinations"] == [record["destination"]]
 
 
 def test_restore_event_rejects_invalid_transition_without_writing() -> None:

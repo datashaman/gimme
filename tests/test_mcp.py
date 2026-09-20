@@ -803,6 +803,7 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
     assert partial["selected_components"] == ["postgres"]
     assert partial["untouched_components"] == ["valkey"]
     assert partial["partial"] is True
+    assert partial["request_fingerprint"] != plan["request_fingerprint"]
     assert partial["destinations"] == [{
         "resource": "devbox-postgres", "provider": "target_local",
         "kind": "postgres", "version": "17.2", "empty": True,
@@ -828,6 +829,9 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
         "kind": "valkey", "version": "8.0.2",
     }]
     assert incompatible["readiness_issues"] == ["valkey_destination_incompatible"]
+    assert incompatible["request_fingerprint"] not in {
+        plan["request_fingerprint"], partial["request_fingerprint"],
+    }
     assert inspected == [
         "gimme:recovery:inspect-postgres",
         "gimme:recovery:inspect-postgres",
@@ -1636,6 +1640,34 @@ def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
     )
     swap = calls.index(("gimme:recovery:postgres", "swap"))
     assert prepare < replace < swap
+    record = recovery_module.load_restore_record(
+        state.backup_destinations["primary"], None, adapter,
+        "example-app", "restore-full",
+    )
+    assert record["request_fingerprint"] == plan["request_fingerprint"]
+    assert record["destinations"] == [
+        {
+            "resource": "devbox-postgres", "provider": "target_local",
+            "kind": "postgres", "version": "17.2",
+        },
+        {
+            "resource": "devbox-valkey", "provider": "target_local",
+            "kind": "valkey", "version": "8.0.1",
+        },
+    ]
+    changed = selected.load()
+    changed.resources["devbox-valkey"] = ResourceConfig(
+        target="devbox", kind="valkey", version="8.0.2"
+    )
+    selected.save(changed)
+    blocked_verification = server_module.plan_verify_restore(
+        "example-app", "restore-full"
+    )
+    assert blocked_verification["ready"] is False
+    assert blocked_verification["readiness_issues"] == [
+        "restore_destination_changed"
+    ]
+    selected.save(state)
     safety = recovery_module.find_recovery_point(
         "primary", state.backup_destinations["primary"], None, adapter,
         "example-app", recovery_module.safety_recovery_point_id(

@@ -319,6 +319,10 @@ and its stronger confirmation states that consistency with untouched components 
 broken. Plans expose only bounded destination Resource provenance for selected components. Valkey
 planning requires the registered destination to have a supported provider and `valkey` kind, then
 compares its exact version with the source component version.
+An opaque request fingerprint binds the private source manifest, normalized selector, every
+selected destination binding, recovery policy, immutable placement, and execution fingerprint.
+Restore Records retain that fingerprint and all bounded destination provenance; reuse after any
+bound identity changes fails closed without exposing private manifest or placement values.
 The state machine supports full PostgreSQL-and-Valkey Restore plus either explicit partial
 selection. Valkey-only Restore captures a Valkey-only Safety Recovery Point, validates the source
 archive before mutation, replaces and verifies only the registered prefix, and performs no

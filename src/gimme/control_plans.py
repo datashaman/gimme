@@ -288,6 +288,7 @@ def deployment_restore_plan(
     destination_version: str, destination_empty: bool,
     selected_components: list[str],
     valkey_destination: dict[str, str] | None = None,
+    request_fingerprint: str | None = None,
     restore_state: str | None = None, request_conflict: bool = False,
     destination_changed: bool = False,
 ) -> dict[str, Any]:
@@ -338,6 +339,7 @@ def deployment_restore_plan(
         "kind": "deployment_restore",
         "deployment": deployment_name,
         "request_id": request_id,
+        "request_fingerprint": request_fingerprint,
         "selected_components": selected_components,
         "untouched_components": untouched_components,
         "partial": partial,
@@ -396,23 +398,30 @@ def deployment_restore_plan(
 
 def restore_verification_plan(
     deployment_name: str, request_id: str, restore: dict[str, object],
+    *, identity_conflict: bool = False,
 ) -> dict[str, Any]:
     state = str(restore["state"])
-    ready = state in {
+    state_ready = state in {
         "data_replaced", "verification_failed", "verification_succeeded",
         "cleanup_completed", "completed",
     }
+    ready = state_ready and not identity_conflict
     return exact_plan({
         "kind": "restore_verification",
         "deployment": deployment_name,
         "request_id": request_id,
         "source_recovery_point_id": restore["source_recovery_point_id"],
+        "request_fingerprint": restore["request_fingerprint"],
+        "destinations": restore["destinations"],
         "selected_components": restore["selected_components"],
         "untouched_components": restore["untouched_components"],
         "partial": restore["partial"],
         "state": state,
         "ready": ready,
-        "readiness_issues": [] if ready else ["restore_data_not_replaced"],
+        "readiness_issues": [
+            *([] if state_ready else ["restore_data_not_replaced"]),
+            *(["restore_destination_changed"] if identity_conflict else []),
+        ],
         "effects": [
             "keep public routing on the fixed maintenance response",
             "resume only the managed processes active before restore",
