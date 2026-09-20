@@ -391,7 +391,8 @@ def atomic_write(path: Path, content: str, mode: int) -> bool:
 
 
 def service_unit(
-    deployment: str, account: pwd.struct_passwd, *, stored_credentials: bool,
+    deployment: str, account: pwd.struct_passwd, relative_path: str, *,
+    stored_credentials: bool,
     stored_valkey_credentials: bool = False,
 ) -> str:
     authority = AUTHORITY_ROOT / f"{deployment}.json"
@@ -404,6 +405,8 @@ def service_unit(
         f"LoadCredential=valkey:{AUTHORITY_ROOT / f'{deployment}.valkey-credentials'}\n"
         if stored_valkey_credentials else ""
     )
+    shared = EXPECTED_APPS_ROOT / relative_path / "shared"
+    requests = EXPECTED_APPS_ROOT / ".gimme" / "recovery-requests"
     return (
         "[Unit]\n"
         f"Description=Gimme Recovery Schedule for {deployment}\n"
@@ -415,6 +418,7 @@ def service_unit(
         f"{credential}"
         f"{valkey_credential}"
         f"StateDirectory=gimme/recovery-schedules/{deployment}\n"
+        f"ReadWritePaths={shared} {requests}\n"
         "RuntimeMaxSec=7200\nTimeoutStopSec=30\n"
         "NoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\n"
         "ProtectSystem=strict\nProtectHome=true\nProtectKernelTunables=true\n"
@@ -423,6 +427,32 @@ def service_unit(
         "RestrictRealtime=true\nCapabilityBoundingSet=\nAmbientCapabilities=\n"
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nUMask=0077\n"
     )
+
+
+def prepare_runtime_directories(
+    authority: dict[str, Any], account: pwd.struct_passwd,
+) -> None:
+    """Validate the two narrowly writable paths and create the shared request directory."""
+    gimme_root = EXPECTED_APPS_ROOT / ".gimme"
+    shared = EXPECTED_APPS_ROOT / authority["placement"]["relative_path"] / "shared"
+    requests = gimme_root / "recovery-requests"
+    for path, label in ((EXPECTED_APPS_ROOT, "apps"), (gimme_root, "state"),
+                        (shared, "Deployment shared")):
+        if path.is_symlink() or not path.is_dir():
+            fail(f"Recovery Schedule {label} directory is invalid")
+    if requests.is_symlink():
+        fail("Recovery Schedule request directory is invalid")
+    try:
+        requests.mkdir(mode=0o700, exist_ok=True)
+        details = requests.stat()
+        if not requests.is_dir() or details.st_uid not in {ROOT_UID, account.pw_uid}:
+            fail("Recovery Schedule request directory is invalid")
+        os.chown(requests, account.pw_uid, account.pw_gid)
+        os.chmod(requests, 0o700)
+    except RuntimeError:
+        raise
+    except OSError as error:
+        raise RuntimeError("Recovery Schedule request directory is unavailable") from error
 
 
 def timer_unit(deployment: str, calendar: str) -> str:
@@ -527,10 +557,12 @@ def reconcile() -> None:
             or runner_sha256 != EXPECTED_RUNNER_SHA256
         ):
             fail("validated Recovery Schedule runner is not installed")
+        prepare_runtime_directories(authority, account)
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
         rendered_service = service_unit(
-            deployment, account, stored_credentials=credential_content is not None,
+            deployment, account, authority["placement"]["relative_path"],
+            stored_credentials=credential_content is not None,
             stored_valkey_credentials=valkey_credential_content is not None,
         )
         rendered_timer = timer_unit(deployment, calendar)

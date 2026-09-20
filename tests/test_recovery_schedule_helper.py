@@ -160,10 +160,10 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
 
     service = helper["service_unit"](
-        "example-app", account, stored_credentials=False
+        "example-app", account, "deployments/example-app", stored_credentials=False
     )
     stored_service = helper["service_unit"](
-        "example-app", account, stored_credentials=True
+        "example-app", account, "deployments/example-app", stored_credentials=True
     )
     timer = helper["timer_unit"]("example-app", "*-*-* *:15:00 UTC")
 
@@ -177,6 +177,10 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     )
     assert "NoNewPrivileges=true" in service
     assert "ProtectSystem=strict" in service
+    assert (
+        "ReadWritePaths=/srv/gimme/apps/deployments/example-app/shared "
+        "/srv/gimme/apps/.gimme/recovery-requests" in service
+    )
     assert "CapabilityBoundingSet=" in service
     assert "OnCalendar=*-*-* *:15:00 UTC" in timer
     assert "Persistent=true" in timer
@@ -189,7 +193,7 @@ def test_units_load_valkey_credential_only_from_fixed_installed_path() -> None:
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
 
     service = helper["service_unit"](
-        "example-app", account, stored_credentials=False,
+        "example-app", account, "deployments/example-app", stored_credentials=False,
         stored_valkey_credentials=True,
     )
 
@@ -204,6 +208,7 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
     apps = tmp_path / "apps"
     transfer = apps / ".gimme" / "recovery-schedules"
     transfer.mkdir(parents=True)
+    (apps / "deployments" / "example-app" / "shared").mkdir(parents=True)
     state = transfer / "example-app.json"
     state.write_text(json.dumps(selected))
     state.chmod(0o600)
@@ -267,6 +272,9 @@ def test_reconcile_installs_exact_units_and_is_idempotent(tmp_path, monkeypatch)
     assert ["systemctl", "daemon-reload"] in calls
     assert ["systemctl", "enable", "gimme-recovery-example-app.timer"] in calls
     assert ["systemctl", "restart", "gimme-recovery-example-app.timer"] in calls
+    requests = helper["EXPECTED_APPS_ROOT"] / ".gimme" / "recovery-requests"
+    assert requests.is_dir()
+    assert requests.stat().st_mode & 0o777 == 0o700
 
     calls.clear()
     active.update({
