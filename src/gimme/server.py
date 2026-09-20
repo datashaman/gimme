@@ -34,6 +34,7 @@ from gimme.deployer import CommandResult, DeployerRunner
 from gimme.deployment_lifecycle_orchestration import DeploymentLifecycleOrchestrator
 from gimme.deployment_resource_orchestration import DeploymentResourceOrchestrator
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
+from gimme.fleet_orchestration import FleetPlacementOrchestrator, fleet_state
 from gimme.journal import OperationJournal
 from gimme.managed_valkey_recovery_orchestration import (
     ManagedValkeyRecoveryOrchestrator,
@@ -205,6 +206,47 @@ def _deployment_lifecycle_orchestrator() -> DeploymentLifecycleOrchestrator:
         delete=_delete,
         recovery_schedule_authority=_recovery_schedule_authority,
         result=_result,
+    )
+
+
+def _observe_fleet_target(
+    name: str, _definition: DeploymentRegistration | None
+) -> dict[str, object]:
+    stack = _target_runtime_orchestrator().resolved_stack_plan(name)
+    if not stack["mcp_apply_ready"]:
+        return {
+            "status": (
+                "target_unbootstrapped"
+                if stack["privileged_helper"] != "ready"
+                else "target_policy_incompatible"
+            ),
+            "runtimes": {},
+        }
+    target = store.target(name)
+    result = runner.run(
+        "gimme:inspect:runtimes",
+        legacy_server(target),
+        stack=target.stack,
+        timeout=60,
+    )
+    runtimes: dict[str, str] = {}
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        if line.startswith("GIMME_RUNTIME|"):
+            _, runtime, version = line.split("|", 2)
+            if re.fullmatch(r"[a-z][a-z0-9-]{0,31}", runtime) and re.fullmatch(
+                r"[0-9]+(?:\.[0-9]+){0,3}(?:[-+][a-zA-Z0-9.-]+)?", version
+            ):
+                runtimes[runtime] = version
+    return {"status": "ready", "runtimes": runtimes}
+
+
+def _fleet_placement_orchestrator() -> FleetPlacementOrchestrator:
+    return FleetPlacementOrchestrator(
+        store=store,
+        observe_target=_observe_fleet_target,
+        assert_plan=_assert_plan,
+        replace=_replace,
     )
 
 
@@ -685,6 +727,7 @@ def _migration_targets() -> dict[str, TargetConfig]:
             migrated = dict(value)
             migrated.pop("toolchains", None)
             migrated.setdefault("runtimes", {"mise_version": None})
+            migrated.setdefault("deployment_slots", 1)
             result[name] = TargetConfig.model_validate(migrated)
         return result
     from gimme.config import ConfigStore
@@ -700,6 +743,7 @@ def _migration_targets() -> dict[str, TargetConfig]:
             remote_user=server.remote_user,
             apps_root=server.apps_root,
             keep_releases=server.keep_releases,
+            deployment_slots=1,
             network={"mode": "local_mdns", "mdns_name": server.mdns_name},
             stack=legacy.stack(),
         )
@@ -723,16 +767,17 @@ def _migration_observations() -> dict[str, dict[str, str]]:
 
 
 def _migration_state(
-    release_modes: dict[str, Literal["source", "artifact"]],
-    artifact_stores: dict[str, S3ArtifactStore],
-    application_builds: dict[str, ApplicationBuildPolicy],
+    release_modes: dict[str, Literal["source", "artifact"]] | None,
+    artifact_stores: dict[str, S3ArtifactStore] | None,
+    application_builds: dict[str, ApplicationBuildPolicy] | None,
 ) -> ControlState:
-    if store.exists() and store.raw_state().get("schema_version") in {3, 4, 5}:
-        return store.state_migration(
-            {}, release_modes, artifact_stores, application_builds
-        )
+    modes = release_modes or {}
+    stores = artifact_stores or {}
+    builds = application_builds or {}
+    if store.exists() and store.raw_state().get("schema_version") in {3, 4, 5, 6}:
+        return store.state_migration({}, modes, stores, builds)
     return store.state_migration(
-        _migration_observations(), release_modes, artifact_stores, application_builds
+        _migration_observations(), modes, stores, builds
     )
 
 
@@ -740,6 +785,12 @@ def _migration_state(
 def desired_state() -> dict[str, object]:
     """Complete desired state without artifact credential or build-secret references."""
     return public_state(store.load())
+
+
+@mcp.resource("gimme://fleet")
+def fleet_resource() -> dict[str, object]:
+    """Read desired Target slot capacity, reservations, free slots, and overcommit."""
+    return fleet_state(store.load())
 
 
 @mcp.resource("gimme://targets/{name}")
@@ -847,13 +898,13 @@ def operation_trace_resource(correlation_id: str) -> dict[str, object]:
 @mcp.tool(annotations=READ)
 @_journal_plan("state_migration")
 def plan_state_migration(
-    release_modes: dict[str, Literal["source", "artifact"]],
-    artifact_stores: dict[str, S3ArtifactStore],
-    application_builds: dict[str, ApplicationBuildPolicy],
+    release_modes: dict[str, Literal["source", "artifact"]] | None = None,
+    artifact_stores: dict[str, S3ArtifactStore] | None = None,
+    application_builds: dict[str, ApplicationBuildPolicy] | None = None,
 ) -> dict[str, object]:
-    """Plan schema-v6 state from explicit release modes and artifact policy."""
-    if store.exists() and store.raw_state().get("schema_version") == 6:
-        raise ValueError("schema-v6 state already exists")
+    """Plan schema-v7 state with explicit release and immutable placement policy."""
+    if store.exists() and store.raw_state().get("schema_version") == 7:
+        raise ValueError("schema-v7 state already exists")
     state = _migration_state(release_modes, artifact_stores, application_builds)
     return migration_plan(state, str(store.root))
 
@@ -861,17 +912,17 @@ def plan_state_migration(
 @mcp.tool(annotations=WRITE)
 @_journal_apply("state_migration")
 def apply_state_migration(
-    release_modes: dict[str, Literal["source", "artifact"]],
-    artifact_stores: dict[str, S3ArtifactStore],
-    application_builds: dict[str, ApplicationBuildPolicy],
     plan_id: PlanId,
+    release_modes: dict[str, Literal["source", "artifact"]] | None = None,
+    artifact_stores: dict[str, S3ArtifactStore] | None = None,
+    application_builds: dict[str, ApplicationBuildPolicy] | None = None,
 ) -> dict[str, object]:
-    """Atomically write reviewed schema-v6 state from explicit release policy."""
+    """Atomically write reviewed schema-v7 state and immutable placement policy."""
     state = _migration_state(release_modes, artifact_stores, application_builds)
     expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
     store.save(state)
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 6}
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 7}
 
 
 @mcp.tool(annotations=READ)
@@ -1855,11 +1906,28 @@ def apply_forget_resource(name: Name, plan_id: PlanId, confirmation: str) -> dic
     )
 
 
+@mcp.tool(annotations=READ)
+def inspect_fleet() -> dict[str, object]:
+    """Inspect bounded readiness for every explicitly registered Target."""
+    return _fleet_placement_orchestrator().inspect_fleet()
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("register_deployment", "name")
+def plan_register_deployment(
+    name: Name, definition: DeploymentRegistration
+) -> dict[str, object]:
+    """Plan deterministic explicit or policy-driven initial Deployment placement."""
+    return _fleet_placement_orchestrator().registration_plan(name, definition)
+
+
 @mcp.tool(annotations=WRITE)
 @_journal_apply("register_deployment", "name")
-def register_deployment(name: Name, definition: DeploymentRegistration) -> dict[str, object]:
-    """Register a deployment and allocate its immutable placement identities."""
-    return _deployment_lifecycle_orchestrator().register_deployment(name, definition)
+def register_deployment(
+    name: Name, definition: DeploymentRegistration, plan_id: PlanId
+) -> dict[str, object]:
+    """Reserve one slot and atomically persist the reviewed immutable placement."""
+    return _fleet_placement_orchestrator().register_deployment(name, definition, plan_id)
 
 
 @mcp.tool(annotations=READ)

@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added schema-v7 deterministic fleet placement. Targets declare bounded Deployment slots;
+  reviewed registration can use one explicit Target or a bounded candidate policy; planning
+  explains safe rejection reasons and selects by occupied ratio, free slots, then name; apply
+  rechecks observations and reserves atomically without relocation. Fleet resource, inspection,
+  migration, overcommit behavior, tests, and operator documentation complete the initial slice.
 - Completed the build-once/deploy-many artifact tracer bullet with an exact-publication resource,
   secret- and storage-identity-safe public projections, a disposable two-Target lifecycle proof,
   and operator/acceptance documentation covering migration, IAM separation, deployment,

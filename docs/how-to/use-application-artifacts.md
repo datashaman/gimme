@@ -13,7 +13,7 @@ publisher and reader identities: the Build Target needs write/read/exact-version
 Deployment Targets need exact-version read access only. A reader failure is terminal—Gimme never
 substitutes publisher credentials.
 
-Schema v6 requires an explicit `release_mode` for every Deployment. Use
+Schema v7 requires an explicit `release_mode` for every Deployment. Use
 `plan_state_migration` and `apply_state_migration` to choose `source` for local/preview work or
 `artifact` for any stage. Artifact mode also requires a named Artifact Store and an Application
 `build` policy with a Deployment-capable Build Target and `laravel_v1` packaging. Review the

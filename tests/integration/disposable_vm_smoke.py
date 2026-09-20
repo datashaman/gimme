@@ -86,6 +86,26 @@ def deployment(
             "cache_prefix": f"gimme:{name}:",
             "site_host": f"{name}.gimme-ci.local",
         },
+        "placement_decision": {
+            "mode": "explicit",
+            "candidates": [TARGET],
+            "selected_target": TARGET,
+            "selection_rule": "occupied_ratio_free_slots_name_v1",
+            "candidate_results": [{
+                "target": TARGET,
+                "deployment_slots": 2,
+                "occupied_slots": 0 if name == "smoke-default" else 1,
+                "free_slots": 2 if name == "smoke-default" else 1,
+                "eligible": True,
+                "reasons": [],
+            }],
+            "policy_fingerprint": "fleet_" + hashlib.sha256(json.dumps({
+                "mode": "explicit", "candidates": [TARGET],
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "deployment_slots": 2,
+            "occupied_slots": 0 if name == "smoke-default" else 1,
+            "observation_fingerprint": None,
+        },
     }
 
 
@@ -123,7 +143,7 @@ def setup() -> None:
         "composer",
     ]
     state = {
-        "schema_version": 6,
+        "schema_version": 7,
         "provider_accounts": {},
         "secret_stores": {"local-sops": {"provider": "sops"}},
         "targets": {
@@ -135,6 +155,7 @@ def setup() -> None:
                 "remote_user": remote_user,
                 "apps_root": APPS_ROOT,
                 "keep_releases": 2,
+                "deployment_slots": 2,
                 "network": {
                     "mode": "local_mdns",
                     "mdns_name": "gimme-ci",

@@ -27,6 +27,7 @@ from gimme.control import (
     StateStore,
     TargetConfig,
     TargetNetwork,
+    explicit_placement_decision,
     new_placement,
 )
 from gimme.control_plane_registration_orchestration import (
@@ -49,6 +50,7 @@ def target(name: str, role: str = "deployment") -> TargetConfig:
         system_hostname=name,
         remote_user="deployer",
         apps_root="/srv/gimme/apps",
+        deployment_slots=0 if role == "administration" else 2,
         network=TargetNetwork(mode="local_mdns", mdns_name=name),
         stack=StackConfig(package_manager="apt", packages=["git"], services=[]),
         role=role,
@@ -101,6 +103,7 @@ def deployment(release_mode: str = "artifact", stage: str = "local") -> Deployme
             valkey={"resource": "deploy-valkey", "uses": ["cache"]},
         ),
         placement=new_placement("example-local", deploy_target),
+        placement_decision=explicit_placement_decision("deploy", deploy_target),
     )
 
 
@@ -252,9 +255,9 @@ def test_schema_v5_requires_explicit_complete_release_policy(tmp_path: Path) -> 
     )
     desired.save(migrated)
 
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert migrated.deployments["example-local"].release_mode == "artifact"
-    with pytest.raises(ValueError, match="schema-v6 state already exists"):
+    with pytest.raises(ValueError, match="schema-v7 state already exists"):
         desired.state_migration({}, {"example-local": "artifact"})
 
 
