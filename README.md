@@ -221,6 +221,10 @@ Example stdio client configuration:
    success.
 8. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
 
+See [Build once and deploy an Application Artifact](docs/how-to/use-application-artifacts.md)
+for migration, IAM separation, publishing, multi-Target deployment, promotion, rollback,
+reproducibility failures, costs, and retention boundaries.
+
 Laravel candidate probes run inside the release before activation. Live HTTPS probes
 run after activation and automatically restore the prior release if any live probe
 fails. Each probe has a stable `name`, a bounded absolute `path`, and explicit `phases`
@@ -238,6 +242,7 @@ Read-only resources:
 - `gimme://operations`
 - `gimme://targets/{name}`
 - `gimme://applications/{name}`
+- `gimme://applications/{name}/artifacts/{build_id}`
 - `gimme://provider-accounts/{name}`
 - `gimme://secret-stores/{name}`
 - `gimme://artifact-stores/{name}`
@@ -259,7 +264,7 @@ catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
 
 Gimme provides the multi-target foundation, local SOPS, bounded AWS Secrets Manager stores,
 versioned S3-compatible Artifact Stores, deterministic Laravel artifact publication with Composer
-plus npm, pnpm, Yarn, or Bun and protected build-only secrets, and single-Target artifact
+plus npm, pnpm, Yarn, or Bun and protected build-only secrets, and multi-Target artifact
 deployment with existing health-gated activation and automatic live rollback. Artifact and source
 promotion reuse the current live release without rebuilding, and content-addressed rollback
 verifies retained source or artifact releases before activation. Traffic splitting and fleet

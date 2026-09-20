@@ -158,7 +158,7 @@ def test_build_plan_binds_every_reviewed_identity_input(tmp_path: Path) -> None:
             "packaging": "laravel_v1",
             "build_secrets_used": False,
             "build_secret_count": 0,
-            "build_secret_names": [],
+            "build_secret_names_sha256": hashlib.sha256(b"[]").hexdigest(),
         },
         "runtimes": {
             "composer": {"provider": "system", "version": "2.8.4"},
@@ -172,6 +172,17 @@ def test_build_plan_binds_every_reviewed_identity_input(tmp_path: Path) -> None:
     }
     assert "git@github.com:example/example.git" not in json.dumps(plan)
     assert plan["publication"] == {"status": "absent", "build_id": plan["build_id"]}
+
+
+def test_exact_artifact_resource_status_is_bounded_and_version_free(tmp_path: Path) -> None:
+    runner = PlanningRunner()
+    build_id = "build_v1_" + "a" * 64
+
+    assert orchestrator(tmp_path, runner).artifact_status("example", build_id) == {
+        "status": "absent", "build_id": build_id,
+    }
+    with pytest.raises(ValueError, match="build_id is invalid"):
+        orchestrator(tmp_path, runner).artifact_status("example", "latest")
 
 
 @pytest.mark.parametrize("changed", ["lock", "capability", "commit"])
@@ -303,8 +314,14 @@ def test_secret_reference_value_does_not_change_build_id(tmp_path: Path, monkeyp
     assert first["identity"]["build_policy"] == {
         "target": "buildbox", "artifact_store": "primary", "packaging": "laravel_v1",
         "build_secrets_used": True, "build_secret_count": 1,
-        "build_secret_names": ["NPM_TOKEN"],
+        "build_secret_names_sha256": hashlib.sha256(
+            json.dumps(["NPM_TOKEN"], separators=(",", ":")).encode()
+        ).hexdigest(),
     }
+    encoded = json.dumps(first)
+    for forbidden in ("NPM_TOKEN", "example/build", "FIRST", "ver_" + "a" * 64):
+        assert forbidden not in encoded
+    assert len(first["build_secret_versions_sha256"]) == 64
 
 
 def test_build_secrets_are_resolved_only_after_plan_acceptance(

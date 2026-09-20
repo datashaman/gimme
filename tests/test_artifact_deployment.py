@@ -238,6 +238,68 @@ def test_exact_artifact_is_resolved_and_materialized_with_readonly_metadata(
     assert list(workspace_root.iterdir()) == []
 
 
+def test_two_targets_reuse_one_exact_artifact_without_builder_or_repository(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake = FakeS3()
+    build_id, manifest, manifest_version = seed_artifact(tmp_path, fake)
+    monkeypatch.setattr(artifact_program, "s3_client", lambda *_arguments: fake)
+
+    def builder_unavailable(*_arguments, **_kwargs):
+        raise AssertionError("destination lifecycle must not execute build or Git commands")
+
+    monkeypatch.setattr(artifact_program, "command", builder_unavailable)
+    artifact = artifact_program.resolve_artifact(
+        {"application": "example", "build_id": build_id, "store": STORE}, "-"
+    )
+
+    metadata = []
+    for target_name, release_names in (("target-a", ("1",)), ("target-b", ("1", "2"))):
+        apps_root = tmp_path / target_name
+        apps_root.mkdir()
+        deploy_path = apps_root / "deployments" / "example"
+        workspace_root = artifact_program.checked_root(str(apps_root))
+        for release_name in release_names:
+            release = deploy_path / "releases" / release_name
+            release.mkdir(parents=True)
+            assert artifact_program.materialize_artifact(
+                materialize_request(artifact), "-", workspace_root, apps_root, str(release)
+            ) == {
+                "status": "materialized",
+                "application": "example",
+                "build_id": build_id,
+            }
+            metadata.append(json.loads((release / ".gimme-artifact.json").read_text()))
+        (deploy_path / ".dep").mkdir()
+        (deploy_path / ".dep" / "releases_log").write_text(
+            "\n".join(json.dumps({"release_name": name}) for name in release_names)
+        )
+        (deploy_path / "current").symlink_to(deploy_path / "releases" / release_names[-1])
+        assert list(workspace_root.iterdir()) == []
+
+    assert {
+        (
+            item["build_id"], item["manifest_version"], item["package_version"],
+            item["artifact_digest"], item["tree_digest"],
+        )
+        for item in metadata
+    } == {(
+        build_id,
+        manifest_version,
+        manifest["package_version"],
+        manifest["artifact_digest"],
+        manifest["tree_digest"],
+    )}
+    rollback = artifact_program.rollback_inventory(
+        tmp_path / "target-b",
+        str(tmp_path / "target-b" / "deployments" / "example"),
+        "artifact",
+    )
+    assert rollback["status"] == "ready"
+    assert rollback["current"]["identity"]["build_id"] == build_id
+    assert rollback["target"]["identity"]["build_id"] == build_id
+
+
 def test_corrupt_exact_package_fails_resolution(tmp_path: Path, monkeypatch) -> None:
     fake = FakeS3()
     build_id, manifest, _ = seed_artifact(tmp_path, fake)
@@ -554,8 +616,8 @@ def test_artifact_release_plan_binds_versions_and_apply_uses_materialization() -
     assert plan["release_mode"] == "artifact"
     assert plan["artifact"] == {
         "expected_build_id": "build_v1_" + "a" * 64,
-        "reader_credential_versions": [],
-        "publication": resolved_artifact(),
+        "reader_credential_versions_sha256": operations._digest([]),
+        "publication": operations._public_artifact(resolved_artifact()),
     }
     assert plan["runtimes"]["declared"] == {
         "php": {"provider": "system", "version": "8.4.1"},
@@ -563,7 +625,7 @@ def test_artifact_release_plan_binds_versions_and_apply_uses_materialization() -
     }
 
     result = operations.apply_deployment("example-local", plan["plan_id"])
-    assert result["output"] == "deploy"
+    assert result["status"] == "deployed"
     applied = [call for call in calls if call[0] == "deploy" and not call[2].get("arguments")]
     assert applied[-1][2]["artifact_request"]["operation"] == "materialize"
     assert applied[-1][2]["artifact_secret_file"] is None
@@ -1138,15 +1200,19 @@ def test_artifact_promotion_reuses_live_publication_without_build_target() -> No
         "build_id_matches": True,
         "release_contract_matches": True,
     }
-    assert plan["artifact"]["manifest_version"] == "manifest-v1"
+    assert "manifest_version" not in plan["artifact"]
+    assert "package_version" not in plan["artifact"]
+    assert len(plan["artifact"]["publication_versions_sha256"]) == 64
     result = operations.promote_deployment(
         "artifact-source", "artifact-destination", plan["plan_id"]
     )
 
-    assert result["output"] == "deployed"
+    assert result["status"] == "promoted"
     assert store.deployment("artifact-destination").source.ref == "a" * 40
     applied = [call for call in calls if call[0] == "deploy" and not call[2].get("arguments")]
-    assert applied[-1][2]["artifact_request"]["artifact"] == plan["artifact"]
+    assert operations._public_artifact(
+        applied[-1][2]["artifact_request"]["artifact"]
+    ) == plan["artifact"]
 
 
 def test_incompatible_artifact_promotion_is_inspectable_and_does_not_resolve_reader() -> None:

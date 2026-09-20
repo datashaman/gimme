@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from gimme.artifact_store_orchestration import ArtifactStoreOrchestrator
+from gimme.artifact_public import public_state
 from gimme.config import HealthCheckConfig, StackConfig
 from gimme.control import (
     ApplicationBuildPolicy,
@@ -31,6 +32,7 @@ from gimme.control import (
 from gimme.control_plane_registration_orchestration import (
     ControlPlaneRegistrationOrchestrator,
 )
+from gimme.control_plans import migration_plan
 from gimme.deployer import CommandResult, DeployerError
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 import gimme.artifact_store_orchestration as artifact_module
@@ -152,6 +154,50 @@ def test_artifact_store_auth_is_reference_only_and_local_sops_bound() -> None:
                 )
             }
         )
+
+
+def test_public_state_and_plans_hide_artifact_auth_and_build_secret_references(
+    tmp_path: Path,
+) -> None:
+    auth = SopsArtifactAuth(
+        access_key_id=SecretReference(
+            store="local-sops", secret="artifacts/reader", field="ACCESS_KEY_ID"
+        ),
+        secret_access_key=SecretReference(
+            store="local-sops", secret="artifacts/reader", field="SECRET_ACCESS_KEY"
+        ),
+    )
+    document = state().model_dump(mode="json")
+    document["artifact_stores"]["primary"].update({
+        "publisher_auth": auth.model_dump(mode="json"),
+        "reader_auth": auth.model_dump(mode="json"),
+    })
+    document["applications"]["example"]["build"]["secrets"] = {
+        "NPM_TOKEN": {
+            "store": "local-sops", "secret": "example/build", "field": "TOKEN",
+        }
+    }
+    selected = ControlState.model_validate(document)
+
+    desired = StateStore(tmp_path)
+    desired.save(ControlState())
+    registration = registration_orchestrator(desired).plan_register_artifact_store(
+        "primary", selected.artifact_stores["primary"]
+    )
+
+    for value in (public_state(selected), migration_plan(selected, "/state"), registration):
+        encoded = json.dumps(value)
+        for forbidden in (
+            "artifacts/reader", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY",
+            "example/build", "NPM_TOKEN", '"field": "TOKEN"',
+        ):
+            assert forbidden not in encoded
+    assert public_state(selected)["artifact_stores"]["primary"]["publisher_auth"] == {
+        "mode": "sops_reference"
+    }
+    assert public_state(selected)["applications"]["example"]["build"][
+        "build_secret_count"
+    ] == 1
 
 
 def test_release_mode_policy_has_no_source_or_missing_build_fallback() -> None:

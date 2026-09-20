@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from gimme.artifact_public import public_application_policy, public_store_policy
 from gimme.control import (
     ApplicationConfig,
     AWSElastiCacheValkeyResource,
@@ -38,9 +39,15 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
             "state_directory": state_directory,
             "provider_accounts": sorted(state.provider_accounts),
             "secret_stores": state.model_dump(mode="json")["secret_stores"],
-            "artifact_stores": state.model_dump(mode="json")["artifact_stores"],
+            "artifact_stores": {
+                name: public_store_policy(definition)
+                for name, definition in state.artifact_stores.items()
+            },
             "targets": state.model_dump(mode="json")["targets"],
-            "applications": state.model_dump(mode="json")["applications"],
+            "applications": {
+                name: public_application_policy(application)
+                for name, application in state.applications.items()
+            },
             "resources": state.model_dump(mode="json")["resources"],
             "deployments": {
                 name: {

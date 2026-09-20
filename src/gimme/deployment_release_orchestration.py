@@ -171,12 +171,27 @@ class DeploymentReleaseOrchestrator:
             issues + process_issues,
             artifact={
                 "expected_build_id": artifact_context["build_id"],
-                "reader_credential_versions": artifact_context[
-                    "reader_credential_versions"
-                ],
-                "publication": artifact,
+                "reader_credential_versions_sha256": self._digest(
+                    artifact_context["reader_credential_versions"]
+                ),
+                "publication": self._public_artifact(artifact),
             },
         )
+
+    @classmethod
+    def _public_artifact(cls, artifact: dict[str, object]) -> dict[str, object]:
+        if artifact.get("status") != "ready":
+            return artifact
+        return {
+            key: value
+            for key, value in artifact.items()
+            if key not in {"manifest_version", "package_version"}
+        } | {
+            "publication_versions_sha256": cls._digest({
+                "manifest_version": artifact["manifest_version"],
+                "package_version": artifact["package_version"],
+            })
+        }
 
     def _artifact_runtime(self, name, deployment, application, identity):
         preflight = self.run_deployment(
@@ -287,9 +302,10 @@ class DeploymentReleaseOrchestrator:
                 artifact_plan = expected.get("artifact")
                 if (
                     not isinstance(artifact_plan, dict)
-                    or artifact_context["artifact"] != artifact_plan["publication"]
-                    or artifact_context["reader_credential_versions"]
-                    != artifact_plan["reader_credential_versions"]
+                    or self._public_artifact(artifact_context["artifact"])
+                    != artifact_plan["publication"]
+                    or self._digest(artifact_context["reader_credential_versions"])
+                    != artifact_plan["reader_credential_versions_sha256"]
                 ):
                     raise ValueError("artifact deployment plan is stale")
                 request, secret_context = self.artifact_deployment.apply_arguments(
@@ -310,6 +326,18 @@ class DeploymentReleaseOrchestrator:
                 )
             if self._manages_processes(deployment, application):
                 self.run_deployment("gimme:provision:processes", name, timeout=1800)
+            if deployment.release_mode == "artifact":
+                artifact = artifact_context["artifact"]
+                return {
+                    "status": "deployed",
+                    "deployment": name,
+                    "release_mode": "artifact",
+                    "application": artifact["application"],
+                    "commit": artifact["commit"],
+                    "build_id": artifact["build_id"],
+                    "artifact_digest": artifact["artifact_digest"],
+                    "tree_digest": artifact["tree_digest"],
+                }
             return self.result(applied)
 
     def list_releases(self, name: str) -> dict[str, object]:
@@ -318,7 +346,9 @@ class DeploymentReleaseOrchestrator:
     @staticmethod
     def _bounded_rollback_identity(mode: str, identity: dict[str, object]):
         if mode == "artifact":
-            return DeploymentReleaseOrchestrator._metadata_artifact(identity)
+            return DeploymentReleaseOrchestrator._public_artifact(
+                DeploymentReleaseOrchestrator._metadata_artifact(identity)
+            )
         if set(identity) != {"commit", "release_mode"} or identity.get(
             "release_mode"
         ) != "source" or not isinstance(identity.get("commit"), str) or re.fullmatch(
@@ -516,6 +546,7 @@ class DeploymentReleaseOrchestrator:
         metadata = self.artifact_deployment.live_release(source)
         expected = self.artifact_deployment.expected_from_release(destination, metadata)
         source_artifact = self._metadata_artifact(metadata)
+        public_source_artifact = self._public_artifact(source_artifact)
         destination_application = state.applications[destination_deployment.application]
         contract_matches = metadata["release_contract"] == release_contract(
             destination_deployment, destination_application
@@ -533,7 +564,7 @@ class DeploymentReleaseOrchestrator:
                 "source": source,
                 "destination": destination,
                 "revision": metadata["commit"],
-                "artifact": source_artifact,
+                "artifact": public_source_artifact,
                 "compatibility": compatibility,
                 "ready": False,
                 "readiness_issues": ["artifact_incompatible"],
@@ -558,7 +589,7 @@ class DeploymentReleaseOrchestrator:
             "source": source,
             "destination": destination,
             "revision": metadata["commit"],
-            "artifact": source_artifact,
+            "artifact": public_source_artifact,
             "compatibility": compatibility,
             "ready": release["ready"],
             "readiness_issues": release["readiness_issues"],
@@ -623,4 +654,17 @@ class DeploymentReleaseOrchestrator:
                     "gimme:provision:processes", destination, timeout=1800
                 )
             self.store.save(self.replace(state, "deployments", destination, deployment))
+            if artifact_mode:
+                artifact = artifact_context["artifact"]
+                return {
+                    "status": "promoted",
+                    "source": source,
+                    "destination": destination,
+                    "release_mode": "artifact",
+                    "application": artifact["application"],
+                    "commit": artifact["commit"],
+                    "build_id": artifact["build_id"],
+                    "artifact_digest": artifact["artifact_digest"],
+                    "tree_digest": artifact["tree_digest"],
+                }
             return self.result(applied)

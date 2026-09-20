@@ -327,14 +327,23 @@ class ArtifactBuildOrchestrator:
         publication = self._publication(
             target, definition, deployment.application, build_id, credentials
         )
+        public_identity = json.loads(json.dumps(identity))
+        secret_names = public_identity["build_policy"].pop("build_secret_names")
+        public_identity["build_policy"]["build_secret_names_sha256"] = hashlib.sha256(
+            json.dumps(secret_names, separators=(",", ":")).encode()
+        ).hexdigest()
         plan = exact_plan({
             "kind": "artifact_build",
             "deployment": name,
             "application": deployment.application,
             "build_id": build_id,
-            "identity": identity,
-            "publisher_credential_versions": planned,
-            "build_secret_versions": build_secret_versions,
+            "identity": public_identity,
+            "publisher_credential_versions_sha256": hashlib.sha256(json.dumps(
+                planned, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
+            "build_secret_versions_sha256": hashlib.sha256(json.dumps(
+                build_secret_versions, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
             "publication": publication,
             "effects": [
                 "fetch the exact reviewed commit into an isolated Build Target workspace",
@@ -348,7 +357,8 @@ class ArtifactBuildOrchestrator:
             ],
         })
         return (
-            state, deployment, application, build, target, definition, credentials, plan
+            state, deployment, application, build, target, definition, credentials,
+            planned, build_secret_versions, identity, plan,
         )
 
     def plan_build_artifact(self, name: str) -> dict[str, object]:
@@ -356,18 +366,16 @@ class ArtifactBuildOrchestrator:
 
     def build_artifact(self, name: str, plan_id: str) -> dict[str, object]:
         (
-            state, deployment, application, build, target, definition, credentials, expected
+            state, deployment, application, build, target, definition, credentials,
+            _publisher_versions, build_secret_versions, identity, expected,
         ) = self._plan_context(name)
         self.assert_plan(expected, plan_id)
         build_secrets = resolve_planned_secret_references(
             state,
             self.store.secrets_path,
             build.secrets,
-            expected["build_secret_versions"],
+            build_secret_versions,
         )
-        identity = expected["identity"]
-        if not isinstance(identity, dict):
-            raise RuntimeError("artifact_plan_invalid")
         request = {
             "operation": "build",
             "application": deployment.application,
@@ -478,3 +486,21 @@ class ArtifactBuildOrchestrator:
                 raise RuntimeError("artifact_inventory_invalid")
             previous = order
         return value
+
+    def artifact_status(self, application_name: str, build_id: str) -> dict[str, object]:
+        """Read one publication through the fixed derived identity and public projection."""
+        if BUILD_ID.fullmatch(build_id) is None:
+            raise ValueError("build_id is invalid")
+        state = self.store.load()
+        application = state.applications.get(application_name)
+        if application is None:
+            raise KeyError("application is not registered")
+        build = application.build
+        if build is None:
+            return {"status": "absent", "build_id": build_id}
+        target = state.targets[build.target]
+        definition = state.artifact_stores[build.artifact_store]
+        _, credentials = self._publisher_credentials(state, definition)
+        return self._publication(
+            target, definition, application_name, build_id, credentials
+        )

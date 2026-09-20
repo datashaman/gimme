@@ -25,14 +25,15 @@ stable intent, mutation boundary, and pairing of each primitive.
 
 | URI | Contents |
 | --- | --- |
-| `gimme://state` | Complete desired state without decrypted secret values |
+| `gimme://state` | Complete desired state with artifact auth and build-secret references replaced by bounded public projections |
 | `gimme://operations` | The 50 most recent secret-safe operation events, newest first |
 | `gimme://targets/{name}` | One target and its network, stack, and runtime policy |
-| `gimme://applications/{name}` | One reusable application definition |
+| `gimme://applications/{name}` | One reusable application definition without build-secret names or references |
+| `gimme://applications/{name}/artifacts/{build_id}` | One exact bounded publication status without object identities, versions, or raw manifests |
 | `gimme://provider-accounts/{name}` | One credential-free provider identity policy |
 | `gimme://secret-stores/{name}` | One bounded Secret Store policy and derived ownership tag |
 | `gimme://backup-destinations/{name}` | One bounded S3-compatible Backup Destination policy without credentials |
-| `gimme://artifact-stores/{name}` | One bounded versioned S3-compatible Artifact Store policy with credential references, never values |
+| `gimme://artifact-stores/{name}` | One bounded versioned S3-compatible Artifact Store policy without credential references or values |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
@@ -48,13 +49,13 @@ The parameterized URIs are resource templates. `gimme://state` and
 | `plan_state_migration` | Read | Inspect installed versions and plan schema-v6 migration from explicit per-Deployment release modes, Artifact Stores, and Application build policies |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
-| `list_applications` | Read | List application source/build definitions |
+| `list_applications` | Read | List application source/build definitions without build-secret names or references |
 | `list_provider_accounts` | Read | List credential-free external-provider identity policy |
 | `list_secret_stores` | Read | List bounded Secret Store policy without secret identities or values |
 | `list_resources` | Read | List named resources, optionally filtered by target |
 | `list_deployments` | Read | List deployments, optionally filtered by target |
 | `list_backup_destinations` | Read | List registered S3-compatible Backup Destinations without credentials |
-| `list_artifact_stores` | Read | List bounded Artifact Store policies without resolving credentials |
+| `list_artifact_stores` | Read | List bounded Artifact Store policies without credential references or values |
 | `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
 
@@ -187,7 +188,7 @@ metadata before mutable release tasks. The normal shared paths, environment acti
 optimization and migrations, candidate/live health gates, symlink activation, automatic live
 rollback, worker refresh, and retained-release cleanup then apply. Artifact destinations execute
 no Git checkout, Composer install, Node/package-manager install, or frontend build. Explicit
-rollback remains source-mode-only.
+rollback uses the same content-addressed retained-release verification described below.
 
 Artifact promotion is also content-addressed. `plan_promotion` reads the source Deployment's fixed
 `current` release metadata, verifies its readonly shape and canonical immutable-tree digest, and
@@ -213,6 +214,15 @@ the fixed `secret_leak_detected` outcome before publication. Secret values and r
 `build_id` or provenance; the manifest records only whether build secrets were used and their
 bounded count. A secret-induced output difference is therefore rejected by the existing
 `non_reproducible_build` rule.
+
+Artifact rollback uses `plan_rollback_deployment` and `rollback_deployment` with the exact plan ID
+and displayed confirmation. It revalidates retained readonly metadata, the canonical tree,
+runtime compatibility, candidate/live health, and process refresh without contacting Git or the
+Build Target. Artifact-sensitive public projections omit credential references, build-secret
+names/references, raw storage object identities and versions, builder paths, commands, manifests,
+and output. See the
+[operator guide](../how-to/use-application-artifacts.md) and
+[acceptance evidence](application-artifact-evidence.md).
 
 ## Managed AWS RDS PostgreSQL resources
 

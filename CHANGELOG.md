@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Completed the build-once/deploy-many artifact tracer bullet with an exact-publication resource,
+  secret- and storage-identity-safe public projections, a disposable two-Target lifecycle proof,
+  and operator/acceptance documentation covering migration, IAM separation, deployment,
+  promotion, verified rollback, failure handling, costs, and the no-garbage-collection boundary.
 - Replaced confirmation-only rollback with a content-addressed plan/apply flow for source and
   artifact releases. Planning selects and verifies the exact retained predecessor, runtime and
   platform capability, health, and process effects. Apply rechecks the complete inventory on the
