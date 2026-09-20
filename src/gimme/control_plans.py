@@ -312,11 +312,6 @@ def deployment_restore_plan(
     )
     issues = [
         *(
-            ["valkey_restore_unsupported"]
-            if len(selected_components) != 1
-            or selected_components == ["postgres"] and postgres is None else []
-        ),
-        *(
             ["valkey_destination_incompatible"]
             if "valkey" in selected_components and (
                 valkey is None or valkey_destination is None

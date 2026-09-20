@@ -779,15 +779,15 @@ def test_restore_plan_defaults_to_full_and_explicit_postgres_is_partial(
 
     plan = server_module.plan_restore_deployment("example-app", point, "restore-1")
 
-    assert plan["ready"] is False
-    assert plan["readiness_issues"] == ["valkey_restore_unsupported"]
+    assert plan["ready"] is True
+    assert plan["readiness_issues"] == []
     assert plan["selected_components"] == ["postgres", "valkey"]
     assert plan["untouched_components"] == []
     assert plan["partial"] is False
     assert plan["destinations"] == [
         {
             "resource": "devbox-postgres", "provider": "target_local",
-            "kind": "postgres", "version": "17.2", "empty": True,
+            "kind": "postgres", "version": "17.2", "empty": False,
         },
         {
             "resource": "devbox-valkey", "provider": "target_local",
@@ -1563,6 +1563,87 @@ def test_valkey_only_restore_replaces_prefix_and_completes_without_postgres_muta
         "resource": "devbox-valkey", "provider": "target_local",
         "kind": "valkey", "version": "8.0.1",
     }
+
+
+def test_full_restore_prepares_postgres_then_replaces_valkey_then_swaps(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    state = selected.load()
+    adapter = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", adapter)
+    pg_body = b"source-pg"
+    valkey_body = b'{"format":"gimme-valkey-v1"}\n'
+    postgres = tmp_path / "source.pg"
+    valkey = tmp_path / "source.valkey"
+    postgres.write_bytes(pg_body)
+    valkey.write_bytes(valkey_body)
+    point = recovery_point_id("example-app", "primary", "full-source")
+    recovery_module.create_recovery_point(
+        "primary", state.backup_destinations["primary"], None, adapter,
+        "example-app", point, [
+            recovery_module.ComponentDump(
+                kind="postgres", local_path=postgres,
+                sha256=hashlib.sha256(pg_body).hexdigest(), bytes=len(pg_body),
+                resource_version="17.2",
+            ),
+            recovery_module.ComponentDump(
+                kind="valkey", local_path=valkey,
+                sha256=hashlib.sha256(valkey_body).hexdigest(),
+                bytes=len(valkey_body), resource_version="8.0.1",
+                format="gimme-valkey-v1", records=0,
+            ),
+        ],
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_run(task, *args, **kwargs):
+        action = kwargs.get("postgres_restore_action")
+        calls.append((task, action))
+        if task == "gimme:recovery:inspect-postgres":
+            return CommandResult(["dep"], 0, "GIMME_POSTGRES_RESTORE_PREFLIGHT|empty")
+        if task == "gimme:backup:dump-postgres":
+            safety_pg = b"safety-pg"
+            kwargs["backup_local_path"].write_bytes(safety_pg)
+            return CommandResult(
+                ["dep"], 0,
+                f"GIMME_BACKUP|{hashlib.sha256(safety_pg).hexdigest()}|{len(safety_pg)}",
+            )
+        if task == "gimme:backup:capture-valkey":
+            kwargs["backup_local_path"].write_bytes(valkey_body)
+            return CommandResult(
+                ["dep"], 0,
+                "GIMME_VALKEY_BACKUP|"
+                f"{hashlib.sha256(valkey_body).hexdigest()}|{len(valkey_body)}|0|"
+                "2026-09-20T02:00:00+00:00",
+            )
+        if task == "gimme:recovery:valkey":
+            return CommandResult(["dep"], 0, "GIMME_VALKEY_RESTORE|0|0")
+        return CommandResult(["dep"], 0, "maintenance")
+
+    monkeypatch.setattr(server_module, "_run_deployment", fake_run)
+    plan = server_module.plan_restore_deployment("example-app", point, "restore-full")
+    applied = server_module.apply_restore_deployment(
+        "example-app", point, "restore-full", str(plan["plan_id"]),
+        str(plan["confirmation"]),
+    )
+
+    assert applied["state"] == "data_replaced"
+    prepare = calls.index(("gimme:recovery:postgres", "prepare"))
+    replace = next(
+        index for index, call in enumerate(calls)
+        if call[0] == "gimme:recovery:valkey"
+    )
+    swap = calls.index(("gimme:recovery:postgres", "swap"))
+    assert prepare < replace < swap
+    safety = recovery_module.find_recovery_point(
+        "primary", state.backup_destinations["primary"], None, adapter,
+        "example-app", recovery_module.safety_recovery_point_id(
+            "example-app", "primary", "restore-full"
+        ),
+    )
+    assert safety is not None
+    assert [item["kind"] for item in safety["components"]] == ["postgres", "valkey"]
 
 
 def test_create_recovery_point_rejects_mismatched_dump_metadata(tmp_path, monkeypatch) -> None:

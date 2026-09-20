@@ -573,6 +573,43 @@ def _capture_restore_safety(
     return safety
 
 
+def _restore_valkey_component(
+    name: str, request_id: str, component: dict[str, object],
+    local_source: Path, state: ControlState, deployment: DeploymentConfig,
+) -> None:
+    binding = deployment.resources.valkey
+    resource_name = binding.resource if binding is not None else None
+    resource = state.resources.get(resource_name) if resource_name else None
+    if not isinstance(
+        resource, (ResourceConfig, AWSElastiCacheValkeyResource)
+    ) or resource_name is None:
+        raise RecoveryError("restore_destination_incompatible")
+    credential = _valkey_capture_credential(state, resource_name, resource)
+    try:
+        with protected_secret_file(credential) as secret_file:
+            result = _run_deployment(
+                "gimme:recovery:valkey", name,
+                backup_local_path=local_source, secret_file=secret_file,
+                valkey_restore_request_id=request_id,
+                valkey_restore_sha256=str(component["sha256"]),
+                valkey_restore_bytes=int(component["bytes"]),
+                valkey_restore_records=int(component["records"]),
+                timeout=3600,
+            )
+    except Exception:
+        raise RecoveryError("valkey_restore_failed") from None
+    markers = []
+    for raw in result.output.splitlines():
+        line = raw.split("] ", 1)[-1].strip()
+        match = re.fullmatch(
+            r"GIMME_VALKEY_RESTORE\|([0-9]{1,6})\|([0-9]{1,6})", line
+        )
+        if match is not None:
+            markers.append((int(match[1]), int(match[2])))
+    if len(markers) != 1 or sum(markers[0]) != int(component["records"]):
+        raise RecoveryError("valkey_verification_failed")
+
+
 def _revision(name: str) -> str:
     deployment = store.deployment(name)
     if deployment.source.kind == "commit":
@@ -1530,7 +1567,8 @@ def _deployment_restore_plan(
     return deployment_restore_plan(
         name, recovery_point_id, request_id,
         manifest_components,
-        resource_name, resource.version, original_empty,
+        resource_name, resource.version,
+        original_empty and "valkey" not in selected_components,
         selected_components,
         valkey_destination,
         None if existing_restore is None else str(existing_restore["state"]),
@@ -1659,86 +1697,54 @@ def apply_restore_deployment(
                 )
                 advance("safety_verified")
         with tempfile.TemporaryDirectory(prefix="gimme-restore-source-") as directory:
-            selected_kind = selected_components[0]
-            component = source_components[selected_kind]
-            local_source = Path(directory) / (
-                "postgres.dump" if selected_kind == "postgres" else "valkey.archive"
-            )
+            local_sources = {
+                "postgres": Path(directory) / "postgres.dump",
+                "valkey": Path(directory) / "valkey.archive",
+            }
             if current in {
                 "safety_verified", "safety_not_required", "artifact_verified"
             }:
-                component = recovery_module.materialize_recovery_component(
-                    destination_name, destination, credentials, backup_s3, name,
-                    recovery_point_id, selected_kind, local_source,
-                )
+                for selected_kind in selected_components:
+                    source_components[selected_kind] = (
+                        recovery_module.materialize_recovery_component(
+                            destination_name, destination, credentials, backup_s3,
+                            name, recovery_point_id, selected_kind,
+                            local_sources[selected_kind],
+                        )
+                    )
             if current in {"safety_verified", "safety_not_required"}:
                 advance("artifact_verified")
             if current == "artifact_verified":
-                if selected_kind == "postgres":
+                if "postgres" in selected_components:
+                    postgres_component = source_components["postgres"]
                     try:
                         _run_deployment(
                             "gimme:recovery:postgres", name,
-                            backup_local_path=local_source,
+                            backup_local_path=local_sources["postgres"],
                             postgres_restore_action="prepare",
                             postgres_restore_request_id=request_id,
-                            postgres_restore_sha256=str(component["sha256"]),
-                            postgres_restore_bytes=int(component["bytes"]),
+                            postgres_restore_sha256=str(postgres_component["sha256"]),
+                            postgres_restore_bytes=int(postgres_component["bytes"]),
                             timeout=3600,
                         )
                     except Exception:
                         raise RecoveryError("restore_shadow_prepare_failed") from None
-                else:
-                    binding = deployment.resources.valkey
-                    valkey_name = binding.resource if binding is not None else None
-                    valkey_resource = (
-                        state.resources.get(valkey_name) if valkey_name else None
+                if "valkey" in selected_components:
+                    _restore_valkey_component(
+                        name, request_id, source_components["valkey"],
+                        local_sources["valkey"], state, deployment,
                     )
-                    if not isinstance(
-                        valkey_resource,
-                        (ResourceConfig, AWSElastiCacheValkeyResource),
-                    ) or valkey_name is None:
-                        raise RecoveryError("restore_destination_incompatible")
-                    credential = _valkey_capture_credential(
-                        state, valkey_name, valkey_resource
-                    )
-                    try:
-                        with protected_secret_file(credential) as secret_file:
-                            result = _run_deployment(
-                                "gimme:recovery:valkey", name,
-                                backup_local_path=local_source,
-                                secret_file=secret_file,
-                                valkey_restore_request_id=request_id,
-                                valkey_restore_sha256=str(component["sha256"]),
-                                valkey_restore_bytes=int(component["bytes"]),
-                                valkey_restore_records=int(component["records"]),
-                                timeout=3600,
-                            )
-                    except Exception:
-                        raise RecoveryError("valkey_restore_failed") from None
-                    markers = []
-                    for raw in result.output.splitlines():
-                        line = raw.split("] ", 1)[-1].strip()
-                        match = re.fullmatch(
-                            r"GIMME_VALKEY_RESTORE\|([0-9]{1,6})\|([0-9]{1,6})",
-                            line,
-                        )
-                        if match is not None:
-                            markers.append((int(match[1]), int(match[2])))
-                    if (
-                        len(markers) != 1
-                        or sum(markers[0]) != int(component["records"])
-                    ):
-                        raise RecoveryError("valkey_verification_failed")
                 advance("shadow_verified")
         if current == "shadow_verified":
-            if selected_components == ["postgres"]:
+            if "postgres" in selected_components:
+                postgres_component = source_components["postgres"]
                 try:
                     _run_deployment(
                         "gimme:recovery:postgres", name,
                         postgres_restore_action="swap",
                         postgres_restore_request_id=request_id,
-                        postgres_restore_sha256=str(component["sha256"]),
-                        postgres_restore_bytes=int(component["bytes"]),
+                        postgres_restore_sha256=str(postgres_component["sha256"]),
+                        postgres_restore_bytes=int(postgres_component["bytes"]),
                         timeout=300,
                     )
                 except Exception:
