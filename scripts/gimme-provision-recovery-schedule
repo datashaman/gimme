@@ -285,6 +285,60 @@ def load_transferred_credentials(
             raise RuntimeError("Recovery Schedule credential cleanup failed") from error
 
 
+def load_transferred_valkey_credentials(
+    deployment: str, sudo_uid: int, auth_mode: str
+) -> str | None:
+    path = TRANSFER_ROOT / f"{deployment}.valkey-credentials"
+    if auth_mode == "none":
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule Valkey credential cleanup failed") from error
+        return None
+    try:
+        if path.is_symlink():
+            fail("Recovery Schedule Valkey credential transfer is unsafe")
+        try:
+            details = path.stat()
+        except OSError as error:
+            raise RuntimeError(
+                "Recovery Schedule Valkey credential transfer is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != sudo_uid
+            or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+            or details.st_size > 4096
+        ):
+            fail("Recovery Schedule Valkey credential transfer is unsafe")
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Recovery Schedule Valkey credential transfer is invalid") from error
+        credentials = require_object(
+            value, {"username", "password"}, "scheduled Valkey credentials"
+        )
+        for key in ("username", "password"):
+            item = credentials[key]
+            if (
+                not isinstance(item, str)
+                or not 1 <= len(item.encode()) <= 2048
+                or any(character in item for character in "\0\r\n")
+            ):
+                fail("Recovery Schedule Valkey credential transfer is invalid")
+        encoded = json.dumps(credentials, sort_keys=True, separators=(",", ":")) + "\n"
+        if len(encoded.encode()) > 4096:
+            fail("Recovery Schedule Valkey credential transfer is invalid")
+        return encoded
+    finally:
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule Valkey credential cleanup failed") from error
+
+
 def run(command: list[str]) -> None:
     if not command or command[0] not in EXECUTABLES:
         fail("Recovery Schedule helper attempted an unexpected executable")
@@ -333,13 +387,18 @@ def atomic_write(path: Path, content: str, mode: int) -> bool:
 
 
 def service_unit(
-    deployment: str, account: pwd.struct_passwd, *, stored_credentials: bool
+    deployment: str, account: pwd.struct_passwd, *, stored_credentials: bool,
+    stored_valkey_credentials: bool = False,
 ) -> str:
     authority = AUTHORITY_ROOT / f"{deployment}.json"
     group = grp.getgrgid(account.pw_gid).gr_name
     credential = (
         f"LoadCredential=aws:{AUTHORITY_ROOT / f'{deployment}.credentials'}\n"
         if stored_credentials else ""
+    )
+    valkey_credential = (
+        f"LoadCredential=valkey:{AUTHORITY_ROOT / f'{deployment}.valkey-credentials'}\n"
+        if stored_valkey_credentials else ""
     )
     return (
         "[Unit]\n"
@@ -350,6 +409,7 @@ def service_unit(
         f"ExecStart={RUNNER} scheduled {deployment}\n"
         f"LoadCredential=authority:{authority}\n"
         f"{credential}"
+        f"{valkey_credential}"
         f"StateDirectory=gimme/recovery-schedules/{deployment}\n"
         "RuntimeMaxSec=7200\nTimeoutStopSec=30\n"
         "NoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\n"
@@ -389,13 +449,16 @@ def remove_schedule(deployment: str) -> bool:
         if path.exists() or path.is_symlink():
             path.unlink()
             changed = True
-    credential = AUTHORITY_ROOT / f"{deployment}.credentials"
-    try:
-        if credential.exists() or credential.is_symlink():
-            credential.unlink()
-            changed = True
-    except OSError as error:
-        raise RuntimeError("Recovery Schedule credential cleanup failed") from error
+    for credential in (
+        AUTHORITY_ROOT / f"{deployment}.credentials",
+        AUTHORITY_ROOT / f"{deployment}.valkey-credentials",
+    ):
+        try:
+            if credential.exists() or credential.is_symlink():
+                credential.unlink()
+                changed = True
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule credential cleanup failed") from error
     status_directory = STATUS_ROOT / deployment
     status = status_directory / "status.json"
     if status.exists() or status.is_symlink():
@@ -428,6 +491,13 @@ def reconcile() -> None:
     credential_content = load_transferred_credentials(
         deployment, account.pw_uid, "ambient" if calendar is None else auth_mode
     )
+    valkey = authority["valkey_execution"]
+    valkey_auth_mode = (
+        "none" if calendar is None or valkey is None else valkey["auth_mode"]
+    )
+    valkey_credential_content = load_transferred_valkey_credentials(
+        deployment, account.pw_uid, valkey_auth_mode
+    )
     service = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.service"
     timer = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.timer"
     if calendar is None:
@@ -445,7 +515,8 @@ def reconcile() -> None:
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
         rendered_service = service_unit(
-            deployment, account, stored_credentials=credential_content is not None
+            deployment, account, stored_credentials=credential_content is not None,
+            stored_valkey_credentials=valkey_credential_content is not None,
         )
         rendered_timer = timer_unit(deployment, calendar)
         desired = [
@@ -454,8 +525,11 @@ def reconcile() -> None:
             (timer, rendered_timer, 0o644),
         ]
         credential_path = AUTHORITY_ROOT / f"{deployment}.credentials"
+        valkey_credential_path = AUTHORITY_ROOT / f"{deployment}.valkey-credentials"
         if credential_content is not None:
             desired.append((credential_path, credential_content, 0o600))
+        if valkey_credential_content is not None:
+            desired.append((valkey_credential_path, valkey_credential_content, 0o600))
         try:
             replacing = any(
                 not file_matches(path, content, mode) for path, content, mode in desired
@@ -475,8 +549,18 @@ def reconcile() -> None:
                 changed = True
             else:
                 changed = False
+            if valkey_credential_content is None and (
+                valkey_credential_path.exists() or valkey_credential_path.is_symlink()
+            ):
+                disable(timer.name)
+                valkey_credential_path.unlink()
+                changed = True
             if credential_content is not None:
                 changed = atomic_write(credential_path, credential_content, 0o600) or changed
+            if valkey_credential_content is not None:
+                changed = atomic_write(
+                    valkey_credential_path, valkey_credential_content, 0o600
+                ) or changed
         except OSError as error:
             raise RuntimeError("Recovery Schedule credential installation failed") from error
         changed = atomic_write(AUTHORITY_ROOT / f"{deployment}.json", encoded, 0o600) or changed
