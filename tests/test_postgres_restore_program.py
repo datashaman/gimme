@@ -199,7 +199,7 @@ def test_failed_second_rename_compensates_the_original_database_name(
 
     monkeypatch.setitem(program, "rename_database", rename)
 
-    with pytest.raises(program["RestoreFailure"], match="second rename"):
+    with pytest.raises(program["RestoreFailure"], match="shadow rename failed"):
         program["swap"](state_path)
 
     assert renames == [

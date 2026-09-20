@@ -610,10 +610,38 @@ def verify_postgres_restore(gimme) -> None:
     )
     if not restore["ready"] or restore["destination"]["empty"]:
         raise AssertionError(f"non-empty Restore did not require Safety capture: {restore}")
-    applied = gimme.apply_restore_deployment(
-        RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
-        str(restore["plan_id"]), str(restore["confirmation"]),
-    )
+    try:
+        applied = gimme.apply_restore_deployment(
+            RECOVERY_DEPLOYMENT, point_id, "ci-nonempty-restore",
+            str(restore["plan_id"]), str(restore["confirmation"]),
+        )
+    except RecoveryError as exc:
+        if str(exc) == "restore_swap_failed":
+            try:
+                gimme._run_deployment(
+                    "gimme:recovery:postgres", RECOVERY_DEPLOYMENT,
+                    postgres_restore_action="swap",
+                    postgres_restore_request_id="ci-nonempty-restore",
+                    postgres_restore_sha256=str(
+                        created["recovery_point"]["components"][0]["sha256"]
+                    ),
+                    postgres_restore_bytes=int(
+                        created["recovery_point"]["components"][0]["bytes"]
+                    ),
+                    timeout=300,
+                )
+            except Exception as detail:
+                allowed = [
+                    "restore connection termination failed",
+                    "restore live rename failed",
+                    "restore shadow rename failed",
+                    "restore compensation failed",
+                ]
+                reason = next(
+                    (item for item in allowed if item in str(detail)), "restore stage unknown"
+                )
+                print(f"[DEBUG-restore-swap] {reason}", flush=True)
+        raise
     if applied["state"] != "data_replaced" or restore_probe_value() != "before":
         raise AssertionError(f"PostgreSQL data was not replaced: {applied}")
     record = gimme.restore_record_resource(

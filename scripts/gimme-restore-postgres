@@ -250,21 +250,30 @@ def swap(state_path: Path) -> None:
         atomic_write(state_path, state)
         return
     if observed == {"live": live_oid, "shadow": shadow_oid, "previous": None}:
-        query(
-            "postgres",
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
-            {"database": database},
-        )
-        rename_database(database, previous, state["role"])
+        try:
+            query(
+                "postgres",
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
+                {"database": database},
+            )
+        except RestoreFailure as exc:
+            raise RestoreFailure("restore connection termination failed") from exc
+        try:
+            rename_database(database, previous, state["role"])
+        except RestoreFailure as exc:
+            raise RestoreFailure("restore live rename failed") from exc
     elif observed != {"live": None, "shadow": shadow_oid, "previous": live_oid}:
         raise RestoreFailure("restore swap state ambiguous")
     try:
         rename_database(shadow, database, state["role"])
-    except RestoreFailure:
+    except RestoreFailure as exc:
         if database_oid(database) is None and database_oid(previous) == live_oid:
-            rename_database(previous, database, state["role"])
-        raise
+            try:
+                rename_database(previous, database, state["role"])
+            except RestoreFailure as compensation:
+                raise RestoreFailure("restore compensation failed") from compensation
+        raise RestoreFailure("restore shadow rename failed") from exc
     if database_oid(database) != shadow_oid or database_oid(previous) != live_oid:
         raise RestoreFailure("restore swap verification failed")
     state["phase"] = "data_replaced"
