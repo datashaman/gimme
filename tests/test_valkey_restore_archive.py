@@ -114,3 +114,92 @@ def test_verification_rejects_an_unexpected_prefix_key() -> None:
 
     with pytest.raises(ValkeyArchiveError, match="valkey_restore_verification_failed"):
         replace_archive(adapter, PREFIX, body, expected_records=1)
+
+
+def test_replay_interruption_is_recovered_by_full_clear_and_replay() -> None:
+    first = PREFIX + b"first"
+    second = PREFIX + b"second"
+    body = archive([(first, b"one", None), (second, b"two", None)])
+
+    class InterruptedReplay(FakeRestore):
+        interrupted = False
+
+        def restore(self, key, payload, expires_at_ms):
+            super().restore(key, payload, expires_at_ms)
+            if not self.interrupted:
+                self.interrupted = True
+                raise RuntimeError("transport interrupted")
+
+    adapter = InterruptedReplay({PREFIX + b"old": (b"old", None)})
+
+    with pytest.raises(RuntimeError, match="transport interrupted"):
+        replace_archive(adapter, PREFIX, body, expected_records=2)
+    assert first in adapter.values or second in adapter.values
+
+    result = replace_archive(adapter, PREFIX, body, expected_records=2)
+
+    assert result.restored == 2
+    assert adapter.values == {
+        first: (b"one", None),
+        second: (b"two", None),
+    }
+
+
+def test_clear_interruption_mutates_no_foreign_prefix_and_retry_restarts_clear() -> None:
+    source = PREFIX + b"source"
+    foreign = OTHER + b"foreign"
+    body = archive([(source, b"restored", None)])
+
+    class InterruptedClear(FakeRestore):
+        interrupted = False
+
+        def unlink(self, keys):
+            super().unlink(keys[:1])
+            if not self.interrupted:
+                self.interrupted = True
+                raise RuntimeError("clear interrupted")
+            super().unlink(keys[1:])
+
+    adapter = InterruptedClear({
+        PREFIX + b"old-a": (b"a", None),
+        PREFIX + b"old-b": (b"b", None),
+        foreign: (b"untouched", None),
+    })
+
+    with pytest.raises(RuntimeError, match="clear interrupted"):
+        replace_archive(adapter, PREFIX, body, expected_records=1)
+    assert adapter.values[foreign] == (b"untouched", None)
+
+    replace_archive(adapter, PREFIX, body, expected_records=1)
+
+    assert adapter.values == {
+        source: (b"restored", None),
+        foreign: (b"untouched", None),
+    }
+
+
+def test_record_expiring_between_replay_turns_is_never_resurrected() -> None:
+    early = PREFIX + b"a-early"
+    expired_before_turn = PREFIX + b"b-expired"
+    persistent = PREFIX + b"persistent"
+    body = archive([
+        (early, b"early", 5_000),
+        (expired_before_turn, b"expired", 1_001),
+        (persistent, b"keep", None),
+    ])
+
+    class AdvancingTime(FakeRestore):
+        calls = 0
+
+        def server_time_ms(self):
+            self.calls += 1
+            return 1_000 if self.calls == 1 else 1_002
+
+    adapter = AdvancingTime()
+
+    result = replace_archive(adapter, PREFIX, body, expected_records=3)
+
+    assert result.restored == 2 and result.expired == 1
+    assert expired_before_turn not in adapter.values
+    assert adapter.values[early] == (b"early", 5_000)
+    assert adapter.values[persistent] == (b"keep", None)
