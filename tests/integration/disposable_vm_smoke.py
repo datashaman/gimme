@@ -711,14 +711,17 @@ def postgres_blocker(database: str, *, wait_for_database: bool = False) -> subpr
     return process
 
 
-def postgres_admin(statement: str) -> str:
+def postgres_admin(statement: str, *, as_postgres: bool = False) -> str:
     """Run one internally fixed statement without OpenSSH shell re-tokenization."""
     return ssh_python_output(textwrap.dedent(
         f"""
         import subprocess
+        command = ["psql", "-Atq", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
+                   "-c", {statement!r}]
+        if {as_postgres!r}:
+            command = ["sudo", "-n", "-u", "postgres", *command]
         result = subprocess.run(
-            ["psql", "-Atq", "-d", "postgres", "-v", "ON_ERROR_STOP=1",
-             "-c", {statement!r}],
+            command,
             check=True, text=True, stdout=subprocess.PIPE,
         )
         print(result.stdout.strip())
@@ -761,7 +764,8 @@ def set_database_connections(database: str, allowed: bool) -> None:
         raise AssertionError("invalid fixed integration database identity")
     action = "true" if allowed else "false"
     postgres_admin(
-        f'ALTER DATABASE "{database}" ALLOW_CONNECTIONS {action}'
+        f'ALTER DATABASE "{database}" ALLOW_CONNECTIONS {action}',
+        as_postgres=True,
     )
 
 
