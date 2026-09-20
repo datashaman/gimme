@@ -421,6 +421,40 @@ def test_control_plane_registration_mcp_adapter_uses_current_orchestrator(
     assert seen == [("production", account)]
 
 
+def test_target_runtime_orchestration_preserves_fixed_task_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    packages = selected.target("devbox").stack.packages
+    preflight = "\n".join(
+        [*(f"GIMME_PACKAGE|{name}|installed|installed" for name in packages),
+         "GIMME_APT_BUSY|no", "GIMME_HELPER|ready"]
+    )
+    calls: list[str] = []
+
+    def fake_run(task, *args, **kwargs):
+        calls.append(task)
+        if task == "gimme:preflight:stack":
+            return CommandResult(["dep"], 0, preflight)
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fake_run)
+    stack_plan = server_module.plan_target_stack("devbox")
+    server_module.apply_target_stack("devbox", str(stack_plan["plan_id"]))
+    runtime_plan = server_module.plan_deployment_runtimes("example-app")
+    server_module.apply_deployment_runtimes(
+        "example-app", str(runtime_plan["plan_id"])
+    )
+
+    assert calls == [
+        "gimme:preflight:stack",
+        "gimme:preflight:stack",
+        "gimme:provision:stack",
+        "gimme:provision:runtimes",
+        "gimme:preflight:runtimes",
+    ]
+
+
 async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
