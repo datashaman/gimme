@@ -28,6 +28,8 @@ jobs:
           tools: composer:v2
       - run: uv sync --frozen
       - run: composer install --no-interaction --prefer-dist
+      - name: Install locked real-Laravel Valkey fixture
+        run: composer install --working-dir=tests/integration/laravel-valkey --no-interaction --prefer-dist
       - name: Configure loopback SSH
         run: |
           sudo apt-get update
@@ -61,6 +63,8 @@ jobs:
         run: uv run python tests/integration/disposable_vm_smoke.py pin-resources
       - name: Exercise isolated resources and host services
         run: uv run python tests/integration/disposable_vm_smoke.py verify
+      - name: Exercise the real Laravel and Horizon Valkey contract
+        run: uv run python tests/integration/laravel_valkey_smoke.py
       - name: Start a TLS-verified MinIO Backup Destination
         run: |
           install -d -m 0700 "$RUNNER_TEMP/minio-certs" "$RUNNER_TEMP/minio-data"
@@ -85,6 +89,7 @@ jobs:
       - name: Stop disposable services
         if: always()
         run: |
+          uv run python tests/integration/laravel_valkey_smoke.py cleanup || true
           docker rm -f gimme-ci-minio >/dev/null 2>&1 || true
           sudo systemctl stop 'gimme-worker-*' 'gimme-horizon-*' \
             'gimme-scheduler-*.timer' 'gimme-scheduler-*.service' || true

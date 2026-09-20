@@ -53,10 +53,12 @@ may contain deliberate schema and MCP API breaks.
   runs a fixed stdlib probe on the Target before the symlink switch, ahead of the candidate
   health check (cluster mode, TLS with hostname verification, auth, primary read-after-write,
   namespace enforcement, each declared use, and Horizon compatibility from `composer.lock`:
-  laravel/framework 13.5.0 and laravel/horizon 5.46.0 or later); a failed probe fails the deploy
+  laravel/framework 12.0.0 and laravel/horizon 5.46.0 or later); a failed probe fails the deploy
   and leaves the current release live, and probe keys are namespaced, short-lived, and removed.
-  No privilege change. Verified only against a local TLS, cluster-mode, ACL-enforcing Redis: the
-  disposable Laravel tests and any ElastiCache behavior are not yet exercised.
+  The disposable workflow now independently drives real Laravel cache, session, and queue APIs
+  plus Horizon's Redis repository through a locked Laravel 12/Horizon 5 fixture and observes
+  namespace and ACL denials. This also corrected the former impossible Laravel 13/Horizon 5
+  compatibility pair. No privilege change. ElastiCache behavior is not yet exercised.
 - Replaced the Deployment's `resources.cache` string with a typed `resources.valkey` binding
   (`resource` plus `uses` of `cache`, `session`, and `queue`) and bumped desired state to
   **schema v5** (slice 4 of #14). `plan_state_migration` migrates v2, v3, and v4 state one way:

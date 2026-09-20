@@ -212,7 +212,7 @@ MAX_ITEMS = 4096
 MAX_REDIRECTS = 2
 CONNECT_ATTEMPTS = 3
 KEY_TTL = 30
-MINIMUMS = {"laravel/framework": (13, 5, 0), "laravel/horizon": (5, 46, 0)}
+MINIMUMS = {"laravel/framework": (12, 0, 0), "laravel/horizon": (5, 46, 0)}
 
 
 class ProbeFailure(Exception):
