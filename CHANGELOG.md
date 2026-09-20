@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Wired Recovery Schedule reconciliation into Deployment Resource apply and removal. Apply now
+  rotates protected S3 and managed-Valkey credentials only after application-secret activation;
+  manual policy and removal disable units without requiring a live managed endpoint or decrypted
+  credential. The scheduled runner now preserves request-owned Valkey maintenance through capture
+  verification, restores runtime before manifest publication, and keeps failed-exit authority for
+  safe retry. Bounded runner status is exposed through one strictly parsed fixed marker to the MCP
+  schedule projection.
 - Completed the standalone runner's scheduled activation path: it validates the exact
   fingerprint and stable delay, consumes only named systemd credentials, records atomic bounded
   attempt status, waits at most five minutes for the Deployment lock, executes the shared capture

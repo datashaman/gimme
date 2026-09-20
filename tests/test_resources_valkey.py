@@ -3095,8 +3095,9 @@ def test_a_restore_recreates_from_the_snapshot_keeping_every_credential_then_ver
     assert result["restored"] is True and result["phase"] == "ready"
     assert result["verified"] == [DEPLOYMENT] and result["snapshot"] == SNAPSHOT
     # the Deployment is pointed at the new group, proven against the live release, and restarted
-    assert tasks(calls)[-3:] == [
-        "gimme:provision:app", "gimme:probe:valkey:current", "gimme:restart:workers",
+    assert tasks(calls)[-4:] == [
+        "gimme:provision:app", "gimme:recovery:schedule-reconcile",
+        "gimme:probe:valkey:current", "gimme:restart:workers",
     ]
     assert not marker_file("restoring").exists()
     after = load_observed(server_module.store.root, NAME)
@@ -3417,8 +3418,9 @@ def test_a_rotation_swaps_users_after_a_probed_switch_and_deletes_the_old_one_la
         binding_username(DEPLOYMENT), binding_username(DEPLOYMENT, 2)
     ]
     assert adapter.removed_users == [old_user] and old_user not in adapter.users
-    assert tasks(calls)[-3:] == [
-        "gimme:provision:app", "gimme:probe:valkey:current", "gimme:restart:workers",
+    assert tasks(calls)[-4:] == [
+        "gimme:provision:app", "gimme:recovery:schedule-reconcile",
+        "gimme:probe:valkey:current", "gimme:restart:workers",
     ]
     assert not marker_file("rotating").exists()
     text = json.dumps(result).lower()

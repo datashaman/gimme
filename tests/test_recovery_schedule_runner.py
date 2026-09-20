@@ -135,7 +135,12 @@ def test_runner_executes_postgres_and_valkey_through_shared_capture_core(tmp_pat
             return SimpleNamespace(path=path)
 
         @staticmethod
-        def publish(store, deployment, destination, point_id, components, observed_at=None):
+        def publish(
+            store, deployment, destination, point_id, components, observed_at=None,
+            before_publish=None,
+        ):
+            if before_publish is not None:
+                before_publish()
             calls.append(("publish", deployment, destination, point_id, len(components)))
             return {"recovery_point_id": point_id, "components": [1, 2]}
 
@@ -195,11 +200,20 @@ def test_scheduled_execution_records_verified_point_and_retention(tmp_path) -> N
     runner["capture_recovery"] = lambda *args, **kwargs: {
         "recovery_point_id": "rp_" + "a" * 20
     }
+    runner["maintenance"] = lambda *_args, **_kwargs: None
 
     class Core:
         class BotoObjectStore:
             def __init__(self, _destination, _credentials):
                 pass
+
+        @staticmethod
+        def recovery_point_id(_deployment, _destination, _request):
+            return "rp_" + "a" * 20
+
+        @staticmethod
+        def find_recovery_point(_store, _deployment, _destination, _point_id):
+            return None
 
         @staticmethod
         def enforce_retention(_store, _deployment, _destination, retain, replacement):
@@ -219,6 +233,42 @@ def test_scheduled_execution_records_verified_point_and_retention(tmp_path) -> N
     assert result["retention_deleted"] == 2
     assert json.loads(status_path.read_text()) == result
     assert closed == [True]
+
+
+def test_runner_maintenance_uses_only_fixed_helper_and_protected_request(
+    tmp_path, monkeypatch
+) -> None:
+    runner = runner_namespace()
+    runner["EXPECTED_APPS_ROOT"] = tmp_path
+    calls = []
+
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    authority = runner_authority()
+    runner["maintenance"]("enter", authority, "scheduled-abc", execute=execute)
+    request = tmp_path / ".gimme/recovery-requests/example-app.json"
+    assert json.loads(request.read_text()) == {
+        "schema_version": 1, "deployment": "example-app",
+        "request_id": "scheduled-abc", "quiesce_wait_seconds": 30,
+    }
+    assert request.stat().st_mode & 0o777 == 0o600
+    runner["maintenance"]("exit", authority, "scheduled-abc", execute=execute)
+    assert not request.exists()
+    assert calls[0][0] == [
+        "/usr/bin/sudo", "-n", "/usr/local/sbin/gimme-recovery-maintenance",
+        "enter", "example-app", "scheduled-abc",
+    ]
+    assert "shell" not in calls[0][1]
+
+    runner["maintenance"]("enter", authority, "scheduled-abc", execute=execute)
+    with pytest.raises(runner["RunnerFailure"], match="^capture_failed$"):
+        runner["maintenance"](
+            "exit", authority, "scheduled-abc",
+            execute=lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+        )
+    assert request.exists(), "failed runtime restoration must preserve retry authority"
 
 
 def test_scheduled_execution_records_busy_without_capture(tmp_path) -> None:
@@ -272,3 +322,28 @@ def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypat
     assert observed["args"][1] == "shared-core"
     assert observed["kwargs"]["aws_credentials"] is None
     assert observed["kwargs"]["valkey_credential_path"] == valkey
+
+
+def test_runner_status_emits_only_one_bounded_canonical_marker(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    runner = runner_namespace()
+    root = tmp_path / "status"
+    path = root / "example-app" / "status.json"
+    path.parent.mkdir(parents=True)
+    now = datetime(2026, 9, 20, 10, 15, tzinfo=UTC)
+    status = runner["attempt_status"](
+        "example-app", now, now, "succeeded", finished_at=now
+    )
+    path.write_text(json.dumps(status))
+    path.chmod(0o600)
+    runner["STATUS_ROOT"] = root
+    monkeypatch.setattr(
+        runner["sys"], "argv", ["gimme-recovery-runner", "status", "example-app"]
+    )
+
+    assert runner["main"]() == 0
+    marker = capsys.readouterr().out.strip()
+    assert marker.startswith("GIMME_RECOVERY_STATUS|")
+    decoded = runner["base64"].b64decode(marker.split("|", 1)[1])
+    assert json.loads(decoded) == status

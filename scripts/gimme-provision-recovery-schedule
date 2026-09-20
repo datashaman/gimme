@@ -207,7 +207,7 @@ def validate_authority(value: Any, deployment: str) -> dict[str, Any]:
     if authority["status_identity"] != deployment:
         fail("Recovery Schedule status identity mismatch")
     valkey = authority["valkey_execution"]
-    if components == ["postgres"]:
+    if components == ["postgres"] or authority["calendar"] is None:
         if valkey is not None:
             fail("invalid Recovery Schedule Valkey authority")
     else:
