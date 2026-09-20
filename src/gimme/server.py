@@ -306,6 +306,10 @@ def _run_deployment(
     postgres_restore_request_id: str | None = None,
     postgres_restore_sha256: str | None = None,
     postgres_restore_bytes: int | None = None,
+    valkey_restore_request_id: str | None = None,
+    valkey_restore_sha256: str | None = None,
+    valkey_restore_bytes: int | None = None,
+    valkey_restore_records: int | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -331,7 +335,7 @@ def _run_deployment(
         database_identifier=deployment.placement.database_identifier,
         cache_prefix=(
             f"{{gimme:{name}}}:"
-            if task == "gimme:backup:capture-valkey"
+            if task in {"gimme:backup:capture-valkey", "gimme:recovery:valkey"}
             and isinstance(valkey_resource, AWSElastiCacheValkeyResource)
             else deployment.placement.cache_prefix
         ),
@@ -357,6 +361,10 @@ def _run_deployment(
         postgres_restore_request_id=postgres_restore_request_id,
         postgres_restore_sha256=postgres_restore_sha256,
         postgres_restore_bytes=postgres_restore_bytes,
+        valkey_restore_request_id=valkey_restore_request_id,
+        valkey_restore_sha256=valkey_restore_sha256,
+        valkey_restore_bytes=valkey_restore_bytes,
+        valkey_restore_records=valkey_restore_records,
         timeout=timeout,
     )
 

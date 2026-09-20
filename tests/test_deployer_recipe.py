@@ -742,6 +742,24 @@ def test_postgres_restore_task_uses_request_scoped_protected_atomic_state() -> N
     assert "escapeshellarg($bytes)" in task
 
 
+def test_valkey_restore_task_is_request_scoped_prefix_bounded_and_cleans_up() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:valkey'", 1)[1].split(
+        "task('gimme:recovery:verify-application'", 1
+    )[0]
+
+    assert "required_env('GIMME_VALKEY_RESTORE_REQUEST_ID')" in task
+    assert "required_env('GIMME_CACHE_PREFIX')" in task
+    assert "required_env('GIMME_VALKEY_RESTORE_SHA256')" in task
+    assert "required_env('GIMME_VALKEY_RESTORE_RECORDS')" in task
+    assert "upload($localPath, $remotePath)" in task
+    assert "chmod 0600" in task
+    assert "scripts/gimme-restore-valkey" in task
+    assert "python3 - " in task
+    assert "rm -f " in task
+    assert task.index("try {") < task.index("upload($localPath") < task.index("} finally {")
+
+
 def test_restore_verification_runs_database_and_health_checks_behind_maintenance() -> None:
     recipe = deployer_source()
     task = recipe.split("task('gimme:recovery:verify-application'", 1)[1].split(

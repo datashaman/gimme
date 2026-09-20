@@ -134,6 +134,10 @@ class DeployerRunner:
         postgres_restore_request_id: str | None = None,
         postgres_restore_sha256: str | None = None,
         postgres_restore_bytes: int | None = None,
+        valkey_restore_request_id: str | None = None,
+        valkey_restore_sha256: str | None = None,
+        valkey_restore_bytes: int | None = None,
+        valkey_restore_records: int | None = None,
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
         resource_trust_bundle_sha256: str | None = None,
@@ -245,6 +249,21 @@ class DeployerRunner:
             environment["GIMME_POSTGRES_RESTORE_REQUEST_ID"] = postgres_restore_request_id
             environment["GIMME_POSTGRES_RESTORE_SHA256"] = postgres_restore_sha256
             environment["GIMME_POSTGRES_RESTORE_BYTES"] = str(postgres_restore_bytes)
+        if any(value is not None for value in (
+            valkey_restore_request_id, valkey_restore_sha256,
+            valkey_restore_bytes, valkey_restore_records
+        )):
+            if (
+                valkey_restore_request_id is None
+                or valkey_restore_sha256 is None
+                or valkey_restore_bytes is None
+                or valkey_restore_records is None
+            ):
+                raise ValueError("Valkey restore inputs must be complete")
+            environment["GIMME_VALKEY_RESTORE_REQUEST_ID"] = valkey_restore_request_id
+            environment["GIMME_VALKEY_RESTORE_SHA256"] = valkey_restore_sha256
+            environment["GIMME_VALKEY_RESTORE_BYTES"] = str(valkey_restore_bytes)
+            environment["GIMME_VALKEY_RESTORE_RECORDS"] = str(valkey_restore_records)
         if resource_endpoint is not None:
             host, port = resource_endpoint
             environment["GIMME_RESOURCE_ENDPOINT"] = host

@@ -15,6 +15,7 @@ REQUIRED_FILES = (
     "scripts/gimme-postgres-restore-swap",
     "scripts/gimme-capture-valkey",
     "scripts/gimme-restore-postgres",
+    "scripts/gimme-restore-valkey",
     "vendor/deployer/deployer/bin/dep",
     "pyproject.toml",
     "uv.lock",

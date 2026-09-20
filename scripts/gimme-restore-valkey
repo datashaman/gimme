@@ -1,0 +1,304 @@
+#!/usr/bin/python3
+"""Replace one internally supplied Deployment Valkey prefix from a checked archive."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import socket
+import ssl
+import stat
+import sys
+from pathlib import Path
+
+
+MAX_BULK = 64 * 1024 * 1024
+MAX_KEYS = 100_000
+MAX_ARCHIVE = 512 * 1024 * 1024
+MAX_SCAN_ITERATIONS = 100_000
+MAX_CLEAR_PASSES = 100
+UNLINK_BATCH = 1_000
+PREFIX = re.compile(
+    r"^(?:[a-zA-Z0-9:_-]{1,160}|\{gimme:[a-z][a-z0-9-]{0,63}\}:)$"
+)
+HOST = re.compile(r"^[a-zA-Z0-9.-]{1,255}$")
+
+
+class RestoreFailure(RuntimeError):
+    pass
+
+
+class ServerError(RestoreFailure):
+    def __init__(self, message: bytes):
+        super().__init__("valkey server rejected restore")
+        self.message = message
+
+
+class Connection:
+    def __init__(self, host: str, port: int, tls: bool):
+        raw = socket.create_connection((host, port), timeout=10)
+        self.socket = (
+            ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+            if tls else raw
+        )
+        self.socket.settimeout(10)
+        self.reader = self.socket.makefile("rb")
+
+    def call(self, *arguments: str | bytes | int):
+        parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+        self.socket.sendall(
+            b"*%d\r\n" % len(parts)
+            + b"".join(b"$%d\r\n%s\r\n" % (len(item), item) for item in parts)
+        )
+        return self.read()
+
+    def read(self):
+        line = self.reader.readline(128)
+        if not line.endswith(b"\r\n"):
+            raise RestoreFailure("valkey restore protocol invalid")
+        kind, value = line[:1], line[1:-2]
+        if kind == b"+":
+            return value
+        if kind == b"-":
+            raise ServerError(value)
+        if kind == b":":
+            return int(value)
+        if kind == b"$":
+            size = int(value)
+            if size < 0:
+                return None
+            if size > MAX_BULK:
+                raise RestoreFailure("valkey restore value too large")
+            payload = self.reader.read(size + 2)
+            if len(payload) != size + 2 or not payload.endswith(b"\r\n"):
+                raise RestoreFailure("valkey restore protocol invalid")
+            return payload[:-2]
+        if kind == b"*":
+            count = int(value)
+            if count < 0:
+                return None
+            if count > MAX_KEYS:
+                raise RestoreFailure("valkey restore response too large")
+            return [self.read() for _ in range(count)]
+        raise RestoreFailure("valkey restore protocol invalid")
+
+    def close(self) -> None:
+        self.reader.close()
+        self.socket.close()
+
+
+class Session:
+    def __init__(
+        self, host: str, port: int, tls: bool, username: str | None, password: str | None
+    ):
+        self.base_host = host
+        self.tls = tls
+        self.username = username
+        self.password = password
+        self.connection = Connection(host, port, tls)
+        self.authenticate()
+
+    def authenticate(self) -> None:
+        if self.username is not None and self.password is not None:
+            self.connection.call("AUTH", self.username, self.password)
+
+    def call(self, *arguments: str | bytes | int):
+        for _attempt in range(3):
+            try:
+                return self.connection.call(*arguments)
+            except ServerError as error:
+                parts = error.message.split()
+                if len(parts) < 3 or parts[0] != b"MOVED":
+                    raise
+                rendered = parts[2].decode("ascii", "strict")
+                host, separator, port = rendered.rpartition(":")
+                domain = self.base_host.partition(".")[2]
+                if (
+                    separator != ":" or not port.isdigit() or not 1 <= int(port) <= 65535
+                    or not (
+                        host == self.base_host
+                        or ("." in domain and host.endswith("." + domain))
+                    )
+                ):
+                    raise RestoreFailure("valkey restore redirect invalid") from None
+                self.connection.close()
+                self.connection = Connection(host, int(port), self.tls)
+                self.authenticate()
+        raise RestoreFailure("valkey restore redirect limit")
+
+
+def credential(path: str) -> tuple[str | None, str | None]:
+    if path == "-":
+        return None, None
+    secret = Path(path)
+    details = secret.lstat()
+    if (
+        secret.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size > 4096
+    ):
+        raise RestoreFailure("valkey restore credential invalid")
+    value = json.loads(secret.read_text())
+    if (
+        not isinstance(value, dict) or set(value) != {"username", "password"}
+        or not all(isinstance(item, str) and item for item in value.values())
+    ):
+        raise RestoreFailure("valkey restore credential invalid")
+    return value["username"], value["password"]
+
+
+def archive(path: Path, prefix: bytes, sha256: str, size: int, count: int):
+    details = path.lstat()
+    if (
+        path.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size != size or size < 30 or size > MAX_ARCHIVE
+    ):
+        raise RestoreFailure("valkey restore archive invalid")
+    body = path.read_bytes()
+    if hashlib.sha256(body).hexdigest() != sha256 or not body.endswith(b"\n"):
+        raise RestoreFailure("valkey restore archive invalid")
+    lines = body.splitlines()
+    if len(lines) - 1 != count or count > MAX_KEYS:
+        raise RestoreFailure("valkey restore archive invalid")
+    try:
+        if json.loads(lines[0]) != {"format": "gimme-valkey-v1"}:
+            raise RestoreFailure("valkey restore archive invalid")
+        records = []
+        previous = None
+        for line in lines[1:]:
+            item = json.loads(line)
+            if not isinstance(item, dict) or set(item) != {"dump", "expires_at_ms", "key"}:
+                raise RestoreFailure("valkey restore archive invalid")
+            key = base64.b64decode(item["key"], validate=True)
+            payload = base64.b64decode(item["dump"], validate=True)
+            expiry = item["expires_at_ms"]
+            if (
+                not key.startswith(prefix) or not payload
+                or previous is not None and key <= previous
+                or expiry is not None and (
+                    not isinstance(expiry, int) or isinstance(expiry, bool) or expiry < 0
+                )
+            ):
+                raise RestoreFailure("valkey restore archive invalid")
+            records.append((key, payload, expiry))
+            previous = key
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise RestoreFailure("valkey restore archive invalid") from None
+    return records
+
+
+def scan(session: Session, prefix: bytes) -> list[bytes]:
+    cursor = 0
+    seen: set[bytes] = set()
+    for _iteration in range(MAX_SCAN_ITERATIONS):
+        response = session.call("SCAN", cursor, "MATCH", prefix + b"*", "COUNT", 1000)
+        if not isinstance(response, list) or len(response) != 2:
+            raise RestoreFailure("valkey restore scan invalid")
+        cursor = int(response[0])
+        if cursor < 0:
+            raise RestoreFailure("valkey restore scan invalid")
+        keys = response[1]
+        if not isinstance(keys, list):
+            raise RestoreFailure("valkey restore scan invalid")
+        for key in keys:
+            if not isinstance(key, bytes) or not key.startswith(prefix):
+                raise RestoreFailure("valkey restore isolation failed")
+            seen.add(key)
+            if len(seen) > MAX_KEYS:
+                raise RestoreFailure("valkey restore key limit")
+        if cursor == 0:
+            return sorted(seen)
+    raise RestoreFailure("valkey restore scan limit")
+
+
+def server_time_ms(session: Session) -> int:
+    value = session.call("TIME")
+    if (
+        not isinstance(value, list) or len(value) != 2
+        or not all(isinstance(part, bytes) and part.isdigit() for part in value)
+    ):
+        raise RestoreFailure("valkey restore time invalid")
+    return int(value[0]) * 1000 + int(value[1]) // 1000
+
+
+def replace(session: Session, prefix: bytes, records) -> tuple[int, int]:
+    for _clear_pass in range(MAX_CLEAR_PASSES):
+        keys = scan(session, prefix)
+        if not keys:
+            break
+        for offset in range(0, len(keys), UNLINK_BATCH):
+            response = session.call("UNLINK", *keys[offset:offset + UNLINK_BATCH])
+            if not isinstance(response, int):
+                raise RestoreFailure("valkey restore clear failed")
+    else:
+        raise RestoreFailure("valkey restore clear failed")
+    restored = expired = 0
+    for key, payload, expiry in records:
+        if expiry is not None and expiry <= server_time_ms(session):
+            expired += 1
+            continue
+        arguments = ("RESTORE", key, 0 if expiry is None else expiry, payload, "REPLACE")
+        response = session.call(*arguments, *(("ABSTTL",) if expiry is not None else ()))
+        if response != b"OK":
+            raise RestoreFailure("valkey restore replay failed")
+        restored += 1
+    observed = scan(session, prefix)
+    now = server_time_ms(session)
+    expected = {
+        key: (payload, expiry) for key, payload, expiry in records
+        if expiry is None or expiry > now
+    }
+    archive_keys = {key for key, _payload, _expiry in records}
+    unexpected = set(observed) - archive_keys
+    live_observed = set(observed) & set(expected)
+    if unexpected or live_observed != set(expected):
+        raise RestoreFailure("valkey restore verification failed")
+    for key in sorted(live_observed):
+        payload = session.call("DUMP", key)
+        expiry = session.call("PEXPIRETIME", key)
+        wanted_payload, wanted_expiry = expected[key]
+        if (
+            payload is None and wanted_expiry is not None
+            and wanted_expiry <= server_time_ms(session)
+        ):
+            continue
+        if payload != wanted_payload or expiry != (-1 if wanted_expiry is None else wanted_expiry):
+            raise RestoreFailure("valkey restore verification failed")
+    return restored, expired
+
+
+def main() -> None:
+    if len(sys.argv) != 10:
+        raise RestoreFailure("valkey restore requires fixed internal inputs")
+    archive_path = Path(sys.argv[1])
+    prefix_value, host, port_value, tls_value, secret_path, sha256, size, count = sys.argv[2:]
+    if (
+        not archive_path.is_absolute() or PREFIX.fullmatch(prefix_value) is None
+        or HOST.fullmatch(host) is None or not port_value.isdigit()
+        or not 1 <= int(port_value) <= 65535 or tls_value not in {"yes", "no"}
+        or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        or not size.isdigit() or not count.isdigit()
+        or int(size) > MAX_ARCHIVE or int(count) > MAX_KEYS
+    ):
+        raise RestoreFailure("valkey restore policy invalid")
+    records = archive(archive_path, prefix_value.encode(), sha256, int(size), int(count))
+    username, password = credential(secret_path)
+    session = Session(host, int(port_value), tls_value == "yes", username, password)
+    try:
+        restored, expired = replace(session, prefix_value.encode(), records)
+    finally:
+        session.connection.close()
+    print(f"GIMME_VALKEY_RESTORE|{restored}|{expired}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RestoreFailure, OSError, ValueError, json.JSONDecodeError):
+        print("GIMME_VALKEY_RESTORE_FAILED|restore_failed", file=sys.stderr)
+        raise SystemExit(1) from None
