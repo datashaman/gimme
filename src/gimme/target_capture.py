@@ -55,8 +55,167 @@ class Component:
 class ObjectStore(Protocol):
     def put(self, key: str, body: bytes, sha256: str) -> ObjectMetadata: ...
     def head(self, key: str, version_id: str | None = None) -> ObjectMetadata | None: ...
-    def get(self, key: str, version_id: str | None = None) -> bytes: ...
+    def get(
+        self, key: str, version_id: str | None = None,
+        max_bytes: int = MAX_COMPONENT_BYTES,
+    ) -> bytes: ...
     def delete(self, key: str, version_id: str) -> None: ...
+
+
+def _provider_failure(error: Exception, operation: str) -> CaptureFailure:
+    response = getattr(error, "response", None)
+    provider_code = None
+    if isinstance(response, dict) and isinstance(response.get("Error"), dict):
+        provider_code = response["Error"].get("Code")
+    codes = {
+        "AccessDenied": "access_denied", "NoSuchBucket": "missing",
+        "NoSuchKey": "missing", "404": "missing", "SlowDown": "throttled",
+        "Throttling": "throttled",
+    }
+    return CaptureFailure(
+        f"backup_destination_{operation}_{codes.get(provider_code, 'unavailable')}"
+    )
+
+
+class BotoObjectStore:
+    """Exact-key/version S3 boundary for the shared Target capture core."""
+
+    def __init__(self, destination: dict[str, object], credentials: dict[str, str] | None,
+                 *, boto_module=None) -> None:
+        if set(destination) != {
+            "name", "provider", "bucket", "region", "endpoint", "addressing", "encryption",
+            "auth_mode",
+        } or destination.get("provider") != "s3_compatible":
+            raise CaptureFailure("backup_destination_policy_invalid")
+        if destination.get("addressing") not in {"virtual_hosted", "path"}:
+            raise CaptureFailure("backup_destination_policy_invalid")
+        encryption = destination.get("encryption")
+        if not isinstance(encryption, dict) or encryption.get("method") not in {"AES256", "kms"}:
+            raise CaptureFailure("backup_destination_policy_invalid")
+        if (
+            (encryption["method"] == "AES256" and set(encryption) != {"method"})
+            or (
+                encryption["method"] == "kms"
+                and (
+                    set(encryption) != {"method", "kms_key_arn"}
+                    or not isinstance(encryption.get("kms_key_arn"), str)
+                )
+            )
+            or not all(isinstance(destination.get(key), str) for key in (
+                "name", "bucket", "region",
+            ))
+            or (
+                destination.get("endpoint") is not None
+                and not isinstance(destination.get("endpoint"), str)
+            )
+        ):
+            raise CaptureFailure("backup_destination_policy_invalid")
+        auth_mode = destination.get("auth_mode")
+        if auth_mode == "ambient" and credentials is not None:
+            raise CaptureFailure("credentials_unavailable")
+        if auth_mode == "stored" and (
+            not isinstance(credentials, dict)
+            or set(credentials) != {"access_key_id", "secret_access_key"}
+            or not all(
+                isinstance(value, str) and value and "\n" not in value and "\0" not in value
+                for value in credentials.values()
+            )
+        ):
+            raise CaptureFailure("credentials_unavailable")
+        if boto_module is None:
+            try:
+                import boto3 as boto_module
+            except ImportError:
+                raise CaptureFailure("credentials_unavailable") from None
+        try:
+            from botocore.config import Config
+
+            kwargs: dict[str, object] = {
+                "region_name": destination["region"],
+                "config": Config(s3={
+                    "addressing_style": (
+                        "virtual" if destination["addressing"] == "virtual_hosted" else "path"
+                    )
+                }),
+            }
+            if destination["endpoint"] is not None:
+                kwargs["endpoint_url"] = f"https://{destination['endpoint']}"
+            if credentials is not None:
+                kwargs["aws_access_key_id"] = credentials["access_key_id"]
+                kwargs["aws_secret_access_key"] = credentials["secret_access_key"]
+            self.client = boto_module.client("s3", **kwargs)
+        except CaptureFailure:
+            raise
+        except Exception:
+            raise CaptureFailure("destination_unavailable") from None
+        self.destination = destination
+
+    def _encryption(self) -> dict[str, str]:
+        encryption = self.destination["encryption"]
+        if encryption["method"] == "kms":
+            return {
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": str(encryption["kms_key_arn"]),
+            }
+        return {"ServerSideEncryption": "AES256"}
+
+    def put(self, key: str, body: bytes, sha256: str) -> ObjectMetadata:
+        try:
+            response = self.client.put_object(
+                Bucket=self.destination["bucket"], Key=key, Body=body,
+                Metadata={"gimme-sha256": sha256}, **self._encryption(),
+            )
+        except Exception as error:
+            raise _provider_failure(error, "upload") from None
+        return ObjectMetadata(
+            len(body), sha256, str(response.get("ServerSideEncryption") or ""),
+            response.get("VersionId"),
+        )
+
+    def head(self, key: str, version_id: str | None = None) -> ObjectMetadata | None:
+        try:
+            response = self.client.head_object(
+                Bucket=self.destination["bucket"], Key=key,
+                **({"VersionId": version_id} if version_id is not None else {}),
+            )
+        except Exception as error:
+            failure = _provider_failure(error, "head")
+            if str(failure).endswith("_missing"):
+                return None
+            raise failure from None
+        metadata = response.get("Metadata") or {}
+        return ObjectMetadata(
+            int(response.get("ContentLength", -1)), str(metadata.get("gimme-sha256") or ""),
+            str(response.get("ServerSideEncryption") or ""), response.get("VersionId"),
+        )
+
+    def get(
+        self, key: str, version_id: str | None = None,
+        max_bytes: int = MAX_COMPONENT_BYTES,
+    ) -> bytes:
+        if not 1 <= max_bytes <= MAX_COMPONENT_BYTES:
+            raise CaptureFailure("recovery_component_too_large")
+        try:
+            response = self.client.get_object(
+                Bucket=self.destination["bucket"], Key=key,
+                **({"VersionId": version_id} if version_id is not None else {}),
+            )
+            body = response["Body"].read(max_bytes + 1)
+            if not isinstance(body, bytes) or len(body) > max_bytes:
+                raise CaptureFailure("recovery_component_too_large")
+            return body
+        except CaptureFailure:
+            raise
+        except Exception as error:
+            raise _provider_failure(error, "read") from None
+
+    def delete(self, key: str, version_id: str) -> None:
+        try:
+            self.client.delete_object(
+                Bucket=self.destination["bucket"], Key=key, VersionId=version_id,
+            )
+        except Exception as error:
+            raise _provider_failure(error, "cleanup") from None
 
 
 def recovery_point_id(deployment: str, destination: str, request_id: str) -> str:
@@ -149,7 +308,7 @@ def _existing_manifest(
     metadata = store.head(key)
     if metadata is None:
         return None
-    body = store.get(key, metadata.version_id)
+    body = store.get(key, metadata.version_id, MAX_MANIFEST_BYTES)
     if len(body) > MAX_MANIFEST_BYTES or hashlib.sha256(body).hexdigest() != metadata.sha256:
         raise CaptureFailure("recovery_manifest_tampered")
     try:

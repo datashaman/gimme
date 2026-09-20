@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the shared Target capture core's narrow boto3 adapter. It builds one client from the
+  validated registered destination and ambient-or-stored credential mode, forces registered
+  addressing and encryption, and exposes only exact-key/exact-version put, head, read, and cleanup
+  operations with fixed provider failures. The review also corrected the merged privileged
+  helper's endpoint validator to accept the state model's raw `host[:port]` representation rather
+  than incorrectly requiring an `https://` URL.
 - Added the dependency-light shared Target capture core that will be invoked by both scheduled
   and on-demand execution. It derives the existing Recovery Point identity, captures PostgreSQL
   through one fixed argv vector, hashes protected local output, uploads and re-reads exact object

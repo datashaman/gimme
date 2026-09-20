@@ -91,6 +91,14 @@ def test_authority_accepts_only_derived_calendars(cadence, calendar) -> None:
         helper["validate_authority"](value, "example-app")
 
 
+def test_authority_accepts_registered_raw_s3_endpoint() -> None:
+    helper = helper_namespace()
+    value = authority()
+    value["destination"]["endpoint"] = "minio.example.test:9000"
+
+    assert helper["validate_authority"](value, "example-app") == value
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     [

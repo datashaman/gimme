@@ -6,7 +6,8 @@ from pathlib import Path
 
 from gimme import recovery
 from gimme.target_capture import (
-    Component, ObjectMetadata, capture_postgres, publish, recovery_point_id,
+    BotoObjectStore, Component, ObjectMetadata, capture_postgres, publish,
+    recovery_point_id,
 )
 
 
@@ -26,7 +27,8 @@ class Store:
         item = self.objects.get((key, version_id))
         return None if item is None else item[1]
 
-    def get(self, key, version_id=None):
+    def get(self, key, version_id=None, max_bytes=512 * 1024 * 1024):
+        assert len(self.objects[(key, version_id)][0]) <= max_bytes
         return self.objects[(key, version_id)][0]
 
     def delete(self, key, version_id):
@@ -122,3 +124,58 @@ def test_lost_manifest_response_preserves_published_components(tmp_path) -> None
     assert publish(store, "example-app", "primary", point_id, [component])[
         "recovery_point_id"
     ] == point_id
+
+
+def test_boto_store_uses_bounded_destination_credentials_and_exact_versions() -> None:
+    class Body:
+        def read(self, _limit):
+            return b"dump"
+
+    class Client:
+        def put_object(self, **kwargs):
+            assert kwargs["Bucket"] == "gimme-backups"
+            assert kwargs["ServerSideEncryption"] == "AES256"
+            return {"ServerSideEncryption": "AES256", "VersionId": "version-1"}
+
+        def head_object(self, **kwargs):
+            assert kwargs["VersionId"] == "version-1"
+            return {
+                "ContentLength": 4, "Metadata": {"gimme-sha256": "a" * 64},
+                "ServerSideEncryption": "AES256", "VersionId": "version-1",
+            }
+
+        def get_object(self, **kwargs):
+            assert kwargs["VersionId"] == "version-1"
+            return {"Body": Body()}
+
+        def delete_object(self, **kwargs):
+            assert kwargs["VersionId"] == "version-1"
+
+    class Boto:
+        observed = None
+
+        @classmethod
+        def client(cls, service, **kwargs):
+            assert service == "s3"
+            cls.observed = kwargs
+            return Client()
+
+    destination = {
+        "name": "primary", "provider": "s3_compatible", "bucket": "gimme-backups",
+        "region": "us-east-1", "endpoint": "minio.example.test:9000",
+        "addressing": "path", "encryption": {"method": "AES256"},
+        "auth_mode": "stored",
+    }
+    store = BotoObjectStore(
+        destination,
+        {"access_key_id": "access-canary", "secret_access_key": "secret-canary"},
+        boto_module=Boto,
+    )
+
+    written = store.put("fixed-key", b"dump", "a" * 64)
+    assert written.version_id == "version-1"
+    assert store.head("fixed-key", "version-1").bytes == 4
+    assert store.get("fixed-key", "version-1") == b"dump"
+    store.delete("fixed-key", "version-1")
+    assert Boto.observed["endpoint_url"] == "https://minio.example.test:9000"
+    assert Boto.observed["aws_access_key_id"] == "access-canary"
