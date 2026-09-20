@@ -189,6 +189,7 @@ function privileged_helper_source_hashes(): array
     $hashes = [];
     foreach ([
         'gimme-provision-stack', 'gimme-provision-processes',
+        'gimme-provision-recovery-schedule',
         'gimme-recovery-maintenance', 'gimme-postgres-restore-swap',
     ] as $name) {
         $source = file_get_contents(dirname(__DIR__) . "/scripts/{$name}");

@@ -662,10 +662,12 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "NOPASSWD: ALL" not in recipe
     assert "SUDO_USER" in helper
     process_helper = (ROOT / "scripts" / "gimme-provision-processes").read_text()
+    schedule_helper = (ROOT / "scripts" / "gimme-provision-recovery-schedule").read_text()
     recovery_helper = (ROOT / "scripts" / "gimme-recovery-maintenance").read_text()
 
     assert "len(sys.argv) != 1" in helper
     assert "len(sys.argv) != 2" in process_helper
+    assert "len(sys.argv) != 2" in schedule_helper
     assert "len(sys.argv) != 4" in recovery_helper
     assert "ALLOWED_PACKAGES" in helper
     assert "ALLOWED_SERVICES" in helper
@@ -673,6 +675,7 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "GIMME_POLICY_ID" in helper
     assert "'helper_source_sha256' => privileged_helper_source_hashes()" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-processes" in recipe
+    assert "NOPASSWD: /usr/local/sbin/gimme-provision-recovery-schedule *" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *" in recipe
     assert "maintenance is owned by another request" in recovery_helper
     assert 'action not in {"enter", "resume", "quiesce", "exit"}' in recovery_helper

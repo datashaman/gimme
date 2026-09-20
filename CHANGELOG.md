@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the Target-bound privileged Recovery Schedule reconciler and bound its exact source to
+  the bootstrap policy and execution fingerprint. It accepts only a caller-owned mode-0600
+  authority document, independently validates every policy-derived field, renders one fixed
+  hardened service/timer pair, installs root-owned authority atomically, and disables the timer
+  before a changed multi-file set is replaced. Manual cadence removes exact units, authority,
+  stored credential material, and bounded status. Timer activation remains gated on the separate
+  content-addressed runner layer, so this slice cannot enable a non-existent runner.
 - Added a content-addressed, secret-reference-free Recovery Schedule authority model to
   Deployment Resource plans. It binds the normalized policy, registered Deployment/Target,
   immutable placement, selected Resource provenance, destination execution policy, fixed unit
@@ -21,7 +28,7 @@ may contain deliberate schema and MCP API breaks.
   unions, `retain_last` from 1 through 365 (default 7), exact systemd-calendar normalization,
   latest-slot catch-up calculations, stable 0–300 second Deployment jitter, and deterministic
   policy-and-slot-scoped scheduled request identities. This slice adds policy and pure scheduling
-  semantics only; target runner, timer reconciliation, and status remain.
+  semantics only; target runner activation and persisted attempt status remain.
   Existing state without these fields loads as manual cadence with the documented defaults.
 - Added an executable opt-in ElastiCache recovery/rotation live matrix for an isolated registered
   Resource and Deployment. Separate `GIMME_AWS_VALKEY_LIVE_CREATE=1` and
