@@ -25,6 +25,7 @@ from gimme.resources_valkey import (
 )
 from gimme.config import HorizonWorkerConfig
 from gimme.deployer import CommandResult
+from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.secrets import SecretMetadata
 from gimme.valkey_contract import (
     contract_variables, credential_references, probe_names,
@@ -2070,11 +2071,12 @@ def test_a_deployment_with_a_managed_database_and_valkey_binds_the_database_firs
     }))
     order: list[str] = []
     monkeypatch.setattr(
-        server_module, "_database_binding_plan",
-        lambda name: {"resource": "example-rds-postgres", "resource_ready": True},
+        ManagedResourceOrchestrator, "_database_binding_plan",
+        lambda self, name: {"resource": "example-rds-postgres", "resource_ready": True},
     )
     monkeypatch.setattr(
-        server_module, "_bind_database", lambda name, expected: order.append("database") or {
+        ManagedResourceOrchestrator, "_bind_database",
+        lambda self, name, expected: order.append("database") or {
             "database": "gimme_example_local"},
     )
     original = adapter.ensure_binding

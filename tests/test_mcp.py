@@ -569,6 +569,8 @@ async def test_managed_resource_tool_schemas_remain_stable_across_module_extract
         "plan_apply_resource": ({"name"}, {"name"}, True),
         "apply_resource": ({"name", "plan_id"}, {"name", "plan_id"}, False),
         "inspect_resource": ({"name"}, {"name"}, True),
+        "plan_bind_resource": ({"name"}, {"name"}, True),
+        "bind_resource": ({"name", "plan_id"}, {"name", "plan_id"}, False),
     }
     for name, (properties, required, read_only) in expected.items():
         tool = tools[name]
@@ -673,6 +675,8 @@ def test_managed_resource_orchestrator_owns_local_inspection() -> None:
         elasticache_valkey=None,
         deployment_resource_locks=None,
         assert_plan=None,
+        runner=None,
+        context=None,
     )
 
     assert orchestrator.inspect_resource("devbox-postgres") == {
@@ -705,6 +709,26 @@ def test_managed_resource_mcp_adapter_delegates_to_current_orchestrator(
         "provider": "target_local",
     }
     assert seen == ["devbox-postgres"]
+
+
+def test_resource_binding_mcp_adapter_delegates_to_current_orchestrator(
+    monkeypatch,
+) -> None:
+    seen = []
+
+    class FakeManagedResourceOrchestrator:
+        def plan_bind_resource(self, name):
+            seen.append(name)
+            return {"kind": "resource_binding", "plan_id": "plan_" + "0" * 20}
+
+    monkeypatch.setattr(
+        server_module,
+        "_managed_resource_orchestrator",
+        FakeManagedResourceOrchestrator,
+    )
+
+    assert server_module.plan_bind_resource("example-app")["kind"] == "resource_binding"
+    assert seen == ["example-app"]
 
 
 def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch) -> None:
@@ -3260,6 +3284,33 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert MASTER_PASSWORD not in everything
     assert workload_password not in everything
     assert adapter.secret_payloads["primary-rds/example-app"]["password"] == workload_password
+
+
+def test_failed_database_binding_cleans_protected_credentials_before_raising(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    seen = {}
+
+    def fail_run(task, server, **kwargs):
+        secret_file = kwargs["secret_file"]
+        seen["path"] = secret_file
+        seen["document"] = json.loads(secret_file.read_text())
+        raise RuntimeError("bounded target failure")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_run)
+    plan = server_module.plan_bind_resource("example-app")
+
+    with pytest.raises(RuntimeError, match="bounded target failure") as failure:
+        server_module.bind_resource("example-app", str(plan["plan_id"]))
+
+    document = seen["document"]
+    assert not Path(seen["path"]).exists()
+    assert all(value not in str(failure.value) for value in document.values())
+    assert server_module.inspect_resource("primary-rds")["allocations"] == {}
 
 
 @pytest.mark.parametrize("region", ["us-gov-west-1", "cn-north-1"])

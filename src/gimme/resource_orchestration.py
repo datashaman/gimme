@@ -10,9 +10,18 @@ from gimme.control import (
     AWSRDSPostgresResource,
     AWSSecretsManagerStore,
     ControlState,
+    DeploymentConfig,
+    ValkeyBinding,
+    legacy_server,
 )
-from gimme.control_plans import resource_provision_plan, valkey_provision_plan
+from gimme.control_plans import (
+    resource_binding_plan,
+    resource_provision_plan,
+    valkey_binding_plan,
+    valkey_provision_plan,
+)
 from gimme.resources_postgres import ResourceError
+from gimme.secrets import protected_secret_file
 
 Name = str
 PlanId = str
@@ -20,13 +29,15 @@ PlanId = str
 
 @dataclass(frozen=True)
 class ManagedResourceOrchestrator:
-    """Own non-destructive managed Resource provision and inspection."""
+    """Own non-destructive managed Resource provision, inspection, and binding."""
 
     store: Any
     rds_postgres: Any
     elasticache_valkey: Any
     deployment_resource_locks: Callable[..., Any]
     assert_plan: Callable[..., Any]
+    runner: Any
+    context: Callable[..., Any]
 
     def _refuse_unverifiable_tls_region(
         self, state: ControlState, resource: AWSRDSPostgresResource
@@ -82,6 +93,150 @@ class ManagedResourceOrchestrator:
                 )
             )
         )
+
+    def _managed_valkey_binding(
+        self, name: str
+    ) -> tuple[
+        ControlState, DeploymentConfig, str, AWSElastiCacheValkeyResource
+    ] | None:
+        state, deployment, _target, _application = self.context(name)
+        binding = deployment.resources.valkey
+        resource = None if binding is None else state.resources.get(binding.resource)
+        if binding is None or not isinstance(resource, AWSElastiCacheValkeyResource):
+            return None
+        return state, deployment, binding.resource, resource
+
+    def _database_binding_plan(self, name: str) -> dict[str, object]:
+        _state, deployment, _target, _application = self.context(name)
+        resource_name = deployment.resources.database
+        if resource_name is None:
+            raise ValueError(f"deployment {name} has no bound database resource")
+        self._managed_resource(resource_name)
+        observed = resources_postgres_module.load_observed(self.store.root, resource_name)
+        return resource_binding_plan(name, deployment, resource_name, observed)
+
+    def _resource_binding_plan(self, name: str) -> dict[str, object]:
+        valkey = self._managed_valkey_binding(name)
+        if valkey is None:
+            return self._database_binding_plan(name)
+        state, deployment, resource_name, _resource = valkey
+        binding = cast(ValkeyBinding, deployment.resources.valkey)
+        uses = cast(list[str], binding.uses)
+        database = deployment.resources.database
+        return valkey_binding_plan(
+            name,
+            resource_name,
+            uses,
+            resources_valkey_module.namespace_prefixes(name, uses),
+            resources_valkey_module.LARAVEL_PROFILE,
+            resources_valkey_module.load_observed(self.store.root, resource_name),
+            self._database_binding_plan(name)
+            if isinstance(
+                state.resources.get(database or ""), AWSRDSPostgresResource
+            )
+            else None,
+        )
+
+    def plan_bind_resource(self, name: Name) -> dict[str, object]:
+        """Plan the Deployment's isolated managed PostgreSQL and Valkey allocations."""
+        return self._resource_binding_plan(name)
+
+    def bind_resource(self, name: Name, plan_id: PlanId) -> dict[str, object]:
+        """Create or reconcile the Deployment's managed Resource allocations without
+        returning either Resource Credential."""
+        with self.deployment_resource_locks(name):
+            expected = self._resource_binding_plan(name)
+            self.assert_plan(expected, plan_id)
+            valkey = self._managed_valkey_binding(name)
+            if valkey is None:
+                return {"changed": True, **self._bind_database(name, expected)}
+            state, deployment, resource_name, resource = valkey
+            ready = cast(dict[str, object], expected["valkey"])["resource_ready"]
+            database = cast(dict[str, object] | None, expected["database"])
+            if not ready or (database is not None and not database["resource_ready"]):
+                raise ValueError("managed resource is not ready; run apply_resource first")
+            result: dict[str, object] = {"changed": True}
+            if database is not None:
+                result.update(self._bind_database(name, database))
+            network = state.aws_networks[resource.aws_network]
+            workload_store = cast(
+                AWSSecretsManagerStore,
+                state.secret_stores[resource.workload_secret_store],
+            )
+            result["valkey"] = resources_valkey_module.apply_binding(
+                self.elasticache_valkey,
+                self.store.root,
+                state.provider_accounts[network.provider_account],
+                network,
+                resource,
+                resource_name,
+                workload_store,
+                resource.workload_secret_store,
+                name,
+                cast(list[str], cast(ValkeyBinding, deployment.resources.valkey).uses),
+            )
+            return result
+
+    def _bind_database(
+        self, name: str, expected: dict[str, object]
+    ) -> dict[str, object]:
+        if not expected["resource_ready"]:
+            raise ValueError("managed resource is not ready; run apply_resource first")
+        state, deployment, _target, _application = self.context(name)
+        resource_name = str(expected["resource"])
+        _state, resource = self._managed_resource(resource_name)
+        network = state.aws_networks[resource.aws_network]
+        account = state.provider_accounts[network.provider_account]
+        admin_target = state.targets[resource.administration_target]
+        store_name = resource.workload_secret_store
+        workload_store = state.secret_stores[store_name]
+        if not isinstance(workload_store, AWSSecretsManagerStore):
+            raise ValueError("workload_secret_store must be an AWS Secrets Manager store")
+        observed = resources_postgres_module.load_observed(self.store.root, resource_name)
+        if observed is None or observed["master_secret_arn"] is None:
+            raise ResourceError("aws_rds_master_secret_missing")
+        master_username, master_password = self.rds_postgres.resolve_master_credential(
+            account, network.region, str(observed["master_secret_arn"])
+        )
+        database_identifier = deployment.placement.database_identifier
+        workload_password = resources_postgres_module.generate_workload_password()
+        payload = {
+            "master_username": master_username,
+            "master_password": master_password,
+            "workload_password": workload_password,
+        }
+        with self.deployment_resource_locks(name), protected_secret_file(
+            payload
+        ) as secret_file:
+            self.runner.run(
+                "gimme:resource:bind-postgres",
+                legacy_server(admin_target),
+                stack=admin_target.stack,
+                resource_endpoint=(
+                    str(observed["endpoint"]),
+                    int(cast(int, observed["port"])),
+                ),
+                resource_database=database_identifier,
+                secret_file=secret_file,
+                resource_trust_bundle_sha256=(
+                    resources_postgres_module.RDS_TRUST_BUNDLE_SHA256
+                ),
+                timeout=120,
+            )
+            return resources_postgres_module.persist_binding(
+                self.rds_postgres,
+                self.store.root,
+                account,
+                workload_store,
+                store_name,
+                resource_name,
+                name,
+                database_identifier,
+                database_identifier,
+                workload_password,
+                str(observed["endpoint"]),
+                int(cast(int, observed["port"])),
+            )
 
     def plan_apply_resource(self, name: Name) -> dict[str, object]:
         """Plan provisioning or reconciling one managed AWS RDS PostgreSQL instance or
