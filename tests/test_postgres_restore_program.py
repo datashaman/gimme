@@ -154,6 +154,31 @@ def test_invocation_must_match_the_protected_request_state(tmp_path, monkeypatch
         program["main"]()
 
 
+def test_database_rename_assumes_only_the_validated_owner_role(
+    tmp_path, monkeypatch
+) -> None:
+    program = program_namespace(tmp_path)
+    observed = []
+    monkeypatch.setitem(
+        program, "query",
+        lambda database, statement, variables: observed.append(
+            (database, statement, variables)
+        ) or "",
+    )
+
+    program["rename_database"](
+        "gimme_example_app", "gimme_previous_example", "gimme_example_app"
+    )
+
+    assert observed[0][0] == "postgres"
+    assert 'SET ROLE :"role"' in observed[0][1]
+    assert observed[0][2] == {
+        "current": "gimme_example_app",
+        "replacement": "gimme_previous_example",
+        "role": "gimme_example_app",
+    }
+
+
 def test_failed_second_rename_compensates_the_original_database_name(
     tmp_path, monkeypatch
 ) -> None:
@@ -166,8 +191,8 @@ def test_failed_second_rename_compensates_the_original_database_name(
     monkeypatch.setitem(program, "database_oid", lambda name: oids.get(name))
     monkeypatch.setitem(program, "query", lambda *_args: "")
 
-    def rename(current, replacement):
-        renames.append((current, replacement))
+    def rename(current, replacement, role):
+        renames.append((current, replacement, role))
         if current == shadow:
             raise program["RestoreFailure"]("simulated second rename failure")
         oids[replacement] = oids.pop(current)
@@ -178,7 +203,9 @@ def test_failed_second_rename_compensates_the_original_database_name(
         program["swap"](state_path)
 
     assert renames == [
-        (database, previous), (shadow, database), (previous, database),
+        (database, previous, database),
+        (shadow, database, database),
+        (previous, database, database),
     ]
     assert oids == {database: 101, shadow: 202}
     assert json.loads(state_path.read_text())["phase"] == "shadow_verified"
@@ -195,15 +222,15 @@ def test_swap_retries_after_the_live_database_was_already_renamed(
     renames = []
     monkeypatch.setitem(program, "database_oid", lambda name: oids.get(name))
 
-    def rename(current, replacement):
-        renames.append((current, replacement))
+    def rename(current, replacement, role):
+        renames.append((current, replacement, role))
         oids[replacement] = oids.pop(current)
 
     monkeypatch.setitem(program, "rename_database", rename)
 
     program["swap"](state_path)
 
-    assert renames == [(shadow, database)]
+    assert renames == [(shadow, database, database)]
     assert oids == {previous: 101, database: 202}
     assert json.loads(state_path.read_text())["phase"] == "data_replaced"
 
@@ -223,7 +250,7 @@ def test_successful_swap_terminates_only_live_database_connections(
         queries.append((target, statement, variables))
         return ""
 
-    def rename(current, replacement):
+    def rename(current, replacement, _role):
         oids[replacement] = oids.pop(current)
 
     monkeypatch.setitem(program, "query", query)

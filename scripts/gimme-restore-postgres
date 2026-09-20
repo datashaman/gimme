@@ -178,12 +178,13 @@ def database_oid(name: str) -> int | None:
     return int(output)
 
 
-def rename_database(current: str, replacement: str) -> None:
+def rename_database(current: str, replacement: str, role: str) -> None:
     query(
         "postgres",
+        'SET ROLE :"role";\n'
         "SELECT format('ALTER DATABASE %I RENAME TO %I', :'current', :'replacement') "
         "\\gexec\n",
-        {"current": current, "replacement": replacement},
+        {"current": current, "replacement": replacement, "role": role},
     )
 
 
@@ -255,14 +256,14 @@ def swap(state_path: Path) -> None:
             "WHERE datname = :'database' AND pid <> pg_backend_pid();\n",
             {"database": database},
         )
-        rename_database(database, previous)
+        rename_database(database, previous, state["role"])
     elif observed != {"live": None, "shadow": shadow_oid, "previous": live_oid}:
         raise RestoreFailure("restore swap state ambiguous")
     try:
-        rename_database(shadow, database)
+        rename_database(shadow, database, state["role"])
     except RestoreFailure:
         if database_oid(database) is None and database_oid(previous) == live_oid:
-            rename_database(previous, database)
+            rename_database(previous, database, state["role"])
         raise
     if database_oid(database) != shadow_oid or database_oid(previous) != live_oid:
         raise RestoreFailure("restore swap verification failed")
