@@ -484,6 +484,9 @@ processes that cached configuration keep the old credential until they reload it
 proves the new credential from the Target, not from each running process. Whether ElastiCache lets
 a user be deleted while it is still a member of a user group is also unverified.
 
+For the executable, separately authorized live restore and rotation matrix, see
+[Validate ElastiCache Valkey against AWS](validate-aws-elasticache-live.md#run-the-executable-recovery-matrix).
+
 ## Forget a retained tombstone
 
 `plan_cleanup_resource` and `apply_cleanup_resource` retain the infrastructure and write a

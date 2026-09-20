@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added an executable opt-in ElastiCache recovery/rotation live matrix for an isolated registered
+  Resource and Deployment. Separate `GIMME_AWS_VALKEY_LIVE_CREATE=1` and
+  `GIMME_AWS_VALKEY_LIVE_DESTROY=1` flags authorize creation/rotation and exact deletion. The
+  harness rotates through Gimme, simulates exact out-of-band group loss, proves ordinary apply
+  fails closed, restores and verifies the Deployment through Gimme, removes its exact test
+  snapshot, and leaves the supplied Resource ready. A private exact-run marker makes interrupted
+  delete/restore/cleanup phases resumable. No MCP, schema, or privilege change.
 - Completed the Recovery Point deletion verification matrix. Provider protection and access
   failures now map to fixed secret-safe outcomes, deterministic tests cover the complete S3
   failure taxonomy and concurrent cross-Deployment isolation, and the disposable MinIO workflow
