@@ -321,13 +321,17 @@ planning requires the registered destination to have a supported provider and `v
 compares its exact version with the source component version.
 An opaque request fingerprint binds the private source manifest, normalized selector, every
 selected destination binding, recovery policy, immutable placement, and execution fingerprint.
-Restore Records retain that fingerprint and all bounded destination provenance; reuse after any
+Restore Records retain that fingerprint, the exact Safety component set, and all bounded
+destination provenance; reuse after any
 bound identity changes fails closed without exposing private manifest or placement values.
 The state machine supports full PostgreSQL-and-Valkey Restore plus either explicit partial
 selection. Valkey-only Restore captures a Valkey-only Safety Recovery Point, validates the source
 archive before mutation, replaces and verifies only the registered prefix, and performs no
-PostgreSQL mutation or cleanup. Full Restore captures both Safety components, prepares and verifies
-the PostgreSQL shadow first, replaces and verifies Valkey second, and swaps PostgreSQL last.
+PostgreSQL mutation or cleanup. Full Restore protects each non-empty selected destination (and any
+destination whose emptiness is ambiguous), prepares and verifies the PostgreSQL shadow first,
+replaces and verifies Valkey second, and swaps PostgreSQL last. Thus an empty PostgreSQL database
+paired with an ambiguous Valkey prefix produces a Valkey-only Safety point without changing the
+full-Restore selector.
 Valkey-only planning resolves PostgreSQL binding provenance but does not run PostgreSQL catalog
 inspection or inspect its data.
 

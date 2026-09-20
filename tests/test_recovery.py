@@ -419,7 +419,7 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
     )
 
     assert started["sequence"] == 0
-    assert started["schema_version"] == 4
+    assert started["schema_version"] == 5
     assert started["selected_components"] == ["postgres"]
     assert started["untouched_components"] == []
     assert started["partial"] is False
@@ -428,6 +428,7 @@ def test_restore_events_are_append_only_validated_and_listed_newest_first() -> N
         "kind": "postgres", "version": "17.2",
     }]
     assert started["request_fingerprint"] == "plan_" + "a" * 20
+    assert started["safety_components"] == []
     assert entered["sequence"] == 1
     record = load_restore_record(
         destination(), None, adapter, "checkout", "restore-1"
@@ -481,6 +482,7 @@ def test_restore_event_conflicting_retry_fails_closed() -> None:
 
 def test_legacy_multi_component_restore_identity_remains_resumable() -> None:
     adapter = FakeS3()
+    safety_id = safety_recovery_point_id("checkout", "primary", "restore-legacy")
     identity = {
         "source_recovery_point_id": recovery_point_id(
             "checkout", "primary", "legacy-full"
@@ -492,6 +494,7 @@ def test_legacy_multi_component_restore_identity_remains_resumable() -> None:
         "selected_components": ["postgres", "valkey"],
         "untouched_components": [],
         "partial": False,
+        "safety_recovery_point_id": safety_id,
     }
 
     append_restore_event(
@@ -502,6 +505,14 @@ def test_legacy_multi_component_restore_identity_remains_resumable() -> None:
         destination(), None, adapter, "checkout", "restore-legacy",
         "maintenance_entered", **identity,
     )
+    for sequence in range(2):
+        key = restore_event_key("checkout", "restore-legacy", sequence)
+        event = json.loads(adapter.objects[key])
+        event["schema_version"] = 4
+        del event["safety_components"]
+        adapter.objects[key] = json.dumps(
+            event, sort_keys=True, separators=(",", ":")
+        ).encode()
 
     record = load_restore_record(
         destination(), None, adapter, "checkout", "restore-legacy"
@@ -509,6 +520,13 @@ def test_legacy_multi_component_restore_identity_remains_resumable() -> None:
     assert record["state"] == "maintenance_entered"
     assert record["request_fingerprint"] is None
     assert record["destinations"] == [record["destination"]]
+    assert record["safety_components"] == ["postgres", "valkey"]
+
+    resumed = append_restore_event(
+        destination(), None, adapter, "checkout", "restore-legacy",
+        "safety_verified", **identity,
+    )
+    assert resumed["schema_version"] == 5
 
 
 def test_restore_event_rejects_invalid_transition_without_writing() -> None:

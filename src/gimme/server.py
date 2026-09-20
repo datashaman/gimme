@@ -521,17 +521,17 @@ def _capture_valkey_dump(
 
 def _capture_restore_safety(
     name: str, request_id: str, safety_id: str,
-    selected_components: list[str], state: ControlState,
+    safety_components: list[str], state: ControlState,
     deployment: DeploymentConfig, destination_name: str,
     destination: S3BackupDestination,
     credentials: tuple[str, str] | None,
 ) -> dict[str, object]:
-    """Capture and verify exactly the selected destination components."""
+    """Capture and verify exactly the protected destination components."""
     dumps: list[ComponentDump] = []
     expected_versions: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="gimme-restore-safety-") as directory:
         root = Path(directory)
-        if "postgres" in selected_components:
+        if "postgres" in safety_components:
             resource_name = deployment.resources.database
             resource = state.resources.get(resource_name) if resource_name else None
             if not isinstance(resource, ResourceConfig) or resource.kind != "postgres":
@@ -540,7 +540,7 @@ def _capture_restore_safety(
             dumps.append(_capture_postgres_dump(
                 name, root / "postgres.dump", resource.version
             ))
-        if "valkey" in selected_components:
+        if "valkey" in safety_components:
             binding = deployment.resources.valkey
             resource_name = binding.resource if binding is not None else None
             resource = state.resources.get(resource_name) if resource_name else None
@@ -568,7 +568,7 @@ def _capture_restore_safety(
         safety["safety"] is not True
         or safety["restore_request_id"] != request_id
         or observed != expected_versions
-        or len(components) != len(selected_components)
+        or len(components) != len(safety_components)
     ):
         raise RecoveryError("restore_safety_conflict")
     return safety
@@ -1555,10 +1555,16 @@ def _deployment_restore_plan(
     )
     # Ambiguous or uninspected selected destinations require Safety capture.
     observed_empty = "postgres" in selected_components and states == {"empty"}
+    observed_safety_components = [
+        component for component in selected_components
+        if component == "valkey" or component == "postgres" and not observed_empty
+    ]
+    safety_components = (
+        observed_safety_components if existing_restore is None
+        else cast(list[str], existing_restore["safety_components"])
+    )
     original_empty = (
-        observed_empty
-        if existing_restore is None
-        else existing_restore["safety_recovery_point_id"] is None
+        "postgres" in selected_components and "postgres" not in safety_components
     )
     destination_changed = (
         existing_restore is not None
@@ -1604,8 +1610,9 @@ def _deployment_restore_plan(
         name, recovery_point_id, request_id,
         manifest_components,
         resource_name, resource.version,
-        original_empty and "valkey" not in selected_components,
+        original_empty,
         selected_components,
+        safety_components=safety_components,
         valkey_destination=valkey_destination,
         request_fingerprint=request_fingerprint,
         restore_state=None if existing_restore is None else str(existing_restore["state"]),
@@ -1657,6 +1664,7 @@ def apply_restore_deployment(
         if manifest is None:
             raise RecoveryError("restore_source_missing")
         selected_components = cast(list[str], expected["selected_components"])
+        safety_components = cast(list[str], expected["safety_components"])
         untouched_components = cast(list[str], expected["untouched_components"])
         source_components = {
             str(item["kind"]): item
@@ -1676,11 +1684,9 @@ def apply_restore_deployment(
             if expected["restore_state"] is not None else None
         )
         safety_id = (
-            None
-            if cast(dict[str, object], expected["destination"])["empty"]
-            else recovery_module.safety_recovery_point_id(
+            recovery_module.safety_recovery_point_id(
                 name, destination_name, request_id
-            )
+            ) if safety_components else None
         )
         if existing is not None:
             safety_id = cast(str | None, existing["safety_recovery_point_id"])
@@ -1710,6 +1716,7 @@ def apply_restore_deployment(
                 str(expected["request_fingerprint"]) if existing is None
                 else cast(str | None, existing["request_fingerprint"])
             ),
+            "safety_components": safety_components,
         }
         current = None if existing is None else str(existing["state"])
         changed = False
@@ -1742,7 +1749,7 @@ def apply_restore_deployment(
             else:
                 try:
                     _capture_restore_safety(
-                        name, request_id, safety_id, selected_components,
+                        name, request_id, safety_id, safety_components,
                         state, deployment, destination_name, destination, credentials,
                     )
                 except Exception:
@@ -1930,6 +1937,9 @@ def apply_verify_restore(
             ),
             "request_fingerprint": cast(
                 str | None, restore["request_fingerprint"]
+            ),
+            "safety_components": cast(
+                list[str], restore["safety_components"]
             ),
         }
         current = str(restore["state"])

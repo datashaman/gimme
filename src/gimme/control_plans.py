@@ -287,6 +287,7 @@ def deployment_restore_plan(
     source_components: list[dict[str, object]], destination_resource: str,
     destination_version: str, destination_empty: bool,
     selected_components: list[str],
+    safety_components: list[str] | None = None,
     valkey_destination: dict[str, str] | None = None,
     request_fingerprint: str | None = None,
     restore_state: str | None = None, request_conflict: bool = False,
@@ -298,6 +299,10 @@ def deployment_restore_plan(
         if component not in selected_components
     ]
     partial = bool(untouched_components)
+    protected_components = (
+        ([] if destination_empty else list(selected_components))
+        if safety_components is None else safety_components
+    )
     postgres = next(
         (component for component in source_components if component.get("kind") == "postgres"),
         None,
@@ -343,6 +348,7 @@ def deployment_restore_plan(
         "selected_components": selected_components,
         "untouched_components": untouched_components,
         "partial": partial,
+        "safety_components": protected_components,
         "source": {
             "recovery_point_id": recovery_point_id,
             "provider": "target_local", "kind": "postgres", "version": source_version,
@@ -376,7 +382,7 @@ def deployment_restore_plan(
             "enter request-owned maintenance and stop only managed writers",
             *(
                 ["create and verify a protected Safety Recovery Point"]
-                if not destination_empty else []
+                if protected_components else []
             ),
             *(
                 ["verify the exact PostgreSQL artifact before loading a shadow database",
@@ -416,6 +422,7 @@ def restore_verification_plan(
         "selected_components": restore["selected_components"],
         "untouched_components": restore["untouched_components"],
         "partial": restore["partial"],
+        "safety_components": restore["safety_components"],
         "state": state,
         "ready": ready,
         "readiness_issues": [

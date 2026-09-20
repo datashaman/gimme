@@ -38,7 +38,9 @@ that it intentionally breaks cross-component consistency.
 
 A Safety Recovery Point contains exactly the components the Restore will overwrite. This permits
 PostgreSQL-only or Valkey-only Safety Recovery Points for explicit partial Restore even though an
-ordinary Recovery Policy includes PostgreSQL by default.
+ordinary Recovery Policy includes PostgreSQL by default. A full Restore also omits a selected
+component when that destination is proven empty; the authoritative Restore Record persists the
+exact protected component set so retries do not infer it from mutable destination state.
 
 Each Restore request writes an append-only, secret-free Restore Record to its Backup Destination.
 That record, rather than controller or Target-local state, is authoritative for resumption and for
