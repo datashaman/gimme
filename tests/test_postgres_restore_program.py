@@ -51,6 +51,18 @@ def test_restore_identities_are_deterministic_bounded_and_request_specific(tmp_p
     assert all(len(value) <= 63 and value.startswith("gimme_") for value in first)
 
 
+def test_public_failure_codes_are_fixed_and_do_not_include_request_data(tmp_path) -> None:
+    program = program_namespace(tmp_path)
+
+    assert program["PUBLIC_FAILURE_CODES"] == {
+        "restore connection termination failed": "connection_termination_failed",
+        "restore live rename failed": "live_rename_failed",
+        "restore shadow rename failed": "shadow_rename_failed",
+        "restore compensation failed": "compensation_failed",
+        "restore invocation does not match state": "invocation_mismatch",
+    }
+
+
 def test_prepare_verifies_artifact_restores_only_the_derived_shadow_and_records_oids(
     tmp_path, monkeypatch
 ) -> None:

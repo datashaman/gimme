@@ -632,7 +632,7 @@ def verify_postgres_restore(gimme) -> None:
                 )
             except Exception as detail:
                 reasons = re.findall(
-                    r"RestoreFailure: ([a-z ]{1,64})", str(detail)
+                    r"GIMME_POSTGRES_RESTORE_FAILED\|([a-z_]{1,64})", str(detail)
                 )
                 reason = reasons[-1] if reasons else "restore stage unknown"
                 print(f"[DEBUG-restore-swap] {reason}", flush=True)

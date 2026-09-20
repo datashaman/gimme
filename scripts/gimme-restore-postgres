@@ -29,6 +29,13 @@ EXECUTABLES = {
     "pg_restore": "/usr/bin/pg_restore",
     "psql": "/usr/bin/psql",
 }
+PUBLIC_FAILURE_CODES = {
+    "restore connection termination failed": "connection_termination_failed",
+    "restore live rename failed": "live_rename_failed",
+    "restore shadow rename failed": "shadow_rename_failed",
+    "restore compensation failed": "compensation_failed",
+    "restore invocation does not match state": "invocation_mismatch",
+}
 
 
 class RestoreFailure(RuntimeError):
@@ -330,6 +337,10 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, UnicodeError, json.JSONDecodeError, RestoreFailure):
+    except RestoreFailure as exc:
+        code = PUBLIC_FAILURE_CODES.get(str(exc), "restore_failed")
+        print(f"GIMME_POSTGRES_RESTORE_FAILED|{code}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError):
         print("GIMME_POSTGRES_RESTORE_FAILED|restore_failed", file=sys.stderr)
         raise SystemExit(1) from None
