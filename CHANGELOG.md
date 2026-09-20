@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Made the standalone runner's S3 runtime an explicit Target policy prerequisite. A non-manual
+  Recovery Policy is not resource-apply-ready unless the registered exact APT stack includes
+  `python3-boto3`; plans return the fixed `recovery_schedule_runtime_missing` issue otherwise.
+  The example state and disposable-host policy declare the package. Manual and existing
+  controller-side on-demand capture remain unaffected while the common Target capture moves.
 - Added, but deliberately did not install, the standalone Recovery Schedule runner core. It
   duplicates no capture or S3 behavior: this slice only fixes logical-slot derivation, the exact
   controller-compatible scheduled request identity, atomic bounded attempt status, and a

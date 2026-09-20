@@ -504,6 +504,7 @@ def test_external_secret_canary_never_crosses_mcp_or_failure_surfaces(
 
     monkeypatch.setattr(server_module.runner, "run", fake_run)
     plan = server_module.plan_deployment_resources("example-app")
+
     applied = server_module.apply_deployment_resources(
         "example-app", str(plan["plan_id"])
     )
@@ -876,6 +877,7 @@ def test_deployment_resource_plan_includes_secret_safe_schedule_authority(
 
     plan = server_module.plan_deployment_resources("example-app")
 
+    assert "recovery_schedule_runtime_missing" in plan["readiness_issues"]
     assert plan["recovery_schedule"] == {
         "enabled": True,
         "cadence": {"kind": "hourly", "minute": 15},
@@ -905,6 +907,20 @@ def test_deployment_resource_plan_includes_secret_safe_schedule_authority(
     )
     assert "minio" not in json.dumps(authority, sort_keys=True)
     assert authority["destination"]["auth_mode"] == "stored"
+
+    target = state.targets[scheduled.target]
+    selected.save(selected.load().model_copy(update={
+        "targets": {
+            scheduled.target: target.model_copy(update={
+                "stack": target.stack.model_copy(update={
+                    "packages": [*target.stack.packages, "python3-boto3"]
+                })
+            })
+        }
+    }))
+    assert "recovery_schedule_runtime_missing" not in server_module.plan_deployment_resources(
+        "example-app"
+    ).get("readiness_issues", [])
 
 
 def test_private_runner_authority_changes_with_bound_execution_policy() -> None:
