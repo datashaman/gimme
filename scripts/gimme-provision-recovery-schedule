@@ -195,7 +195,7 @@ def validate_authority(value: Any, deployment: str) -> dict[str, Any]:
     encryption = destination["encryption"]
     if not isinstance(encryption, dict):
         fail("invalid destination encryption")
-    if encryption.get("method") == "AES256":
+    if encryption.get("method") == "aes256":
         require_object(encryption, {"method"}, "destination encryption")
     elif encryption.get("method") == "kms":
         require_object(encryption, {"method", "kms_key_arn"}, "destination encryption")
@@ -266,10 +266,13 @@ def load_transferred_credentials(
             value = json.loads(path.read_text())
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise RuntimeError("Recovery Schedule credential transfer is invalid") from error
-        credentials = require_object(
-            value, {"access_key_id", "secret_access_key"}, "scheduled credentials"
-        )
-        for key in ("access_key_id", "secret_access_key"):
+        if not isinstance(value, dict) or set(value) not in (
+            {"access_key_id", "secret_access_key"},
+            {"access_key_id", "secret_access_key", "session_token"},
+        ):
+            fail("scheduled credentials is invalid")
+        credentials = value
+        for key in credentials:
             item = credentials[key]
             if (
                 not isinstance(item, str)

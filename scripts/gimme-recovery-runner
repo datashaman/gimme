@@ -209,7 +209,9 @@ def attempt_status(
     }
 
 
-def load_credential(path: Path | None, keys: set[str]) -> dict[str, str] | None:
+def load_credential(
+    path: Path | None, keys: set[str] | tuple[set[str], ...]
+) -> dict[str, str] | None:
     if path is None:
         return None
     try:
@@ -224,9 +226,10 @@ def load_credential(path: Path | None, keys: set[str]) -> dict[str, str] | None:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise RunnerFailure("credentials_unavailable") from None
+    allowed = (keys,) if isinstance(keys, set) else keys
     if (
         not isinstance(value, dict)
-        or set(value) != keys
+        or set(value) not in allowed
         or not all(
             isinstance(item, str) and item and "\0" not in item and "\n" not in item
             for item in value.values()
@@ -413,15 +416,15 @@ def capture_recovery(
         raise
     except Exception as error:
         safe = str(error)
-        allowed = {
-            "credentials_unavailable", "destination_unavailable", "recovery_capture_failed",
-            "recovery_dump_metadata_invalid", "recovery_capacity_insufficient",
-            "recovery_component_verification_failed", "recovery_manifest_tampered",
-            "recovery_manifest_invalid", "backup_destination_upload_access_denied",
-            "backup_destination_upload_unavailable", "backup_destination_head_unavailable",
-            "backup_destination_read_unavailable",
+        mapped = {
+            "credentials_unavailable": "credentials_unavailable",
+            "credentials_expired": "credentials_expired",
+            "destination_unavailable": "destination_unavailable",
+            "recovery_component_verification_failed": "verification_failed",
+            "recovery_manifest_tampered": "verification_failed",
+            "recovery_manifest_invalid": "verification_failed",
         }
-        raise RunnerFailure(safe if safe in allowed else "capture_failed") from None
+        raise RunnerFailure(mapped.get(safe, "capture_failed")) from None
     finally:
         for component in locals().get("components", []):
             try:
@@ -430,26 +433,20 @@ def capture_recovery(
                 pass
 
 
-def execute_scheduled(
-    authority: dict[str, Any], target_capture: Any, status_path: Path, lock_path: Path,
-    directory: Path, *, aws_credentials: dict[str, str] | None = None,
-    valkey_credential_path: Path | None = None, observed_at: datetime | None = None,
-    pause: Callable[[float], None] = time.sleep,
-) -> dict[str, Any]:
-    """Run one latest-slot activation with bounded delay, lock, status, capture, and retention."""
-    now = utc(observed_at or datetime.now(UTC))
+def validate_policy(authority: dict[str, Any]) -> tuple[str, dict[str, Any], int, str]:
     deployment = str(authority.get("deployment"))
     cadence = authority.get("cadence")
     delay = authority.get("stable_delay_seconds")
     fingerprint = authority.get("policy_fingerprint")
+    destination = authority.get("destination")
     if (
-        not isinstance(cadence, dict) or isinstance(delay, bool) or not isinstance(delay, int)
-        or not 0 <= delay <= 300 or not isinstance(fingerprint, str)
+        NAME.fullmatch(deployment) is None or not isinstance(cadence, dict)
+        or isinstance(delay, bool) or not isinstance(delay, int) or not 0 <= delay <= 300
+        or not isinstance(fingerprint, str) or not isinstance(destination, dict)
     ):
         raise RunnerFailure("policy_stale")
     expected_policy = {
-        "destination": authority.get("destination", {}).get("name")
-        if isinstance(authority.get("destination"), dict) else None,
+        "destination": destination.get("name"),
         "valkey": authority.get("components") == ["postgres", "valkey"],
         "quiesce_wait_seconds": authority.get("quiesce_wait_seconds"),
         "cadence": cadence, "retain_last": authority.get("retain_last"),
@@ -463,6 +460,66 @@ def execute_scheduled(
     ) % 301
     if fingerprint != expected_fingerprint or delay != expected_delay:
         raise RunnerFailure("policy_stale")
+    return deployment, cadence, delay, fingerprint
+
+
+def execute_capture_policy(
+    authority: dict[str, Any], capture_request: str, target_capture: Any, directory: Path,
+    *, aws_credentials: dict[str, str] | None = None,
+    valkey_credential_path: Path | None = None, observed_at: datetime | None = None,
+) -> dict[str, Any]:
+    deployment, _cadence, _delay, _fingerprint = validate_policy(authority)
+    if REQUEST.fullmatch(capture_request) is None:
+        raise RunnerFailure("policy_stale")
+    destination = authority["destination"]
+    store = target_capture.BotoObjectStore(destination, aws_credentials)
+    point_id = target_capture.recovery_point_id(
+        deployment, str(destination["name"]), capture_request
+    )
+    manifest = target_capture.find_recovery_point(
+        store, deployment, str(destination["name"]), point_id
+    )
+    changed = manifest is None
+    if manifest is None:
+        maintenance_active = False
+
+        def restore_runtime() -> None:
+            nonlocal maintenance_active
+            if maintenance_active:
+                maintenance("exit", authority, capture_request)
+                maintenance_active = False
+
+        try:
+            if authority.get("components") == ["postgres", "valkey"]:
+                maintenance_active = True
+                maintenance("enter", authority, capture_request)
+            manifest = capture_recovery(
+                authority, capture_request, directory, target_capture,
+                aws_credentials=aws_credentials,
+                valkey_credential_path=valkey_credential_path,
+                observed_at=observed_at, object_store=store,
+                before_publish=restore_runtime if maintenance_active else None,
+            )
+        finally:
+            restore_runtime()
+    point_id = str(manifest["recovery_point_id"])
+    retention = target_capture.enforce_retention(
+        store, deployment, str(destination["name"]), authority["retain_last"], point_id,
+    )
+    return {
+        "changed": changed, "recovery_point_id": point_id, "retention": retention,
+    }
+
+
+def execute_scheduled(
+    authority: dict[str, Any], target_capture: Any, status_path: Path, lock_path: Path,
+    directory: Path, *, aws_credentials: dict[str, str] | None = None,
+    valkey_credential_path: Path | None = None, observed_at: datetime | None = None,
+    pause: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Run one latest-slot activation with bounded delay, lock, status, capture, and retention."""
+    now = utc(observed_at or datetime.now(UTC))
+    deployment, cadence, delay, fingerprint = validate_policy(authority)
     slot = latest_slot(cadence, now)
     if slot is None:
         raise RunnerFailure("policy_stale")
@@ -483,43 +540,14 @@ def execute_scheduled(
         atomic_status(status_path, status)
         return status
     try:
-        destination = authority.get("destination")
-        if not isinstance(destination, dict):
-            raise RunnerFailure("policy_stale")
-        store = target_capture.BotoObjectStore(destination, aws_credentials)
         scheduled_request = request_id(deployment, fingerprint, slot)
-        point_id = target_capture.recovery_point_id(
-            deployment, str(destination["name"]), scheduled_request
+        execution = execute_capture_policy(
+            authority, scheduled_request, target_capture, directory,
+            aws_credentials=aws_credentials, valkey_credential_path=valkey_credential_path,
+            observed_at=started,
         )
-        manifest = target_capture.find_recovery_point(
-            store, deployment, str(destination["name"]), point_id
-        )
-        if manifest is None:
-            maintenance_active = False
-
-            def restore_runtime() -> None:
-                nonlocal maintenance_active
-                if maintenance_active:
-                    maintenance("exit", authority, scheduled_request)
-                    maintenance_active = False
-
-            try:
-                if authority.get("components") == ["postgres", "valkey"]:
-                    maintenance_active = True
-                    maintenance("enter", authority, scheduled_request)
-                manifest = capture_recovery(
-                    authority, scheduled_request, directory, target_capture,
-                    aws_credentials=aws_credentials,
-                    valkey_credential_path=valkey_credential_path,
-                    observed_at=started, object_store=store,
-                    before_publish=restore_runtime if maintenance_active else None,
-                )
-            finally:
-                restore_runtime()
-        point_id = str(manifest["recovery_point_id"])
-        retention = target_capture.enforce_retention(
-            store, deployment, str(destination["name"]), authority["retain_last"], point_id,
-        )
+        point_id = execution["recovery_point_id"]
+        retention = execution["retention"]
         status.update({
             "finished_at": datetime.now(UTC).isoformat(),
             "outcome": retention["outcome"], "error_code": retention["error_code"],
@@ -532,7 +560,8 @@ def execute_scheduled(
     except RunnerFailure as error:
         code = str(error)
         outcome = code if code in {
-            "credentials_unavailable", "destination_unavailable", "policy_stale",
+            "credentials_unavailable", "credentials_expired", "destination_unavailable",
+            "policy_stale", "verification_failed",
         } else "capture_failed"
         status.update({
             "finished_at": datetime.now(UTC).isoformat(), "outcome": outcome,
@@ -549,8 +578,32 @@ def execute_scheduled(
     return status
 
 
+def execute_on_demand(
+    authority: dict[str, Any], capture_request: str, target_capture: Any,
+    lock_path: Path, directory: Path, *, aws_credentials: dict[str, str] | None = None,
+    valkey_credential_path: Path | None = None,
+) -> dict[str, Any]:
+    """Execute one caller-reviewed request through the same lock/capture/retention path."""
+    handle = acquire_lock(lock_path)
+    if handle is None:
+        raise RunnerFailure("deployment_busy")
+    try:
+        return execute_capture_policy(
+            authority, capture_request, target_capture, directory,
+            aws_credentials=aws_credentials,
+            valkey_credential_path=valkey_credential_path,
+        )
+    finally:
+        handle.close()
+
+
 def main() -> int:
-    if len(sys.argv) != 3 or sys.argv[1] not in {"scheduled", "status"}:
+    operation = sys.argv[1] if len(sys.argv) >= 2 else ""
+    if (
+        (operation in {"scheduled", "status"} and len(sys.argv) != 3)
+        or (operation == "on-demand" and len(sys.argv) != 4)
+        or operation not in {"scheduled", "status", "on-demand"}
+    ):
         return 2
     deployment = sys.argv[2]
     if NAME.fullmatch(deployment) is None:
@@ -583,7 +636,10 @@ def main() -> int:
             raise RunnerFailure("policy_stale")
         aws_credentials = load_credential(
             credentials / "aws" if destination.get("auth_mode") == "stored" else None,
-            {"access_key_id", "secret_access_key"},
+            (
+                {"access_key_id", "secret_access_key"},
+                {"access_key_id", "secret_access_key", "session_token"},
+            ),
         )
         valkey_path = (
             credentials / "valkey"
@@ -592,11 +648,32 @@ def main() -> int:
         )
         if valkey_path is not None:
             load_credential(valkey_path, {"username", "password"})
+        target_capture = load_target_capture()
+        placement = authority.get("placement")
+        relative = placement.get("relative_path") if isinstance(placement, dict) else None
+        if (
+            not isinstance(relative, str) or not relative or len(relative) > 255
+            or Path(relative).is_absolute() or ".." in Path(relative).parts
+        ):
+            raise RunnerFailure("policy_stale")
+        # Resource reconciliation already holds this exact Target-side lock while it
+        # rewrites Deployment runtime state. Sharing it excludes scheduled/on-demand
+        # capture from those mutations even when different controllers are involved.
+        lock_path = EXPECTED_APPS_ROOT / relative / "shared" / ".gimme-resource.lock"
+        if operation == "on-demand":
+            capture_request = sys.argv[3]
+            result = execute_on_demand(
+                authority, capture_request, target_capture, lock_path, state / "capture",
+                aws_credentials=aws_credentials, valkey_credential_path=valkey_path,
+            )
+            encoded = base64.b64encode(json.dumps(
+                result, sort_keys=True, separators=(",", ":")
+            ).encode()).decode()
+            print(f"GIMME_RECOVERY_RESULT|{encoded}")
+            return 0
         result = execute_scheduled(
-            authority, load_target_capture(), state / "status.json",
-            EXPECTED_APPS_ROOT / ".gimme" / "locks" / f"{deployment}.lock",
-            state / "capture", aws_credentials=aws_credentials,
-            valkey_credential_path=valkey_path,
+            authority, target_capture, state / "status.json", lock_path, state / "capture",
+            aws_credentials=aws_credentials, valkey_credential_path=valkey_path,
         )
         return 0 if result["outcome"] in {
             "succeeded", "backup_succeeded_retention_failed", "deployment_busy",

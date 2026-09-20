@@ -96,7 +96,7 @@ def runner_authority() -> dict[str, object]:
         "destination": {
             "name": "primary", "provider": "s3_compatible", "bucket": "backups",
             "region": "us-east-1", "endpoint": None, "addressing": "virtual_hosted",
-            "encryption": {"method": "AES256"}, "auth_mode": "ambient",
+            "encryption": {"method": "aes256"}, "auth_mode": "ambient",
         },
         "status_identity": "example-app",
         "valkey_execution": {
@@ -289,6 +289,65 @@ def test_scheduled_execution_records_busy_without_capture(tmp_path) -> None:
     assert json.loads(status_path.read_text()) == result
 
 
+def test_scheduled_execution_records_expired_session_credentials(tmp_path) -> None:
+    runner = runner_namespace()
+    runner["acquire_lock"] = lambda _path: SimpleNamespace(close=lambda: None)
+    runner["execute_capture_policy"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        runner["RunnerFailure"]("credentials_expired")
+    )
+    status_path = tmp_path / "status.json"
+
+    result = runner["execute_scheduled"](
+        runner_authority(), SimpleNamespace(), status_path, tmp_path / "lock",
+        tmp_path / "capture", observed_at=datetime(2026, 9, 20, 10, 20, tzinfo=UTC),
+    )
+
+    assert result["outcome"] == "credentials_expired"
+    assert result["error_code"] == "credentials_expired"
+
+
+def test_on_demand_uses_shared_capture_policy_and_deployment_lock(tmp_path) -> None:
+    runner = runner_namespace()
+    calls = []
+    handle = SimpleNamespace(close=lambda: calls.append("closed"))
+    runner["acquire_lock"] = lambda path: calls.append(("lock", path)) or handle
+    runner["execute_capture_policy"] = lambda *args, **kwargs: (
+        calls.append(("capture", args, kwargs)) or {
+            "changed": True,
+            "recovery_point_id": "rp_" + "a" * 20,
+            "retention": {
+                "outcome": "succeeded", "error_code": None,
+                "deleted": 0, "remaining": 1,
+            },
+        }
+    )
+
+    result = runner["execute_on_demand"](
+        runner_authority(), "manual-request", "shared-core",
+        tmp_path / "deployment.lock", tmp_path / "capture",
+    )
+
+    assert result["changed"] is True
+    assert calls[0] == ("lock", tmp_path / "deployment.lock")
+    assert calls[1][0] == "capture"
+    assert calls[1][1][1:3] == ("manual-request", "shared-core")
+    assert calls[-1] == "closed"
+
+
+def test_on_demand_lock_timeout_performs_no_capture(tmp_path) -> None:
+    runner = runner_namespace()
+    runner["acquire_lock"] = lambda _path: None
+    runner["execute_capture_policy"] = lambda *_args, **_kwargs: pytest.fail(
+        "busy on-demand request must not capture"
+    )
+
+    with pytest.raises(runner["RunnerFailure"], match="^deployment_busy$"):
+        runner["execute_on_demand"](
+            runner_authority(), "manual-request", SimpleNamespace(),
+            tmp_path / "deployment.lock", tmp_path / "capture",
+        )
+
+
 def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypatch) -> None:
     runner = runner_namespace()
     credentials = tmp_path / "credentials"
@@ -320,8 +379,46 @@ def test_runner_main_consumes_only_named_systemd_credentials(tmp_path, monkeypat
     assert runner["main"]() == 0
     assert observed["args"][0] == authority
     assert observed["args"][1] == "shared-core"
+    assert observed["args"][3] == Path(
+        "/srv/gimme/apps/deployments/example-app/shared/.gimme-resource.lock"
+    )
     assert observed["kwargs"]["aws_credentials"] is None
     assert observed["kwargs"]["valkey_credential_path"] == valkey
+
+
+def test_runner_main_emits_one_bounded_on_demand_result(tmp_path, monkeypatch, capsys) -> None:
+    runner = runner_namespace()
+    credentials = tmp_path / "credentials"
+    state = tmp_path / "state"
+    credentials.mkdir()
+    state.mkdir()
+    authority = runner_authority()
+    authority_path = credentials / "authority"
+    authority_path.write_text(json.dumps(authority))
+    authority_path.chmod(0o600)
+    valkey = credentials / "valkey"
+    valkey.write_text('{"username":"admin","password":"secret"}')
+    valkey.chmod(0o600)
+    runner["load_target_capture"] = lambda: "shared-core"
+    expected = {
+        "changed": True, "recovery_point_id": "rp_" + "a" * 20,
+        "retention": {
+            "outcome": "succeeded", "error_code": None,
+            "deleted": 0, "remaining": 1,
+        },
+    }
+    runner["execute_on_demand"] = lambda *args, **kwargs: expected
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
+    monkeypatch.setenv("STATE_DIRECTORY", str(state))
+    monkeypatch.setattr(runner["sys"], "argv", [
+        "gimme-recovery-runner", "on-demand", "example-app", "manual-request",
+    ])
+
+    assert runner["main"]() == 0
+    marker = capsys.readouterr().out.strip()
+    assert marker.startswith("GIMME_RECOVERY_RESULT|")
+    decoded = runner["base64"].b64decode(marker.split("|", 1)[1])
+    assert json.loads(decoded) == expected
 
 
 def test_runner_status_emits_only_one_bounded_canonical_marker(

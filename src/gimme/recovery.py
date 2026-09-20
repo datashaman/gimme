@@ -60,7 +60,7 @@ class RecoveryError(RuntimeError):
     """A bounded error whose text is safe for plans, logs, and journals."""
 
 
-Credentials = tuple[str, str] | None
+Credentials = tuple[str, str] | tuple[str, str, str] | None
 
 
 @dataclass(frozen=True)
@@ -147,7 +147,10 @@ class BotoS3Adapter:
         if destination.endpoint is not None:
             kwargs["endpoint_url"] = f"https://{destination.endpoint}"
         if credentials is not None:
-            kwargs["aws_access_key_id"], kwargs["aws_secret_access_key"] = credentials
+            kwargs["aws_access_key_id"] = credentials[0]
+            kwargs["aws_secret_access_key"] = credentials[1]
+            if len(credentials) == 3:
+                kwargs["aws_session_token"] = credentials[2]
         return boto3.client("s3", **kwargs)
 
     @staticmethod
@@ -258,10 +261,13 @@ def destination_credentials(destination: S3BackupDestination) -> dict[str, objec
     """Return the two SecretReferences a credential-referenced destination needs, or None."""
     if not isinstance(destination.auth, CredentialReferenceBackupAuth):
         return None
-    return {
+    references = {
         "access_key_id": destination.auth.access_key_id,
         "secret_access_key": destination.auth.secret_access_key,
     }
+    if destination.auth.session_token is not None:
+        references["session_token"] = destination.auth.session_token
+    return references
 
 
 def plan_destination_credentials(
@@ -287,7 +293,8 @@ def resolve_destination_credentials(
     resolved = resolve_planned_secret_references(
         state, secrets_path, references, planned or []  # type: ignore[arg-type]
     )
-    return resolved["access_key_id"], resolved["secret_access_key"]
+    base = resolved["access_key_id"], resolved["secret_access_key"]
+    return base if "session_token" not in resolved else (*base, resolved["session_token"])
 
 
 def preflight_backup_destination(

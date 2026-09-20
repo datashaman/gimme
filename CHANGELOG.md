@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Completed the common Recovery Policy execution path: reviewed on-demand requests now invoke
+  the same content-bound Target runner, Deployment lock, capture, verification, idempotency, and
+  retention implementation as timers. Manual Valkey policies retain capture authority while
+  schedule cleanup remains endpoint- and credential-free. Stored Backup Destination credentials
+  now optionally carry bounded session tokens and report fixed expiry outcomes. Operator
+  documentation and the disposable-host matrix cover cadence reconciliation, stored credentials,
+  latest-slot catch-up, bounded status, ambient/manual cleanup, and secret redaction.
 - Wired Recovery Schedule reconciliation into Deployment Resource apply and removal. Apply now
   rotates protected S3 and managed-Valkey credentials only after application-secret activation;
   manual policy and removal disable units without requiring a live managed endpoint or decrypted

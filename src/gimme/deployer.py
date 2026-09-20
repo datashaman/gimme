@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 # Deployer is invoked through a fixed argv vector and never through a shell.
 import subprocess  # nosec B404
@@ -145,6 +146,7 @@ class DeployerRunner:
         resource_trust_bundle_sha256: str | None = None,
         recovery_schedule_authority: dict[str, object] | None = None,
         recovery_schedule_valkey_file: Path | None = None,
+        recovery_on_demand_request_id: str | None = None,
         timeout: int = 900,
         bootstrap: bool = False,
         interactive_sudo: bool = False,
@@ -291,6 +293,10 @@ class DeployerRunner:
             if not resolved_valkey_file.is_file():
                 raise ValueError("recovery_schedule_valkey_file must be a regular local file")
             environment["GIMME_RECOVERY_SCHEDULE_VALKEY_FILE"] = str(resolved_valkey_file)
+        if recovery_on_demand_request_id is not None:
+            if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", recovery_on_demand_request_id) is None:
+                raise ValueError("recovery_on_demand_request_id is invalid")
+            environment["GIMME_RECOVERY_ON_DEMAND_REQUEST_ID"] = recovery_on_demand_request_id
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
         if deployment_name is not None:

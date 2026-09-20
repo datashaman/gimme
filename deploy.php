@@ -1124,12 +1124,33 @@ printf 'GIMME_BOOTSTRAP|reconcile|applying target desired state\n'
 printf 'GIMME_BOOTSTRAP|complete|target bootstrap complete\n'
 BASH;
     $sudo = sudo_prefix();
-    run(
-        "{$sudo} bash -c %bootstrap%",
-        secrets: ['bootstrap' => escapeshellarg($bootstrap)],
-        forceOutput: true,
-        timeout: 1800,
-    );
+    $localBootstrap = tempnam(sys_get_temp_dir(), 'gimme-bootstrap-');
+    if ($localBootstrap === false) {
+        throw new \RuntimeException('Could not allocate local bootstrap transfer');
+    }
+    $remoteBootstrap = '';
+    try {
+        if (file_put_contents($localBootstrap, $bootstrap) === false ||
+            !chmod($localBootstrap, 0600)) {
+            throw new \RuntimeException('Could not prepare local bootstrap transfer');
+        }
+        $remoteBootstrap = trim(run('mktemp /tmp/.gimme-bootstrap.XXXXXX'));
+        if (!preg_match('/^\/tmp\/\.gimme-bootstrap\.[A-Za-z0-9]{6}$/', $remoteBootstrap)) {
+            throw new \RuntimeException('Unsafe remote bootstrap transfer path');
+        }
+        upload($localBootstrap, $remoteBootstrap);
+        run('chmod 0600 ' . escapeshellarg($remoteBootstrap));
+        run(
+            "{$sudo} bash " . escapeshellarg($remoteBootstrap),
+            forceOutput: true,
+            timeout: 1800,
+        );
+    } finally {
+        @unlink($localBootstrap);
+        if ($remoteBootstrap !== '') {
+            run('rm -f ' . escapeshellarg($remoteBootstrap));
+        }
+    }
 });
 
 task('gimme:reconcile:sites', function () use (
@@ -2148,6 +2169,67 @@ task('gimme:recovery:schedule-reconcile', function () use (
         run(
             'rm -f ' . escapeshellarg($remoteCredential) . ' ' .
             escapeshellarg($remoteValkeyCredential)
+        );
+    }
+});
+
+task('gimme:recovery:on-demand', function () use ($app, $appsRoot): void {
+    if ($app === '') {
+        throw new \RuntimeException('On-demand recovery requires a Deployment');
+    }
+    $deployment = required_env('GIMME_DEPLOYMENT');
+    $request = required_env('GIMME_RECOVERY_ON_DEMAND_REQUEST_ID');
+    if (!preg_match('/^[a-z][a-z0-9-]{0,63}$/', $deployment) ||
+        !preg_match('/^[a-z0-9][a-z0-9-]{0,63}$/', $request)) {
+        throw new \RuntimeException('Unsafe on-demand Recovery identity');
+    }
+    // Different reviewed requests may arrive from independent controllers. Keep their
+    // protected transfer/state material separate; the runner's Deployment lock serializes
+    // the actual mutation after each request has loaded its own snapshot.
+    $root = "{$appsRoot}/.gimme/recovery-on-demand/{$deployment}/{$request}";
+    $credentials = "{$root}/credentials";
+    $state = "{$root}/state";
+    $capture = "{$state}/capture";
+    $authority = "{$credentials}/authority";
+    $aws = "{$credentials}/aws";
+    $valkey = "{$credentials}/valkey";
+    run('install -d -m 0700 ' . escapeshellarg($credentials) . ' ' . escapeshellarg($state));
+    run('bash -c ' . escapeshellarg(recovery_schedule_state_write_command(
+        $authority,
+        $deployment,
+    )));
+    $localAws = getenv('GIMME_SECRET_FILE') ?: '';
+    $localValkey = getenv('GIMME_RECOVERY_SCHEDULE_VALKEY_FILE') ?: '';
+    try {
+        foreach ([[$localAws, $aws], [$localValkey, $valkey]] as [$local, $remote]) {
+            if ($local === '') {
+                continue;
+            }
+            if (!is_file($local) || is_link($local)) {
+                throw new \RuntimeException('Unsafe on-demand Recovery credential transfer');
+            }
+            upload($local, $remote);
+            run('chmod 0600 ' . escapeshellarg($remote));
+        }
+        $output = run(
+            'CREDENTIALS_DIRECTORY=' . escapeshellarg($credentials) . ' ' .
+            'STATE_DIRECTORY=' . escapeshellarg($state) . ' ' .
+            '/usr/local/libexec/gimme-recovery-runner on-demand ' .
+            escapeshellarg($deployment) . ' ' . escapeshellarg($request),
+            timeout: 7200,
+        );
+        if (!preg_match('/^GIMME_RECOVERY_RESULT\|[A-Za-z0-9+\/=]{1,24576}$/', $output)) {
+            throw new \RuntimeException('Invalid on-demand Recovery result');
+        }
+        writeln($output);
+    } finally {
+        run(
+            'rm -f ' . escapeshellarg($authority) . ' ' . escapeshellarg($aws) . ' ' .
+            escapeshellarg($valkey)
+        );
+        run(
+            'rmdir ' . escapeshellarg($capture) . ' ' . escapeshellarg($credentials) . ' ' .
+            escapeshellarg($state) . ' ' . escapeshellarg($root) . ' 2>/dev/null || true'
         );
     }
 });

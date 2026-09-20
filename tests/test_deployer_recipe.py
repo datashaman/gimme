@@ -361,6 +361,27 @@ def test_recovery_schedule_status_reads_only_the_fixed_runner_marker() -> None:
     assert "[A-Za-z0-9+\\/=]{1,24576}" in task
 
 
+def test_on_demand_recovery_uses_isolated_fixed_runner_transfer() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:on-demand'", 1)[1].split(
+        "task('gimme:restart:workers'", 1
+    )[0]
+
+    assert "required_env('GIMME_RECOVERY_ON_DEMAND_REQUEST_ID')" in task
+    assert "recovery-on-demand/{$deployment}/{$request}" in task
+    assert "recovery_schedule_state_write_command(" in task
+    assert "/usr/local/libexec/gimme-recovery-runner on-demand" in task
+    assert "CREDENTIALS_DIRECTORY=" in task
+    assert "STATE_DIRECTORY=" in task
+    assert "GIMME_RECOVERY_RESULT" in task
+    assert "[A-Za-z0-9+\\/=]{1,24576}" in task
+    assert "upload($local, $remote)" in task
+    assert "chmod 0600" in task
+    assert "finally" in task
+    assert "rm -f" in task
+    assert "rmdir" in task
+
+
 def test_recovery_schedule_state_writer_is_bounded_and_secret_free() -> None:
     state = (ROOT / "deploy/state.php").read_text().split(
         "function recovery_schedule_state_write_command", 1
@@ -514,8 +535,13 @@ def test_stack_provisions_https_sites_and_mdns_aliases() -> None:
     assert ".caddy-local-root.crt" in helper
     assert "| {$sudo} tee" not in task
     assert 'getenv("GIMME_INTERACTIVE_SUDO")' in task
-    assert '"{$sudo} bash -c %bootstrap%"' in task
-    assert "secrets: ['bootstrap' => escapeshellarg($bootstrap)]" in task
+    assert "tempnam(sys_get_temp_dir(), 'gimme-bootstrap-')" in task
+    assert "mktemp /tmp/.gimme-bootstrap.XXXXXX" in task
+    assert "upload($localBootstrap, $remoteBootstrap)" in task
+    assert '"{$sudo} bash " . escapeshellarg($remoteBootstrap)' in task
+    assert '"{$sudo} bash -c %bootstrap%"' not in task
+    assert "@unlink($localBootstrap)" in task
+    assert "rm -f " in task
     assert "sudo -n /usr/local/sbin/gimme-provision-stack" in task
     assert "/usr/local/sbin/gimme-postgres-restore-swap *" in task
     assert r'mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap' in task

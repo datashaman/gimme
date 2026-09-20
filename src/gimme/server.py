@@ -317,6 +317,7 @@ def _run_deployment(
     valkey_restore_records: int | None = None,
     recovery_schedule_authority: dict[str, object] | None = None,
     recovery_schedule_valkey_file: Path | None = None,
+    recovery_on_demand_request_id: str | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -376,6 +377,7 @@ def _run_deployment(
         valkey_restore_records=valkey_restore_records,
         recovery_schedule_authority=recovery_schedule_authority,
         recovery_schedule_valkey_file=recovery_schedule_valkey_file,
+        recovery_on_demand_request_id=recovery_on_demand_request_id,
         timeout=timeout,
     )
 
@@ -534,7 +536,7 @@ def _capture_restore_safety(
     safety_components: list[str], state: ControlState,
     deployment: DeploymentConfig, destination_name: str,
     destination: S3BackupDestination,
-    credentials: tuple[str, str] | None,
+    credentials: tuple[str, str] | tuple[str, str, str] | None,
 ) -> dict[str, object]:
     """Capture and verify exactly the protected destination components."""
     dumps: list[ComponentDump] = []
@@ -799,7 +801,7 @@ def _recovery_valkey_execution(
 
 
 def _recovery_schedule_authority(
-    name: str, state: ControlState, deployment: DeploymentConfig,
+    name: str, state: ControlState, deployment: DeploymentConfig, *, cleanup: bool = False,
 ) -> dict[str, object] | None:
     if deployment.recovery is None:
         return None
@@ -826,17 +828,21 @@ def _recovery_schedule_authority(
             "name": resource_name, "provider": resource.provider,
             "kind": resource.kind, "version": version,
         }
-    valkey_execution = (
-        None if deployment.recovery.cadence.kind == "manual"
-        else _recovery_valkey_execution(name, state, deployment)
+    valkey_execution = None if cleanup else _recovery_valkey_execution(
+        name, state, deployment
     )
-    if (
-        deployment.recovery.valkey and deployment.recovery.cadence.kind != "manual"
-        and valkey_execution is None
-    ):
+    if deployment.recovery.valkey and not cleanup and valkey_execution is None:
         return None
+    selected = deployment
+    if cleanup:
+        selected = deployment.model_copy(update={
+            "recovery": deployment.recovery.model_copy(update={
+                "cadence": ManualRecoveryCadence(), "valkey": False,
+            })
+        })
+        resource_provenance.pop("valkey", None)
     return recovery_schedule_module.runner_authority(
-        name, deployment, destination_name, state.backup_destinations[destination_name],
+        name, selected, destination_name, state.backup_destinations[destination_name],
         resource_provenance, valkey_execution,
     )
 
@@ -1429,7 +1435,10 @@ def remove_secret_store(name: Name, plan_id: PlanId) -> dict[str, object]:
 
 def _backup_destination_credentials(
     state: ControlState, definition: S3BackupDestination
-) -> tuple[list[dict[str, str]] | None, tuple[str, str] | None]:
+) -> tuple[
+    list[dict[str, str]] | None,
+    tuple[str, str] | tuple[str, str, str] | None,
+]:
     planned = recovery_module.plan_destination_credentials(state, store.secrets_path, definition)
     credentials = recovery_module.resolve_destination_credentials(
         state, store.secrets_path, definition, planned
@@ -1589,68 +1598,79 @@ def create_recovery_point(name: Name, request_id: RequestId, plan_id: PlanId) ->
     _assert_plan(expected, plan_id)
     _, credentials = _backup_destination_credentials(state, destination)
     with _deployment_resource_lock(name):
-        existing = recovery_module.find_recovery_point(
+        authority = _recovery_schedule_authority(name, state, deployment)
+        if authority is None:
+            raise RecoveryError("recovery_authority_unavailable")
+        aws_values = {} if credentials is None else {
+            "access_key_id": credentials[0], "secret_access_key": credentials[1],
+        }
+        if credentials is not None and len(credentials) == 3:
+            aws_values["session_token"] = credentials[2]
+        valkey_values: dict[str, str] = {}
+        binding = deployment.resources.valkey
+        if deployment.recovery.valkey and binding is not None:
+            valkey_values = _valkey_capture_credential(
+                state, binding.resource, state.resources[binding.resource]
+            )
+        try:
+            with ExitStack() as protected:
+                aws_file = protected.enter_context(protected_secret_file(aws_values))
+                valkey_file = protected.enter_context(
+                    protected_secret_file(valkey_values)
+                )
+                executed = _run_deployment(
+                    "gimme:recovery:on-demand", name, secret_file=aws_file,
+                    recovery_schedule_authority=authority,
+                    recovery_schedule_valkey_file=valkey_file,
+                    recovery_on_demand_request_id=request_id, timeout=7200,
+                )
+        except Exception:
+            raise RecoveryError("recovery_capture_failed") from None
+        markers = [
+            line.split("|", 1)[1]
+            for raw in executed.output.splitlines()
+            if (line := raw.split("] ", 1)[-1].strip()).startswith(
+                "GIMME_RECOVERY_RESULT|"
+            )
+        ]
+        try:
+            if len(markers) != 1 or len(markers[0]) > 24_576:
+                raise ValueError
+            raw_result = base64.b64decode(markers[0], validate=True)
+            if len(raw_result) > 16 * 1024:
+                raise ValueError
+            result = json.loads(raw_result)
+            if not isinstance(result, dict):
+                raise ValueError
+            retention = result["retention"]
+            if (
+                set(result) != {"changed", "recovery_point_id", "retention"}
+                or not isinstance(result["changed"], bool)
+                or result["recovery_point_id"] != point_id
+                or not isinstance(retention, dict)
+                or set(retention) != {"outcome", "error_code", "deleted", "remaining"}
+                or retention["outcome"] not in {
+                    "succeeded", "backup_succeeded_retention_failed",
+                }
+                or retention["error_code"] not in {None, "retention_failed"}
+                or any(
+                    isinstance(retention[key], bool) or not isinstance(retention[key], int)
+                    or not 0 <= retention[key] <= 10_000
+                    for key in ("deleted", "remaining")
+                )
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise RecoveryError("recovery_result_invalid") from None
+        manifest = recovery_module.find_recovery_point(
             destination_name, destination, credentials, backup_s3, name, point_id
         )
-        if existing is not None:
-            return {
-                "changed": False,
-                "recovery_point": recovery_module.public_recovery_point(existing),
-                "retention": recovery_module.enforce_recovery_retention(
-                    destination_name, destination, credentials, backup_s3, name,
-                    deployment.recovery.retain_last, point_id,
-                ),
-            }
-        database_name = deployment.resources.database
-        database = state.resources[database_name] if database_name is not None else None
-        if not isinstance(database, ResourceConfig):
-            raise RecoveryError("recovery_database_provenance_invalid")
-        with tempfile.TemporaryDirectory(prefix="gimme-recovery-") as directory:
-            local_path = Path(directory) / "postgres.dump"
-            valkey_path = Path(directory) / "valkey.archive"
-            binding = deployment.resources.valkey
-            valkey_resource_name = binding.resource if binding is not None else None
-            valkey_resource = (
-                state.resources[valkey_resource_name]
-                if valkey_resource_name is not None else None
-            )
-            admin_credential: dict[str, str] = {}
-            valkey_version = ""
-            if deployment.recovery.valkey:
-                if not isinstance(
-                    valkey_resource, (ResourceConfig, AWSElastiCacheValkeyResource)
-                ) or valkey_resource_name is None:
-                    raise RecoveryError("recovery_valkey_provenance_invalid")
-                valkey_version = _valkey_resource_version(valkey_resource)
-                admin_credential = _valkey_capture_credential(
-                    state, valkey_resource_name, valkey_resource
-                )
-            with _recovery_maintenance_window(
-                name, request_id, deployment.recovery.quiesce_wait_seconds,
-                enabled=deployment.recovery.valkey,
-            ) as restore_runtime:
-                with protected_secret_file(admin_credential) as valkey_secret:
-                    postgres_dump = _capture_postgres_dump(
-                        name, local_path, database.version
-                    )
-                    if deployment.recovery.valkey:
-                        valkey_dump = _capture_valkey_dump(
-                            name, valkey_path, valkey_version, valkey_secret
-                        )
-                dumps = [postgres_dump]
-                if deployment.recovery.valkey:
-                    dumps.append(valkey_dump)
-                manifest = recovery_module.create_recovery_point(
-                    destination_name, destination, credentials, backup_s3, name, point_id, dumps,
-                    before_publish=restore_runtime if deployment.recovery.valkey else None,
-                )
+        if manifest is None:
+            raise RecoveryError("recovery_verification_failed")
         return {
-            "changed": True,
+            "changed": result["changed"],
             "recovery_point": recovery_module.public_recovery_point(manifest),
-            "retention": recovery_module.enforce_recovery_retention(
-                destination_name, destination, credentials, backup_s3, name,
-                deployment.recovery.retain_last, point_id,
-            ),
+            "retention": retention,
         }
 
 
@@ -3507,7 +3527,11 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
         # Remote activation includes transactional rollback, but neither successful nor
         # failed Deployer output is a safe MCP surface after plaintext resolution.
         raise SecretError("deployment_secret_activation_failed") from None
-    authority = _recovery_schedule_authority(name, state, deployment)
+    authority = _recovery_schedule_authority(
+        name, state, deployment,
+        cleanup=deployment.recovery is not None
+        and deployment.recovery.cadence.kind == "manual",
+    )
     if authority is not None:
         destination = state.backup_destinations[deployment.recovery.destination]
         try:
@@ -3522,6 +3546,8 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
                     "secret_access_key": destination_credentials[1],
                 }
             )
+            if destination_credentials is not None and len(destination_credentials) == 3:
+                aws_values["session_token"] = destination_credentials[2]
             valkey_values: dict[str, str] = {}
             binding = deployment.resources.valkey
             if (
