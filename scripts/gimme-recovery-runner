@@ -228,6 +228,20 @@ def startup_failure_status(
     return status
 
 
+def record_startup_failure(
+    state: Path, deployment: str, authority: dict[str, Any] | None, outcome: str,
+) -> bool:
+    """Best-effort status must never replace the original fixed activation failure."""
+    try:
+        atomic_status(
+            state / "status.json",
+            startup_failure_status(deployment, authority, outcome),
+        )
+    except Exception:
+        return False
+    return True
+
+
 def load_credential(
     path: Path | None, keys: set[str] | tuple[set[str], ...], *, systemd: bool = False,
 ) -> dict[str, str] | None:
@@ -716,23 +730,13 @@ def main() -> int:
                 "destination_unavailable", "capture_failed", "verification_failed",
             }:
                 outcome = "policy_stale"
-            try:
-                atomic_status(
-                    state / "status.json",
-                    startup_failure_status(deployment, authority, outcome),
-                )
-            except Exception:
-                pass
+            record_startup_failure(state, deployment, authority, outcome)
         return 1
     except Exception:
         if operation == "scheduled":
-            try:
-                atomic_status(
-                    state / "status.json",
-                    startup_failure_status(deployment, authority, "capture_failed"),
-                )
-            except Exception:
-                pass
+            record_startup_failure(
+                state, deployment, authority, "capture_failed",
+            )
         return 1
 
 
