@@ -267,7 +267,7 @@ On-demand Recovery Points are created and listed with:
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
 | `plan_restore_deployment` | Destination + remote read | Default to every manifest component or normalize an explicit `postgres`/`valkey` selector; return full/partial semantics, exact effects, compatibility, and confirmation without mutation |
-| `apply_restore_deployment` | Remote + destination write | Apply the exact reviewed selector; PostgreSQL selection enters request-owned maintenance, protects non-empty current data, verifies a shadow database, then swaps while remaining in maintenance |
+| `apply_restore_deployment` | Remote + destination write | Apply the exact reviewed selector under request-owned maintenance; protect matching current components, verify PostgreSQL in a shadow, replace only the registered Valkey prefix, and swap PostgreSQL last for full Restore |
 | `plan_verify_restore` | Destination read | Plan private application and managed-process verification for a data-replaced Restore |
 | `apply_verify_restore` | Remote + destination write | Resume managed processes behind maintenance, verify database connectivity and configured live-health probes privately, re-quiesce on failure, and restore routing only after retry-safe cleanup and final verification |
 
