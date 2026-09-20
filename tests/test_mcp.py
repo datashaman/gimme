@@ -394,6 +394,33 @@ def test_registering_an_account_never_assumes_its_destructive_role(
     assert destructive not in aws.roles and len(aws.roles) == 4
 
 
+def test_control_plane_registration_mcp_adapter_uses_current_orchestrator(
+    monkeypatch,
+) -> None:
+    seen: list[tuple[str, object]] = []
+
+    class FakeRegistrationOrchestrator:
+        def plan_register_provider_account(self, name, definition):
+            seen.append((name, definition))
+            return {"kind": "provider_account_registration", "plan_id": "plan_" + "0" * 20}
+
+    account = AWSProviderAccount(
+        account_id="123456789012",
+        inspection_role_arn="arn:aws:iam::123456789012:role/gimme-inspect",
+        resolver_role_arn="arn:aws:iam::123456789012:role/gimme-resolve",
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_control_plane_registration_orchestrator",
+        FakeRegistrationOrchestrator,
+    )
+
+    result = server_module.plan_register_provider_account("production", account)
+
+    assert result["kind"] == "provider_account_registration"
+    assert seen == [("production", account)]
+
+
 async def test_hard_v4_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
