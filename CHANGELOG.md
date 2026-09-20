@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the standalone runner's bounded execution core over the shared Target capture module. It
+  independently checks the fingerprinted authority shape and credential-mode agreement, creates
+  the deterministic Recovery Point identity, captures PostgreSQL and optional Valkey through the
+  sole fixed implementations, publishes through the narrow S3 adapter, removes protected local
+  dumps, and collapses unexpected provider or secret-bearing failures to fixed safe outcomes.
 - Installed the standalone Recovery Schedule runner, shared Target capture module, and fixed
   Valkey capture program as root-owned Target bootstrap assets. Their sources now participate in
   the Target-bound helper policy; stack inspection fails back to bootstrap when an asset is
