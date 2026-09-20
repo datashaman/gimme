@@ -159,9 +159,12 @@ replacement verifies. A pruning failure preserves the new point, stops further d
 returns `backup_succeeded_retention_failed`; retry retention with a later successful capture or
 use the explicit manual deletion workflow.
 
-The policy model already accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence
-shapes and a bounded `retain_last` value from 1 through 365. Until timer reconciliation lands,
-leave `cadence` as `{kind: manual}`; the default is manual and the default retained count is 7.
+The policy model accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence shapes and
+a bounded `retain_last` value from 1 through 365. A non-manual schedule requires the registered
+Target APT stack to include `python3-boto3`; planning reports
+`recovery_schedule_runtime_missing` and apply remains unavailable otherwise. Until the shared
+Target capture executable lands, leave `cadence` as `{kind: manual}`; the default is manual and
+the default retained count is 7.
 Inspect `get_recovery_schedule_status(deployment)` or
 `gimme://deployments/{name}/recovery-schedule` for bounded timer state and logical/effective next
 UTC times. `status_unavailable` means the Target observation could not be obtained; destination

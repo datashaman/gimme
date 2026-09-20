@@ -755,12 +755,28 @@ def _managed_database_issues(state: ControlState, deployment: DeploymentConfig) 
     return []
 
 
+def _recovery_schedule_runtime_issues(
+    deployment: DeploymentConfig, target: TargetConfig
+) -> list[str]:
+    if (
+        deployment.recovery is not None
+        and deployment.recovery.cadence.kind != "manual"
+        and "python3-boto3" not in target.stack.packages
+    ):
+        return ["recovery_schedule_runtime_missing"]
+    return []
+
+
 def _resource_plan(name: str) -> dict[str, Any]:
     state, deployment, target, application = _context(name)
     secret_versions, secret_issues = _secret_plan(name, state, deployment)
-    issues = secret_issues + _dns_issues(deployment, target) + _managed_database_issues(
-        state, deployment
-    ) + _valkey_runtime(name, state, deployment)[3]
+    issues = (
+        secret_issues
+        + _dns_issues(deployment, target)
+        + _managed_database_issues(state, deployment)
+        + _recovery_schedule_runtime_issues(deployment, target)
+        + _valkey_runtime(name, state, deployment)[3]
+    )
     schedule = None
     if deployment.recovery is not None:
         destination_name = deployment.recovery.destination

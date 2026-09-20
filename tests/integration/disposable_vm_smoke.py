@@ -105,6 +105,7 @@ def setup() -> None:
         "caddy",
         "postgresql",
         "python3",
+        "python3-boto3",
         "valkey-server",
         "valkey-tools",
         "php-cli",
