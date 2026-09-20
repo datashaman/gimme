@@ -111,6 +111,7 @@ class DeployerRunner:
         artisan_arguments: Sequence[str] | None = None,
         artisan_allowed_commands: Sequence[str] | None = None,
         instance_name: str | None = None,
+        deployment_name: str | None = None,
         deploy_path: str | None = None,
         site_host: str | None = None,
         database_identifier: str | None = None,
@@ -279,6 +280,8 @@ class DeployerRunner:
             environment["GIMME_DATABASE_IDENTIFIER"] = resource_database
         if exclude_instance is not None:
             environment["GIMME_EXCLUDE_INSTANCE"] = exclude_instance
+        if deployment_name is not None:
+            environment["GIMME_DEPLOYMENT"] = deployment_name
         if app_name is not None and app is not None:
             definition = app.environment(environment_name)
             site_url = environment_site_url(server, app_name, environment_name)

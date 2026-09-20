@@ -204,8 +204,12 @@ def test_process_configuration_crosses_the_runner_boundary_as_json(
         health=HealthCheckConfig(path="/up", attempts=5),
     )
 
-    runner(tmp_path).run("gimme:preflight:processes", server(), app_name="example-app", app=app)
+    runner(tmp_path).run(
+        "gimme:preflight:processes", server(), app_name="example-app", app=app,
+        deployment_name="checkout-preview",
+    )
 
+    assert captured["GIMME_DEPLOYMENT"] == "checkout-preview"
     assert json.loads(captured["GIMME_WORKERS_JSON"])["driver"] == "horizon"
     assert json.loads(captured["GIMME_SCHEDULER_JSON"]) == {"enabled": True}
     assert json.loads(captured["GIMME_HEALTH_JSON"]) == [{

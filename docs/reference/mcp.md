@@ -265,6 +265,7 @@ On-demand Recovery Points are created and listed with:
 | `create_recovery_point` | Remote + destination write | Quiesce when required, capture, upload, verify, restore runtime, and publish one Recovery Point |
 | `plan_delete_recovery_point` | Destination read | Resolve one immutable manifest and plan exact-version deletion without exposing storage identities |
 | `delete_recovery_point` | Destination write | Delete reviewed component versions and the exact manifest version last |
+| `get_recovery_schedule_status` | Remote read | Read bounded timer and latest-attempt status without raw systemd or runner output |
 | `list_restores` | Destination read | List authoritative, secret-safe Restore records newest first |
 | `plan_restore_deployment` | Destination + remote read | Default to every manifest component or normalize an explicit `postgres`/`valkey` selector; return full/partial semantics, exact effects, compatibility, and confirmation without mutation |
 | `apply_restore_deployment` | Remote + destination write | Apply the exact reviewed selector under request-owned maintenance; protect matching current components, verify PostgreSQL in a shadow, replace only the registered Valkey prefix, and swap PostgreSQL last for full Restore |
@@ -308,6 +309,15 @@ and accepts exactly one UTC cadence shape: `{kind: manual}`, `{kind: hourly, min
 hour is 0–23 and minute is 0–59. Arbitrary time zones, seconds, cron expressions, and extra
 calendar fields are rejected. Scheduled runner, timer reconciliation, and schedule status are
 separate follow-on slices; scheduled execution will invoke the same retention path.
+
+`gimme://deployments/{name}/recovery-schedule` and `get_recovery_schedule_status` expose
+the same bounded projection. Manual cadence reports a locally known disabled timer without
+contacting the Target. A scheduled cadence queries only its Deployment-derived timer and returns
+fixed `status_unavailable` fields when the Target or observation is unavailable. The projection
+contains normalized cadence, logical/effective next UTC time, bounded timer state, the latest
+attempt fields, Recovery Point identities, and retention counts; it never includes raw systemd
+properties, unit contents, commands, paths, provider responses, or logs. Until the runner layer
+lands, latest-attempt fields remain empty and a missing timer is reported explicitly.
 
 Deletion accepts only a registered Deployment and Recovery Point ID. The private manifest
 supplies every object key and exact S3 version; callers cannot provide a key, prefix, path,

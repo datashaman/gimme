@@ -162,3 +162,7 @@ use the explicit manual deletion workflow.
 The policy model already accepts strict UTC `manual`, `hourly`, `daily`, and `weekly` cadence
 shapes and a bounded `retain_last` value from 1 through 365. Until timer reconciliation lands,
 leave `cadence` as `{kind: manual}`; the default is manual and the default retained count is 7.
+Inspect `get_recovery_schedule_status(deployment)` or
+`gimme://deployments/{name}/recovery-schedule` for bounded timer state and logical/effective next
+UTC times. `status_unavailable` means the Target observation could not be obtained; destination
+manifests remain the authoritative Recovery Point inventory.

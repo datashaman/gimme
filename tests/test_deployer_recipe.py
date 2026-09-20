@@ -295,6 +295,21 @@ def test_inspection_uses_content_bound_helper_readiness() -> None:
     assert "sudo -n -l /usr/local/sbin/gimme-postgres-restore-swap swap probe probe" in inspect
 
 
+def test_recovery_schedule_status_queries_only_the_derived_timer() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:recovery:schedule-status'", 1)[1].split(
+        "task('gimme:restart:workers'", 1
+    )[0]
+
+    assert "required_env('GIMME_DEPLOYMENT')" in task
+    assert '"gimme-recovery-{$deployment}.timer"' in task
+    assert "systemctl show --no-pager" in task
+    assert "--property=LoadState --value" in task
+    assert "systemctl is-enabled --quiet" in task
+    assert "systemctl is-active --quiet" in task
+    assert "GIMME_RECOVERY_TIMER|" in task
+
+
 def test_laravel_runtime_reconciler_preserves_secrets_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

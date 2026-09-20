@@ -1940,6 +1940,37 @@ task('gimme:processes:status', function () use ($app, $instance): void {
     }
 });
 
+task('gimme:recovery:schedule-status', function () use ($app): void {
+    if ($app === '') {
+        throw new \RuntimeException('Recovery Schedule status requires a Deployment');
+    }
+    $deployment = required_env('GIMME_DEPLOYMENT');
+    if (!preg_match('/^[a-z][a-z0-9-]{0,63}$/', $deployment)) {
+        throw new \RuntimeException('Unsafe Deployment identity');
+    }
+    $unit = "gimme-recovery-{$deployment}.timer";
+    if (!preg_match('/^gimme-recovery-[a-z][a-z0-9-]{0,63}\.timer$/', $unit)) {
+        throw new \RuntimeException('Unsafe Recovery Schedule unit name');
+    }
+    $loadState = trim(run(
+        'systemctl show --no-pager ' . escapeshellarg($unit) .
+        ' --property=LoadState --value 2>/dev/null || true'
+    ));
+    if ($loadState === '' || $loadState === 'not-found') {
+        writeln('GIMME_RECOVERY_TIMER|missing|inactive');
+        return;
+    }
+    if (!in_array($loadState, ['loaded', 'masked'], true)) {
+        throw new \RuntimeException('Unexpected Recovery Schedule unit state');
+    }
+    $enabled = test('systemctl is-enabled --quiet ' . escapeshellarg($unit));
+    $active = test('systemctl is-active --quiet ' . escapeshellarg($unit));
+    writeln(
+        'GIMME_RECOVERY_TIMER|' . ($enabled ? 'enabled' : 'disabled') .
+        '|' . ($active ? 'active' : 'inactive')
+    );
+});
+
 task('gimme:restart:workers', function (): void {
     $workers = configured_workers();
     if (!is_array($workers) || ($workers['enabled'] ?? null) !== true) {
