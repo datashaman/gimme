@@ -7,6 +7,8 @@ import re
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -212,13 +214,14 @@ def ssh_python(program: str) -> None:
     )
 
 
-def ssh_python_output(program: str) -> str:
+def ssh_python_output(program: str, *, timeout: float | None = None) -> str:
     return subprocess.run(
         ["ssh", "-o", "BatchMode=yes", HOSTNAME, "python3", "-"],
         input=program,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
+        timeout=timeout,
     ).stdout.strip()
 
 
@@ -336,11 +339,15 @@ def observe_recovery_valkey_state() -> dict[str, object]:
                 }
         unrelated = b"gimme:smoke-preview:unrelated"
         unrelated_dump = call("DUMP", unrelated)
+        concurrent = call("GET", b"gimme:smoke-preview:concurrent")
         print(json.dumps({
             "selected": observed,
             "unrelated_dump": (
                 None if unrelated_dump is None
                 else base64.b64encode(unrelated_dump).decode()
+            ),
+            "concurrent": (
+                None if concurrent is None else int(concurrent)
             ),
         }))
         """
@@ -678,10 +685,72 @@ def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object])
     )
     if not valkey_plan["ready"] or not valkey_plan["partial"]:
         raise AssertionError(f"Valkey partial Restore was not ready: {valkey_plan}")
-    gimme.apply_restore_deployment(
-        RECOVERY_DEPLOYMENT, first_point_id, "ci-valkey-partial",
-        str(valkey_plan["plan_id"]), str(valkey_plan["confirmation"]), ["valkey"],
-    )
+    writer_stop = threading.Event()
+    writer_ready = threading.Event()
+    writer_times: list[float] = []
+    writer_errors: list[Exception] = []
+
+    def write_other_deployment_prefix() -> None:
+        while not writer_stop.is_set():
+            try:
+                value = ssh_python_output(textwrap.dedent(
+                    """
+                    import socket
+
+                    connection = socket.create_connection(("127.0.0.1", 6379), timeout=10)
+                    reader = connection.makefile("rb")
+                    key = b"gimme:smoke-preview:concurrent"
+                    arguments = (b"INCR", key)
+                    connection.sendall(
+                        b"*2\\r\\n"
+                        + b"".join(
+                            b"$%d\\r\\n%s\\r\\n" % (len(item), item)
+                            for item in arguments
+                        )
+                    )
+                    response = reader.readline()
+                    if response[:1] != b":" or int(response[1:-2]) < 1:
+                        raise RuntimeError("unexpected Valkey response")
+                    print(response[1:-2].decode())
+                    """
+                ), timeout=15)
+                if int(value) < 1:
+                    raise AssertionError("concurrent writer did not advance")
+                writer_times.append(time.monotonic())
+                writer_ready.set()
+            except Exception as exc:
+                writer_errors.append(exc)
+                writer_ready.set()
+                return
+
+    writer = threading.Thread(target=write_other_deployment_prefix)
+    writer.start()
+    if not writer_ready.wait(15):
+        writer_stop.set()
+        writer.join(timeout=20)
+        raise AssertionError("concurrent writer did not start")
+    if writer_errors:
+        writer_stop.set()
+        writer.join(timeout=20)
+        raise AssertionError("concurrent writer failed to start") from writer_errors[0]
+    restore_started = time.monotonic()
+    try:
+        gimme.apply_restore_deployment(
+            RECOVERY_DEPLOYMENT, first_point_id, "ci-valkey-partial",
+            str(valkey_plan["plan_id"]), str(valkey_plan["confirmation"]), ["valkey"],
+        )
+    finally:
+        restore_finished = time.monotonic()
+        writer_stop.set()
+        writer.join(timeout=20)
+    if writer.is_alive():
+        raise AssertionError("concurrent writer did not stop")
+    if writer_errors:
+        raise AssertionError("concurrent writer failed") from writer_errors[0]
+    if not any(restore_started <= item <= restore_finished for item in writer_times):
+        raise AssertionError("other Deployment did not operate concurrently with Restore")
+    if observe_recovery_valkey_state()["concurrent"] is None:
+        raise AssertionError("Restore removed the concurrent other-Deployment key")
     assert_restore_maintenance()
     if restore_probe_value() != "before":
         raise AssertionError("Valkey-only Restore changed PostgreSQL")
