@@ -75,6 +75,9 @@ reference and version fingerprints.
 retagged, deleting, or re-keyed secret as a stale plan. It requests the exact reviewed
 version ID, resolves and validates every Deployment secret in memory, and only then begins
 target work. A failure during any resolution leaves the target unchanged.
+After plaintext resolution begins, both success and failure return only a bounded outcome; raw
+Deployer output is never returned through MCP. Activation failure, including degraded rollback,
+maps to `deployment_secret_activation_failed`.
 
 Rotate values in AWS, then request and explicitly apply a new Deployment resource plan.
 Gimme never rolls out a rotation automatically. A revoked or missing reference produces a
@@ -108,3 +111,25 @@ missing fields, and stale versions fail with bounded codes. Plaintext is never i
 exceptions or diagnostics. If target activation fails, the protected prior environment and
 manifest remain the recovery boundary; rerun a fresh plan only after correcting the cause.
 Do not delete the working environment or manifest to force reconciliation.
+
+## Opt-in live smoke test
+
+Use an isolated desired-state directory containing a disposable Deployment and Target. Register
+an AWS Secret Store and reference a dedicated single-line test value from that Deployment. The
+inspection and resolver roles must already be assumable through the ambient AWS credential chain;
+the smoke test never creates, edits, tags, rotates, or deletes an AWS object.
+
+After reviewing the Deployment resource plan, run:
+
+```bash
+GIMME_STATE_DIR=/absolute/path/to/isolated-state \
+GIMME_AWS_SECRETS_LIVE=1 \
+GIMME_AWS_SECRETS_DEPLOYMENT=example-live \
+uv run python tests/integration/aws_secrets_live_smoke.py
+```
+
+The program reads metadata, resolves the exact reviewed `AWSCURRENT` version, transfers the value
+only through the protected Target path, health-gates environment activation, and verifies that a
+subsequent plan reports the applied manifest as current. It also rejects private reference
+identities in the public plan/result/journal surfaces. Remove the disposable Target environment
+and isolated state after the run; AWS cleanup is unnecessary because this test is read-only there.
