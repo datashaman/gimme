@@ -846,8 +846,6 @@ def verify_valkey_restore(gimme, first_point_id: str, seeded: dict[str, object])
     rebound = gimme.store.deployment(RECOVERY_DEPLOYMENT)
     if rebound.placement != current.placement:
         raise AssertionError("Valkey Resource replacement changed immutable placement")
-    resources = gimme.plan_deployment_resources(RECOVERY_DEPLOYMENT)
-    gimme.apply_deployment_resources(RECOVERY_DEPLOYMENT, str(resources["plan_id"]))
 
     mutate_recovery_valkey_state()
     replacement = gimme.plan_restore_deployment(
