@@ -417,6 +417,7 @@ def service_unit(
         "After=network-online.target\nWants=network-online.target\n\n"
         "[Service]\nType=oneshot\n"
         f"User={account.pw_name}\nGroup={group}\n"
+        "Environment=AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null\n"
         f"ExecStart={RUNNER} scheduled {deployment}\n"
         f"LoadCredential=authority:{authority}\n"
         f"{credential}"

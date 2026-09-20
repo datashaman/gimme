@@ -168,6 +168,10 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     timer = helper["timer_unit"]("example-app", "*-*-* *:15:00 UTC")
 
     assert "ExecStart=/usr/local/libexec/gimme-recovery-runner scheduled example-app" in service
+    assert (
+        "Environment=AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null"
+        in service
+    )
     assert "LoadCredential=authority:/etc/gimme/recovery-schedules/example-app.json" in service
     assert "LoadCredential=aws:" not in service
     assert "LoadCredential=valkey:" not in service
