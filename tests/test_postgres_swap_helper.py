@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -156,3 +157,50 @@ def test_query_uses_only_fixed_runuser_and_psql_executables(tmp_path, monkeypatc
     assert observed[0][0][:5] == [
         "/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql"
     ]
+
+
+def test_capacity_observes_only_policy_and_postgres_filesystems(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    helper = helper_namespace(tmp_path)
+    postgres_data = tmp_path / "postgres-data"
+    postgres_data.mkdir()
+    observed = []
+
+    monkeypatch.setitem(helper, "query", lambda statement, variables: str(postgres_data))
+
+    class Filesystem:
+        f_bavail = 1024 * 1024
+        f_frsize = 1024
+
+    def statvfs(path):
+        observed.append(Path(path))
+        return Filesystem()
+
+    monkeypatch.setattr(helper["os"], "statvfs", statvfs)
+
+    helper["report_capacity"](42)
+
+    assert capsys.readouterr().out == "GIMME_POSTGRES_RESTORE_CAPACITY|ready\n"
+    assert observed == [tmp_path, postgres_data]
+
+
+def test_capacity_fails_closed_without_exposing_a_path(tmp_path, monkeypatch, capsys) -> None:
+    helper = helper_namespace(tmp_path)
+    postgres_data = tmp_path / "postgres-data"
+    postgres_data.mkdir()
+    monkeypatch.setitem(helper, "query", lambda statement, variables: str(postgres_data))
+
+    filesystem = os.statvfs(tmp_path)
+    monkeypatch.setattr(
+        helper["os"], "statvfs",
+        lambda path: type("Filesystem", (), {
+            "f_bavail": 0, "f_frsize": filesystem.f_frsize,
+        })(),
+    )
+
+    helper["report_capacity"](42)
+
+    output = capsys.readouterr().out
+    assert output == "GIMME_POSTGRES_RESTORE_CAPACITY|insufficient\n"
+    assert str(postgres_data) not in output

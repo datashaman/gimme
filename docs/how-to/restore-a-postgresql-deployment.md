@@ -29,7 +29,10 @@ or delete the source or Safety Recovery Point while a Restore is unresolved.
 1. Call `plan_restore_deployment` with the Deployment, Recovery Point ID, and request ID.
    Omit `components` for full Restore, or pass exactly the component subset to restore partially.
 2. Check `ready`, `readiness_issues`, source/destination provenance and exact versions,
-   whether the destination is empty, and the returned confirmation text.
+   whether the destination is empty, and the returned confirmation text. A PostgreSQL Restore
+   is not ready unless the controller temporary directory, Target application filesystem, and
+   PostgreSQL data filesystem each report enough bounded staging capacity for the selected
+   artifact and shadow workflow.
 3. Call `apply_restore_deployment` with the same identities and component selector, exact
    `plan_id`, and exact confirmation.
 4. Inspect the request with `list_restores` or
@@ -83,16 +86,18 @@ The destination-authoritative Restore record tells you which call to retry:
 | --- | --- |
 | `started` through `maintenance_entered` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
 | `safety_failed` | The original runtime was restored without source mutation. Request a fresh plan with the same request ID and retry; if the prior error was `recovery_runtime_restore_failed`, repair the runtime first |
-| `safety_verified` through `shadow_verified` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
+| `artifact_failed` or `shadow_failed` | No destination data was replaced and the original runtime was restored. Correct the storage, artifact, or PostgreSQL fault, request a fresh plan with the same request ID, and retry; Gimme re-enters request-owned maintenance before resuming |
+| `safety_verified`, `safety_not_required`, `artifact_verified`, or `shadow_verified` | Request a fresh `plan_restore_deployment` with the same request ID and retry `apply_restore_deployment` |
 | `data_replaced` | Run `plan_verify_restore`, then `apply_verify_restore` |
 | `verification_failed` | Correct the application, database, process, or health-check fault; request a fresh verification plan and retry it |
 | `verification_succeeded` or `cleanup_completed` | Retry a fresh verification plan; cleanup and maintenance exit are idempotent |
 | `completed` | No recovery action is required |
 
-After Safety capture succeeds, every failure before completion leaves the public route in
-maintenance. A Safety capture failure happens before source mutation, attempts to restore the
-original runtime, and records `safety_failed`. There is no MCP force-online bypass. A lost
-response is safe to retry: target state, immutable Restore events,
+Safety, source-artifact materialization, and PostgreSQL shadow preparation all precede destination
+mutation. A failure at any of those boundaries attempts to restore the original runtime and records
+`safety_failed`, `artifact_failed`, or `shadow_failed`. Once Valkey replacement or PostgreSQL swap
+can begin, every failure leaves the public route in maintenance. There is no MCP force-online
+bypass. A lost response is safe to retry: target state, immutable Restore events,
 PostgreSQL OIDs, replayed-and-reverified Valkey state, and the protected maintenance-exit receipt
 distinguish completed work from work that must still run. A Valkey retry clears and replays the
 selected prefix from the verified archive; it never guesses which individual keys completed.

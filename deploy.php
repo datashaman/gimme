@@ -1173,9 +1173,11 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
 });
 
-task('gimme:recovery:inspect-postgres', function (): void {
+task('gimme:recovery:inspect-postgres', function () use ($instance): void {
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
-    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)) {
+    $sourceBytes = required_env('GIMME_RESTORE_SOURCE_BYTES');
+    if (!preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[0-9]{1,9}$/', $sourceBytes) || (int) $sourceBytes > 536870912) {
         throw new \RuntimeException('Unsafe PostgreSQL recovery identity');
     }
     $query = <<<'SQL'
@@ -1203,6 +1205,19 @@ SQL;
         '"GIMME_POSTGRES_RESTORE_PREFLIGHT|$result" ;; *) exit 1 ;; esac';
     $output = trim(run('bash -c ' . escapeshellarg($command), timeout: 60));
     writeln($output);
+    $capacityOutput = trim(run(
+        'sudo -n /usr/local/sbin/gimme-postgres-restore-swap capacity ' .
+        escapeshellarg($instance) . ' ' . escapeshellarg($sourceBytes),
+        forceOutput: true,
+        timeout: 60,
+    ));
+    if (!in_array($capacityOutput, [
+        'GIMME_POSTGRES_RESTORE_CAPACITY|ready',
+        'GIMME_POSTGRES_RESTORE_CAPACITY|insufficient',
+    ], true)) {
+        throw new \RuntimeException('Invalid PostgreSQL restore capacity observation');
+    }
+    writeln($capacityOutput);
 });
 
 task('gimme:recovery:postgres', function () use ($appsRoot, $instance): void {

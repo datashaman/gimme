@@ -342,7 +342,9 @@ materialized views, sequences, foreign tables, routines, user-defined composite/
 range types, and non-baseline extensions all make the database non-empty; an ambiguous or
 failed inspection fails closed. The plan contains no database name. Its exact confirmation names
 the selected components; partial confirmation also names untouched components and the deliberate
-consistency break.
+consistency break. Planning also checks bounded free-space readiness on the controller temporary
+directory, Target application filesystem, and PostgreSQL data filesystem. Insufficient capacity
+returns `restore_capacity_insufficient` before maintenance or mutation.
 `apply_restore_deployment` advances the destination-authoritative Restore record through
 maintenance, Safety Recovery Point protection (when the destination was non-empty), exact
 artifact verification, shadow verification, and atomic data replacement. A failed or successful
@@ -352,6 +354,10 @@ If required Safety capture fails, Restore performs no source mutation, attempts 
 original runtime, and appends `safety_failed`. A matching retry re-enters request-owned maintenance
 and repeats the complete Safety capture. Failure to restore the runtime instead returns the fixed
 `recovery_runtime_restore_failed` code while retaining that recovery-required record state.
+Artifact materialization and PostgreSQL shadow preparation are also pre-mutation boundaries. Their
+failures append `artifact_failed` or `shadow_failed`, restore the original runtime, and allow the
+same request to re-enter maintenance and resume from the last authoritative safe phase. Failures
+after destination mutation can begin remain behind maintenance for verification or retry.
 
 `apply_verify_restore` boots each configured live-health request directly through the current
 Laravel application while the public Caddy route continues to return 503. It resumes only the

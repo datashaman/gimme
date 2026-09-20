@@ -113,6 +113,22 @@ def drop_database(database: str) -> None:
     )
 
 
+def report_capacity(source_bytes: int) -> None:
+    if isinstance(source_bytes, bool) or not 0 <= source_bytes <= 512 * 1024 * 1024:
+        fail("restore capacity size invalid")
+    data_directory = query("SHOW data_directory;\n", {})
+    data_path = Path(data_directory)
+    if not data_path.is_absolute() or len(data_directory) > 256:
+        fail("restore capacity path invalid")
+    required_bytes = source_bytes * 2 + 64 * 1024 * 1024
+    available = []
+    for path in (EXPECTED_APPS_ROOT, data_path):
+        filesystem = os.statvfs(path)
+        available.append(filesystem.f_bavail * filesystem.f_frsize)
+    status = "ready" if all(value >= required_bytes for value in available) else "insufficient"
+    print(f"GIMME_POSTGRES_RESTORE_CAPACITY|{status}")
+
+
 def derived_identities(database: str, request_id: str) -> tuple[str, str]:
     digest = hashlib.sha256(
         f"gimme-postgres-restore-v1\0{database}\0{request_id}".encode()
@@ -174,9 +190,9 @@ def cleanup(state: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 4 or sys.argv[1] not in {"swap", "cleanup"}:
+    if len(sys.argv) != 4 or sys.argv[1] not in {"capacity", "swap", "cleanup"}:
         fail("restore swap arguments invalid")
-    action, instance, request_id = sys.argv[1:]
+    action, instance, request_value = sys.argv[1:]
     sudo_user = os.environ.get("SUDO_USER", "")
     if (
         not isinstance(ALLOWED_DATABASES, dict)
@@ -189,9 +205,17 @@ def main() -> None:
             for key, value in ALLOWED_DATABASES.items()
         )
         or INSTANCE.fullmatch(instance) is None
-        or REQUEST.fullmatch(request_id) is None
+        or instance not in ALLOWED_DATABASES
         or sudo_user == ""
     ):
+        fail("restore swap identity invalid")
+    if action == "capacity":
+        if not request_value.isdigit() or len(request_value) > 9:
+            fail("restore capacity size invalid")
+        report_capacity(int(request_value))
+        return
+    request_id = request_value
+    if REQUEST.fullmatch(request_id) is None:
         fail("restore swap identity invalid")
     owner = pwd.getpwnam(sudo_user).pw_uid
     expected_phase = "shadow_verified" if action == "swap" else "data_replaced"

@@ -288,6 +288,7 @@ def deployment_restore_plan(
     destination_version: str, destination_empty: bool,
     selected_components: list[str],
     safety_components: list[str] | None = None,
+    capacity_ready: bool = True,
     valkey_destination: dict[str, str] | None = None,
     request_fingerprint: str | None = None,
     restore_state: str | None = None, request_conflict: bool = False,
@@ -337,6 +338,7 @@ def deployment_restore_plan(
             or not 0 <= source_bytes <= 512 * 1024 * 1024
             ) else []
         ),
+        *(["restore_capacity_insufficient"] if not capacity_ready else []),
         *(["restore_request_conflict"] if request_conflict else []),
         *(["restore_destination_changed"] if destination_changed else []),
     ]
@@ -379,6 +381,7 @@ def deployment_restore_plan(
             f"COMPONENTS {','.join(selected_components)}"
         ),
         "effects": [
+            "require bounded controller, application, and PostgreSQL staging capacity",
             "enter request-owned maintenance and stop only managed writers",
             *(
                 ["create and verify a protected Safety Recovery Point"]
