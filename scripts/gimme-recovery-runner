@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+"""Fixed unattended Recovery Schedule orchestration core.
+
+This source is deliberately not installed until the common capture executable is complete.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable
+
+
+EXPECTED_APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+FINGERPRINT = re.compile(r"^[a-f0-9]{64}$")
+STATUS_KEYS = {
+    "schema_version", "deployment", "last_logical_slot", "started_at", "finished_at",
+    "outcome", "error_code", "recovery_point_id", "last_verified_recovery_point_id",
+    "retention_outcome", "retention_deleted", "retention_remaining",
+}
+OUTCOMES = {
+    "succeeded", "backup_succeeded_retention_failed", "deployment_busy", "policy_stale",
+    "credentials_unavailable", "credentials_expired", "destination_unavailable",
+    "capture_failed", "verification_failed", "retention_failed", "status_unavailable",
+}
+
+
+class RunnerFailure(RuntimeError):
+    pass
+
+
+def utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise RunnerFailure("status_unavailable")
+    return value.astimezone(UTC)
+
+
+def latest_slot(cadence: dict[str, Any], observed_at: datetime) -> datetime | None:
+    observed = utc(observed_at)
+    kind = cadence.get("kind")
+    if kind == "manual" and set(cadence) == {"kind"}:
+        return None
+    if kind == "hourly" and set(cadence) == {"kind", "minute"}:
+        minute = cadence["minute"]
+        if isinstance(minute, bool) or not isinstance(minute, int) or not 0 <= minute <= 59:
+            raise RunnerFailure("policy_stale")
+        candidate = observed.replace(minute=minute, second=0, microsecond=0)
+        return candidate if candidate <= observed else candidate - timedelta(hours=1)
+    expected = {"kind", "hour", "minute"}
+    if kind == "weekly":
+        expected.add("weekday")
+    if set(cadence) != expected or kind not in {"daily", "weekly"}:
+        raise RunnerFailure("policy_stale")
+    hour, minute = cadence["hour"], cadence["minute"]
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in (hour, minute)):
+        raise RunnerFailure("policy_stale")
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise RunnerFailure("policy_stale")
+    candidate = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if kind == "weekly":
+        weekdays = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        if cadence["weekday"] not in weekdays:
+            raise RunnerFailure("policy_stale")
+        candidate -= timedelta(days=(candidate.weekday() - weekdays.index(cadence["weekday"])) % 7)
+        return candidate if candidate <= observed else candidate - timedelta(days=7)
+    return candidate if candidate <= observed else candidate - timedelta(days=1)
+
+
+def request_id(deployment: str, policy_fingerprint: str, logical_slot: datetime) -> str:
+    if NAME.fullmatch(deployment) is None or FINGERPRINT.fullmatch(policy_fingerprint) is None:
+        raise RunnerFailure("policy_stale")
+    encoded = (
+        f"gimme-scheduled-recovery-v1\0{deployment}\0{policy_fingerprint}\0"
+        f"{utc(logical_slot).isoformat()}"
+    ).encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:20]
+    return f"scheduled-{digest}"
+
+
+def atomic_status(path: Path, document: dict[str, Any]) -> None:
+    if (
+        set(document) != STATUS_KEYS
+        or document["outcome"] not in OUTCOMES
+        or document["error_code"] not in OUTCOMES | {None}
+        or NAME.fullmatch(str(document["deployment"])) is None
+    ):
+        raise RunnerFailure("status_unavailable")
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    if len(encoded.encode()) > 16 * 1024:
+        raise RunnerFailure("status_unavailable")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def acquire_lock(
+    path: Path, timeout_seconds: int = 300, *, monotonic: Callable[[], float] = time.monotonic,
+    pause: Callable[[float], None] = time.sleep,
+):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = path.open("a+")
+    os.chmod(path, 0o600)
+    deadline = monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if monotonic() >= deadline:
+                handle.close()
+                return None
+            pause(min(1.0, max(0.0, deadline - monotonic())))
+
+
+def attempt_status(
+    deployment: str, logical_slot: datetime, started_at: datetime, outcome: str,
+    *, finished_at: datetime | None = None, error_code: str | None = None,
+) -> dict[str, Any]:
+    if (
+        outcome not in OUTCOMES
+        or error_code not in OUTCOMES | {None}
+        or NAME.fullmatch(deployment) is None
+    ):
+        raise RunnerFailure("status_unavailable")
+    return {
+        "schema_version": 1,
+        "deployment": deployment,
+        "last_logical_slot": utc(logical_slot).isoformat(),
+        "started_at": utc(started_at).isoformat(),
+        "finished_at": None if finished_at is None else utc(finished_at).isoformat(),
+        "outcome": outcome,
+        "error_code": error_code,
+        "recovery_point_id": None,
+        "last_verified_recovery_point_id": None,
+        "retention_outcome": None,
+        "retention_deleted": 0,
+        "retention_remaining": 0,
+    }
+
+
+def main() -> int:
+    # Installation/activation follows only with the shared capture executable.
+    if len(sys.argv) != 3 or sys.argv[1] not in {"scheduled", "status"}:
+        return 2
+    if NAME.fullmatch(sys.argv[2]) is None:
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
