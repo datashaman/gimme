@@ -13,6 +13,8 @@ FORMAT = "gimme-valkey-v1"
 MAX_KEYS = 100_000
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_SCAN_ITERATIONS = 100_000
+MAX_CLEAR_PASSES = 100
+UNLINK_BATCH = 1_000
 
 
 class ValkeyArchiveError(RuntimeError):
@@ -26,12 +28,35 @@ class CaptureAdapter(Protocol):
         """Atomically return DUMP bytes and absolute expiry milliseconds."""
 
 
+class RestoreAdapter(CaptureAdapter, Protocol):
+    def unlink(self, keys: list[bytes]) -> None: ...
+
+    def restore(
+        self, key: bytes, payload: bytes, expires_at_ms: int | None
+    ) -> None: ...
+
+    def server_time_ms(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class ValkeyArchive:
     body: bytes
     sha256: str
     keys: int
     bytes: int
+
+
+@dataclass(frozen=True)
+class ValkeyRecord:
+    key: bytes
+    payload: bytes
+    expires_at_ms: int | None
+
+
+@dataclass(frozen=True)
+class ValkeyRestore:
+    restored: int
+    expired: int
 
 
 def _encoded_record(key: bytes, payload: bytes, expires_at_ms: int | None) -> bytes:
@@ -130,3 +155,110 @@ def verify_archive(body: bytes) -> int:
     except (ValueError, TypeError, KeyError, json.JSONDecodeError):
         raise ValkeyArchiveError("valkey_archive_invalid") from None
     return len(lines) - 1
+
+
+def archive_records(
+    body: bytes, registered_prefix: bytes, *, expected_records: int
+) -> tuple[ValkeyRecord, ...]:
+    """Decode a fully bounded archive and prove every record belongs to one prefix."""
+    if (
+        not registered_prefix
+        or len(registered_prefix) > 160
+        or not 0 <= expected_records <= MAX_KEYS
+        or verify_archive(body) != expected_records
+    ):
+        raise ValkeyArchiveError("valkey_archive_invalid")
+    records: list[ValkeyRecord] = []
+    try:
+        for line in body.splitlines()[1:]:
+            raw = json.loads(line)
+            key = base64.b64decode(raw["key"], validate=True)
+            payload = base64.b64decode(raw["dump"], validate=True)
+            if not key.startswith(registered_prefix) or not payload:
+                raise ValkeyArchiveError("valkey_archive_invalid")
+            records.append(ValkeyRecord(key, payload, raw["expires_at_ms"]))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise ValkeyArchiveError("valkey_archive_invalid") from None
+    return tuple(records)
+
+
+def _scan_prefix(adapter: CaptureAdapter, prefix: bytes) -> list[bytes]:
+    cursor = 0
+    iterations = 0
+    seen: set[bytes] = set()
+    while True:
+        iterations += 1
+        if iterations > MAX_SCAN_ITERATIONS:
+            raise ValkeyArchiveError("valkey_restore_scan_unbounded")
+        cursor, keys = adapter.scan(cursor)
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ValkeyArchiveError("valkey_restore_protocol_invalid")
+        for key in keys:
+            if not isinstance(key, bytes) or not key.startswith(prefix):
+                raise ValkeyArchiveError("valkey_restore_isolation_failed")
+            seen.add(key)
+            if len(seen) > MAX_KEYS:
+                raise ValkeyArchiveError("valkey_restore_too_large")
+        if cursor == 0:
+            return sorted(seen)
+
+
+def replace_archive(
+    adapter: RestoreAdapter,
+    registered_prefix: bytes,
+    body: bytes,
+    *,
+    expected_records: int,
+) -> ValkeyRestore:
+    """Clear, replay, and verify exactly one registered prefix from a checked archive."""
+    records = archive_records(
+        body, registered_prefix, expected_records=expected_records
+    )
+    for _pass in range(MAX_CLEAR_PASSES):
+        existing = _scan_prefix(adapter, registered_prefix)
+        if not existing:
+            break
+        for offset in range(0, len(existing), UNLINK_BATCH):
+            adapter.unlink(existing[offset:offset + UNLINK_BATCH])
+    else:
+        raise ValkeyArchiveError("valkey_restore_clear_failed")
+    restored = 0
+    expired = 0
+    for record in records:
+        if (
+            record.expires_at_ms is not None
+            and record.expires_at_ms <= adapter.server_time_ms()
+        ):
+            expired += 1
+            continue
+        adapter.restore(record.key, record.payload, record.expires_at_ms)
+        restored += 1
+    observed = _scan_prefix(adapter, registered_prefix)
+    now_ms = adapter.server_time_ms()
+    all_records = {record.key: record for record in records}
+    expected = {
+        record.key: record for record in records
+        if record.expires_at_ms is None or record.expires_at_ms > now_ms
+    }
+    unexpected = set(observed) - set(all_records)
+    live_observed = {
+        key for key in observed
+        if key in all_records and (
+            all_records[key].expires_at_ms is None
+            or all_records[key].expires_at_ms > now_ms
+        )
+    }
+    if unexpected or live_observed != set(expected):
+        raise ValkeyArchiveError("valkey_restore_verification_failed")
+    for key in sorted(live_observed):
+        payload, expires_at_ms = adapter.capture(key)
+        record = expected[key]
+        if (
+            payload is None
+            and record.expires_at_ms is not None
+            and record.expires_at_ms <= adapter.server_time_ms()
+        ):
+            continue
+        if payload != record.payload or expires_at_ms != record.expires_at_ms:
+            raise ValkeyArchiveError("valkey_restore_verification_failed")
+    return ValkeyRestore(restored=restored, expired=expired)
