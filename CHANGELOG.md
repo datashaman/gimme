@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added a fixed Target runtime probe before non-manual Recovery Schedule reconciliation. It
+  imports only boto3 through the fixed `python3` executable, emits one strictly parsed bounded
+  version marker, and runs before desired-state transfer or privileged mutation. Manual cleanup
+  does not depend on boto3, so a broken runtime can never prevent disabling a schedule.
 - Made the standalone runner's S3 runtime an explicit Target policy prerequisite. A non-manual
   Recovery Policy is not resource-apply-ready unless the registered exact APT stack includes
   `python3-boto3`; plans return the fixed `recovery_schedule_runtime_missing` issue otherwise.
