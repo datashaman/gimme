@@ -41,7 +41,10 @@ DATABASE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 CACHE_PREFIX = re.compile(r"^[a-zA-Z0-9:_-]{1,160}$")
 HOST = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$")
 MAX_STATE_BYTES = 64 * 1024
+MAX_CREDENTIAL_BYTES = 16 * 1024
 EXECUTABLES = {"systemctl": "/usr/bin/systemctl"}
+ROOT_UID = 0
+ROOT_GID = 0
 
 
 def fail(message: str) -> None:
@@ -193,6 +196,55 @@ def load_authority(deployment: str, sudo_uid: int) -> dict[str, Any]:
     return validate_authority(json.loads(path.read_text()), deployment)
 
 
+def load_transferred_credentials(
+    deployment: str, sudo_uid: int, auth_mode: str
+) -> str | None:
+    path = TRANSFER_ROOT / f"{deployment}.credentials"
+    if auth_mode == "ambient":
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule credential cleanup failed") from error
+        return None
+    try:
+        if path.is_symlink():
+            fail("Recovery Schedule credential transfer is unsafe")
+        try:
+            details = path.stat()
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule credential transfer is unavailable") from error
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != sudo_uid
+            or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+            or details.st_size > MAX_CREDENTIAL_BYTES
+        ):
+            fail("Recovery Schedule credential transfer is unsafe")
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Recovery Schedule credential transfer is invalid") from error
+        credentials = require_object(
+            value, {"access_key_id", "secret_access_key"}, "scheduled credentials"
+        )
+        for key in ("access_key_id", "secret_access_key"):
+            item = credentials[key]
+            if (
+                not isinstance(item, str)
+                or not 1 <= len(item.encode()) <= 8192
+                or any(character in item for character in "\0\r\n")
+            ):
+                fail("Recovery Schedule credential transfer is invalid")
+        return json.dumps(credentials, sort_keys=True, separators=(",", ":")) + "\n"
+    finally:
+        try:
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule credential cleanup failed") from error
+
+
 def run(command: list[str]) -> None:
     if not command or command[0] not in EXECUTABLES:
         fail("Recovery Schedule helper attempted an unexpected executable")
@@ -208,8 +260,20 @@ def succeeds(command: list[str]) -> bool:
     ).returncode == 0
 
 
+def file_matches(path: Path, content: str, mode: int) -> bool:
+    if path.is_file() and not path.is_symlink():
+        details = path.stat()
+        return (
+            details.st_uid == ROOT_UID
+            and details.st_gid == ROOT_GID
+            and stat.S_IMODE(details.st_mode) == mode
+            and path.read_text() == content
+        )
+    return False
+
+
 def atomic_write(path: Path, content: str, mode: int) -> bool:
-    if path.is_file() and not path.is_symlink() and path.read_text() == content:
+    if file_matches(path, content, mode):
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -220,7 +284,7 @@ def atomic_write(path: Path, content: str, mode: int) -> bool:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temp, mode)
-        os.chown(temp, 0, 0)
+        os.chown(temp, ROOT_UID, ROOT_GID)
         os.replace(temp, path)
     except BaseException:
         temp.unlink(missing_ok=True)
@@ -228,9 +292,15 @@ def atomic_write(path: Path, content: str, mode: int) -> bool:
     return True
 
 
-def service_unit(deployment: str, account: pwd.struct_passwd) -> str:
+def service_unit(
+    deployment: str, account: pwd.struct_passwd, *, stored_credentials: bool
+) -> str:
     authority = AUTHORITY_ROOT / f"{deployment}.json"
     group = grp.getgrgid(account.pw_gid).gr_name
+    credential = (
+        f"LoadCredential=aws:{AUTHORITY_ROOT / f'{deployment}.credentials'}\n"
+        if stored_credentials else ""
+    )
     return (
         "[Unit]\n"
         f"Description=Gimme Recovery Schedule for {deployment}\n"
@@ -239,6 +309,7 @@ def service_unit(deployment: str, account: pwd.struct_passwd) -> str:
         f"User={account.pw_name}\nGroup={group}\n"
         f"ExecStart={RUNNER} scheduled {deployment}\n"
         f"LoadCredential=authority:{authority}\n"
+        f"{credential}"
         f"StateDirectory=gimme/recovery-schedules/{deployment}\n"
         "RuntimeMaxSec=7200\nTimeoutStopSec=30\n"
         "NoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\n"
@@ -279,9 +350,12 @@ def remove_schedule(deployment: str) -> bool:
             path.unlink()
             changed = True
     credential = AUTHORITY_ROOT / f"{deployment}.credentials"
-    if credential.exists() or credential.is_symlink():
-        credential.unlink()
-        changed = True
+    try:
+        if credential.exists() or credential.is_symlink():
+            credential.unlink()
+            changed = True
+    except OSError as error:
+        raise RuntimeError("Recovery Schedule credential cleanup failed") from error
     status_directory = STATUS_ROOT / deployment
     status = status_directory / "status.json"
     if status.exists() or status.is_symlink():
@@ -309,9 +383,13 @@ def reconcile() -> None:
         fail("invalid sudo caller")
     account = pwd.getpwnam(sudo_user)
     authority = load_authority(deployment, account.pw_uid)
+    calendar = authority["calendar"]
+    auth_mode = authority["destination"]["auth_mode"]
+    credential_content = load_transferred_credentials(
+        deployment, account.pw_uid, "ambient" if calendar is None else auth_mode
+    )
     service = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.service"
     timer = SYSTEMD_ROOT / f"gimme-recovery-{deployment}.timer"
-    calendar = authority["calendar"]
     if calendar is None:
         changed = remove_schedule(deployment)
     else:
@@ -319,29 +397,49 @@ def reconcile() -> None:
         if (
             runner_details is None
             or not stat.S_ISREG(runner_details.st_mode)
-            or runner_details.st_uid != 0
+            or runner_details.st_uid != ROOT_UID
             or runner_details.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             or not os.access(RUNNER, os.X_OK)
         ):
             fail("validated Recovery Schedule runner is not installed")
         encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n"
         fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
-        rendered_service = service_unit(deployment, account)
+        rendered_service = service_unit(
+            deployment, account, stored_credentials=credential_content is not None
+        )
         rendered_timer = timer_unit(deployment, calendar)
-        desired = (
-            (AUTHORITY_ROOT / f"{deployment}.json", encoded),
-            (service, rendered_service),
-            (timer, rendered_timer),
-        )
-        replacing = any(
-            not path.is_file() or path.is_symlink() or path.read_text() != content
-            for path, content in desired
-        )
+        desired = [
+            (AUTHORITY_ROOT / f"{deployment}.json", encoded, 0o600),
+            (service, rendered_service, 0o644),
+            (timer, rendered_timer, 0o644),
+        ]
+        credential_path = AUTHORITY_ROOT / f"{deployment}.credentials"
+        if credential_content is not None:
+            desired.append((credential_path, credential_content, 0o600))
+        try:
+            replacing = any(
+                not file_matches(path, content, mode) for path, content, mode in desired
+            )
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule installed state is unreadable") from error
         if replacing:
             # Any interrupted multi-file replacement is fail-closed. The next apply
             # converges the individually atomic files before re-enabling the timer.
             disable(timer.name)
-        changed = atomic_write(AUTHORITY_ROOT / f"{deployment}.json", encoded, 0o600)
+        try:
+            if credential_content is None and (
+                credential_path.exists() or credential_path.is_symlink()
+            ):
+                disable(timer.name)
+                credential_path.unlink()
+                changed = True
+            else:
+                changed = False
+            if credential_content is not None:
+                changed = atomic_write(credential_path, credential_content, 0o600) or changed
+        except OSError as error:
+            raise RuntimeError("Recovery Schedule credential installation failed") from error
+        changed = atomic_write(AUTHORITY_ROOT / f"{deployment}.json", encoded, 0o600) or changed
         changed = atomic_write(service, rendered_service, 0o644) or changed
         changed = atomic_write(timer, rendered_timer, 0o644) or changed
         if changed:

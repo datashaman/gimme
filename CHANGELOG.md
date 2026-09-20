@@ -5,6 +5,12 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added the Recovery Schedule helper's stored-credential boundary. A scheduled stored-auth
+  authority now requires one fixed caller-owned mode-0600 transfer containing exactly the two
+  resolved S3 credential values; the helper validates and removes the transfer before mutation,
+  installs or rotates one root-owned mode-0600 credential atomically, and exposes it to the fixed
+  service only through `LoadCredential`. Ambient and manual policies persist no credential and
+  remove superseded material. No secret value or reference enters units, plans, or output.
 - Added the Target-bound privileged Recovery Schedule reconciler and bound its exact source to
   the bootstrap policy and execution fingerprint. It accepts only a caller-owned mode-0600
   authority document, independently validates every policy-derived field, renders one fixed

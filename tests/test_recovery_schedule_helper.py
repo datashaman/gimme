@@ -118,11 +118,21 @@ def test_units_use_only_fixed_runner_and_hardening() -> None:
     helper["grp"] = SimpleNamespace(getgrgid=lambda _gid: SimpleNamespace(gr_name="deployer"))
     account = SimpleNamespace(pw_name="deployer", pw_gid=1000)
 
-    service = helper["service_unit"]("example-app", account)
+    service = helper["service_unit"](
+        "example-app", account, stored_credentials=False
+    )
+    stored_service = helper["service_unit"](
+        "example-app", account, stored_credentials=True
+    )
     timer = helper["timer_unit"]("example-app", "*-*-* *:15:00 UTC")
 
     assert "ExecStart=/usr/local/libexec/gimme-recovery-runner scheduled example-app" in service
     assert "LoadCredential=authority:/etc/gimme/recovery-schedules/example-app.json" in service
+    assert "LoadCredential=aws:" not in service
+    assert (
+        "LoadCredential=aws:/etc/gimme/recovery-schedules/example-app.credentials"
+        in stored_service
+    )
     assert "NoNewPrivileges=true" in service
     assert "ProtectSystem=strict" in service
     assert "CapabilityBoundingSet=" in service
@@ -156,7 +166,7 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
 
         def stat(self):
             details = runner.stat()
-            return SimpleNamespace(st_mode=details.st_mode, st_uid=0)
+            return SimpleNamespace(st_mode=details.st_mode, st_uid=os.getuid())
 
     helper.update({
         "EXPECTED_APPS_ROOT": apps,
@@ -165,6 +175,8 @@ def configure_filesystem(helper, tmp_path: Path, selected: dict[str, object]) ->
         "STATUS_ROOT": tmp_path / "var" / "recovery-schedules",
         "SYSTEMD_ROOT": tmp_path / "systemd",
         "RUNNER": RootOwnedRunner(),
+        "ROOT_UID": os.getuid(),
+        "ROOT_GID": os.getgid(),
     })
 
 
@@ -202,7 +214,9 @@ def test_reconcile_installs_exact_units_and_is_idempotent(tmp_path, monkeypatch)
 
 def test_manual_cadence_removes_units_authority_and_credentials(tmp_path, monkeypatch) -> None:
     helper = helper_namespace()
-    configure_filesystem(helper, tmp_path, authority({"kind": "manual"}))
+    selected = authority({"kind": "manual"})
+    selected["destination"]["auth_mode"] = "stored"
+    configure_filesystem(helper, tmp_path, selected)
     systemd = helper["SYSTEMD_ROOT"]
     systemd.mkdir(parents=True)
     authority_root = helper["AUTHORITY_ROOT"]
@@ -227,3 +241,75 @@ def test_manual_cadence_removes_units_authority_and_credentials(tmp_path, monkey
     assert not list(authority_root.glob("example-app*"))
     assert ["systemctl", "disable", "--now", "gimme-recovery-example-app.timer"] in calls
     assert ["systemctl", "daemon-reload"] in calls
+
+
+def test_stored_credentials_are_validated_installed_and_transfer_removed(
+    tmp_path, monkeypatch
+) -> None:
+    helper = helper_namespace()
+    selected = authority()
+    selected["destination"]["auth_mode"] = "stored"
+    configure_filesystem(helper, tmp_path, selected)
+    transfer = helper["TRANSFER_ROOT"] / "example-app.credentials"
+    transfer.write_text(json.dumps({
+        "access_key_id": "access-canary",
+        "secret_access_key": "secret-canary",
+    }))
+    transfer.chmod(0o600)
+    monkeypatch.setitem(helper, "run", lambda _command: None)
+    monkeypatch.setitem(helper, "succeeds", lambda _command: False)
+    monkeypatch.setattr(helper["os"], "chown", lambda *_args: None)
+    monkeypatch.setattr(helper["os"], "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", pwd.getpwuid(os.getuid()).pw_name)
+    monkeypatch.setattr(helper["sys"], "argv", ["helper", "example-app"])
+
+    helper["reconcile"]()
+
+    installed = helper["AUTHORITY_ROOT"] / "example-app.credentials"
+    assert json.loads(installed.read_text()) == {
+        "access_key_id": "access-canary",
+        "secret_access_key": "secret-canary",
+    }
+    assert installed.stat().st_mode & 0o777 == 0o600
+    assert not transfer.exists()
+    unit = (helper["SYSTEMD_ROOT"] / "gimme-recovery-example-app.service").read_text()
+    assert "LoadCredential=aws:" in unit
+    assert "access-canary" not in unit
+    assert "secret-canary" not in unit
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"access_key_id": "access"},
+        {"access_key_id": "access", "secret_access_key": "line\nbreak"},
+        {"access_key_id": "access", "secret_access_key": "secret", "extra": "value"},
+    ],
+)
+def test_invalid_stored_credentials_fail_before_mutation_and_remove_transfer(
+    tmp_path, credentials
+) -> None:
+    helper = helper_namespace()
+    selected = authority()
+    selected["destination"]["auth_mode"] = "stored"
+    configure_filesystem(helper, tmp_path, selected)
+    transfer = helper["TRANSFER_ROOT"] / "example-app.credentials"
+    transfer.write_text(json.dumps(credentials))
+    transfer.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="credential"):
+        helper["load_transferred_credentials"]("example-app", os.getuid(), "stored")
+
+    assert not transfer.exists()
+    assert not helper["AUTHORITY_ROOT"].exists()
+
+
+def test_missing_stored_credential_error_does_not_expose_path(tmp_path) -> None:
+    helper = helper_namespace()
+    configure_filesystem(helper, tmp_path, authority())
+
+    with pytest.raises(RuntimeError) as failure:
+        helper["load_transferred_credentials"]("example-app", os.getuid(), "stored")
+
+    assert str(failure.value) == "Recovery Schedule credential transfer is unavailable"
+    assert ".credentials" not in str(failure.value)
