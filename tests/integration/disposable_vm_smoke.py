@@ -603,6 +603,19 @@ def verify_postgres_restore(gimme) -> None:
         RECOVERY_DEPLOYMENT, "ci-postgres-source", str(capture["plan_id"])
     )
     point_id = str(created["recovery_point"]["recovery_point_id"])
+    restore_state, _deployment, destination_name, destination = (
+        gimme._recovery_context(RECOVERY_DEPLOYMENT)
+    )
+    _, restore_credentials = gimme._backup_destination_credentials(
+        restore_state, destination
+    )
+    private_source = gimme.recovery_module.find_recovery_point(
+        destination_name, destination, restore_credentials, gimme.backup_s3,
+        RECOVERY_DEPLOYMENT, point_id,
+    )
+    if private_source is None:
+        raise AssertionError("private restore source disappeared after capture")
+    private_component = private_source["components"][0]
 
     set_restore_probe("after")
     restore = gimme.plan_restore_deployment(
@@ -622,12 +635,8 @@ def verify_postgres_restore(gimme) -> None:
                     "gimme:recovery:postgres", RECOVERY_DEPLOYMENT,
                     postgres_restore_action="swap",
                     postgres_restore_request_id="ci-nonempty-restore",
-                    postgres_restore_sha256=str(
-                        created["recovery_point"]["components"][0]["sha256"]
-                    ),
-                    postgres_restore_bytes=int(
-                        created["recovery_point"]["components"][0]["bytes"]
-                    ),
+                    postgres_restore_sha256=str(private_component["sha256"]),
+                    postgres_restore_bytes=int(private_component["bytes"]),
                     timeout=300,
                 )
             except Exception as detail:
