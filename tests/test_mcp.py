@@ -1657,6 +1657,31 @@ def test_deployment_removal_disables_schedule_before_deleting_placement(
     assert "example-app" not in selected.load().deployments
 
 
+def test_deployment_removal_schedule_failure_preserves_state_and_manifest(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_recovery_store(tmp_path, monkeypatch)
+    manifest = selected.root / "applied-secrets" / "example-app.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text("[]")
+
+    def fail_schedule(task, *args, **kwargs):
+        if task == "gimme:recovery:schedule-reconcile":
+            raise RuntimeError("private cleanup output")
+        return CommandResult(["dep"], 0, "ok")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_schedule)
+    plan = server_module.plan_remove_deployment("example-app")
+
+    with pytest.raises(RuntimeError, match="^recovery_schedule_cleanup_failed$"):
+        server_module.remove_deployment(
+            "example-app", str(plan["plan_id"]), "REMOVE example-app"
+        )
+
+    assert "example-app" in selected.load().deployments
+    assert manifest.is_file()
+
+
 def test_manual_valkey_uses_cleanup_authority_but_on_demand_keeps_execution(
     tmp_path, monkeypatch
 ) -> None:
