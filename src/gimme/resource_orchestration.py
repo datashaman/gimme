@@ -680,6 +680,9 @@ class ManagedResourceOrchestrator:
                 deployment_name: {"status": allocation["status"]}
                 for deployment_name, allocation in allocations.items()
             }
+            result["detached_count"] = sum(
+                allocation["status"] == "detached" for allocation in allocations.values()
+            )
             if live is not None:
                 result["binding_count"] = sum(
                     allocation["status"] == "active" for allocation in allocations.values()

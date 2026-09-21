@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Callable, cast
 
 from gimme import resources_postgres as resources_postgres_module
@@ -32,6 +33,8 @@ class ResourceRetirementOrchestrator:
     rds_postgres: Any
     runner: Any
     postgres_recovery_evidence: Callable[..., Any]
+    recovery_evidence: Callable[..., Any]
+    run_deployment: Callable[..., Any]
     deployment_resource_lock: Callable[..., Any]
     assert_plan: Callable[..., Any]
     delete: Callable[..., Any]
@@ -100,6 +103,52 @@ class ResourceRetirementOrchestrator:
         return {
             "detached": True,
             "generation": detached["generation"],
+            "recovery_evidence": detached["recovery_evidence"] is not None,
+        }
+
+    def detach_valkey_allocation(
+        self, deployment_name: str, resource_name: str, deployment: Any, *,
+        stop_processes: bool,
+    ) -> dict[str, object]:
+        """Unbind one Deployment from a managed Valkey Resource: stop its managed processes,
+        disable its ACL user, and record a Detached Allocation. Every namespaced key and the
+        credential secret are kept. Idempotent, so a crash part-way is finished by re-running the
+        same update or removal. Missing Component Backup evidence never blocks this."""
+        state = self.store.load()
+        resource = state.resources.get(resource_name)
+        if not isinstance(resource, AWSElastiCacheValkeyResource):
+            return {"detached": False}
+        observed = resources_valkey_module.load_observed(self.store.root, resource_name)
+        allocation = (
+            None if observed is None
+            else cast(dict[str, dict[str, object]], observed["allocations"]).get(deployment_name)
+        )
+        if allocation is None:
+            return {"detached": False}
+        if allocation["status"] == "detached":
+            return {"detached": True, "already_detached": True}
+        resources_valkey_module.refuse_while_busy(self.store.root, resource_name)
+        moment = datetime.now(UTC)
+        expected = deployment.recovery is not None and deployment.recovery.valkey
+        evidence = (
+            self.recovery_evidence("valkey", deployment_name, allocation, cutoff=moment)
+            if expected else None
+        )
+        if stop_processes:
+            self.run_deployment("gimme:stop:processes", deployment_name, timeout=1800)
+        network = state.aws_networks[resource.aws_network]
+        self.elasticache_valkey.disable_binding(
+            state.provider_accounts[network.provider_account], network,
+            resources_valkey_module.derive_group_id(resource_name),
+            str(allocation["user_id"]),
+        )
+        detached = resources_valkey_module.detach_allocation(
+            self.store.root, resource_name, deployment_name,
+            recovery_expected=expected, evidence=evidence, detached_at=moment,
+        )
+        return {
+            "detached": True,
+            "generation": detached.get("generation", 1),
             "recovery_evidence": detached["recovery_evidence"] is not None,
         }
 
@@ -409,10 +458,40 @@ class ResourceRetirementOrchestrator:
         ):
             raise ValueError(f"resource {name} is still referenced by a deployment")
         observed = resources_valkey_module.load_observed(self.store.root, name)
-        if observed is not None and set(
-            cast(dict[str, object], observed["allocations"])
-        ) & set(state.deployments):
+        allocations = (
+            {} if observed is None
+            else cast(dict[str, dict[str, object]], observed["allocations"])
+        )
+        # An allocation is resolved once detached; an active one that still names an existing
+        # Deployment is an unfinished unbind, and an active one of a removed Deployment predates
+        # detachment and is destroyed as before.
+        if any(
+            item["status"] != "detached" and deployment in state.deployments
+            for deployment, item in allocations.items()
+        ):
             raise ResourceError("aws_elasticache_destroy_bindings_remain")
+        in_progress = resources_valkey_module.read_marker(
+            self.store.root, "destroying", name
+        ) is not None
+        safe_allocations: list[dict[str, object]] = []
+        for deployment, allocation in sorted(allocations.items()):
+            if allocation["status"] != "detached":
+                continue
+            evidence = cast(dict[str, object] | None, allocation["recovery_evidence"])
+            if allocation["recovery_expected"]:
+                if not resources_valkey_module.recovery_evidence_is_fresh(allocation):
+                    raise ResourceError("aws_elasticache_destroy_recovery_evidence_missing")
+                if (
+                    not in_progress
+                    and self.recovery_evidence("valkey", deployment, allocation) != evidence
+                ):
+                    raise ResourceError("aws_elasticache_destroy_recovery_evidence_stale")
+            safe_allocations.append({
+                "deployment": deployment,
+                "generation": allocation.get("generation", 1),
+                "recovery_point_id": None if evidence is None else evidence["recovery_point_id"],
+                "captured_at": None if evidence is None else evidence["captured_at"],
+            })
         account = state.provider_accounts[
             state.aws_networks[resource.aws_network].provider_account
         ]
@@ -428,6 +507,7 @@ class ResourceRetirementOrchestrator:
                 resources_valkey_module.derive_group_id(name), fingerprint
             ),
             len(users),
+            safe_allocations,
         )
 
     def plan_destroy_resource(self, name: str) -> dict[str, object]:

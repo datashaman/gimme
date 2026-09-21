@@ -341,7 +341,7 @@ The same tools accept an AWS ElastiCache Valkey resource (provider `aws_elastica
 `plan_apply_resource` and `apply_resource` create its replication group, and
 `inspect_resource` reports secret-free `phase`, `status`, `engine_version`,
 `effective_durability`, fixed `issues` codes, `drift`, `topology`, snapshot and maintenance policy,
-`pending_service_updates`, `binding_count`, and, for an available group, bounded recent CloudWatch
+`pending_service_updates`, `binding_count`, `detached_count`, and, for an available group, bounded recent CloudWatch
 `metrics` with fixed `warnings` codes (or a bounded `metrics_error`), never an endpoint or
 identifier.
 `apply_resource` on an existing group makes one modification of only the differing same-major
@@ -353,7 +353,11 @@ receives the fixed `laravel-cluster-v1` contract and is probed before its releas
 `security_group_id`. Registering or updating to a `node_type` outside the documented durable
 families (`r8g`, `r7g`, `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, `c7gn`) is refused with
 `aws_elasticache_node_type_not_durable`, and one the account does not offer with
-`aws_elasticache_node_type_unavailable`.
+`aws_elasticache_node_type_unavailable`. `update_deployment` moving a Deployment off a managed
+Valkey Resource, and `remove_deployment`, stop its managed processes (an update only), disable its
+ACL user, and record a Detached Allocation that keeps every namespaced key and the credential
+secret; binding it to the same Resource again restores the namespace with a new ACL-user
+generation (see the how-to).
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
@@ -366,7 +370,7 @@ families (`r8g`, `r7g`, `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, `c7gn`) is refused w
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
 | `plan_purge_resource_allocation` | Read | Plan purging one detached managed PostgreSQL allocation with current Recovery Point evidence |
 | `apply_purge_resource_allocation` | Remote write (destructive) | Delete the exact detached database and roles, then schedule its workload secret for the fixed 30-day recovery window after exact confirmation `PURGE <deployment> FROM <resource>` |
-| `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey or AWS RDS PostgreSQL Resource and its data; reads only local state and never assumes the destructive role |
+| `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey or AWS RDS PostgreSQL Resource and its data, listing every Detached Allocation and its recovery evidence or a recovery-not-guaranteed warning; reads only local state and never assumes the destructive role |
 | `apply_destroy_resource` | Remote write (destructive) | Destroy the reviewed Resource through the Provider Account's destructive role after exact confirmation `DESTROY RESOURCE <name>`; Valkey and RDS both preserve a verified final snapshot, and RDS also retains automated backups |
 | `plan_purge_final_snapshot` | Read | Plan deleting only the deterministic final snapshot retained after a destroyed Valkey Resource; reads a local receipt only |
 | `apply_purge_final_snapshot` | Remote write (destructive) | Delete that exact final snapshot through the destructive role after exact confirmation `PURGE FINAL SNAPSHOT <name>` |

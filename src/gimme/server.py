@@ -217,6 +217,9 @@ def _deployment_lifecycle_orchestrator() -> DeploymentLifecycleOrchestrator:
         detach_postgres_allocation=(
             _resource_retirement_orchestrator().detach_postgres_allocation
         ),
+        detach_valkey_allocation=(
+            _resource_retirement_orchestrator().detach_valkey_allocation
+        ),
         result=_result,
     )
 
@@ -301,6 +304,8 @@ def _resource_retirement_orchestrator() -> ResourceRetirementOrchestrator:
         rds_postgres=rds_postgres,
         runner=runner,
         postgres_recovery_evidence=_postgres_recovery_evidence,
+        recovery_evidence=_recovery_evidence,
+        run_deployment=_run_deployment,
         deployment_resource_lock=_deployment_resource_lock,
         assert_plan=_assert_plan,
         delete=_delete,
@@ -1227,6 +1232,15 @@ def _postgres_recovery_evidence(
     deployment_name: str, allocation: dict[str, object]
 ) -> dict[str, object] | None:
     """Select recent destination-authoritative PostgreSQL evidence before detachment."""
+    return _recovery_evidence("postgres", deployment_name, allocation)
+
+
+def _recovery_evidence(
+    kind: str, deployment_name: str, allocation: dict[str, object],
+    *, cutoff: datetime | None = None,
+) -> dict[str, object] | None:
+    """Select recent destination-authoritative evidence of one Component Backup kind. A first
+    selection is judged at `cutoff` (default now); a recorded one at its detachment time."""
     state = store.load()
     deployment = state.deployments.get(deployment_name)
     recorded = allocation.get("recovery_evidence")
@@ -1247,7 +1261,7 @@ def _postgres_recovery_evidence(
     except Exception:
         return None
     now = datetime.now(UTC)
-    evidence_cutoff = now
+    evidence_cutoff = cutoff or now
     if isinstance(recorded, dict) and allocation.get("detached_at") is not None:
         try:
             evidence_cutoff = datetime.fromisoformat(str(allocation["detached_at"]))
@@ -1264,13 +1278,13 @@ def _postgres_recovery_evidence(
         if point.get("state") != "verified":
             continue
         components = cast(list[dict[str, object]], point.get("components", []))
-        postgres = next(
-            (item for item in components if item.get("kind") == "postgres"), None
+        component = next(
+            (item for item in components if item.get("kind") == kind), None
         )
-        if postgres is None:
+        if component is None:
             continue
         try:
-            captured_at = datetime.fromisoformat(str(postgres["captured_at"]))
+            captured_at = datetime.fromisoformat(str(component["captured_at"]))
         except (KeyError, ValueError):
             continue
         if (
@@ -1288,7 +1302,7 @@ def _postgres_recovery_evidence(
                 "recovery_point_id": point["recovery_point_id"],
                 "destination": destination_name,
                 "captured_at": captured_at.astimezone(UTC).isoformat(),
-                "generation": allocation["generation"],
+                "generation": allocation.get("generation", 1),
             }
             if candidate == recorded:
                 return candidate
@@ -1298,7 +1312,7 @@ def _postgres_recovery_evidence(
         "recovery_point_id": point["recovery_point_id"],
         "destination": destination_name,
         "captured_at": captured_at.astimezone(UTC).isoformat(),
-        "generation": allocation["generation"],
+        "generation": allocation.get("generation", 1),
     }
 
 

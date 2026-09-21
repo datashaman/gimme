@@ -5,6 +5,17 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added managed Valkey detachment and same-Resource rebinding. Moving a Deployment to another
+  Resource or removing it stops its managed processes (an update only, through a new
+  `gimme:stop:processes` task that reuses the existing privileged process helper), disables its
+  ACL user with the inspection role, and records a Detached Allocation that keeps every
+  namespaced key and the credential secret, with its Valkey Recovery Policy expectation and any
+  verified Component Backup taken within 24 hours before disablement. Binding the Deployment to
+  the same Resource again creates a new ACL-user generation and records the previous user as
+  retired. Destroying a Resource now resolves each Detached Allocation (fresh evidence, or an
+  explicit recovery-not-guaranteed warning) and deletes retired users. Observations gain optional
+  `detached_at`, `recovery_expected`, `recovery_evidence`, and `retired_user_ids`; old records stay
+  valid. `inspect_resource` reports `detached_count`. Allocation purge follows separately.
 - Extended managed Valkey `inspect_resource` with topology, snapshot and maintenance policy,
   binding count, pending service updates, and one bounded CloudWatch read (memory, connections,
   evictions, replica lag, durability lag, durability-buffer rejections, traffic management) that
