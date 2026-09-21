@@ -1296,7 +1296,9 @@ def structural_issues(
         "maintenance_policy": observed.maintenance_window == resource.maintenance_window,
         "automatic_minor_upgrade": observed.automatic_minor_upgrade is False,
         "service_update_overdue": not observed.service_update_overdue,
-        "security_group": (
+        # Attached groups and ingress are read only from an available group, so a modifying
+        # one (a failover, an ACL change) has nothing to compare and is not reported as drift.
+        "security_group": observed.status != "available" or (
             observed.security_group_ids == (resource.security_group_id,)
             and set(observed.ingress_sources or ()) <= {
                 resource.administration_security_group_id,

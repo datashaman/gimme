@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed `inspect_resource` reporting a false `security_group` readiness issue while a managed
+  Valkey group was `modifying` (found live during a failover): attached security groups are read
+  only from an available group, so a modifying group is now compared on nothing rather than on
+  an unread value.
 - Extended the disposable real-Laravel Valkey suite (local TLS cluster, saved ACLs, zero cost) to
   drive each declared use on its own and to cover credential rotation and restarts: candidates with a wrong password or a missing permission
   are refused without disturbing the live credential or its open connection and are rolled back; a
