@@ -1122,6 +1122,10 @@ def expect_create(
          "Tags": TAG},
     )
     stub.add_response(
+        "describe_user_groups", {"UserGroups": [{"UserGroupId": users, "Status": "active"}]},
+        {"UserGroupId": users},
+    )
+    stub.add_response(
         "create_replication_group", {},
         {
             "ReplicationGroupId": GROUP_ID,
@@ -1137,6 +1141,24 @@ def expect_create(
             "PreferredMaintenanceWindow": "sun:05:00-sun:06:00", "Port": 6379, "Tags": TAG,
         },
     )
+
+
+def test_create_waits_for_a_creating_user_group_before_creating_the_group(monkeypatch) -> None:
+    # Live AWS: InvalidUserGroupStateFault "has status creating" on every first create.
+    client, stub = stubbed("elasticache")
+    sleeps: list[float] = []
+    monkeypatch.setattr("gimme.resources_valkey.time.sleep", sleeps.append)
+    for status in ("creating", "creating", "active"):
+        stub.add_response(
+            "describe_user_groups", {"UserGroups": [{"UserGroupId": "g", "Status": status}]},
+            {"UserGroupId": "g"},
+        )
+
+    stub.activate()
+    BotoElastiCacheAdapter._wait_for_user_group(client, "g")
+
+    stub.assert_no_pending_responses()
+    assert sleeps == [3, 3]
 
 
 def test_create_sends_exactly_the_fixed_contract_and_writes_the_admin_secret(
@@ -3883,6 +3905,10 @@ def test_a_snapshot_restore_sends_the_snapshot_omits_the_shard_count_and_never_w
     )
     stub.add_response(
         "modify_user_group", {}, {"UserGroupId": users, "UserIdsToAdd": [USER_ID]},
+    )
+    stub.add_response(
+        "describe_user_groups", {"UserGroups": [{"UserGroupId": users, "Status": "active"}]},
+        {"UserGroupId": users},
     )
     stub.add_response(
         "create_replication_group", {},
