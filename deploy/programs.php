@@ -456,7 +456,9 @@ def check_namespace(session, token):
         try:
             session.call(*command)
         except ServerError as error:
-            if error.code != "noperm":
+            # ElastiCache removes CONFIG outright, so it answers "unknown command", not NOPERM.
+            removed = command[0] == "CONFIG" and error.message.startswith("ERR unknown command")
+            if error.code != "noperm" and not removed:
                 raise ProbeFailure("namespace_unverified")
         else:
             try:

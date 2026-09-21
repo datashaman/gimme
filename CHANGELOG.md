@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed the Valkey activation probe's `namespace` check failing on ElastiCache with
+  `namespace_unverified`: ElastiCache removes `CONFIG` outright, so it answers `ERR unknown command`
+  rather than `NOPERM`. That reply now counts as a denial for `CONFIG` only; every other
+  non-`NOPERM` reply still fails the probe. Found by the first live activation on AWS.
 - Fixed bootstrapping a Target that has no placed Deployments (an administration Target, or any
   Target before its first placement): the desired state wrote `"sites": []`, which the privileged
   helper rejected with `sites must be an object`. It now writes an empty object.
