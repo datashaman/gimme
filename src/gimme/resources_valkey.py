@@ -70,6 +70,11 @@ METRICS_PERIOD_SECONDS = 300
 METRICS_MAX_MEMBERS = 8
 ENGINE_VERSION_FLOOR = 9
 PORT = 6379
+# A replication group can only use a user group that is active or modifying; a new one is
+# `creating` for a while, so creation waits up to POLLS * SECONDS for it.
+USER_GROUP_USABLE = ("active", "modifying")
+USER_GROUP_POLLS = 20
+USER_GROUP_POLL_SECONDS = 3
 # The default user can never authenticate; the administrative identity is limited to
 # Gimme-owned key and channel prefixes and a fixed maintenance command set.
 DEFAULT_ACCESS_STRING = "off ~* -@all"
@@ -1220,6 +1225,21 @@ class BotoElastiCacheAdapter(AWSAdapter):
             raise _provider_error(exc, "user_group_restore", self.error_prefix) from None
         return user_group
 
+    @staticmethod
+    def _wait_for_user_group(client, user_group: str) -> None:
+        """AWS refuses a replication group whose user group is still `creating` (seen on every
+        live create), so wait a bounded while for it to be usable. If it is not by then the
+        create below fails as before and the same apply resumes."""
+        for attempt in range(USER_GROUP_POLLS):
+            try:
+                found = client.describe_user_groups(UserGroupId=user_group).get("UserGroups")
+            except Exception:
+                return  # the create below reports the real state
+            if isinstance(found, list) and found and found[0].get("Status") in USER_GROUP_USABLE:
+                return
+            if attempt + 1 < USER_GROUP_POLLS:
+                time.sleep(USER_GROUP_POLL_SECONDS)
+
     def create_group(
         self, account: AWSProviderAccount, network: AWSNetwork,
         resource: AWSElastiCacheValkeyResource, resource_name: str, group_id: str,
@@ -1247,6 +1267,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
             user_group = self.restore_authentication(
                 account, client, store, resource_name, group_id, restore_users
             )
+        self._wait_for_user_group(client, user_group)
         # A snapshot fixes the shard count, so it is not sent; everything durable is.
         restored = {"SnapshotName": snapshot_name} if snapshot_name else {}
         try:
