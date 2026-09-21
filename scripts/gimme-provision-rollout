@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+# GIMME_POLICY_ID=__GIMME_POLICY_ID__
+"""Reconcile one derived, loopback-only rollout backend as root."""
+
+from __future__ import annotations
+
+import hashlib
+import grp
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess  # nosec B404 -- fixed executable vectors only
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+APPS_ROOT = Path("__GIMME_APPS_ROOT__")
+STATE_ROOT = APPS_ROOT / ".gimme" / "rollouts"
+INSTANCE = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
+USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
+PHP_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
+MAX_STATE_BYTES = 16 * 1024
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def run(argv: list[str]) -> None:
+    allowed = {
+        "/usr/bin/systemctl",
+        "/usr/bin/caddy",
+    }
+    if not argv or argv[0] not in allowed:
+        fail("rollout helper attempted an unexpected executable")
+    subprocess.run(argv, check=True)  # nosec B603
+
+
+def atomic_write(path: Path, content: str, mode: int = 0o644) -> bool:
+    if path.is_file() and not path.is_symlink() and path.read_text() == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def ensure_log(path: Path, uid: int, gid: int) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+        0o640,
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            fail("rollout log must be a regular file")
+        os.fchmod(descriptor, 0o640)
+        os.fchown(descriptor, uid, gid)
+    finally:
+        os.close(descriptor)
+
+
+def load(instance: str) -> dict[str, Any]:
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if INSTANCE.fullmatch(instance) is None or USER.fullmatch(sudo_user) is None:
+        fail("invalid rollout identity")
+    state_path = STATE_ROOT / f"{instance}.json"
+    if STATE_ROOT.is_symlink() or state_path.is_symlink():
+        fail("rollout desired state must not be symlinked")
+    details = state_path.stat()
+    account = pwd.getpwnam(sudo_user)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != account.pw_uid
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size > MAX_STATE_BYTES
+    ):
+        fail("unsafe rollout desired state")
+    value = json.loads(state_path.read_text())
+    expected = {
+        "version", "instance", "generation", "framework", "remote_user",
+        "apps_root", "deploy_path", "php_version",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        fail("invalid rollout desired state document")
+    if (
+        value["version"] != 1
+        or value["instance"] != instance
+        or value["remote_user"] != sudo_user
+        or value["apps_root"] != str(APPS_ROOT)
+        or value["framework"] not in {"laravel", "static"}
+        or isinstance(value["generation"], bool)
+        or not isinstance(value["generation"], int)
+        or not 1 <= value["generation"] <= 2_147_483_647
+        or not isinstance(value["php_version"], str)
+        or PHP_VERSION.fullmatch(value["php_version"]) is None
+    ):
+        fail("rollout desired state authority mismatch")
+    deploy_path = Path(value["deploy_path"])
+    root = APPS_ROOT.resolve()
+    resolved = deploy_path.resolve(strict=False)
+    if not deploy_path.is_absolute() or ".." in deploy_path.parts or (
+        resolved == root or not resolved.is_relative_to(root)
+    ):
+        fail("rollout deploy path escapes applications root")
+    candidate = deploy_path / "rollouts" / str(value["generation"]) / "candidate"
+    if not candidate.is_dir() or candidate.is_symlink():
+        fail("rollout candidate tree is unavailable")
+    return {**value, "candidate": candidate, "account": account}
+
+
+def main() -> None:
+    if os.geteuid() != 0 or len(sys.argv) != 2:
+        fail("rollout helper requires root and one instance")
+    value = load(sys.argv[1])
+    instance = value["instance"]
+    generation = value["generation"]
+    identity = f"{instance}-{generation}"
+    digest = hashlib.sha256(identity.encode()).digest()
+    port = 20_000 + int.from_bytes(digest[:2], "big") % 20_000
+    candidate: Path = value["candidate"]
+    logs = candidate.parent / "logs"
+    runtime = candidate.parent / "runtime"
+    logs.mkdir(mode=0o750, exist_ok=True)
+    runtime.mkdir(mode=0o750, exist_ok=True)
+    account = value["account"]
+    group = grp.getgrgid(account.pw_gid).gr_name
+    caddy = pwd.getpwnam("caddy")
+    os.chmod(logs, 0o750)  # nosec B103 -- caddy needs group traverse to its log
+    os.chown(logs, account.pw_uid, caddy.pw_gid)
+    os.chown(runtime, account.pw_uid, account.pw_gid)
+    ensure_log(logs / "access.log", caddy.pw_uid, caddy.pw_gid)
+    ensure_log(logs / "php-fpm.log", account.pw_uid, account.pw_gid)
+
+    site = Path("/etc/caddy/gimme-rollouts") / f"{identity}.caddy"
+    if value["framework"] == "laravel":
+        pool_name = f"gimme-rollout-{identity}"
+        socket = Path("/run/php") / f"{pool_name}.sock"
+        pool = Path(f"/etc/php/{value['php_version']}/fpm/pool.d") / f"{pool_name}.conf"
+        pool_content = (
+            f"[{pool_name}]\nuser = {account.pw_name}\ngroup = {group}\n"
+            f"listen = {socket}\nlisten.owner = caddy\nlisten.group = caddy\n"
+            "listen.mode = 0660\npm = ondemand\npm.max_children = 4\n"
+            "pm.process_idle_timeout = 10s\npm.max_requests = 500\n"
+            f"chdir = {candidate}\ncatch_workers_output = yes\n"
+            f"php_admin_value[error_log] = {logs / 'php-fpm.log'}\n"
+        )
+        atomic_write(pool, pool_content)
+        public = candidate / "public"
+        caddy_body = (
+            f"http://127.0.0.1:{port} {{\n\troot * {public}\n"
+            f"\tphp_fastcgi unix//{socket}\n\tfile_server\n"
+            f"\tlog {{ output file {logs / 'access.log'} }}\n}}\n"
+        )
+        run(["/usr/bin/systemctl", "reload", f"php{value['php_version']}-fpm.service"])
+    else:
+        caddy_body = (
+            f"http://127.0.0.1:{port} {{\n\troot * {candidate}\n\tfile_server\n"
+            f"\tlog {{ output file {logs / 'access.log'} }}\n}}\n"
+        )
+    atomic_write(site, caddy_body)
+    run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+    run(["/usr/bin/systemctl", "reload", "caddy.service"])
+    print("GIMME_ROLLOUT_BACKEND|ready")
+
+
+if __name__ == "__main__":
+    main()

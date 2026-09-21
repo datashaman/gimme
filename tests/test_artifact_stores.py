@@ -255,9 +255,9 @@ def test_schema_v5_requires_explicit_complete_release_policy(tmp_path: Path) -> 
     )
     desired.save(migrated)
 
-    assert migrated.schema_version == 7
+    assert migrated.schema_version == 8
     assert migrated.deployments["example-local"].release_mode == "artifact"
-    with pytest.raises(ValueError, match="schema-v7 state already exists"):
+    with pytest.raises(ValueError, match="schema-v8 state already exists"):
         desired.state_migration({}, {"example-local": "artifact"})
 
 

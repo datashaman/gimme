@@ -1,7 +1,7 @@
 # MCP reference
 
 Gimme is a local stdio MCP server built with FastMCP. Its desired state is stored in
-schema-v7 JSON; decrypted secrets are never returned by resources or tools.
+schema-v8 JSON; decrypted secrets are never returned by resources or tools.
 
 Runtime schemas returned by MCP discovery are authoritative. This page documents the
 stable intent, mutation boundary, and pairing of each primitive.
@@ -39,6 +39,7 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
 | `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
+| `gimme://deployments/{name}/rollout` | One secret-safe Rollout generation with bounded artifact identities, weights, phase, readiness, and background owner |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
 The parameterized URIs are resource templates. `gimme://state`, `gimme://fleet`, and
@@ -48,7 +49,7 @@ The parameterized URIs are resource templates. `gimme://state`, `gimme://fleet`,
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_state_migration` | Read | Plan schema-v7 migration, preserving placements and assigning no accidental spare Target capacity |
+| `plan_state_migration` | Read | Plan schema-v8 migration, preserving placements, adding empty Rollout state, and assigning no accidental spare Target capacity |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
 | `list_applications` | Read | List application source/build definitions without build-secret names or references |
@@ -61,6 +62,7 @@ The parameterized URIs are resource templates. `gimme://state`, `gimme://fleet`,
 | `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
 | `inspect_fleet` | Remote read | Inspect bounded Target readiness without changing placement |
+| `inspect_rollout` | Read | Inspect one active or recoverable Rollout without target paths, sockets, ports, output, or credentials |
 
 ## Operation journal
 
@@ -121,6 +123,8 @@ bounded to 200 records per call.
 | `register_deployment` | Local write | Reserve one slot and persist the reviewed immutable placement |
 | `plan_update_deployment` | Read | Diff a deployment update while preserving placement |
 | `update_deployment` | Local write | Apply an exact deployment update plan |
+| `plan_start_rollout` | Remote read | Verify stable and candidate artifacts, compatibility, capacity, runtime, and the exact zero-traffic preparation effects |
+| `start_rollout` | Remote write | Reserve one temporary slot, materialize an isolated candidate backend, and directly health-check it at zero traffic |
 
 ### Fleet placement
 
@@ -142,7 +146,7 @@ implemented. See [fleet placement](../how-to/place-deployments-on-a-fleet.md).
 
 ### Artifact Stores and release mode
 
-Schema v7 retains the schema-v6 requirement that every Deployment declares
+Schema v8 retains the schema-v6 requirement that every Deployment declares
 `release_mode: source | artifact`.
 `source` is valid only for local and preview stages. Staging and production must use
 `artifact`, which requires the Application to have a Laravel build policy naming one
@@ -237,6 +241,26 @@ the fixed `secret_leak_detected` outcome before publication. Secret values and r
 `build_id` or provenance; the manifest records only whether build secrets were used and their
 bounded count. A secret-induced output difference is therefore rejected by the existing
 `non_reproducible_build` rule.
+
+### Zero-traffic Rollout preparation
+
+`plan_start_rollout` is limited to artifact-mode staging and production Deployments. It reads the
+verified live stable release, resolves the different exact artifact implied by current desired
+source, verifies release contracts and destination runtime capability, and requires one free
+Target slot. The plan exposes only bounded artifact identities and fingerprints. Apply first
+persists a `preparing` generation and its temporary reservation, then uses the existing verified
+artifact materializer in a generation-derived tree. It links only the Deployment's declared
+shared environment/storage and provisions a separate PHP-FPM pool, socket, loopback-only Caddy
+backend, runtime directory, and logs. No Git, dependency installation, frontend build, database
+migration, public route change, worker, Horizon, or scheduler action occurs.
+
+Candidate probes address that loopback backend directly, bypassing public routing and affinity.
+Success records `active` with immutable weights `100/0`, a ready backend, and `stable` as the sole
+background-process owner. Failure records `degraded`; the same `start_rollout` generation can be
+planned and retried idempotently. `inspect_rollout` and the Rollout resource expose the safe state.
+Ordinary deploy, promotion, rollback, Deployment removal, and Deployment update remain blocked
+while either an active or recoverable Rollout exists. Later rollout slices own traffic shifting,
+completion, reversal, and cleanup; preparation cannot assign candidate traffic.
 
 Artifact rollback uses `plan_rollback_deployment` and `rollback_deployment` with the exact plan ID
 and displayed confirmation. It revalidates retained readonly metadata, the canonical tree,

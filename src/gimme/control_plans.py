@@ -35,7 +35,7 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
     return exact_plan(
         {
             "kind": "state_migration",
-            "schema_version": 7,
+            "schema_version": 8,
             "state_directory": state_directory,
             "provider_accounts": sorted(state.provider_accounts),
             "secret_stores": state.model_dump(mode="json")["secret_stores"],
@@ -69,8 +69,9 @@ def migration_plan(state: ControlState, state_directory: str) -> dict[str, Any]:
                 }
                 for name, deployment in sorted(state.deployments.items())
             },
+            "rollouts": {},
             "effects": [
-                "write one atomic schema-v7 desired-state document",
+                "write one atomic schema-v8 desired-state document",
                 "record every operator-selected release mode without inference",
                 "migrate local secret references to the fixed local-sops store",
                 "pin observed runtime and target-local resource versions explicitly",

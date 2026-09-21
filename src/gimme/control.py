@@ -1071,10 +1071,57 @@ class DeploymentRegistration(BaseModel):
         return value
 
 
+class RolloutArtifact(BaseModel):
+    """Bounded public identity of one immutable rollout artifact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    application: str = Field(pattern=APP_NAME.pattern)
+    build_id: str = Field(pattern=r"^build_v1_[0-9a-f]{64}$")
+    commit: str = Field(pattern=COMMIT.pattern)
+    artifact_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tree_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class Rollout(BaseModel):
+    """Resumable desired state for one isolated zero-traffic generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment: str = Field(pattern=DEPLOYMENT_NAME.pattern)
+    target: str = Field(pattern=TARGET_NAME.pattern)
+    generation: int = Field(ge=1, le=2_147_483_647)
+    phase: Literal["preparing", "active", "degraded"]
+    stable: RolloutArtifact
+    candidate: RolloutArtifact
+    stable_weight: Literal[100] = 100
+    candidate_weight: Literal[0] = 0
+    temporary_slots: Literal[1] = 1
+    backend_ready: bool = False
+    background_owner: Literal["stable"] = "stable"
+    drift: Literal["none", "target_unavailable", "backend_unavailable"] = "none"
+    outcome: Literal["preparing", "ready", "prepare_failed"] = "preparing"
+    policy_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
+    contract_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
+    evidence_fingerprint: str = Field(pattern=r"^rollout_[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def distinct_artifacts(self) -> "Rollout":
+        if self.stable.application != self.candidate.application:
+            raise ValueError("rollout artifacts must belong to the same application")
+        if self.stable.build_id == self.candidate.build_id:
+            raise ValueError("rollout candidate must differ from stable")
+        if self.phase == "active" and not self.backend_ready:
+            raise ValueError("active rollout requires a ready candidate backend")
+        if self.phase == "active" and self.outcome != "ready":
+            raise ValueError("active rollout requires a ready outcome")
+        return self
+
+
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[7] = 7
+    schema_version: Literal[8] = 8
     provider_accounts: dict[str, ProviderAccount] = Field(default_factory=dict)
     secret_stores: dict[str, SecretStore] = Field(
         default_factory=lambda: {"local-sops": SopsSecretStore()}
@@ -1086,6 +1133,7 @@ class ControlState(BaseModel):
     aws_networks: dict[str, AWSNetwork] = Field(default_factory=dict)
     resources: dict[str, Resource] = Field(default_factory=dict)
     deployments: dict[str, DeploymentConfig] = Field(default_factory=dict)
+    rollouts: dict[str, Rollout] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def references_exist(self) -> "ControlState":
@@ -1304,6 +1352,14 @@ class ControlState(BaseModel):
                 "queue" not in valkey.uses
             ):
                 raise ValueError(f"deployment {name} runs Horizon and requires the queue use")
+        for name, rollout in self.rollouts.items():
+            deployment = self.deployments.get(name)
+            if name != rollout.deployment or deployment is None:
+                raise ValueError(f"rollout {name} references an unknown deployment")
+            if rollout.target != deployment.target:
+                raise ValueError(f"rollout {name} target is inconsistent")
+            if rollout.stable.application != deployment.application:
+                raise ValueError(f"rollout {name} application is inconsistent")
         return self
 
 
@@ -1434,7 +1490,7 @@ class StateStore:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
         document = self.raw_state()
-        if document.get("schema_version") != 7:
+        if document.get("schema_version") != 8:
             raise RuntimeError("state migration required; call plan_state_migration")
         return ControlState.model_validate(document)
 
@@ -1619,22 +1675,29 @@ class StateStore:
         if not self.exists():
             return self.legacy_migration(observations, release_modes, stores, builds)
         document = self.raw_state()
+        if document.get("schema_version") == 8:
+            raise ValueError("schema-v8 state already exists")
         if document.get("schema_version") == 7:
-            raise ValueError("schema-v7 state already exists")
+            migrated = json.loads(json.dumps(document))
+            self._migrate_rollout_policy(migrated)
+            return ControlState.model_validate(migrated)
         if document.get("schema_version") == 6:
             migrated = json.loads(json.dumps(document))
             self._migrate_fleet_policy(migrated)
+            self._migrate_rollout_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 5:
             migrated = json.loads(json.dumps(document))
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
             self._migrate_fleet_policy(migrated)
+            self._migrate_rollout_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 4:
             migrated = json.loads(json.dumps(document))
             self._migrate_valkey_bindings(migrated)
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
             self._migrate_fleet_policy(migrated)
+            self._migrate_rollout_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 3:
             migrated = json.loads(json.dumps(document))
@@ -1666,10 +1729,11 @@ class StateStore:
             self._migrate_valkey_bindings(migrated)
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
             self._migrate_fleet_policy(migrated)
+            self._migrate_rollout_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") != 2:
             raise ValueError(
-                "only schema-v2 through schema-v6 state can be migrated"
+                "only schema-v2 through schema-v7 state can be migrated"
             )
         targets = document.get("targets")
         applications = document.get("applications")
@@ -1753,7 +1817,13 @@ class StateStore:
         self._migrate_valkey_bindings(migrated)
         self._migrate_artifact_policy(migrated, release_modes, stores, builds)
         self._migrate_fleet_policy(migrated)
+        self._migrate_rollout_policy(migrated)
         return ControlState.model_validate(migrated)
+
+    @staticmethod
+    def _migrate_rollout_policy(document: dict[str, object]) -> None:
+        document["rollouts"] = {}
+        document["schema_version"] = 8
 
     @staticmethod
     def _migrate_fleet_policy(document: dict[str, object]) -> None:

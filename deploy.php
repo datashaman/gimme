@@ -661,6 +661,7 @@ BASH;
     $helperReady = test(
         '[ -x /usr/local/sbin/gimme-provision-stack ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-processes ] && ' .
+        '[ -x /usr/local/sbin/gimme-provision-rollout ] && ' .
         '[ -x /usr/local/sbin/gimme-provision-recovery-schedule ] && ' .
         '[ -x /usr/local/sbin/gimme-recovery-maintenance ] && ' .
         '[ -x /usr/local/sbin/gimme-postgres-restore-swap ] && ' .
@@ -669,11 +670,13 @@ BASH;
         '[ -x /usr/local/libexec/gimme-capture-valkey ] && ' .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-stack && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-processes && " .
+        "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-rollout && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-provision-recovery-schedule && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-recovery-maintenance && " .
         "grep -Fqx {$policyLine} /usr/local/sbin/gimme-postgres-restore-swap && " .
         'sudo -n -l /usr/local/sbin/gimme-provision-stack >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-provision-processes >/dev/null 2>&1 && ' .
+        'sudo -n -l /usr/local/sbin/gimme-provision-rollout probe >/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-provision-recovery-schedule probe ' .
         '>/dev/null 2>&1 && ' .
         'sudo -n -l /usr/local/sbin/gimme-recovery-maintenance enter probe probe ' .
@@ -951,6 +954,97 @@ if ($app !== '' && $releaseMode === 'artifact') {
     });
 }
 
+task('gimme:rollout:prepare', function () use (
+    $appsRoot,
+    $framework,
+    $health,
+    $instance,
+    $remoteUser,
+    $siteHost,
+): void {
+    if (!in_array($framework, ['laravel', 'static'], true)) {
+        throw new \RuntimeException('Rollout backend requires Laravel or static framework');
+    }
+    $rawGeneration = getenv('GIMME_ROLLOUT_GENERATION') ?: '';
+    if (!preg_match('/^[1-9][0-9]{0,9}$/', $rawGeneration) ||
+        (int) $rawGeneration > 2147483647) {
+        throw new \RuntimeException('Rollout generation is invalid');
+    }
+    $generation = (int) $rawGeneration;
+    $deployPath = get('deploy_path');
+    $candidatePath = "{$deployPath}/rollouts/{$generation}/candidate";
+    $statePath = "{$appsRoot}/.gimme/rollouts/{$instance}.json";
+    set('release_path', $candidatePath);
+    run('rm -rf ' . escapeshellarg($candidatePath));
+    run('install -d -m 0750 ' . escapeshellarg($candidatePath));
+    invoke('gimme:artifact:run');
+    if ($framework === 'laravel') {
+        $sharedPath = "{$deployPath}/shared";
+        foreach (['.env', 'storage'] as $shared) {
+            $source = "{$sharedPath}/{$shared}";
+            if (!test('[ -e ' . escapeshellarg($source) . ' ]')) {
+                throw new \RuntimeException('Rollout shared runtime is not prepared');
+            }
+            $destination = "{$candidatePath}/{$shared}";
+            run('rm -rf ' . escapeshellarg($destination));
+            run('{{bin/symlink}} ' . escapeshellarg($source) . ' ' . escapeshellarg($destination));
+        }
+        run('cd ' . escapeshellarg($candidatePath) .
+            ' && {{bin/php}} artisan optimize:clear && {{bin/php}} artisan optimize');
+    }
+    $phpVersion = get('php_version', '0.0');
+    $document = json_encode([
+        'version' => 1,
+        'instance' => $instance,
+        'generation' => $generation,
+        'framework' => $framework,
+        'remote_user' => $remoteUser,
+        'apps_root' => $appsRoot,
+        'deploy_path' => $deployPath,
+        'php_version' => $phpVersion,
+    ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+    $directory = dirname($statePath);
+    run('install -d -m 0700 ' . escapeshellarg($directory));
+    run('printf %s ' . escapeshellarg(base64_encode($document)) .
+        ' | base64 -d > ' . escapeshellarg("{$statePath}.tmp") .
+        ' && chmod 0600 ' . escapeshellarg("{$statePath}.tmp") .
+        ' && mv ' . escapeshellarg("{$statePath}.tmp") . ' ' . escapeshellarg($statePath));
+    $output = run(
+        'sudo -n /usr/local/sbin/gimme-provision-rollout ' . escapeshellarg($instance),
+        forceOutput: true,
+        timeout: 1800,
+    );
+    if (!preg_match('/GIMME_ROLLOUT_BACKEND\|ready(?:\s|$)/', $output)) {
+        throw new \RuntimeException('Rollout backend did not become ready');
+    }
+    $port = 20000 + (hexdec(substr(hash('sha256', "{$instance}-{$generation}"), 0, 4)) % 20000);
+    foreach ($health as $probe) {
+        if (!in_array('candidate', $probe['phases'], true)) {
+            continue;
+        }
+        $url = "http://127.0.0.1:{$port}{$probe['path']}";
+        $command = 'GIMME_HEALTH_URL=' . escapeshellarg($url) . ' ' .
+            'GIMME_HEALTH_HOST=' . escapeshellarg($siteHost) . ' ' .
+            'GIMME_HEALTH_CA=' . escapeshellarg('-') . ' ' .
+            'GIMME_HEALTH_EXPECTED=' . escapeshellarg((string) $probe['expected_status']) . ' ' .
+            'GIMME_HEALTH_TIMEOUT=' . escapeshellarg((string) $probe['timeout_seconds']) . ' ' .
+            '{{bin/php}} -d display_errors=0 -r %health_script% 2>/dev/null || true';
+        for ($attempt = 1; $attempt <= $probe['attempts']; $attempt++) {
+            $probeOutput = trim(run($command, secrets: [
+                'health_script' => escapeshellarg(laravel_live_health_script()),
+            ]));
+            if ($probeOutput === "GIMME_HEALTH_STATUS|{$probe['expected_status']}") {
+                continue 2;
+            }
+            if ($attempt < $probe['attempts'] && $probe['delay_seconds'] > 0) {
+                run('/usr/bin/sleep ' . escapeshellarg((string) $probe['delay_seconds']));
+            }
+        }
+        throw new \RuntimeException('Direct rollout candidate health probe failed');
+    }
+    writeln('GIMME_ROLLOUT_RESULT|ready');
+});
+
 task('gimme:rollback', function () use ($framework, $health): void {
     $candidate = getenv('GIMME_ROLLBACK_RELEASE') ?: '';
     if (!preg_match('/^[1-9][0-9]{0,19}$/', $candidate)) {
@@ -1089,6 +1183,9 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $processHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-provision-processes'
     );
+    $rolloutHelperTemplate = file_get_contents(
+        __DIR__ . '/scripts/gimme-provision-rollout'
+    );
     $scheduleHelperTemplate = file_get_contents(
         __DIR__ . '/scripts/gimme-provision-recovery-schedule'
     );
@@ -1104,6 +1201,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $targetCapture = file_get_contents(__DIR__ . '/src/gimme/target_capture.py');
     $valkeyCapture = file_get_contents(__DIR__ . '/scripts/gimme-capture-valkey');
     if ($helperTemplate === false || $processHelperTemplate === false ||
+        $rolloutHelperTemplate === false ||
         $scheduleHelperTemplate === false ||
         $recoveryHelperTemplate === false || $postgresSwapHelperTemplate === false ||
         $recoveryRunnerTemplate === false || $targetCapture === false ||
@@ -1150,6 +1248,12 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
         $processHelperTemplate,
     );
     $processHelper = str_replace('__GIMME_POLICY_ID__', $policy, $processHelper);
+    $rolloutHelper = str_replace(
+        '"__GIMME_APPS_ROOT__"',
+        json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+        $rolloutHelperTemplate,
+    );
+    $rolloutHelper = str_replace('__GIMME_POLICY_ID__', $policy, $rolloutHelper);
     $scheduleHelper = str_replace(
         '"__GIMME_APPS_ROOT__"',
         json_encode($appsRoot, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
@@ -1195,6 +1299,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     );
     $helperEncoded = escapeshellarg(base64_encode($helper));
     $processHelperEncoded = escapeshellarg(base64_encode($processHelper));
+    $rolloutHelperEncoded = escapeshellarg(base64_encode($rolloutHelper));
     $scheduleHelperEncoded = escapeshellarg(base64_encode($scheduleHelper));
     $recoveryHelperEncoded = escapeshellarg(base64_encode($recoveryHelper));
     $postgresSwapHelperEncoded = escapeshellarg(base64_encode($postgresSwapHelper));
@@ -1207,6 +1312,7 @@ task('gimme:provision:stack', function () use ($appsRoot, $hostname, $remoteUser
     $sudoers = escapeshellarg(
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-stack\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-processes\n" .
+        "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-rollout *\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-provision-recovery-schedule *\n" .
         "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *\n"
         . "{$remoteUser} ALL=(root) NOPASSWD: /usr/local/sbin/gimme-postgres-restore-swap *\n"
@@ -1256,6 +1362,7 @@ printf 'GIMME_BOOTSTRAP|state|writing validated desired state\n'
 printf 'GIMME_BOOTSTRAP|helpers|installing privileged helpers\n'
 helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-stack.XXXXXX)
 process_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-processes.XXXXXX)
+rollout_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-rollout.XXXXXX)
 schedule_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-provision-recovery-schedule.XXXXXX)
 recovery_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-recovery-maintenance.XXXXXX)
 postgres_swap_helper_tmp=\$(mktemp /usr/local/sbin/.gimme-postgres-restore-swap.XXXXXX)
@@ -1264,13 +1371,16 @@ recovery_runner_tmp=\$(mktemp /usr/local/libexec/.gimme-recovery-runner.XXXXXX)
 target_capture_tmp=\$(mktemp /usr/local/libexec/.gimme_target_capture.py.XXXXXX)
 valkey_capture_tmp=\$(mktemp /usr/local/libexec/.gimme-capture-valkey.XXXXXX)
 sudoers_tmp=\$(mktemp /etc/sudoers.d/.gimme-provision-stack.XXXXXX)
-trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$schedule_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$recovery_runner_tmp" "\$target_capture_tmp" "\$valkey_capture_tmp" "\$sudoers_tmp"' EXIT
+trap 'rm -f "\$helper_tmp" "\$process_helper_tmp" "\$rollout_helper_tmp" "\$schedule_helper_tmp" "\$recovery_helper_tmp" "\$postgres_swap_helper_tmp" "\$recovery_runner_tmp" "\$target_capture_tmp" "\$valkey_capture_tmp" "\$sudoers_tmp"' EXIT
 printf %s {$helperEncoded} | base64 -d > "\$helper_tmp"
 chown root:root "\$helper_tmp"
 chmod 0755 "\$helper_tmp"
 printf %s {$processHelperEncoded} | base64 -d > "\$process_helper_tmp"
 chown root:root "\$process_helper_tmp"
 chmod 0755 "\$process_helper_tmp"
+printf %s {$rolloutHelperEncoded} | base64 -d > "\$rollout_helper_tmp"
+chown root:root "\$rollout_helper_tmp"
+chmod 0755 "\$rollout_helper_tmp"
 printf %s {$scheduleHelperEncoded} | base64 -d > "\$schedule_helper_tmp"
 chown root:root "\$schedule_helper_tmp"
 chmod 0755 "\$schedule_helper_tmp"
@@ -1296,6 +1406,7 @@ printf 'GIMME_BOOTSTRAP|policy|validating sudo policy\n'
 visudo -cf "\$sudoers_tmp"
 mv "\$helper_tmp" /usr/local/sbin/gimme-provision-stack
 mv "\$process_helper_tmp" /usr/local/sbin/gimme-provision-processes
+mv "\$rollout_helper_tmp" /usr/local/sbin/gimme-provision-rollout
 mv "\$schedule_helper_tmp" /usr/local/sbin/gimme-provision-recovery-schedule
 mv "\$recovery_helper_tmp" /usr/local/sbin/gimme-recovery-maintenance
 mv "\$postgres_swap_helper_tmp" /usr/local/sbin/gimme-postgres-restore-swap

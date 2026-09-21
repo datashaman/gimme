@@ -279,6 +279,24 @@ def test_rollback_release_is_a_bounded_dedicated_environment_value(
         deployer.run("gimme:rollback", server(), rollback_release="../17")
 
 
+def test_rollout_generation_is_a_bounded_dedicated_environment_value(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    deployer = runner(tmp_path)
+    deployer.run("gimme:rollout:prepare", server(), rollout_generation=17)
+    assert captured["GIMME_ROLLOUT_GENERATION"] == "17"
+
+    with pytest.raises(ValueError, match="rollout_generation is invalid"):
+        deployer.run("gimme:rollout:prepare", server(), rollout_generation=0)
+
+
 def test_recovery_schedule_authority_crosses_as_canonical_json(
     tmp_path: Path, monkeypatch
 ) -> None:

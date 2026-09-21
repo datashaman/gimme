@@ -18,7 +18,7 @@ from gimme.control_plans import exact_plan
 
 
 def fleet_state(state: ControlState) -> dict[str, object]:
-    reservations = {
+    deployment_reservations = {
         name: sorted(
             deployment_name
             for deployment_name, deployment in state.deployments.items()
@@ -26,14 +26,34 @@ def fleet_state(state: ControlState) -> dict[str, object]:
         )
         for name in state.targets
     }
+    rollout_reservations = {
+        name: sorted(
+            rollout.deployment
+            for rollout in state.rollouts.values()
+            if rollout.target == name
+        )
+        for name in state.targets
+    }
     return {
         "targets": {
             name: {
                 "deployment_slots": target.deployment_slots,
-                "occupied_slots": len(reservations[name]),
-                "free_slots": max(target.deployment_slots - len(reservations[name]), 0),
-                "overcommitted": len(reservations[name]) > target.deployment_slots,
-                "reservations": reservations[name],
+                "occupied_slots": (
+                    len(deployment_reservations[name])
+                    + len(rollout_reservations[name])
+                ),
+                "free_slots": max(
+                    target.deployment_slots
+                    - len(deployment_reservations[name])
+                    - len(rollout_reservations[name]),
+                    0,
+                ),
+                "overcommitted": (
+                    len(deployment_reservations[name]) + len(rollout_reservations[name])
+                    > target.deployment_slots
+                ),
+                "reservations": deployment_reservations[name],
+                "temporary_rollout_reservations": rollout_reservations[name],
             }
             for name, target in sorted(state.targets.items())
         }

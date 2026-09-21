@@ -857,11 +857,13 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "NOPASSWD: ALL" not in recipe
     assert "SUDO_USER" in helper
     process_helper = (ROOT / "scripts" / "gimme-provision-processes").read_text()
+    rollout_helper = (ROOT / "scripts" / "gimme-provision-rollout").read_text()
     schedule_helper = (ROOT / "scripts" / "gimme-provision-recovery-schedule").read_text()
     recovery_helper = (ROOT / "scripts" / "gimme-recovery-maintenance").read_text()
 
     assert "len(sys.argv) != 1" in helper
     assert "len(sys.argv) != 2" in process_helper
+    assert "len(sys.argv) != 2" in rollout_helper
     assert "len(sys.argv) != 2" in schedule_helper
     assert "len(sys.argv) != 4" in recovery_helper
     assert "ALLOWED_PACKAGES" in helper
@@ -870,16 +872,35 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
     assert "GIMME_POLICY_ID" in helper
     assert "'helper_source_sha256' => privileged_helper_source_hashes()" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-processes" in recipe
+    assert "NOPASSWD: /usr/local/sbin/gimme-provision-rollout *" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-provision-recovery-schedule *" in recipe
     assert "NOPASSWD: /usr/local/sbin/gimme-recovery-maintenance *" in recipe
     assert "maintenance is owned by another request" in recovery_helper
     assert 'action not in {"enter", "resume", "quiesce", "exit"}' in recovery_helper
     assert "shell_exec" not in helper
+    assert "shell=True" not in rollout_helper
     assert "GIMME_HELPER|" in recipe
     assert "chown {$user}:{$user}" in recipe
     assert recipe.index('visudo -cf "\\$sudoers_tmp"') < recipe.index(
         'mv "\\$sudoers_tmp" /etc/sudoers.d/gimme-provision-stack'
     )
+
+
+def test_rollout_prepare_is_zero_traffic_and_dependency_install_free() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:rollout:prepare'", 1)[1].split(
+        "task('gimme:rollback'", 1
+    )[0]
+
+    assert "gimme:artifact:run" in task
+    assert task.index("rm -rf") < task.index("gimme:artifact:run")
+    assert "/usr/local/sbin/gimme-provision-rollout" in task
+    assert "http://127.0.0.1:" in task
+    assert "artisan migrate" not in task
+    assert "deploy:symlink" not in task
+    assert "composer install" not in task
+    assert "npm " not in task
+    assert "git " not in task
 
 
 def test_managed_postgres_bind_uses_no_sudo_and_shreds_its_secret_file() -> None:

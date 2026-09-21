@@ -108,7 +108,7 @@ def test_control_state_references_registered_target_and_application() -> None:
         deployments={"example-local": deployment(devbox)},
     )
 
-    assert state.schema_version == 7
+    assert state.schema_version == 8
     assert state.deployments["example-local"].placement.site_host == (
         "example-local.devbox.local"
     )
@@ -235,7 +235,7 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     store.save(state)
 
     assert store.load() == state
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 7
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 8
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -244,7 +244,7 @@ def test_canonical_state_example_validates_against_current_schema() -> None:
 
     state = ControlState.model_validate_json(example.read_text())
 
-    assert state.schema_version == 7
+    assert state.schema_version == 8
     assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
 
 
@@ -322,7 +322,7 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
         }
     }, {"example-local": "source"})
 
-    assert migrated.schema_version == 7
+    assert migrated.schema_version == 8
     assert migrated.deployments["example-local"].placement.model_dump(mode="json") == old_placement
     assert migrated.deployments["example-local"].runtimes["node"].provider == "system"
     assert migrated.deployments["example-local"].resources.database == "devbox-postgres"
@@ -353,7 +353,7 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
         {}, {"example-local": "source"}
     )
 
-    assert migrated.schema_version == 7
+    assert migrated.schema_version == 8
     assert migrated.secret_stores["local-sops"].provider == "sops"
     assert migrated.deployments["example-local"].resources.valkey == ValkeyBinding(
         resource="devbox-valkey", uses=["cache"]

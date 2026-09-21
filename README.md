@@ -60,7 +60,7 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v7 desired state, fleet capacity, stores, and pins
+state.json          # schema-v8 desired state, fleet capacity, stores, pins, and Rollouts
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence
@@ -99,6 +99,7 @@ For guided workflows, see:
 - [`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md)
 - [`docs/how-to/use-backup-destinations.md`](docs/how-to/use-backup-destinations.md)
 - [`docs/how-to/place-deployments-on-a-fleet.md`](docs/how-to/place-deployments-on-a-fleet.md)
+- [`docs/how-to/prepare-an-artifact-rollout.md`](docs/how-to/prepare-an-artifact-rollout.md)
 - [`docs/how-to/restore-a-postgresql-deployment.md`](docs/how-to/restore-a-postgresql-deployment.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
@@ -222,6 +223,13 @@ Example stdio client configuration:
    metadata and never contacts the Build Target. The destination source is pinned only after
    success.
 8. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
+
+For an artifact-mode staging or production Deployment, `plan_start_rollout` / `start_rollout`
+prepares a separately health-checked candidate at guaranteed `100/0` stable/candidate traffic.
+Inspect it with `inspect_rollout` or `gimme://deployments/{name}/rollout`. Preparation reserves one
+temporary Target slot, is retryable after interruption, never runs migrations or candidate
+background processes, and blocks ordinary deploy/promotion/rollback/update/removal until the
+Rollout is completed or reversed by the later rollout workflow.
 
 See [Build once and deploy an Application Artifact](docs/how-to/use-application-artifacts.md)
 for migration, IAM separation, publishing, multi-Target deployment, promotion, rollback,

@@ -143,7 +143,7 @@ def setup() -> None:
         "composer",
     ]
     state = {
-        "schema_version": 7,
+        "schema_version": 8,
         "provider_accounts": {},
         "secret_stores": {"local-sops": {"provider": "sops"}},
         "targets": {

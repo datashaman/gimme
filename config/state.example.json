@@ -1,5 +1,5 @@
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "provider_accounts": {
     "main": {
       "provider": "aws",
@@ -295,5 +295,6 @@
         "observation_fingerprint": null
       }
     }
-  }
+  },
+  "rollouts": {}
 }

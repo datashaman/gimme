@@ -54,6 +54,7 @@ from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
 from gimme.artifact_deployment_orchestration import ArtifactDeploymentOrchestrator
 from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
+from gimme.rollout_orchestration import RolloutOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
 from gimme.resource_retirement_orchestration import ResourceRetirementOrchestrator
 from gimme.resources_postgres import ResourceError
@@ -314,6 +315,47 @@ def _deployment_release_orchestrator() -> DeploymentReleaseOrchestrator:
     )
 
 
+def _rollout_orchestrator() -> RolloutOrchestrator:
+    return RolloutOrchestrator(
+        store=store,
+        artifact_deployment=_artifact_deployment_orchestrator(),
+        run_deployment=_run_deployment,
+        assert_plan=_assert_plan,
+    )
+
+
+def _require_no_rollout(*names: str) -> None:
+    active = sorted(set(names) & set(store.load().rollouts))
+    if active:
+        raise ValueError(f"operation blocked by rollout: {active[0]}")
+
+
+def _require_no_rollout_dependency(kind: str, name: str) -> None:
+    state = store.load()
+    for rollout_name, rollout in sorted(state.rollouts.items()):
+        deployment = state.deployments[rollout_name]
+        application = state.applications[deployment.application]
+        matches = (
+            (kind == "target" and rollout.target == name)
+            or (kind == "application" and deployment.application == name)
+            or (
+                kind == "resource"
+                and name in {
+                    deployment.resources.database,
+                    None if deployment.resources.valkey is None
+                    else deployment.resources.valkey.resource,
+                }
+            )
+            or (
+                kind == "artifact_store"
+                and application.build is not None
+                and application.build.artifact_store == name
+            )
+        )
+        if matches:
+            raise ValueError(f"operation blocked by rollout: {rollout_name}")
+
+
 def _journal() -> OperationJournal:
     return OperationJournal(store.root)
 
@@ -537,6 +579,7 @@ def _run_deployment(
     artifact_request: dict[str, object] | None = None,
     artifact_secret_file: Path | None = None,
     rollback_release: str | None = None,
+    rollout_generation: int | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -578,6 +621,7 @@ def _run_deployment(
         artifact_request=artifact_request,
         artifact_secret_file=artifact_secret_file,
         rollback_release=rollback_release,
+        rollout_generation=rollout_generation,
         secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
@@ -859,6 +903,12 @@ def deployment_resource(name: str) -> dict[str, object]:
     return store.deployment(name).model_dump(mode="json")
 
 
+@mcp.resource("gimme://deployments/{name}/rollout")
+def rollout_resource(name: str) -> dict[str, object]:
+    """Read one bounded, secret-safe rollout generation."""
+    return _rollout_orchestrator().inspect(name)
+
+
 def _valid_recovery_attempt_status(status: object, name: str) -> bool:
     return _recovery_orchestrator()._valid_recovery_attempt_status(status, name)
 
@@ -902,9 +952,9 @@ def plan_state_migration(
     artifact_stores: dict[str, S3ArtifactStore] | None = None,
     application_builds: dict[str, ApplicationBuildPolicy] | None = None,
 ) -> dict[str, object]:
-    """Plan schema-v7 state with explicit release and immutable placement policy."""
-    if store.exists() and store.raw_state().get("schema_version") == 7:
-        raise ValueError("schema-v7 state already exists")
+    """Plan schema-v8 state with fleet placement and rollout policy."""
+    if store.exists() and store.raw_state().get("schema_version") == 8:
+        raise ValueError("schema-v8 state already exists")
     state = _migration_state(release_modes, artifact_stores, application_builds)
     return migration_plan(state, str(store.root))
 
@@ -917,12 +967,12 @@ def apply_state_migration(
     artifact_stores: dict[str, S3ArtifactStore] | None = None,
     application_builds: dict[str, ApplicationBuildPolicy] | None = None,
 ) -> dict[str, object]:
-    """Atomically write reviewed schema-v7 state and immutable placement policy."""
+    """Atomically write reviewed schema-v8 state and rollout policy."""
     state = _migration_state(release_modes, artifact_stores, application_builds)
     expected = migration_plan(state, str(store.root))
     _assert_plan(expected, plan_id)
     store.save(state)
-    return {"changed": True, "state_path": str(store.state_path), "schema_version": 7}
+    return {"changed": True, "state_path": str(store.state_path), "schema_version": 8}
 
 
 @mcp.tool(annotations=READ)
@@ -1243,6 +1293,7 @@ def plan_update_artifact_store(
     name: Name, definition: S3ArtifactStore
 ) -> dict[str, object]:
     """Plan a local Artifact Store policy replacement."""
+    _require_no_rollout_dependency("artifact_store", name)
     return _control_plane_registration_orchestrator().plan_update_artifact_store(
         name, definition
     )
@@ -1254,6 +1305,7 @@ def update_artifact_store(
     name: Name, definition: S3ArtifactStore, plan_id: PlanId
 ) -> dict[str, object]:
     """Apply one reviewed local-only Artifact Store policy replacement."""
+    _require_no_rollout_dependency("artifact_store", name)
     return _control_plane_registration_orchestrator().update_artifact_store(
         name, definition, plan_id
     )
@@ -1263,6 +1315,7 @@ def update_artifact_store(
 @_journal_plan("remove_artifact_store", "name")
 def plan_remove_artifact_store(name: Name) -> dict[str, object]:
     """Plan local removal when no Application build policy references the store."""
+    _require_no_rollout_dependency("artifact_store", name)
     return _control_plane_registration_orchestrator().plan_remove_artifact_store(name)
 
 
@@ -1270,6 +1323,7 @@ def plan_remove_artifact_store(name: Name) -> dict[str, object]:
 @_journal_apply("remove_artifact_store", "name")
 def remove_artifact_store(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Apply one reviewed local-only Artifact Store removal."""
+    _require_no_rollout_dependency("artifact_store", name)
     return _control_plane_registration_orchestrator().remove_artifact_store(name, plan_id)
 
 
@@ -1493,6 +1547,7 @@ def register_target(name: Name, definition: TargetConfig) -> dict[str, object]:
 @_journal_plan("update_target", "name")
 def plan_update_target(name: Name, definition: TargetConfig) -> dict[str, object]:
     """Show the exact before/after state for a target update."""
+    _require_no_rollout_dependency("target", name)
     state = store.load()
     _replace(state, "targets", name, definition)
     return registration_update_plan("target_update", name, state.targets[name], definition)
@@ -1502,6 +1557,7 @@ def plan_update_target(name: Name, definition: TargetConfig) -> dict[str, object
 @_journal_apply("update_target", "name")
 def update_target(name: Name, definition: TargetConfig, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed target update to local desired state."""
+    _require_no_rollout_dependency("target", name)
     expected = plan_update_target(name, definition)
     _assert_plan(expected, plan_id)
     store.save(_replace(store.load(), "targets", name, definition))
@@ -1523,6 +1579,7 @@ def register_application(name: Name, definition: ApplicationConfig) -> dict[str,
 @_journal_plan("update_application", "name")
 def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[str, object]:
     """Show the exact before/after state for an application update."""
+    _require_no_rollout_dependency("application", name)
     state = store.load()
     _replace(state, "applications", name, definition)
     return exact_plan({
@@ -1539,6 +1596,7 @@ def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[s
 def update_application(name: Name, definition: ApplicationConfig,
                        plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed application update to local desired state."""
+    _require_no_rollout_dependency("application", name)
     expected = plan_update_application(name, definition)
     _assert_plan(expected, plan_id)
     store.save(_replace(store.load(), "applications", name, definition))
@@ -1564,6 +1622,7 @@ def register_resource(name: Name, definition: Resource) -> dict[str, object]:
 @_journal_plan("update_resource", "name")
 def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
     """Show the exact before/after state for a resource update."""
+    _require_no_rollout_dependency("resource", name)
     state = store.load()
     current = state.resources.get(name)
     if current is not None and (
@@ -1605,6 +1664,7 @@ def plan_update_resource(name: Name, definition: Resource) -> dict[str, object]:
 @_journal_apply("update_resource", "name")
 def update_resource(name: Name, definition: Resource, plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed resource update to local desired state."""
+    _require_no_rollout_dependency("resource", name)
     with _deployment_resource_locks(*_resource_deployment_names(name)):
         expected = plan_update_resource(name, definition)
         _assert_plan(expected, plan_id)
@@ -1935,6 +1995,7 @@ def register_deployment(
 def plan_update_deployment(name: Name,
                            definition: DeploymentRegistration) -> dict[str, object]:
     """Show a deployment update while preserving immutable placement fields."""
+    _require_no_rollout(name)
     return _deployment_lifecycle_orchestrator().plan_update_deployment(
         name, definition
     )
@@ -1945,6 +2006,7 @@ def plan_update_deployment(name: Name,
 def update_deployment(name: Name, definition: DeploymentRegistration,
                       plan_id: PlanId) -> dict[str, object]:
     """Apply an exact reviewed deployment update to local desired state."""
+    _require_no_rollout(name)
     return _deployment_lifecycle_orchestrator().update_deployment(
         name, definition, plan_id
     )
@@ -1974,6 +2036,7 @@ def apply_target_stack(name: Name, plan_id: PlanId) -> dict[str, object]:
 @_journal_plan("deployment_runtimes", "name")
 def plan_deployment_runtimes(name: Name) -> dict[str, object]:
     """Plan exact runtime and extension reconciliation for one deployment."""
+    _require_no_rollout(name)
     return _target_runtime_orchestrator().plan_deployment_runtimes(name)
 
 
@@ -1981,6 +2044,7 @@ def plan_deployment_runtimes(name: Name) -> dict[str, object]:
 @_journal_apply("deployment_runtimes", "name")
 def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Install mise pins and verify system runtimes for one deployment."""
+    _require_no_rollout(name)
     return _target_runtime_orchestrator().apply_deployment_runtimes(name, plan_id)
 
 
@@ -1988,6 +2052,7 @@ def apply_deployment_runtimes(name: Name, plan_id: PlanId) -> dict[str, object]:
 @_journal_plan("deployment_resources", "name")
 def plan_deployment_resources(name: Name) -> dict[str, object]:
     """Plan routing, database, cache, runtime values, secrets, and processes."""
+    _require_no_rollout(name)
     return _deployment_resource_orchestrator().plan_deployment_resources(name)
 
 
@@ -1995,6 +2060,7 @@ def plan_deployment_resources(name: Name) -> dict[str, object]:
 @_journal_apply("deployment_resources", "name")
 def apply_deployment_resources(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Reconcile one deployment's route and target-local runtime resources."""
+    _require_no_rollout(name)
     return _deployment_resource_orchestrator().apply_deployment_resources(name, plan_id)
 
 
@@ -2006,6 +2072,7 @@ def _apply_resources(name: str, expected: dict[str, Any]) -> dict[str, object]:
 @_journal_plan("deployment", "name")
 def plan_deployment(name: Name) -> dict[str, object]:
     """Resolve source and pinned runtimes and render the exact Deployer task graph."""
+    _require_no_rollout(name)
     return _deployment_release_orchestrator().plan_deployment(name)
 
 
@@ -2013,6 +2080,7 @@ def plan_deployment(name: Name) -> dict[str, object]:
 @_journal_apply("deployment", "name")
 def apply_deployment(name: Name, plan_id: PlanId) -> dict[str, object]:
     """Deploy an exact reviewed revision with health gates and worker refresh."""
+    _require_no_rollout(name)
     return _deployment_release_orchestrator().apply_deployment(name, plan_id)
 
 
@@ -2028,6 +2096,7 @@ def rollback_deployment(
     name: Name, plan_id: PlanId, confirmation: str
 ) -> dict[str, object]:
     """Apply one exact reviewed retained-release rollback."""
+    _require_no_rollout(name)
     return _deployment_release_orchestrator().rollback_deployment(
         name, plan_id, confirmation
     )
@@ -2037,6 +2106,7 @@ def rollback_deployment(
 @_journal_plan("rollback_deployment", "name")
 def plan_rollback_deployment(name: Name) -> dict[str, object]:
     """Plan one exact retained predecessor with health and capability checks."""
+    _require_no_rollout(name)
     return _deployment_release_orchestrator().plan_rollback_deployment(name)
 
 
@@ -2044,6 +2114,7 @@ def plan_rollback_deployment(name: Name) -> dict[str, object]:
 @_journal_plan("promotion", "source", "destination")
 def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
     """Plan deploying the source deployment's exact live commit to a destination."""
+    _require_no_rollout(source, destination)
     return _deployment_release_orchestrator().plan_promotion(source, destination)
 
 
@@ -2051,6 +2122,7 @@ def plan_promotion(source: Name, destination: Name) -> dict[str, object]:
 @_journal_apply("promotion", "source", "destination")
 def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict[str, object]:
     """Promote an exact reviewed live commit and pin the destination after success."""
+    _require_no_rollout(source, destination)
     return _deployment_release_orchestrator().promote_deployment(
         source, destination, plan_id
     )
@@ -2060,6 +2132,7 @@ def promote_deployment(source: Name, destination: Name, plan_id: PlanId) -> dict
 @_journal_plan("remove_deployment", "name")
 def plan_remove_deployment(name: Name) -> dict[str, object]:
     """Plan complete cleanup of one deployment and its isolated resources."""
+    _require_no_rollout(name)
     return _deployment_lifecycle_orchestrator().plan_remove_deployment(name)
 
 
@@ -2067,9 +2140,31 @@ def plan_remove_deployment(name: Name) -> dict[str, object]:
 @_journal_apply("remove_deployment", "name")
 def remove_deployment(name: Name, plan_id: PlanId, confirmation: str) -> dict[str, object]:
     """Remove a deployment after exact plan and confirmation checks."""
+    _require_no_rollout(name)
     return _deployment_lifecycle_orchestrator().remove_deployment(
         name, plan_id, confirmation
     )
+
+
+@mcp.tool(annotations=READ)
+def inspect_rollout(name: Name) -> dict[str, object]:
+    """Inspect bounded rollout identity, phase, readiness, and ownership."""
+    return _rollout_orchestrator().inspect(name)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("start_rollout", "name")
+def plan_start_rollout(name: Name) -> dict[str, object]:
+    """Plan one exact zero-traffic artifact candidate and temporary slot."""
+    return _rollout_orchestrator().plan_start(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("start_rollout", "name")
+def start_rollout(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Persist preparation, materialize an isolated backend, and health-check it."""
+    with _deployment_resource_lock(name):
+        return _rollout_orchestrator().start(name, plan_id)
 
 
 @mcp.tool(annotations=READ)

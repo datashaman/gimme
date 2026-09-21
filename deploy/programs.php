@@ -50,6 +50,7 @@ try {
     $options = [
         CURLOPT_CONNECTTIMEOUT => $timeout,
         CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => ["Host: {$host}"],
         CURLOPT_RESOLVE => ["{$host}:443:127.0.0.1"],
         CURLOPT_RETURNTRANSFER => false,
         CURLOPT_TIMEOUT => $timeout,

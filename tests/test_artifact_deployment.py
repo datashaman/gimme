@@ -39,6 +39,17 @@ def load_artifact_program():
 artifact_program = load_artifact_program()
 
 
+def test_rollout_materialization_boundary_is_generation_derived(tmp_path: Path) -> None:
+    candidate = tmp_path / "deployments" / "example" / "rollouts" / "17" / "candidate"
+    candidate.mkdir(parents=True)
+    assert artifact_program.checked_release(tmp_path, str(candidate)) == candidate
+
+    unsafe = tmp_path / "deployments" / "example" / "rollouts" / "candidate"
+    unsafe.mkdir(parents=True)
+    with pytest.raises(artifact_program.ArtifactFailure, match="artifact_release_invalid"):
+        artifact_program.checked_release(tmp_path, str(unsafe))
+
+
 class FakeS3:
     def __init__(self):
         self.objects: dict[str, dict[str, bytes | str]] = {}
