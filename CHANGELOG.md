@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed a managed Valkey snapshot restore crashing with `'NoneType' object has no attribute
+  'status'` right after it created the group: the real adapter's `create_group` returns nothing
+  (AWS accepting the call is the acknowledgement), and the restore now reads the group afterwards,
+  as provisioning already did. Found by the first live restore on AWS.
 - Fixed `inspect_resource` reporting a false `security_group` readiness issue while a managed
   Valkey group was `modifying` (found live during a failover): attached security groups are read
   only from an available group, so a modifying group is now compared on nothing rather than on
