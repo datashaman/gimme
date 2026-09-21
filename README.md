@@ -4,6 +4,20 @@ Gimme is an alpha MCP deployment control plane for Ubuntu targets. It keeps desi
 state locally, provisions a target through a narrowly scoped privileged helper, and
 deploys PHP/Laravel or static applications through Deployer.
 
+## Contents
+
+- [Capability roadmap](#capability-roadmap)
+- [Safety model](#safety-model)
+- [Install](#install)
+- [Target bootstrap](#target-bootstrap)
+- [Runtime versions](#runtime-versions)
+- [Frontend builds](#frontend-builds)
+- [Run](#run)
+- [Workflow](#workflow)
+- [MCP surface](#mcp-surface)
+- [Current scope](#current-scope)
+- [Development](#development)
+
 Version 0.6 has four explicit resources:
 
 - a **target** is an independently provisioned Ubuntu machine;
