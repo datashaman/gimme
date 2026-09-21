@@ -97,7 +97,7 @@ dedicated `ssh-agent`), registered with the `public_dns` network mode and its pu
   refused while Gimme's exact rules remained. It also found two defects: a Target with no
   Deployments wrote `"sites": []`, which the privileged helper rejected (fixed), and the helper
   assumes Caddy and Avahi are installed, so the example's `acl`/`git` administration stack cannot
-  be bootstrapped (the run's stack carried `caddy` and `avahi-daemon`).
+  be bootstrapped (the run's stack carried `caddy` and `avahi-daemon`; open as #199).
 - Key purge, end to end. From the instance, 250 keys under `{gimme:<deployment>}:` and one key
   under another Deployment's prefix were written with the administrative identity over TLS. After
   detach, `apply_purge_resource_allocation` ran `gimme:resource:purge-valkey-allocation` on the
@@ -106,9 +106,49 @@ dedicated `ssh-agent`), registered with the `public_dns` network mode and its pu
   the group's `modifying` window after detach (`aws_elasticache_purge_resource_not_ready`) and the
   user deletion (`aws_elasticache_rotate_delete_unavailable`), and resumed from its saved phase.
 
-Not verified, because each needs a deployed Laravel Deployment on an application Target (with a
-database Resource): the `gimme:stop:processes` step of detach and unbind, activation probes,
-credential rotation, restore, the backup capture program, and the recovery matrix below.
+A third run (2026-09-21, same account and region) added an application Target next to the
+administration Target, both Ubuntu 26.04 EC2 instances in the run's VPC, and deployed a real
+Laravel release from the public `laravel/laravel` skeleton (default branch `13.x`, which has no
+lockfile for a frontend build, so the Application declares none) bound to a managed Valkey
+Resource and a local PostgreSQL database. It verified, against AWS and real hosts:
+
+- Activation. All nine probes (environment, tls, auth, default-user, cluster, read-after-write,
+  namespace, use-*, cleanup) passed. ElastiCache removes `CONFIG` and answers `ERR unknown command`
+  instead of `NOPERM`, which used to stop the `namespace` probe with `namespace_unverified`
+  (fixed).
+- Rotation. The first attempt stopped with `rotate_switch_failed`; its rollback left the previous
+  credential in place. A retry was refused with `candidate_exists` for about seven minutes,
+  because ElastiCache was still deleting the candidate's ACL user, and then succeeded.
+- Loss and restore. After a simulated loss, `apply_resource` refused to create an empty group and
+  the snapshot restore recreated the group and rebound the Deployment; the recovery matrix
+  passed. A restore used to crash on the create's `None` return (fixed), and listing snapshots
+  needs `elasticache:DescribeSnapshots` on `"Resource": "*"` (the how-to's IAM example now says
+  so).
+- Process stop and detach. Removing the Deployment through Gimme disabled its scheduler timer
+  (`systemctl is-active` reported `inactive`) and left a `detached` allocation with its keys and
+  credential secret; the group went `modifying` as the ACL user left its user group.
+- Purge. `apply_purge_resource_allocation` on the detached allocation ran end to end without
+  stubs: the bounded key deletion ran on the administration Target, the ACL user was deleted
+  (after the same `aws_elasticache_rotate_delete_unavailable` wait as above), and the secret was
+  scheduled for deletion, ending in `purged: true`. The run did not record how many keys the
+  program deleted; the exact count against a seeded prefix is the second run's.
+- Destroy was applied through Gimme and the group was gone when checked, but the final-snapshot
+  and retained-secret purges did not run through Gimme (see the lessons below).
+- Removing a Deployment runs a local `valkey-cli` flush, which fails on a Target that has no local
+  `valkey-server` (open as #203). The run installed one on the disposable instance.
+
+Not verified: a real Horizon or cache-use adapter against the cluster (the stock skeleton could not
+reach a TLS cluster from the environment alone, so the Deployment declared a queue use and ran only
+its scheduler, and the process stop was checked on that timer), an application other than the
+skeleton, and the backup capture program (`gimme:backup:capture-valkey`) and Component Backup
+evidence before a purge.
+
+Two operational lessons. User deletion (about seven minutes) and group deletion (about 12 to 19
+minutes each) dominate a run, so repeat the same confirmed apply rather than re-planning. And keep
+the run's private inventory and isolated state outside any temporary directory: the third run's
+scratch directory was cleared by the host while a destroy was pending, and teardown had to fall
+back to deleting by the `gimme:live-test` tag and the run-id name prefix with the account's own
+credentials.
 
 ## Run the executable recovery matrix
 

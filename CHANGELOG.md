@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Recorded a third live ElastiCache run in `docs/how-to/validate-aws-elasticache-live.md`: real
+  Laravel activation probes, rotation, restore, process stop, detach, and purge, plus what is
+  still unverified.
 - Fixed a managed Valkey snapshot restore crashing with `'NoneType' object has no attribute
   'status'` right after it created the group: the real adapter's `create_group` returns nothing
   (AWS accepting the call is the acknowledgement), and the restore now reads the group afterwards,
