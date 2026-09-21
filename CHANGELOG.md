@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed the Valkey activation probe's `namespace` check failing on ElastiCache with
+  `namespace_unverified`: ElastiCache removes `CONFIG` outright, so it answers `ERR unknown command`
+  rather than `NOPERM`. That reply now counts as a denial for `CONFIG` only; every other
+  non-`NOPERM` reply still fails the probe. Found by the first live activation on AWS.
 - Fixed `inspect_resource` reporting a false `security_group` readiness issue while a managed
   Valkey group was `modifying` (found live during a failover): attached security groups are read
   only from an available group, so a modifying group is now compared on nothing rather than on

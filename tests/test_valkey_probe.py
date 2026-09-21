@@ -427,6 +427,32 @@ def test_a_stale_read_after_write_fails() -> None:
     assert caught.value.code == "read_after_write"
 
 
+class PerCommandSession:
+    def __init__(self, replies: dict[str, str], default: str) -> None:
+        self.replies, self.default = replies, default
+
+    def call(self, *arguments: object) -> object:
+        raise PROBE["ServerError"](self.replies.get(str(arguments[0]), self.default))  # type: ignore[operator]
+
+
+def test_a_provider_that_removes_config_still_proves_namespace_enforcement() -> None:
+    # Live ElastiCache: CONFIG is answered "unknown command"; every other denial is NOPERM.
+    noperm = "NOPERM User u has no permissions to run the command"
+    removed = "ERR unknown command 'CONFIG', with args beginning with: 'GET'"
+    session = PerCommandSession({"CONFIG": removed}, noperm)
+
+    PROBE["check_namespace"](session, "token")  # type: ignore[operator]
+
+
+def test_unknown_command_proves_nothing_for_any_command_other_than_config() -> None:
+    session = PerCommandSession({}, "ERR unknown command 'GET'")
+
+    with pytest.raises(PROBE["ProbeFailure"]) as caught:  # type: ignore[call-overload]
+        PROBE["check_namespace"](session, "token")  # type: ignore[operator]
+
+    assert caught.value.code == "namespace_unverified"
+
+
 def test_a_denial_of_any_other_kind_does_not_prove_namespace_enforcement() -> None:
     session = ScriptedSession(PROBE["ServerError"]("WRONGTYPE Operation against a key"))  # type: ignore[operator]
 
