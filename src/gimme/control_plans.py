@@ -742,6 +742,39 @@ def postgres_allocation_purge_plan(
     )
 
 
+def valkey_allocation_purge_plan(
+    resource_name: str, deployment_name: str, identity_fingerprint: str,
+    allocation_fingerprint: str, evidence: dict[str, object] | None,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_allocation_purge",
+            "resource": resource_name,
+            "deployment": deployment_name,
+            "confirmation": f"PURGE {deployment_name} FROM {resource_name}",
+            "identity_fingerprint": identity_fingerprint,
+            "allocation_fingerprint": allocation_fingerprint,
+            "recovery_expected": evidence is not None,
+            "recovery_evidence": evidence,
+            "warnings": [] if evidence is not None else [
+                f"recovery of {deployment_name} is not guaranteed: its Recovery Policy did not "
+                "include Valkey, so no verified Component Backup exists for it"
+            ],
+            "effects": [
+                f"delete every key under the prefix {{gimme:{deployment_name}}}: in bounded "
+                "rounds, resumable with the same reviewed plan",
+                "delete its disabled ElastiCache ACL user and any retired ones",
+                "schedule its Resource Credential secret for the fixed 30-day recovery window, "
+                "only after every key is gone",
+                "remove the Detached Allocation only after all three phases succeed",
+                "retain the replication group, its snapshots, and every other Deployment's keys",
+            ],
+            "authority": "the Provider Account's destructive role, assumed only during apply",
+            "irreversible": True,
+        }
+    )
+
+
 def valkey_binding_plan(
     deployment_name: str, resource_name: str, uses: list[str], namespaces: dict[str, str],
     profile: str, observed: dict[str, Any] | None, database: dict[str, Any] | None,

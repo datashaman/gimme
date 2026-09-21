@@ -5,6 +5,16 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added managed Valkey Detached Allocation purge through the existing
+  `plan_purge_resource_allocation` and `apply_purge_resource_allocation` tools (exact confirmation
+  `PURGE <deployment> FROM <resource>`). A fixed program run from the administration Target deletes
+  only the Deployment's `{gimme:<deployment>}:` prefix in bounded, resumable rounds; then its
+  disabled and retired ACL users are deleted with the destructive role, and its credential secret
+  is scheduled for the fixed 30-day recovery window only after every key is gone. A Deployment
+  whose Recovery Policy included Valkey needs its verified Component Backup from within 24 hours
+  before disablement; otherwise the plan warns that recovery is not guaranteed. Fixed the retained
+  credential purge reading Secrets Manager tags from the wrong response key, which made its
+  ownership check always fail.
 - Added managed Valkey detachment and same-Resource rebinding. Moving a Deployment to another
   Resource or removing it stops its managed processes (an update only, through a new
   `gimme:stop:processes` task that reuses the existing privileged process helper), disables its

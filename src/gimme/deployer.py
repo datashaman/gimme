@@ -154,6 +154,7 @@ class DeployerRunner:
         resource_database: str | None = None,
         resource_owner: str | None = None,
         resource_login: str | None = None,
+        resource_cache_prefix: str | None = None,
         resource_extensions: Mapping[str, str] | None = None,
         resource_trust_bundle_sha256: str | None = None,
         recovery_schedule_authority: dict[str, object] | None = None,
@@ -356,6 +357,8 @@ class DeployerRunner:
             environment["GIMME_RESOURCE_OWNER"] = resource_owner
         if resource_login is not None:
             environment["GIMME_RESOURCE_LOGIN"] = resource_login
+        if resource_cache_prefix is not None:
+            environment["GIMME_CACHE_PREFIX"] = resource_cache_prefix
         if resource_extensions is not None:
             environment["GIMME_RESOURCE_EXTENSIONS_JSON"] = json.dumps(
                 dict(resource_extensions)

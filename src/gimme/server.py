@@ -1948,7 +1948,7 @@ def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
 def plan_purge_resource_allocation(
     name: Name, deployment: Name
 ) -> dict[str, object]:
-    """Plan deleting one detached managed PostgreSQL allocation with Recovery evidence."""
+    """Plan purging one detached managed PostgreSQL or Valkey allocation with Recovery evidence."""
     return _resource_retirement_orchestrator().plan_purge_resource_allocation(
         name, deployment
     )
@@ -1959,7 +1959,7 @@ def plan_purge_resource_allocation(
 def apply_purge_resource_allocation(
     name: Name, deployment: Name, plan_id: PlanId, confirmation: str
 ) -> dict[str, object]:
-    """Purge one evidenced detached database and schedule its secret for recovery deletion."""
+    """Purge one detached allocation (a database, or Valkey keys and users); schedule its secret."""
     return _resource_retirement_orchestrator().apply_purge_resource_allocation(
         name, deployment, plan_id, confirmation
     )

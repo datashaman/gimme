@@ -157,9 +157,21 @@ assume it (for example behind an MFA condition):
 
 Privilege impact: this is the only Gimme role that can delete anything, and it can delete any
 `gimme-*` ElastiCache object in the account, so Gimme's own checks (below) are the second line of
-defense, not the only one. It has no Secrets Manager permission: destruction never deletes
-secrets. Rotation deletes the previous ACL user with the same statement, so `DeleteUser` is used
-for more than destruction. Whether the final snapshot needs `CreateSnapshot` on the snapshot resource, and whether
+defense, not the only one. Rotation and allocation purge delete ACL users with the same
+statement, so `DeleteUser` is used for more than destruction. Destruction itself never deletes
+secrets, but purging a Detached Allocation and purging retained secrets do, so add this statement
+only if you use them (the Secret Store prefix and name are yours):
+
+```json
+{
+  "Sid": "ElastiCacheSecretsPurge",
+  "Effect": "Allow",
+  "Action": ["secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"],
+  "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<store-prefix>/*",
+  "Condition": {"StringEquals": {"aws:ResourceTag/gimme:secret-store": "<store-name>"}}
+}
+```
+ Whether the final snapshot needs `CreateSnapshot` on the snapshot resource, and whether
 deleting a `default`-named user is allowed, are unverified.
 
 ## Register the Resource
@@ -458,6 +470,45 @@ delete it yourself. While a destruction is in progress the Resource cannot be pr
 progress marker in place, and the same call resumes. `apply_cleanup_resource` abandons a stuck
 destruction and retains what is left.
 
+## Purge a Detached Allocation
+
+A Detached Allocation keeps its keys and credential until you erase them. `plan_purge_resource_allocation`
+then `apply_purge_resource_allocation` (exact confirmation `PURGE <deployment> FROM <resource>`)
+erases one, and only that one. The plan reads only local state and refuses unless:
+
+- no Deployment of that name binds the Resource (`aws_elasticache_allocation_still_bound`) and the
+  allocation is detached (`aws_elasticache_detached_allocation_missing`);
+- when the Deployment's Recovery Policy included Valkey, the verified Valkey Component Backup
+  recorded at detachment (captured within 24 hours before access disablement) is still present at
+  the destination (`aws_elasticache_allocation_recovery_evidence_missing`, `_stale`). When the
+  policy did not include Valkey, the plan carries an explicit warning that recovery is not
+  guaranteed instead;
+- the Provider Account has a destructive role (`aws_elasticache_destroy_role_missing`).
+
+Apply rechecks all of it and the live group's identity (`aws_elasticache_purge_identity_changed`),
+which must be `available` (`aws_elasticache_purge_resource_not_ready`). Then it works in resumable
+phases, recorded in a local marker, so a repeat of the same call with the same plan continues:
+
+1. **Keys.** The administrative user (see the ACL above) scans the Deployment's exact prefix
+   `{gimme:<deployment>}:` from the administration Target and deletes what it finds in batches, over
+   TLS, with a fixed program that refuses any key outside the prefix and names no global command.
+   One apply runs at most six bounded rounds and returns `phase: purging` with the running `deleted`
+   count if keys remain; the phase ends only when a full pass finds nothing left
+   (`aws_elasticache_purge_keys_failed` on any failure). Keys written by nothing else are the
+   assumption: the Deployment's user is disabled.
+2. **Users.** The disabled ACL user and any retired ones are deleted with the destructive role,
+   after their ownership tag is read (`aws_elasticache_rotate_ownership_mismatch` stops it).
+3. **Secret.** The Resource Credential secret is scheduled for deletion with the fixed 30-day
+   recovery window, only after every key is gone, and only if it carries this Resource's, store's,
+   and Deployment's tags (`aws_elasticache_purge_secret_ownership_mismatch`).
+
+Then the allocation and marker are removed. While a purge is unfinished the Resource refuses
+provisioning, binding, restore, rotation, destruction, and another purge
+(`aws_elasticache_purge_in_progress`); `inspect_resource` shows `operation: purging` with the
+Deployment, phase, and deleted count. The replication group, its snapshots, and every other
+Deployment's keys are untouched. Deleted keys cannot be recovered except from the Component
+Backup or a snapshot taken earlier.
+
 ## Recover a lost group
 
 If a replication group disappears from AWS (deleted by hand, or the account lost it) while Gimme's
@@ -606,7 +657,7 @@ Provider failures become fixed `aws_elasticache_<operation>_<reason>` codes, for
 `aws_elasticache_create_access_denied`. Reasons are `access_denied`, `missing`, `already_exists`,
 `invalid_state`, `throttled`, `revoked`, and `unavailable`, and AWS messages, ARNs, and values
 are never included. Operations include `subnet_group`, `parameter_group`,
-`parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
+`parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`, `secret_verify`, `secret_schedule`,
 `user_describe`, `user_bind`, `user_disable`, `user_group_unbind`, `user_group_bind`, `user_restore`, `user_group_restore`, `snapshots`,
 `credential_read`, `rotate_user`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
 `options`, `metrics`, `modify`, and `create`.
