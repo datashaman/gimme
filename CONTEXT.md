@@ -63,6 +63,34 @@ DNS suffix from which Gimme may create managed Resources and one supported AWS r
 it does not grant generic infrastructure provisioning.
 _Avoid_: VPC, cloud network, load balancer
 
+**Execution Profile**:
+A named, versioned, policy-bound selection of one execution engine and its bounded placement,
+capability, and lifecycle contract for materializing a Deployment. It renders portable Deployment
+intent into derived engine-native objects under existing Target, Provider Account, and network
+boundaries; it is neither a generic cloud account nor arbitrary infrastructure-as-code.
+_Avoid_: Provider, target, cluster configuration, task definition
+
+**Target Capability Profile**:
+A named, versioned, policy-bound declaration of the exact machine capabilities an Ubuntu Target
+may host, such as a Laravel application runtime, web runtime, worker runtime, relational database,
+cache, search service, or edge routing. It selects reviewed package, runtime, service, and network
+policy rather than accepting an arbitrary package or service list. It applies only to engines that
+use registered Targets and is independent of a Deployment's Execution Profile.
+_Avoid_: Server type, package list, server recipe
+
+**Execution Engine**:
+The versioned runtime materialization mechanism selected by an Execution Profile, such as
+`ubuntu-systemd`, `docker-compose`, `ecs-fargate`, `kubernetes`, or `lambda`. Its renderer is a
+security-sensitive boundary: it accepts only validated portable intent, produces canonical derived
+state, and rejects capability requests it cannot represent faithfully.
+_Avoid_: Provider, arbitrary executor, infrastructure API
+
+**Process Role**:
+One bounded operational purpose declared by a Deployment: `web`, `worker`, `scheduler`, or
+`realtime`. The Application defines its fixed framework command and behavior; the selected
+Execution Profile determines how the role is materialized without accepting arbitrary commands.
+_Avoid_: Process command, service definition, container command
+
 **Secret Store**:
 A named, bounded external location from which the control plane may resolve Deployment secrets at
 the protected execution boundary. It belongs to one Provider Account and constrains account,

@@ -15,6 +15,42 @@ This is alpha software and 0.6 is a hard state/API break. There are no compatibi
 tools. The migration preserves existing remote paths, database identities, cache
 prefixes, and URLs while recording observed runtime and service versions explicitly.
 
+## Capability roadmap
+
+Gimme keeps provider, Resource, Target capability, and execution-engine concerns separate. The
+table records the public scope rather than promising that a provider's entire platform API is
+available. **Available** capabilities have a supported schema and plan/apply workflow;
+**Proposed** capabilities are described by an ADR but have no implementation contract yet;
+**Planned** and **Deferred** entries are direction, not commitments.
+
+| Layer | Module or capability | Status | Scope |
+| --- | --- | --- | --- |
+| Execution | Ubuntu Target / `ubuntu-systemd` | Available | Fixed, policy-bound deployment processes on registered Ubuntu Targets. |
+| Execution | Explicit Execution Profiles | Proposed | Portable Deployment intent rendered by a bounded engine adapter; see [ADR 0010](docs/adr/0010-portable-deployment-intent-and-execution-profiles.md). |
+| Execution | Docker Compose | Planned | First container renderer while retaining a registered Target boundary. |
+| Execution | AWS ECS/Fargate | Planned | First managed/cloud execution renderer. |
+| Execution | EKS/Kubernetes and Lambda | Deferred | Require separate, narrow workload contracts; arbitrary manifests and provider configuration remain out of scope. |
+| Target capability | Explicit Target Capability Profiles | Proposed | Fixed host catalog such as `laravel-app`, `laravel-web`, `laravel-worker`, `postgresql`, `mysql`, `valkey`, `memcached`, `meilisearch`, and `edge-routing`. |
+| Relational Resource | PostgreSQL | Available | `target_local` and AWS RDS PostgreSQL providers. |
+| Relational Resource | MySQL | Planned | Exact engine contract; provider adapters remain separate work. |
+| Relational Resource | MariaDB | Planned | Exact engine contract, distinct from MySQL despite protocol compatibility. |
+| Data-store Resource | Valkey | Available | `target_local` and synchronously durable AWS ElastiCache Valkey providers. |
+| Data-store Resource | Memcached | Planned | Ephemeral cache contract, distinct from Valkey. |
+| Data-store Resource | DynamoDB-backed cache | Planned | AWS Resource contract with bounded table, TTL, region, and workload-identity policy. |
+| Search Resource | Meilisearch | Planned | A bounded search Resource contract rather than a generic package installation. |
+| Object storage | Artifact and Recovery stores | Available | Versioned S3-compatible stores for immutable artifacts and Recovery Points. |
+| Object storage | Application object-storage binding | Planned | A separately scoped Resource contract for application-managed assets. |
+| Queues | Database and Valkey-backed Laravel workers | Available | Existing bounded worker and scheduler process behavior. |
+| Queues | SQS-compatible queue binding | Planned | External queue Resource/binding contract. |
+| Provider foundation | Ubuntu Targets | Available | Operator-registered machine identities, network policy, exact APT stack, and mise policy. |
+| Provider foundation | AWS | Available, bounded | Secrets Manager, S3-compatible stores, RDS PostgreSQL, ElastiCache Valkey, and the supported AWS HA topology only. |
+
+The proposed execution and Target-capability model is intentionally not a generic infrastructure
+provisioner. It does not accept arbitrary shell, package lists, Compose files, ECS task definitions,
+Kubernetes YAML, Helm values, IAM policies, or ingress snippets. See
+[ADR 0010](docs/adr/0010-portable-deployment-intent-and-execution-profiles.md) for the intended
+portable intent, renderer, and migration boundaries.
+
 ## Safety model
 
 Gimme deliberately exposes no arbitrary shell, SQL, hostname, package, service, or
