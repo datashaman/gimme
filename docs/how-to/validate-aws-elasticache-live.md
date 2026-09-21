@@ -61,9 +61,10 @@ run's three roles; delete both at teardown.
 
 Verified against AWS:
 
-- Create, inspect, and bind. The first create apply stopped once with
-  `aws_elasticache_create_invalid_state` (not root-caused; the new user group may still have been
-  settling), and repeating the same apply created the group. All seven CloudWatch metrics named in the Valkey how-to returned a
+- Create, inspect, and bind. The first create apply used to stop with
+  `aws_elasticache_create_invalid_state`: CloudTrail showed `InvalidUserGroupStateFault` (the new
+  user group was still `creating`) on every live run. Create now waits up to a minute for the
+  user group to be `active` before creating the group. All seven CloudWatch metrics named in the Valkey how-to returned a
   datapoint within minutes of `available`, with the `CacheClusterId` dimension.
 - Detach. `modify_user` accepts the access string `off ~* -@all`, and removing the user from the
   user group leaves it with no group. The group is `modifying` for about a minute afterwards, and
@@ -87,10 +88,27 @@ Verified against AWS:
   mid-run makes a pending destroy plan stale (`plan_id is invalid or stale`) until it is re-planned.
   Do not change the checkout during a run.
 
-Not verified, because each needs a real administration Target (an EC2 instance in the VPC): the
-`gimme:stop:processes` step of detach and unbind, the key-purge program against a live cluster
-(the run stubbed that one step and still resolved the real admin credential), activation probes,
-credential rotation, restore, and the recovery matrix below.
+A second run added an Ubuntu 24.04 EC2 instance in the same VPC as the administration Target
+(a public subnet route, SSH allowed from the operator's address only, a run-tagged key pair, and a
+dedicated `ssh-agent`), registered with the `public_dns` network mode and its public DNS name:
+
+- `gimme-bootstrap-target` completed on the instance. It needed a `deployer` user with sudo for the
+  duration of the bootstrap only; afterwards the broad rule was removed and `sudo -n true` was
+  refused while Gimme's exact rules remained. It also found two defects: a Target with no
+  Deployments wrote `"sites": []`, which the privileged helper rejected (fixed), and the helper
+  assumes Caddy and Avahi are installed, so the example's `acl`/`git` administration stack cannot
+  be bootstrapped (the run's stack carried `caddy` and `avahi-daemon`).
+- Key purge, end to end. From the instance, 250 keys under `{gimme:<deployment>}:` and one key
+  under another Deployment's prefix were written with the administrative identity over TLS. After
+  detach, `apply_purge_resource_allocation` ran `gimme:resource:purge-valkey-allocation` on the
+  instance through the Deployer runner and deleted exactly 250 keys; a scan from the instance then
+  found none under the prefix and the other Deployment's key intact. The same apply also waited out
+  the group's `modifying` window after detach (`aws_elasticache_purge_resource_not_ready`) and the
+  user deletion (`aws_elasticache_rotate_delete_unavailable`), and resumed from its saved phase.
+
+Not verified, because each needs a deployed Laravel Deployment on an application Target (with a
+database Resource): the `gimme:stop:processes` step of detach and unbind, activation probes,
+credential rotation, restore, the backup capture program, and the recovery matrix below.
 
 ## Run the executable recovery matrix
 
