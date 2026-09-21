@@ -1077,7 +1077,8 @@ def _run_bind_script(tmp_path: Path, secret: dict[str, str], *,
     result = subprocess.run(
         [
             "python3", "-c", managed_postgres_bind_script(),
-            "db.example.test", "5432", "gimme_example", str(secret_path),
+            "db.example.test", "5432", "gimme_example", "gimme_example_owner",
+            "gimme_example_g1", '{"pgcrypto":"1.3"}', str(secret_path),
             str(bundle), digest or bundle_digest,
         ],
         text=True, capture_output=True, check=False,
@@ -1092,6 +1093,7 @@ def _run_bind_script(tmp_path: Path, secret: dict[str, str], *,
 BIND_SECRET = {
     "master_username": "gimme_admin",
     "master_password": "s3cr3t-master",
+    "workload_username": "gimme_example_g1",
     "workload_password": "s3cr3t-workload",
 }
 
@@ -1104,18 +1106,24 @@ def test_managed_postgres_bind_script_sends_statements_over_stdin_never_argv(
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "GIMME_RESOURCE_BOUND|gimme_example"
     calls = result.calls  # type: ignore[attr-defined]
-    assert len(calls) == 2
+    assert len(calls) == 3
     for call in calls:
         argv = " ".join(call["argv"])
         assert "-c" not in call["argv"]
         assert "s3cr3t-workload" not in argv
         assert "s3cr3t-master" not in argv
-    role_sql, database_sql = calls[0]["stdin"], calls[1]["stdin"]
-    assert "\\set role 'gimme_example'" in role_sql
-    assert "CREATE ROLE %I LOGIN" in role_sql and "\\gexec" in role_sql
-    assert "ALTER ROLE %I PASSWORD %L" in role_sql
+    role_sql, database_sql, extension_sql = (call["stdin"] for call in calls)
+    assert "\\set owner 'gimme_example_owner'" in role_sql
+    assert "NOLOGIN" in role_sql and "NOCREATEDB NOCREATEROLE NOREPLICATION" in role_sql
+    assert "NOREPLICATION NOBYPASSRLS PASSWORD %L" in role_sql
+    assert "shobj_description(oid, 'pg_authid')" in role_sql
+    assert "REVOKE %I FROM %I" in role_sql
     assert "CREATE DATABASE %I OWNER %I" in database_sql and "\\gexec" in database_sql
-    assert "DO $" not in role_sql + database_sql
+    assert "shobj_description(oid, 'pg_database')" in database_sql
+    assert "REVOKE CONNECT" in database_sql
+    assert "CREATE EXTENSION IF NOT EXISTS %I" in extension_sql
+    assert "ALTER EXTENSION %I UPDATE TO %L" in extension_sql
+    assert "DO $" not in role_sql + database_sql + extension_sql
 
 
 def test_managed_postgres_bind_script_redacts_secrets_from_failure_output(
@@ -1143,7 +1151,8 @@ def test_managed_postgres_bind_script_rejects_unsafe_workload_password_and_datab
     unsafe = subprocess.run(
         [
             "python3", "-c", managed_postgres_bind_script(),
-            "db.example.test", "5432", "x'; drop database postgres; --", str(secret_path),
+            "db.example.test", "5432", "x'; drop database postgres; --",
+            "safe_owner", "safe_g1", "{}", str(secret_path),
             str(_bundle(tmp_path)[0]), "0" * 64,
         ],
         text=True, capture_output=True, check=False,
@@ -1164,7 +1173,8 @@ def test_managed_postgres_bind_script_rejects_an_unexpected_secret_shape(
 def test_managed_postgres_bind_script_rejects_a_symlinked_secret_file(tmp_path: Path) -> None:
     real_secret = tmp_path / "real-secret.json"
     real_secret.write_text(json.dumps({
-        "master_username": "gimme_admin", "master_password": "x", "workload_password": "y",
+        "master_username": "gimme_admin", "master_password": "x",
+        "workload_username": "gimme_example_g1", "workload_password": "y",
     }))
     link = tmp_path / "linked-secret.json"
     link.symlink_to(real_secret)
@@ -1173,7 +1183,8 @@ def test_managed_postgres_bind_script_rejects_a_symlinked_secret_file(tmp_path: 
     result = subprocess.run(
         [
             "python3", "-c", managed_postgres_bind_script(),
-            "db.example.test", "5432", "gimme_example", str(link),
+            "db.example.test", "5432", "gimme_example", "gimme_example_owner",
+            "gimme_example_g1", "{}", str(link),
             str(_bundle(tmp_path)[0]), "0" * 64,
         ],
         text=True, capture_output=True, check=False,
@@ -1216,7 +1227,8 @@ def test_managed_postgres_bind_script_rejects_a_symlinked_trust_bundle(tmp_path:
     result = subprocess.run(
         [
             "python3", "-c", managed_postgres_bind_script(),
-            "db.example.test", "5432", "gimme_example", str(secret_path), str(link), digest,
+            "db.example.test", "5432", "gimme_example", "gimme_example_owner",
+            "gimme_example_g1", "{}", str(secret_path), str(link), digest,
         ],
         text=True, capture_output=True, check=False,
     )

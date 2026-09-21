@@ -185,7 +185,8 @@
           "timeout_seconds": 5
         }
       ],
-      "php_extensions": ["bcmath", "curl", "gd", "intl", "mbstring", "pdo_pgsql", "redis", "xml", "zip"]
+      "php_extensions": ["bcmath", "curl", "gd", "intl", "mbstring", "pdo_pgsql", "redis", "xml", "zip"],
+      "postgres_extensions": ["pgcrypto"]
     }
   },
   "resources": {
@@ -209,6 +210,9 @@
       "engine_version": "17.2",
       "instance_class": "db.t3.medium",
       "allocated_storage_gb": 20,
+      "backup_window": "03:00-04:00",
+      "backup_retention_days": 7,
+      "maintenance_window": "sun:05:00-sun:06:00",
       "administration_security_group_id": "sg-0123456789abcdef0",
       "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
       "workload_secret_store": "workload-secrets",

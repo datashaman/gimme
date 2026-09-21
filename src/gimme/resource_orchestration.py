@@ -107,13 +107,15 @@ class ManagedResourceOrchestrator:
         return state, deployment, binding.resource, resource
 
     def _database_binding_plan(self, name: str) -> dict[str, object]:
-        _state, deployment, _target, _application = self.context(name)
+        _state, deployment, _target, application = self.context(name)
         resource_name = deployment.resources.database
         if resource_name is None:
             raise ValueError(f"deployment {name} has no bound database resource")
         self._managed_resource(resource_name)
         observed = resources_postgres_module.load_observed(self.store.root, resource_name)
-        return resource_binding_plan(name, deployment, resource_name, observed)
+        return resource_binding_plan(
+            name, deployment, resource_name, observed, application.postgres_extensions
+        )
 
     def _resource_binding_plan(self, name: str) -> dict[str, object]:
         valkey = self._managed_valkey_binding(name)
@@ -195,14 +197,50 @@ class ManagedResourceOrchestrator:
         observed = resources_postgres_module.load_observed(self.store.root, resource_name)
         if observed is None or observed["master_secret_arn"] is None:
             raise ResourceError("aws_rds_master_secret_missing")
+        if resources_postgres_module.load_rotation(self.store.root, resource_name) is not None:
+            raise ResourceError("aws_rds_rotate_in_progress")
+        live = self.rds_postgres.describe_instance(
+            account,
+            network,
+            resources_postgres_module.derive_instance_identifier(resource_name),
+        )
+        if (
+            live is None
+            or resources_postgres_module.readiness_issues(resource, live)
+            or live.identity != observed["identity"]
+        ):
+            raise ResourceError("aws_rds_binding_resource_not_ready")
+        current_master_fingerprint = self.rds_postgres.master_secret_version_fingerprint(
+            account, network.region, str(observed["master_secret_arn"])
+        )
+        if current_master_fingerprint != observed["master_secret_version_fingerprint"]:
+            raise ResourceError("aws_rds_binding_master_secret_stale")
         master_username, master_password = self.rds_postgres.resolve_master_credential(
             account, network.region, str(observed["master_secret_arn"])
         )
         database_identifier = deployment.placement.database_identifier
-        workload_password = resources_postgres_module.generate_workload_password()
+        allocations = cast(dict[str, dict[str, object]], observed["allocations"])
+        existing = allocations.get(name)
+        if existing is None:
+            generation = 1
+            owner = resources_postgres_module.owner_role(database_identifier)
+            login = resources_postgres_module.login_role(database_identifier, generation)
+            workload_password = resources_postgres_module.generate_workload_password()
+        else:
+            generation = int(existing["generation"])
+            owner = str(existing["owner_role"])
+            login, workload_password = self.rds_postgres.resolve_workload_credential(
+                account,
+                workload_store,
+                f"{resource_name}/{name}",
+                str(existing["secret_version_id"]),
+            )
+            if login != existing["login_role"]:
+                raise ResourceError("aws_rds_workload_secret_identity_mismatch")
         payload = {
             "master_username": master_username,
             "master_password": master_password,
+            "workload_username": login,
             "workload_password": workload_password,
         }
         with self.deployment_resource_locks(name), protected_secret_file(
@@ -217,12 +255,28 @@ class ManagedResourceOrchestrator:
                     int(cast(int, observed["port"])),
                 ),
                 resource_database=database_identifier,
+                resource_owner=owner,
+                resource_login=login,
+                resource_extensions=cast(dict[str, str], expected["postgres_extensions"]),
                 secret_file=secret_file,
                 resource_trust_bundle_sha256=(
                     resources_postgres_module.RDS_TRUST_BUNDLE_SHA256
                 ),
                 timeout=120,
             )
+            extensions = cast(dict[str, str], expected["postgres_extensions"])
+            if existing is not None:
+                resources_postgres_module.update_allocation_extensions(
+                    self.store.root, resource_name, name, extensions
+                )
+                return {
+                    "deployment": name,
+                    "database": database_identifier,
+                    "secret_reference": {
+                        "store": store_name,
+                        "secret": f"{resource_name}/{name}",
+                    },
+                }
             return resources_postgres_module.persist_binding(
                 self.rds_postgres,
                 self.store.root,
@@ -232,10 +286,11 @@ class ManagedResourceOrchestrator:
                 resource_name,
                 name,
                 database_identifier,
-                database_identifier,
+                owner,
+                login,
+                generation,
+                extensions,
                 workload_password,
-                str(observed["endpoint"]),
-                int(cast(int, observed["port"])),
             )
 
     def plan_apply_resource(self, name: Name) -> dict[str, object]:
@@ -270,11 +325,56 @@ class ManagedResourceOrchestrator:
                     ),
                 }
             state, resource = self._managed_resource(name)
+            if resources_postgres_module.load_rotation(self.store.root, name) is not None:
+                raise ResourceError("aws_rds_rotate_in_progress")
             network = state.aws_networks[resource.aws_network]
             account = state.provider_accounts[network.provider_account]
             result = resources_postgres_module.apply_provision(
                 self.rds_postgres, self.store.root, account, network, resource, name
             )
+            if result["readiness_issues"] == ["aws_rds_not_ready_administration"]:
+                observed = resources_postgres_module.load_observed(self.store.root, name)
+                if (
+                    observed is None
+                    or observed["master_secret_arn"] is None
+                    or observed["endpoint"] is None
+                    or observed["port"] is None
+                ):
+                    raise ResourceError("aws_rds_administration_context_missing")
+                secret_arn = str(observed["master_secret_arn"])
+                fingerprint = self.rds_postgres.master_secret_version_fingerprint(
+                    account, network.region, secret_arn
+                )
+                username, password = self.rds_postgres.resolve_master_credential(
+                    account, network.region, secret_arn
+                )
+                with protected_secret_file(
+                    {"username": username, "password": password}
+                ) as secret_file:
+                    verification = self.runner.run(
+                        "gimme:resource:verify-postgres",
+                        legacy_server(state.targets[resource.administration_target]),
+                        stack=state.targets[resource.administration_target].stack,
+                        resource_endpoint=(str(observed["endpoint"]), int(observed["port"])),
+                        secret_file=secret_file,
+                        resource_trust_bundle_sha256=(
+                            resources_postgres_module.RDS_TRUST_BUNDLE_SHA256
+                        ),
+                        timeout=120,
+                    )
+                resources_postgres_module.mark_administration_verified(
+                    self.store.root,
+                    name,
+                    fingerprint,
+                    resources_postgres_module.parse_administration_verification(
+                        verification.output
+                    ),
+                )
+                result.update(
+                    phase="ready",
+                    readiness_issues=[],
+                    administration_verified=True,
+                )
             return {"changed": True, **result}
 
     def inspect_resource(self, name: Name) -> dict[str, object]:
@@ -313,24 +413,44 @@ class ManagedResourceOrchestrator:
         if refresh_error is not None:
             result["refresh_error"] = refresh_error
         if live is not None:
+            issues = resources_postgres_module.readiness_issues(resource, live)
+            administration_verified = bool(
+                observed is not None
+                and observed["administration_verified"]
+                and observed["identity"] == live.identity
+            )
+            if not administration_verified:
+                issues.append("aws_rds_not_ready_administration")
+            try:
+                master_version_current = bool(
+                    observed is not None
+                    and observed["master_secret_arn"] is not None
+                    and self.rds_postgres.master_secret_version_fingerprint(
+                        account, network.region, str(observed["master_secret_arn"])
+                    ) == observed["master_secret_version_fingerprint"]
+                )
+            except ResourceError:
+                master_version_current = False
+            if not master_version_current:
+                issues.append("aws_rds_not_ready_master_secret_version")
             result.update(
-                phase="ready"
-                if live.status == "available" and (not live.converging)
-                else "pending",
+                phase="ready" if not issues else "pending",
                 status=live.status,
                 engine_version=live.engine_version,
-                identity=live.identity,
-                endpoint=live.endpoint,
-                port=live.port,
+                identity_fingerprint=resources_postgres_module.identity_fingerprint(
+                    live.identity
+                ),
+                readiness_issues=issues,
                 drift=resources_postgres_module.instance_drift(resource, live),
             )
         elif observed is not None:
             result.update(
                 status=observed["status"],
                 engine_version=observed["engine_version"],
-                identity=observed["identity"],
-                endpoint=observed["endpoint"],
-                port=observed["port"],
+                identity_fingerprint=resources_postgres_module.identity_fingerprint(
+                    str(observed["identity"])
+                ),
+                readiness_issues=observed["readiness_issues"],
             )
         if observed is not None:
             result["allocations"] = {

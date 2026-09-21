@@ -89,6 +89,19 @@ VALKEY_ENV_PREFIX = "GIMME_VALKEY_"
 MANAGED_VALKEY_ENV_KEYS = frozenset(
     {"CACHE_STORE", "SESSION_DRIVER", "QUEUE_CONNECTION", "HORIZON_PREFIX"}
 )
+MANAGED_POSTGRES_ENV_KEYS = frozenset(
+    {
+        "DB_CONNECTION",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_DATABASE",
+        "DB_USERNAME",
+        "DB_PASSWORD",
+        "DB_SSLMODE",
+        "DB_SSLROOTCERT",
+    }
+)
+POSTGRES_EXTENSIONS = frozenset({"pgcrypto", "uuid-ossp", "citext"})
 
 
 class TargetNetwork(BaseModel):
@@ -216,6 +229,9 @@ class AWSRDSPostgresResource(BaseModel):
     engine_version: str
     instance_class: str = Field(pattern=AWS_DB_INSTANCE_CLASS.pattern)
     allocated_storage_gb: int = Field(ge=20, le=65536)
+    backup_window: str = "03:00-04:00"
+    backup_retention_days: int = Field(default=7, ge=7, le=35)
+    maintenance_window: str = "sun:05:00-sun:06:00"
     administration_security_group_id: str = Field(pattern=AWS_SECURITY_GROUP_ID.pattern)
     deployment_security_group_ids: dict[str, str] = Field(default_factory=dict, max_length=32)
     workload_secret_store: str = Field(pattern=SECRET_STORE_NAME.pattern)
@@ -236,6 +252,26 @@ class AWSRDSPostgresResource(BaseModel):
     @classmethod
     def valid_deployment_security_groups(cls, value: dict[str, str]) -> dict[str, str]:
         return _valid_deployment_security_groups(value)
+
+    @field_validator("backup_window")
+    @classmethod
+    def valid_backup_window(cls, value: str) -> str:
+        _snapshot_window_minutes(value)
+        return value
+
+    @field_validator("maintenance_window")
+    @classmethod
+    def valid_maintenance_window(cls, value: str) -> str:
+        _maintenance_window_minutes(value)
+        return value
+
+    @model_validator(mode="after")
+    def windows_do_not_overlap(self) -> "AWSRDSPostgresResource":
+        if set(_snapshot_window_minutes(self.backup_window)) & set(
+            _maintenance_window_minutes(self.maintenance_window)
+        ):
+            raise ValueError("backup_window and maintenance_window must not overlap")
+        return self
 
 
 def _clock_minutes(clock: str) -> int:
@@ -792,6 +828,9 @@ class ApplicationConfig(BaseModel):
     default_health: HealthCheckConfig | None = None
     health_probes: list[HealthCheckConfig] = Field(default_factory=list, max_length=7)
     php_extensions: list[str] = Field(default_factory=list, max_length=64)
+    postgres_extensions: list[Literal["pgcrypto", "uuid-ossp", "citext"]] = Field(
+        default_factory=list, max_length=3
+    )
 
     @field_validator("php_extensions")
     @classmethod
@@ -801,6 +840,13 @@ class ApplicationConfig(BaseModel):
             for extension in value
         ):
             raise ValueError("php_extensions must be unique safe extension names")
+        return sorted(value)
+
+    @field_validator("postgres_extensions")
+    @classmethod
+    def safe_postgres_extensions(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or not set(value) <= POSTGRES_EXTENSIONS:
+            raise ValueError("postgres_extensions must be unique allowlisted names")
         return sorted(value)
 
     @model_validator(mode="after")
@@ -1321,6 +1367,21 @@ class ControlState(BaseModel):
                         f"deployment {name} environment key is managed by the Valkey "
                         f"contract: {key}"
                     )
+            database = deployment.resources.database
+            managed_database = database is not None and isinstance(
+                self.resources.get(database), AWSRDSPostgresResource
+            )
+            if managed_database:
+                if application.framework != "laravel":
+                    raise ValueError(
+                        f"deployment {name} managed PostgreSQL binding supports Laravel only"
+                    )
+                for key in (*deployment.variables, *deployment.secrets):
+                    if key in MANAGED_POSTGRES_ENV_KEYS:
+                        raise ValueError(
+                            f"deployment {name} environment key is managed by the PostgreSQL "
+                            f"contract: {key}"
+                        )
             for binding, kind in (
                 (deployment.resources.database, "postgres"),
                 (None if valkey is None else valkey.resource, "valkey"),

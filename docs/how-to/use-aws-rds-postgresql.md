@@ -11,19 +11,17 @@ the target design and this page is the current behavior.
 
 ## Current scope
 
-Implemented: registration, provisioning, converging an existing instance onto reviewed
-updates, live inspection with drift reporting, creating a Deployment's database and workload
-secret, and non-destructive removal.
+Implemented: registration, provisioning, reviewed maintenance-policy updates, strict live
+readiness and TLS administration verification, isolated Deployment databases and generation
+logins, protected Laravel activation, explicit workload-credential rotation with rollback,
+live inspection with drift reporting, and non-destructive removal.
 
 Not implemented yet:
 
-- runtime wiring of a managed database into a Deployment. A Deployment whose database
-  binding is a managed Resource is fenced off: `plan_deployment_resources` reports a
-  readiness issue, `plan_deployment` refuses, and Recovery Points reject it;
-- workload credential rotation and Detached Allocation rebind (`plan_forget_resource` does
-  delete an RDS Retained Resource tombstone, locally only);
+- Detached Allocation rebind and purge (`plan_forget_resource` deletes an RDS Retained
+  Resource tombstone, locally only);
 - destructive deletion. Removal never deletes the instance;
-- major-version upgrades, storage decreases, backup and maintenance-window policy, and moving
+- major-version upgrades, storage decreases, and moving
   a Resource to another Network or region, all of which need a new Resource.
 Differences from the ADR: two roles are used instead of four, the Administration Target
 runs plain `psql` instead of a root-owned helper (verifying the certificate against a bundle
@@ -45,8 +43,9 @@ workload secrets. Everything else must already exist and is never edited:
 - a Provider Account with the two roles below, and an AWS Secrets Manager Secret Store for
   workload credentials (see [`use-aws-secret-stores.md`](use-aws-secret-stores.md)).
 
-The instance is never public and always uses gp3 storage, `StorageEncrypted`, seven-day
-backups, deletion protection, and no automatic minor upgrades. Its Resource-owned parameter
+The instance is never public and always uses gp3 storage, `StorageEncrypted`, the declared
+7–35 day backup retention and UTC backup/maintenance windows, deletion protection, and no
+automatic minor upgrades. Its Resource-owned parameter
 group (`gimme-<name>-params`, family `postgres<major>`) sets `rds.force_ssl` to `1`, so the
 server rejects unencrypted connections on every PostgreSQL version, not only 15 and later.
 Gimme reuses an existing group of that name only if it carries this Resource's
@@ -131,6 +130,7 @@ secrets. It does not read secret values. Replace `<region>`, `<account>`, and
       "Action": [
         "secretsmanager:CreateSecret",
         "secretsmanager:PutSecretValue",
+        "secretsmanager:DescribeSecret",
         "secretsmanager:TagResource"
       ],
       "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<store-prefix>/*"
@@ -164,7 +164,9 @@ secrets. It does not read secret values. Replace `<region>`, `<account>`, and
 }
 ```
 
-The **resolver role** reads only the RDS-managed master credential, and only at apply time:
+The **resolver role** reads the RDS-managed master credential and Deployment Resource
+Credentials only at apply time. During a failed explicit rotation it may move `AWSCURRENT`
+back to the exact previously reviewed workload-secret version:
 
 ```json
 {
@@ -180,13 +182,26 @@ The **resolver role** reads only the RDS-managed master credential, and only at 
           "aws:ResourceTag/aws:rds:primaryDBInstanceArn": "arn:aws:rds:<region>:<account>:db:gimme-*"
         }
       }
+    },
+    {
+      "Sid": "WorkloadCredentialActivationAndRollback",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:UpdateSecretVersionStage"],
+      "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<store-prefix>/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/gimme:secret-store": "<store-name>"
+        }
+      }
     }
   ]
 }
 ```
 
-Both policies were exercised against a live account with the AWS-managed `aws/rds` and
-`aws/secretsmanager` keys. The `RdsParameterGroup` and `RdsModifyAndReboot` statements and the
+The provisioning policy was exercised against a live account with the AWS-managed `aws/rds`
+and `aws/secretsmanager` keys. The workload activation and rotation additions have deterministic
+adapter coverage but still require the opt-in live harness tracked by #181. The
+`RdsParameterGroup` and `RdsModifyAndReboot` statements and the
 `pg:gimme-*` resource on `RdsCreateAndDescribe` were exercised live in `eu-central-1` (create,
 a combined instance class, storage, and security-group modification, re-attaching the
 parameter group, and the reboot), with the statements copied verbatim from this page; the
@@ -219,6 +234,9 @@ AWS calls. `config/state.example.json` contains a complete example:
       "engine_version": "17.2",
       "instance_class": "db.t3.medium",
       "allocated_storage_gb": 20,
+      "backup_window": "03:00-04:00",
+      "backup_retention_days": 7,
+      "maintenance_window": "sun:05:00-sun:06:00",
       "administration_security_group_id": "sg-0123456789abcdef0",
       "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
       "workload_secret_store": "workload-secrets",
@@ -256,8 +274,12 @@ identifier, and never adopts an unrelated instance.
 Multi-AZ creation takes roughly 12 to 15 minutes. `apply_resource` polls for at most 30
 seconds and returns `phase: pending`. Request a new plan and apply again to resume; a
 resume describes the instance and never creates a second one. The plan changes as the
-instance advances, so an earlier plan is rejected as stale. The result is `phase: ready`
-once AWS reports `available` with no unapplied managed change.
+instance advances, so an earlier plan is rejected as stale. The result is `phase: ready` only
+after AWS reports the complete fixed contract (available, private, encrypted, Multi-AZ,
+deletion-protected, force-SSL parameters applied, exact lifecycle policy, and a current master
+secret) and the Administration Target completes a `sslmode=verify-full` connection using the
+pinned trust bundle. The safe plan records the trust-bundle identity, an ownership fingerprint,
+all cost-bearing inputs, and only a fingerprint of master-secret version metadata.
 
 ### Updating an existing instance
 
@@ -265,7 +287,8 @@ Edit desired state with `plan_update_resource` and `update_resource`, then plan 
 again. For an existing `available` instance, `apply_resource` describes it, compares it with
 desired state, and sends one `ModifyDBInstance` with `ApplyImmediately` and only the fields
 that differ: a same-major `engine_version`, `instance_class`, an increased
-`allocated_storage_gb`, the security-group set, and the Resource-owned parameter group (which
+`allocated_storage_gb`, backup retention and windows, the security-group set, and the
+Resource-owned parameter group (which
 also moves an instance created before `rds.force_ssl` was managed onto it). It never sets
 `AllowMajorVersionUpgrade` and sends no other field. The result lists `modified_fields`
 (names only) and `rebooted`.
@@ -295,9 +318,11 @@ Set the Deployment's `resources.database` to the Resource name, then `plan_bind_
 and `bind_resource`. Binding requires `phase: ready`. Gimme resolves the master credential
 through the resolver role, generates a workload password, and sends both to the
 Administration Target through the same protected temporary file used for Deployment secrets.
-The Target's `psql` creates a role and database named after the Deployment's database
-identifier and sets the role's password. The step is idempotent, and re-binding replaces the
-password.
+The Target's fixed `psql` program creates a database, a stable `NOLOGIN` owner role, and a
+generation-specific least-privilege `LOGIN` role. Application `postgres_extensions` accepts
+only `pgcrypto`, `uuid-ossp`, and `citext`; planning pins the exact provider-reported default
+version and apply creates that version through fixed SQL. A different installed version fails
+closed instead of being silently upgraded.
 
 The `psql` connection uses `sslmode=verify-full` against the pinned AWS commercial-region
 global RDS trust bundle (`deploy/aws-rds-global-bundle.pem`, provenance and refresh steps in
@@ -320,19 +345,30 @@ expect success; then from the Administration Target run
 must fail with `certificate verify failed`).
 
 The workload credential is then written to Secrets Manager at
-`<store-prefix>/<resource>/<deployment>` with a JSON object of `username`, `password`,
-`host`, `port`, and `dbname`, tagged for its Secret Store, Resource, and Deployment. The tool
-returns only the `{store, secret}` reference. Nothing yet copies these values into the
-Deployment's environment.
+`<store-prefix>/<resource>/<deployment>` with exactly `username` and `password`, tagged for its
+Secret Store, Resource, and Deployment. The tool returns only the `{store, secret}` reference.
+`plan_deployment_resources` pins that secret version; `apply_deployment_resources` resolves it
+only for the protected Target transfer and injects fixed `DB_*` settings, including
+`DB_SSLMODE=verify-full` and the atomically installed pinned trust-bundle path. The existing
+environment backup, health probes, and process refresh make activation transactional.
+
+Use `plan_rotate_resource_credential` and `apply_rotate_resource_credential` for an explicit
+rotation. Gimme creates the next login generation, writes a new two-field secret version,
+activates and health-checks the Deployment, and only then drops the previous login. A failed
+activation moves `AWSCURRENT` back to the prior secret version, restores the prior allocation
+and environment, and removes the candidate login. No credential, username, endpoint, ARN, or
+raw provider response is returned.
 
 ## Inspect and remove
 
-`inspect_resource` describes the instance through the inspection role and returns its
-identity, status, engine version, endpoint, and allocations. If AWS cannot be reached it
+`inspect_resource` describes the instance through the inspection role and returns a bounded
+identity fingerprint, status, engine version, readiness issues, and allocation status. It does
+not return an endpoint or ARN. If AWS cannot be reached it
 returns the last observed state with a bounded `refresh_error` and no drift.
 
 After a successful live read it also reports `drift`: `fields` lists, for each of
-`engine_version`, `instance_class`, `allocated_storage_gb` and `security_group_ids` that differs
+`engine_version`, `instance_class`, `allocated_storage_gb`, lifecycle windows and retention,
+and `security_group_ids` that differs
 from desired state, its `desired` and `live` values, and `modification_pending` says whether
 AWS has a pending modification. Drift is informational and is not stored. `apply_resource`
 applies it (see [Updating an existing instance](#updating-an-existing-instance)).

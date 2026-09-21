@@ -637,6 +637,9 @@ def _rds_resource(**updates: object) -> AWSRDSPostgresResource:
         "engine_version": "17.2",
         "instance_class": "db.t3.medium",
         "allocated_storage_gb": 20,
+        "backup_window": "03:00-04:00",
+        "backup_retention_days": 7,
+        "maintenance_window": "sun:05:00-sun:06:00",
         "administration_security_group_id": "sg-0123456789abcdef0",
         "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
         "workload_secret_store": "workload-secrets",
@@ -693,6 +696,19 @@ def test_aws_rds_resource_requires_exact_engine_version() -> None:
 def test_aws_rds_resource_deployment_security_groups_must_be_exact() -> None:
     with pytest.raises(ValidationError, match="deployment_security_group_ids"):
         _rds_resource(deployment_security_group_ids={"devbox": "not-a-security-group"})
+
+
+def test_application_postgres_extensions_are_fixed_allowlisted_and_canonical() -> None:
+    configured = application().model_copy(
+        update={"postgres_extensions": ["pgcrypto", "citext"]}
+    )
+    validated = ApplicationConfig.model_validate(configured.model_dump())
+    assert validated.postgres_extensions == ["citext", "pgcrypto"]
+
+    with pytest.raises(ValidationError, match="postgres_extensions"):
+        ApplicationConfig.model_validate({
+            **application().model_dump(), "postgres_extensions": ["postgis"],
+        })
 
 
 def test_control_state_binds_a_deployment_to_a_managed_postgres_resource() -> None:

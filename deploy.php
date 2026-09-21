@@ -1580,10 +1580,15 @@ task('gimme:resource:bind-postgres', function (): void {
     $host = required_env('GIMME_RESOURCE_ENDPOINT');
     $port = required_env('GIMME_RESOURCE_PORT');
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    $owner = required_env('GIMME_RESOURCE_OWNER');
+    $login = required_env('GIMME_RESOURCE_LOGIN');
+    $extensions = required_env('GIMME_RESOURCE_EXTENSIONS_JSON');
     if (
         !valid_endpoint($host) ||
         !preg_match('/^[1-9][0-9]{0,4}$/', $port) || (int) $port > 65535 ||
-        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database)
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $owner) ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $login)
     ) {
         throw new \RuntimeException('Unsafe managed PostgreSQL binding identity');
     }
@@ -1607,7 +1612,79 @@ task('gimme:resource:bind-postgres', function (): void {
         run(
             'printf %s ' . $bindProgram . ' | base64 -d | python3 - ' .
             escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
-            escapeshellarg($database) . ' ' . escapeshellarg($remoteSecretFile) . ' ' .
+            escapeshellarg($database) . ' ' . escapeshellarg($owner) . ' ' .
+            escapeshellarg($login) . ' ' . escapeshellarg($extensions) . ' ' .
+            escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile) . ' ' .
+            escapeshellarg($bundleDigest),
+            timeout: 120,
+        );
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+    }
+});
+
+task('gimme:resource:verify-postgres', function (): void {
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    if ($localSecretFile === '' || !is_file($localSecretFile) || is_link($localSecretFile)) {
+        throw new \RuntimeException('A safe secret file is required to verify PostgreSQL');
+    }
+    $host = required_env('GIMME_RESOURCE_ENDPOINT');
+    $port = required_env('GIMME_RESOURCE_PORT');
+    $bundleDigest = required_env('GIMME_RESOURCE_TRUST_BUNDLE_SHA256');
+    if (!valid_endpoint($host) || !preg_match('/^[1-9][0-9]{0,4}$/', $port) ||
+        (int) $port > 65535 || !preg_match('/^[0-9a-f]{64}$/', $bundleDigest)) {
+        throw new \RuntimeException('Unsafe managed PostgreSQL verification identity');
+    }
+    $remoteDirectory = '/tmp/.gimme-resource-verify';
+    $suffix = bin2hex(random_bytes(8));
+    $remoteSecretFile = "{$remoteDirectory}/.{$suffix}.json";
+    $remoteBundleFile = "{$remoteDirectory}/.{$suffix}.pem";
+    run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
+    try {
+        upload($localSecretFile, $remoteSecretFile);
+        upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+        $program = escapeshellarg(base64_encode(managed_postgres_verify_script()));
+        run(
+            'printf %s ' . $program . ' | base64 -d | python3 - ' .
+            escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+            escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile) . ' ' .
+            escapeshellarg($bundleDigest),
+            timeout: 120,
+        );
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+    }
+});
+
+task('gimme:resource:retire-postgres-login', function (): void {
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    if ($localSecretFile === '' || !is_file($localSecretFile) || is_link($localSecretFile)) {
+        throw new \RuntimeException('A safe secret file is required to retire PostgreSQL login');
+    }
+    $host = required_env('GIMME_RESOURCE_ENDPOINT');
+    $port = required_env('GIMME_RESOURCE_PORT');
+    $login = required_env('GIMME_RESOURCE_LOGIN');
+    $bundleDigest = required_env('GIMME_RESOURCE_TRUST_BUNDLE_SHA256');
+    if (!valid_endpoint($host) || !preg_match('/^[1-9][0-9]{0,4}$/', $port) ||
+        (int) $port > 65535 || !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $login) ||
+        !preg_match('/^[0-9a-f]{64}$/', $bundleDigest)) {
+        throw new \RuntimeException('Unsafe managed PostgreSQL login retirement identity');
+    }
+    $remoteDirectory = '/tmp/.gimme-resource-retire';
+    $suffix = bin2hex(random_bytes(8));
+    $remoteSecretFile = "{$remoteDirectory}/.{$suffix}.json";
+    $remoteBundleFile = "{$remoteDirectory}/.{$suffix}.pem";
+    run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
+    try {
+        upload($localSecretFile, $remoteSecretFile);
+        upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+        $program = escapeshellarg(base64_encode(managed_postgres_retire_login_script()));
+        run(
+            'printf %s ' . $program . ' | base64 -d | python3 - ' .
+            escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+            escapeshellarg($login) . ' ' . escapeshellarg($remoteSecretFile) . ' ' .
             escapeshellarg($remoteBundleFile) . ' ' . escapeshellarg($bundleDigest),
             timeout: 120,
         );
@@ -2028,6 +2105,31 @@ task('gimme:provision:app', function () use (
 
     run('install -d -m 0700 ' . escapeshellarg($sharedPath));
     run('setfacl -m u:www-data:x ' . escapeshellarg($sharedPath));
+    $rdsBundleDigest = getenv('GIMME_RESOURCE_TRUST_BUNDLE_SHA256') ?: '';
+    if ($rdsBundleDigest !== '') {
+        if (!preg_match('/^[0-9a-f]{64}$/', $rdsBundleDigest)) {
+            throw new \RuntimeException('Unsafe managed PostgreSQL trust bundle digest');
+        }
+        $trustDirectory = "{$appsRoot}/.gimme";
+        $trustPath = "{$trustDirectory}/aws-rds-global-bundle.pem";
+        $temporaryTrustPath = "{$trustPath}." . bin2hex(random_bytes(8));
+        run('install -d -m 0755 ' . escapeshellarg($trustDirectory));
+        try {
+            upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $temporaryTrustPath);
+            $actualDigest = trim(run(
+                'sha256sum ' . escapeshellarg($temporaryTrustPath) . " | cut -d' ' -f1"
+            ));
+            if (!hash_equals($rdsBundleDigest, $actualDigest)) {
+                throw new \RuntimeException('Managed PostgreSQL trust bundle digest mismatch');
+            }
+            run(
+                'chmod 0644 ' . escapeshellarg($temporaryTrustPath) . ' && mv -f ' .
+                escapeshellarg($temporaryTrustPath) . ' ' . escapeshellarg($trustPath)
+            );
+        } finally {
+            run('rm -f ' . escapeshellarg($temporaryTrustPath));
+        }
+    }
     if ($localSecretFile !== '') {
         if (!is_file($localSecretFile) || is_link($localSecretFile)) {
             throw new \RuntimeException('Unsafe local secret transfer file');

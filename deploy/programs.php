@@ -762,11 +762,27 @@ import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
-host, port, database, secret_path_argument, bundle_path_argument, bundle_digest = sys.argv[1:7]
+(
+    host, port, database, owner, login, extensions_json,
+    secret_path_argument, bundle_path_argument, bundle_digest,
+) = sys.argv[1:10]
 if not (1 <= int(port) <= 65535):
     raise SystemExit("unsafe port")
 if re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None:
     raise SystemExit("unsafe database identifier")
+if any(re.fullmatch(r"[a-z][a-z0-9_]{0,62}", value) is None for value in (owner, login)):
+    raise SystemExit("unsafe role identifier")
+extensions = json.loads(extensions_json)
+if (
+    not isinstance(extensions, dict)
+    or any(name not in {"pgcrypto", "uuid-ossp", "citext"} for name in extensions)
+    or any(
+        not isinstance(version, str)
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
+        for version in extensions.values()
+    )
+):
+    raise SystemExit("unsafe PostgreSQL extension policy")
 if re.fullmatch(r"[0-9a-f]{64}", bundle_digest) is None:
     raise SystemExit("unsafe trust bundle digest")
 
@@ -781,7 +797,7 @@ if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != bundle_digest:
     raise SystemExit("trust bundle digest mismatch")
 secrets = json.loads(secret_path.read_text())
 if not isinstance(secrets, dict) or set(secrets) != {
-    "master_username", "master_password", "workload_password",
+    "master_username", "master_password", "workload_username", "workload_password",
 }:
     raise SystemExit("secret document has an unexpected shape")
 for value in secrets.values():
@@ -790,9 +806,10 @@ for value in secrets.values():
 # Only these characters can be embedded in a psql \set line without any quoting concern.
 if re.fullmatch(r"[A-Za-z0-9_-]{8,128}", secrets["workload_password"]) is None:
     raise SystemExit("workload password has an unexpected format")
+if secrets["workload_username"] != login:
+    raise SystemExit("workload login does not match the reviewed identity")
 
 # The role name matches the database identifier, exactly like target-local PostgreSQL.
-role = database
 env = {
     "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     "PGPASSWORD": secrets["master_password"],
@@ -818,13 +835,14 @@ def fail(result: subprocess.CompletedProcess[str], message: str) -> None:
     raise SystemExit(message)
 
 
-def psql(statements: str) -> subprocess.CompletedProcess[str]:
+def psql(statements: str, selected_database: str = "postgres") -> subprocess.CompletedProcess[str]:
     # Statements go over stdin so nothing secret ever appears in argv. psql's :'var'
     # substitution is applied client-side (and quotes each value as a SQL string literal)
     # only for stdin/-f input, never for -c, and never inside a dollar-quoted body.
     return subprocess.run(  # nosec B603
         [
-            "psql", "-h", host, "-p", port, "-U", secrets["master_username"], "-d", "postgres",
+            "psql", "-h", host, "-p", port, "-U", secrets["master_username"],
+            "-d", selected_database,
             "--no-psqlrc", "-v", "ON_ERROR_STOP=1",
         ],
         input=statements, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -836,25 +854,185 @@ def psql(statements: str) -> subprocess.CompletedProcess[str]:
 # when their guard yields a row: idempotent, injection-safe, and CREATE DATABASE stays
 # outside any transaction block.
 role_result = psql(
-    f"\\set role '{role}'\n"
+    f"\\set owner '{owner}'\n"
+    f"\\set login '{login}'\n"
+    f"\\set owner_marker 'gimme:managed-postgres:{database}:owner'\n"
+    f"\\set login_marker 'gimme:managed-postgres:{database}:login'\n"
     f"\\set workload_password '{secrets['workload_password']}'\n"
-    "SELECT format('CREATE ROLE %I LOGIN', :'role') "
-    "WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role') \\gexec\n"
-    "SELECT format('ALTER ROLE %I PASSWORD %L', :'role', :'workload_password') \\gexec\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner') "
+    "OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner' AND "
+    "shobj_description(oid, 'pg_authid') = :'owner_marker') THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login') "
+    "OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login' AND "
+    "shobj_description(oid, 'pg_authid') = :'login_marker') THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT format('CREATE ROLE %I NOLOGIN', :'owner') "
+    "WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner') \\gexec\n"
+    "SELECT format('CREATE ROLE %I LOGIN NOCREATEDB NOCREATEROLE NOREPLICATION', :'login') "
+    "WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login') \\gexec\n"
+    "SELECT format('COMMENT ON ROLE %I IS %L', :'owner', :'owner_marker') \\gexec\n"
+    "SELECT format('COMMENT ON ROLE %I IS %L', :'login', :'login_marker') \\gexec\n"
+    "SELECT format('ALTER ROLE %I NOLOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE "
+    "NOREPLICATION NOBYPASSRLS', :'owner') \\gexec\n"
+    "SELECT format('ALTER ROLE %I LOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE "
+    "NOREPLICATION NOBYPASSRLS PASSWORD %L', :'login', :'workload_password') \\gexec\n"
+    "SELECT format('REVOKE %I FROM %I', parent.rolname, :'owner') "
+    "FROM pg_auth_members membership JOIN pg_roles member ON member.oid = membership.member "
+    "JOIN pg_roles parent ON parent.oid = membership.roleid "
+    "WHERE member.rolname = :'owner' \\gexec\n"
+    "SELECT format('REVOKE %I FROM %I', parent.rolname, :'login') "
+    "FROM pg_auth_members membership JOIN pg_roles member ON member.oid = membership.member "
+    "JOIN pg_roles parent ON parent.oid = membership.roleid "
+    "WHERE member.rolname = :'login' \\gexec\n"
+    "SELECT format('GRANT %I TO %I', :'owner', :'login') \\gexec\n"
 )
 if role_result.returncode != 0:
     fail(role_result, "managed PostgreSQL role reconciliation failed")
 
 database_result = psql(
-    f"\\set role '{role}'\n"
+    f"\\set owner '{owner}'\n"
+    f"\\set login '{login}'\n"
     f"\\set database '{database}'\n"
-    "SELECT format('CREATE DATABASE %I OWNER %I', :'database', :'role') "
+    f"\\set database_marker 'gimme:managed-postgres:{database}:database'\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database') "
+    "OR EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database' "
+    "AND pg_get_userbyid(datdba) = :'owner' "
+    "AND shobj_description(oid, 'pg_database') = :'database_marker') "
+    "THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT format('CREATE DATABASE %I OWNER %I', :'database', :'owner') "
     "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database') \\gexec\n"
+    "SELECT format('COMMENT ON DATABASE %I IS %L', :'database', :'database_marker') \\gexec\n"
+    "SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', :'database') \\gexec\n"
+    "SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'database', :'login') \\gexec\n"
 )
 if database_result.returncode != 0:
     fail(database_result, "managed PostgreSQL database reconciliation failed")
 
+extension_sql = (
+    f"\\set owner '{owner}'\n"
+    "REVOKE ALL ON SCHEMA public FROM PUBLIC;\n"
+    "SELECT format('ALTER SCHEMA public OWNER TO %I', :'owner') \\gexec\n"
+)
+for extension, version in sorted(extensions.items()):
+    extension_sql += (
+        f"\\set extension '{extension}'\n"
+        f"\\set extension_version '{version}'\n"
+        "SELECT format('CREATE EXTENSION IF NOT EXISTS %I VERSION %L', "
+        ":'extension', :'extension_version') \\gexec\n"
+        "SELECT format('ALTER EXTENSION %I UPDATE TO %L', :'extension', :'extension_version') "
+        "WHERE EXISTS (SELECT 1 FROM pg_extension WHERE extname = :'extension' "
+        "AND extversion <> :'extension_version') \\gexec\n"
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_extension "
+        "WHERE extname = :'extension' AND extversion = :'extension_version') "
+        "THEN 1 ELSE 1 / 0 END;\n"
+    )
+extension_result = psql(extension_sql, database)
+if extension_result.returncode != 0:
+    fail(extension_result, "managed PostgreSQL extension reconciliation failed")
+
 print("GIMME_RESOURCE_BOUND|" + database)
+PYTHON;
+}
+
+
+function managed_postgres_verify_script(): string
+{
+    return <<<'PYTHON'
+import base64
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+from pathlib import Path
+
+host, port, secret_argument, bundle_argument, expected_digest = sys.argv[1:6]
+if not 1 <= int(port) <= 65535 or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+    raise SystemExit("unsafe managed PostgreSQL verification input")
+secret_path, bundle_path = Path(secret_argument), Path(bundle_argument)
+for path in (secret_path, bundle_path):
+    if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit("unsafe managed PostgreSQL verification file")
+if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != expected_digest:
+    raise SystemExit("trust bundle digest mismatch")
+secret = json.loads(secret_path.read_text())
+if not isinstance(secret, dict) or set(secret) != {"username", "password"}:
+    raise SystemExit("secret document has an unexpected shape")
+if any(not isinstance(value, str) or not value for value in secret.values()):
+    raise SystemExit("secret document contains an invalid value")
+result = subprocess.run(  # nosec B603
+    ["psql", "-h", host, "-p", port, "-U", secret["username"], "-d", "postgres",
+     "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-At"],
+    input=("SHOW ssl; SELECT 1; "
+           "SELECT name || '=' || default_version FROM pg_available_extensions "
+           "WHERE name IN ('pgcrypto','uuid-ossp','citext') ORDER BY name;\n"),
+    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": secret["password"],
+         "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(bundle_path)},
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, check=False,
+)
+lines = result.stdout.splitlines()
+if result.returncode != 0 or lines[:2] != ["on", "1"]:
+    raise SystemExit("managed PostgreSQL TLS administration verification failed")
+extensions = {}
+for line in lines[2:]:
+    name, separator, version = line.partition("=")
+    if (
+        separator != "="
+        or name not in {"pgcrypto", "uuid-ossp", "citext"}
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
+        or name in extensions
+    ):
+        raise SystemExit("managed PostgreSQL extension inventory invalid")
+    extensions[name] = version
+encoded = base64.b64encode(json.dumps(extensions, sort_keys=True).encode()).decode()
+print("GIMME_RESOURCE_VERIFIED|postgres|" + encoded)
+PYTHON;
+}
+
+
+function managed_postgres_retire_login_script(): string
+{
+    return <<<'PYTHON'
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+from pathlib import Path
+
+host, port, login, secret_argument, bundle_argument, expected_digest = sys.argv[1:7]
+if (
+    not 1 <= int(port) <= 65535
+    or re.fullmatch(r"[a-z][a-z0-9_]{0,62}", login) is None
+    or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+):
+    raise SystemExit("unsafe managed PostgreSQL retirement input")
+secret_path, bundle_path = Path(secret_argument), Path(bundle_argument)
+for path in (secret_path, bundle_path):
+    if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit("unsafe managed PostgreSQL retirement file")
+if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != expected_digest:
+    raise SystemExit("trust bundle digest mismatch")
+secret = json.loads(secret_path.read_text())
+if not isinstance(secret, dict) or set(secret) != {"username", "password"}:
+    raise SystemExit("secret document has an unexpected shape")
+result = subprocess.run(  # nosec B603
+    ["psql", "-h", host, "-p", port, "-U", secret["username"], "-d", "postgres",
+     "--no-psqlrc", "-v", "ON_ERROR_STOP=1"],
+    input=(f"\\set login '{login}'\n"
+           "SELECT format('REVOKE CONNECT ON DATABASE %I FROM %I', datname, :'login') "
+           "FROM pg_database WHERE datallowconn AND NOT datistemplate \\gexec\n"
+           "SELECT format('DROP ROLE IF EXISTS %I', :'login') \\gexec\n"),
+    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": secret["password"],
+         "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(bundle_path)},
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60, check=False,
+)
+if result.returncode != 0:
+    raise SystemExit("managed PostgreSQL login retirement failed")
+print("GIMME_RESOURCE_LOGIN_RETIRED|postgres")
 PYTHON;
 }
 
