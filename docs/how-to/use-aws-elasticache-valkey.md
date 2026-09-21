@@ -90,20 +90,31 @@ delete action. This is a privilege increase for roles already deployed, includin
 ```
 
 Snapshot inventory and restore need the inspection role to read snapshots and to name one when it
-creates a group from it. `CreateReplicationGroup` with `SnapshotName` is authorized against the
-snapshot as well as the group, and the snapshot of a destroyed group is not named `gimme-*` unless
-it is Gimme's own final snapshot, so this statement covers snapshots of `gimme-*` groups only:
+creates a group from it. `DescribeSnapshots` does not support resource-level permissions: scoped to
+`snapshot:gimme-*` it is denied, and listing fails with `aws_elasticache_snapshots_access_denied`
+(seen on a live run), so it needs `"Resource": "*"`. `CreateReplicationGroup` with `SnapshotName`
+is authorized against the snapshot as well as the group, and the snapshot of a destroyed group is
+not named `gimme-*` unless it is Gimme's own final snapshot, so this statement covers snapshots of
+`gimme-*` groups only:
 
 ```json
 {
-  "Sid": "ElastiCacheSnapshotsForRestore",
+  "Sid": "ElastiCacheDescribeSnapshots",
   "Effect": "Allow",
-  "Action": ["elasticache:DescribeSnapshots", "elasticache:CreateReplicationGroup"],
+  "Action": "elasticache:DescribeSnapshots",
+  "Resource": "*"
+}
+```
+
+```json
+{
+  "Sid": "ElastiCacheCreateFromSnapshot",
+  "Effect": "Allow",
+  "Action": "elasticache:CreateReplicationGroup",
   "Resource": ["arn:aws:elasticache:<region>:<account>:snapshot:gimme-*"]
 }
 ```
 
-`DescribeSnapshots` may not support resource-level permissions and then needs `"Resource": "*"`.
 The resolver role already reads the workload namespace, which a restore uses to recreate an ACL
 user from the credential already stored, and rotation reads the same secret. Whether these
 statements are sufficient is unverified.
