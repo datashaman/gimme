@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed bootstrapping a Target that has no placed Deployments (an administration Target, or any
+  Target before its first placement): the desired state wrote `"sites": []`, which the privileged
+  helper rejected with `sites must be an object`. It now writes an empty object.
 - Fixed `inspect_resource` reporting a false `security_group` readiness issue while a managed
   Valkey group was `modifying` (found live during a failover): attached security groups are read
   only from an available group, so a modifying group is now compared on nothing rather than on
