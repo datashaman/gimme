@@ -5,6 +5,13 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Extended the disposable real-Laravel Valkey suite (local TLS cluster, saved ACLs, zero cost) to
+  drive each declared use on its own and to cover credential rotation and restarts: candidates with a wrong password or a missing permission
+  are refused without disturbing the live credential or its open connection and are rolled back; a
+  probed next generation passes alongside the previous one; deleting the previous user closes its
+  connection and ends its credential; and a worker that meets a server restart fails within the
+  contract's bounds and recovers after reconnecting. The suite's contract runs are now repeatable,
+  and it fails on an error reply the CLI would otherwise report with exit status 0.
 - Added managed Valkey Detached Allocation purge through the existing
   `plan_purge_resource_allocation` and `apply_purge_resource_allocation` tools (exact confirmation
   `PURGE <deployment> FROM <resource>`). A fixed program run from the administration Target deletes
