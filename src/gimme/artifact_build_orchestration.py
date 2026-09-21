@@ -260,7 +260,7 @@ class ArtifactBuildOrchestrator:
         return value
 
     @staticmethod
-    def _build_id(inputs: dict[str, object]) -> str:
+    def build_id(inputs: dict[str, object]) -> str:
         encoded = json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
         return "build_v1_" + hashlib.sha256(b"gimme-build-v1\0" + encoded).hexdigest()
 
@@ -296,7 +296,7 @@ class ArtifactBuildOrchestrator:
             "packaging_version": "laravel_v1",
             "execution_fingerprint": execution_fingerprint(),
         }
-        build_id = self._build_id(identity)
+        build_id = self.build_id(identity)
         build_secret_versions = plan_secret_references(
             state, self.store.secrets_path, build.secrets
         )

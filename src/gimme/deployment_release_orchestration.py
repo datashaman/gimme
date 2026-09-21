@@ -10,6 +10,7 @@ from gimme.control import (
     DeploymentSource,
 )
 from gimme.control_plans import deployment_release_plan, exact_plan
+from gimme.artifact_deployment_orchestration import release_contract
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,8 @@ class DeploymentReleaseOrchestrator:
         )
 
     def _artifact_release_plan(
-        self, name: str, state, deployment, target, application
+        self, name: str, state, deployment, target, application,
+        artifact_context=None,
     ) -> dict[str, Any]:
         _, secret_issues = self.secret_plan(name, state, deployment)
         issues = (
@@ -131,7 +133,7 @@ class DeploymentReleaseOrchestrator:
             + self.managed_database_issues(state, deployment)
             + self.valkey_runtime(name, state, deployment)[3]
         )
-        artifact_context = self.artifact_deployment.context(name)
+        artifact_context = artifact_context or self.artifact_deployment.context(name)
         artifact = artifact_context["artifact"]
         if artifact["status"] == "missing":
             issues.append("artifact_missing")
@@ -143,12 +145,33 @@ class DeploymentReleaseOrchestrator:
             preflight = self.run_deployment(
                 "gimme:preflight:artifact-runtimes", name, timeout=60
             )
+            observed: dict[str, object] = {"php_extensions": []}
+            for raw in preflight.output.splitlines():
+                line = raw.split("] ", 1)[-1].strip()
+                if line.startswith("GIMME_RUNTIME|php|"):
+                    observed["php"] = line.rsplit("|", 1)[-1]
+                elif line.startswith("GIMME_PLATFORM|"):
+                    _, system, machine = line.split("|", 2)
+                    observed["system"] = system
+                    observed["machine"] = machine
+                elif line.startswith("GIMME_PHP_EXTENSION|") and line.endswith("|ready"):
+                    observed["php_extensions"].append(line.split("|", 2)[1])
+            capability = artifact_context["identity"]["capability"]
+            expected_observed = {
+                "php": deployment.runtimes["php"].version,
+                "php_extensions": application.php_extensions,
+                "system": capability["system"],
+                "machine": capability["machine"],
+            }
+            observed["php_extensions"] = sorted(observed["php_extensions"])
+            if observed != expected_observed:
+                raise RuntimeError("artifact_runtime_incompatible")
             runtime = {
                 "declared": {
                     "php": deployment.runtimes["php"].model_dump(mode="json"),
                     "php_extensions": application.php_extensions,
                 },
-                "preflight": preflight.output,
+                "observed": observed,
             }
             processes, process_issues = self._process_preflight(
                 name, deployment, application
@@ -243,6 +266,11 @@ class DeploymentReleaseOrchestrator:
     def plan_promotion(self, source: str, destination: str) -> dict[str, object]:
         state, source_deployment, _, _ = self.context(source)
         destination_deployment = state.deployments[destination]
+        if (
+            source_deployment.release_mode == "artifact"
+            or destination_deployment.release_mode == "artifact"
+        ):
+            return self._artifact_promotion(source, destination)[0]
         self._require_source_release(source_deployment)
         self._require_source_release(destination_deployment)
         if source_deployment.application != destination_deployment.application:
@@ -265,21 +293,136 @@ class DeploymentReleaseOrchestrator:
             }
         )
 
+    @staticmethod
+    def _metadata_artifact(metadata: dict[str, object]) -> dict[str, object]:
+        return {
+            "status": "ready",
+            "application": metadata["application"],
+            "build_id": metadata["build_id"],
+            "commit": metadata["commit"],
+            "schema_version": metadata["schema_version"],
+            "format": metadata["packaging_schema"],
+            "artifact_digest": metadata["artifact_digest"],
+            "tree_digest": metadata["tree_digest"],
+            "bytes": metadata["bytes"],
+            "package_version": metadata["package_version"],
+            "manifest_version": metadata["manifest_version"],
+            "build_secrets_used": metadata["build_secrets_used"],
+            "build_secret_count": metadata["build_secret_count"],
+        }
+
+    def _artifact_promotion(
+        self, source: str, destination: str
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        state, source_deployment, _, _ = self.context(source)
+        destination_deployment = state.deployments[destination]
+        if (
+            source_deployment.release_mode != "artifact"
+            or destination_deployment.release_mode != "artifact"
+        ):
+            raise ValueError("artifact promotion requires artifact release mode")
+        if source_deployment.application != destination_deployment.application:
+            raise ValueError("promotion requires deployments of the same application")
+        metadata = self.artifact_deployment.live_release(source)
+        expected = self.artifact_deployment.expected_from_release(destination, metadata)
+        source_artifact = self._metadata_artifact(metadata)
+        destination_application = state.applications[destination_deployment.application]
+        contract_matches = metadata["release_contract"] == release_contract(
+            destination_deployment, destination_application
+        )
+        compatible = expected["build_id"] == metadata["build_id"] and contract_matches
+        compatibility = {
+            "status": "compatible" if compatible else "artifact_incompatible",
+            "build_id_matches": expected["build_id"] == metadata["build_id"],
+            "release_contract_matches": contract_matches,
+        }
+        if not compatible:
+            return exact_plan({
+                "kind": "promotion",
+                "release_mode": "artifact",
+                "source": source,
+                "destination": destination,
+                "revision": metadata["commit"],
+                "artifact": source_artifact,
+                "compatibility": compatibility,
+                "ready": False,
+                "readiness_issues": ["artifact_incompatible"],
+                "operator_action": "publish_destination_context_artifact_first",
+                "effects": [],
+            }), None
+        artifact_context = self.artifact_deployment.resolve_expected(destination, expected)
+        if artifact_context["artifact"] != source_artifact:
+            raise RuntimeError("artifact_promotion_stale")
+        target = state.targets[destination_deployment.target]
+        release = self._artifact_release_plan(
+            destination,
+            state,
+            destination_deployment,
+            target,
+            destination_application,
+            artifact_context,
+        )
+        return exact_plan({
+            "kind": "promotion",
+            "release_mode": "artifact",
+            "source": source,
+            "destination": destination,
+            "revision": metadata["commit"],
+            "artifact": source_artifact,
+            "compatibility": compatibility,
+            "ready": release["ready"],
+            "readiness_issues": release["readiness_issues"],
+            "release": release,
+            "effects": [
+                "reuse the exact live source artifact without rebuilding",
+                "activate it through the verified artifact release path",
+                "pin destination source only after successful live health",
+            ],
+        }), artifact_context
+
     def promote_deployment(
         self, source: str, destination: str, plan_id: str
     ) -> dict[str, object]:
         with self.deployment_resource_locks(source, destination):
-            expected = self.plan_promotion(source, destination)
+            state, source_deployment, _, _ = self.context(source)
+            destination_deployment = state.deployments[destination]
+            artifact_mode = (
+                source_deployment.release_mode == "artifact"
+                or destination_deployment.release_mode == "artifact"
+            )
+            if artifact_mode:
+                expected, artifact_context = self._artifact_promotion(source, destination)
+            else:
+                expected = self.plan_promotion(source, destination)
+                artifact_context = None
             self.assert_plan(expected, plan_id)
+            if not expected.get("ready", True):
+                raise ValueError("promotion is not ready; inspect readiness_issues")
             release = expected["release"]
             if not isinstance(release, dict) or not release["ready"]:
                 raise ValueError(
                     "destination deployment is not ready; inspect release readiness_issues"
                 )
             revision = str(expected["revision"])
-            applied = self.run_deployment(
-                "deploy", destination, revision=revision, timeout=1800
-            )
+            if artifact_mode:
+                if artifact_context is None:
+                    raise ValueError("artifact promotion is not ready")
+                request, secret_context = self.artifact_deployment.apply_arguments(
+                    artifact_context
+                )
+                with secret_context as credential_file:
+                    applied = self.run_deployment(
+                        "deploy",
+                        destination,
+                        revision=revision,
+                        artifact_request=request,
+                        artifact_secret_file=credential_file,
+                        timeout=1800,
+                    )
+            else:
+                applied = self.run_deployment(
+                    "deploy", destination, revision=revision, timeout=1800
+                )
             state = self.store.load()
             deployment = state.deployments[destination].model_copy(
                 update={"source": DeploymentSource(kind="commit", ref=revision)}

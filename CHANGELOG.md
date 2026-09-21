@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added build-free artifact promotion. Planning validates the source Deployment's live readonly
+  release metadata and immutable tree, recomputes the destination-context build identity locally,
+  verifies the exact private publication with destination reader authority, and binds runtime,
+  architecture, health, and process compatibility. Apply rechecks all evidence, activates through
+  the artifact deployment path, and pins destination source only after successful live health.
 - Added the first artifact-mode Deployment path. Planning recomputes the expected build,
   resolves and verifies one exact private publication from the destination Target, checks its
   execution-time PHP capability, and binds object versions plus archive/tree digests. Apply

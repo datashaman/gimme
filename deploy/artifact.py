@@ -40,6 +40,7 @@ MAX_TREE_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_FILES = 100_000
 MAX_MANIFEST_BYTES = 64 * 1024
+MAX_RELEASE_METADATA_BYTES = 12 * 1024
 MIN_FREE_BYTES = 1024 * 1024 * 1024
 LOCKFILES = {
     "npm": ("package-lock.json",),
@@ -159,7 +160,7 @@ def parse_request(argument: str) -> dict[str, object]:
     return value
 
 
-def checked_root(argument: str) -> Path:
+def checked_apps_root(argument: str) -> Path:
     root = Path(argument)
     if (
         not root.is_absolute()
@@ -169,6 +170,11 @@ def checked_root(argument: str) -> Path:
         or root.stat().st_uid != os.getuid()
     ):
         fail("artifact_workspace_root_invalid")
+    return root
+
+
+def checked_root(argument: str) -> Path:
+    root = checked_apps_root(argument)
     workspace_root = root / ".gimme" / "artifact-builds"
     workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(workspace_root, 0o700)
@@ -1141,6 +1147,8 @@ def materialize_artifact(
     apps_root: Path, release_argument: str,
 ) -> dict[str, object]:
     artifact = request.get("artifact")
+    build_identity = request.get("build_identity")
+    release_contract = request.get("release_contract")
     if not isinstance(artifact, dict) or artifact.get("status") != "ready":
         fail("artifact_materialization_invalid")
     application, build_id = artifact.get("application"), artifact.get("build_id")
@@ -1151,6 +1159,34 @@ def materialize_artifact(
         or BUILD_ID.fullmatch(build_id) is None
     ):
         fail("artifact_materialization_invalid")
+    if not isinstance(build_identity, dict) or not isinstance(release_contract, dict):
+        fail("artifact_materialization_invalid")
+    encoded_identity = json.dumps(
+        build_identity, sort_keys=True, separators=(",", ":")
+    ).encode()
+    if (
+        len(encoded_identity) > MAX_RELEASE_METADATA_BYTES
+        or "build_v1_" + hashlib.sha256(
+            b"gimme-build-v1\0" + encoded_identity
+        ).hexdigest() != build_id
+        or set(release_contract) != {
+            "schema", "health_sha256", "processes_sha256"
+        }
+        or release_contract.get("schema") != "laravel_release_v1"
+        or any(
+            not isinstance(release_contract.get(field), str)
+            or SHA256.fullmatch(release_contract[field]) is None
+            for field in ("health_sha256", "processes_sha256")
+        )
+    ):
+        fail("artifact_materialization_invalid")
+    seed_fields = {
+        "repository_fingerprint", "composer_lock_sha256", "composer_lock_bytes",
+        "frontend_lock", "capability",
+    }
+    if not seed_fields <= set(build_identity):
+        fail("artifact_materialization_invalid")
+    promotion_seed = {field: build_identity[field] for field in sorted(seed_fields)}
     store = store_request(request)
     store_credentials, build_values = credentials(credential_argument)
     if build_values:
@@ -1215,12 +1251,24 @@ def materialize_artifact(
             "build_id": build_id,
             "artifact_digest": manifest["artifact_digest"],
             "tree_digest": manifest["tree_digest"],
+            "bytes": manifest["bytes"],
             "manifest_version": manifest_version,
+            "package_version": manifest["package_version"],
+            "schema_version": manifest["schema_version"],
+            "build_secrets_used": manifest["build_secrets_used"],
+            "build_secret_count": manifest["build_secret_count"],
             "packaging_schema": manifest["format"],
             "release_mode": "artifact",
+            "promotion_seed": promotion_seed,
+            "release_contract": release_contract,
         }
         metadata_path = release / ".gimme-artifact.json"
-        metadata_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+        encoded_metadata = json.dumps(
+            metadata, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if len(encoded_metadata) > MAX_RELEASE_METADATA_BYTES:
+            fail("artifact_release_metadata_invalid")
+        metadata_path.write_bytes(encoded_metadata)
         os.chmod(metadata_path, 0o444)
         return {"status": "materialized", "application": application, "build_id": build_id}
     except BaseException:
@@ -1229,6 +1277,172 @@ def materialize_artifact(
     finally:
         if workspace is not None:
             shutil.rmtree(workspace, ignore_errors=True)
+
+
+def valid_promotion_seed(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "repository_fingerprint", "composer_lock_sha256", "composer_lock_bytes",
+        "frontend_lock", "capability",
+    }:
+        return False
+    frontend_lock = value["frontend_lock"]
+    capability = value["capability"]
+    if (
+        not isinstance(value["repository_fingerprint"], str)
+        or re.fullmatch(r"repo_[0-9a-f]{64}", value["repository_fingerprint"]) is None
+        or not isinstance(value["composer_lock_sha256"], str)
+        or SHA256.fullmatch(value["composer_lock_sha256"]) is None
+        or not isinstance(value["composer_lock_bytes"], int)
+        or not 0 < value["composer_lock_bytes"] <= MAX_LOCK_BYTES
+        or frontend_lock is not None and (
+            not isinstance(frontend_lock, dict)
+            or set(frontend_lock) != {"filename", "sha256", "bytes"}
+            or frontend_lock.get("filename") not in {
+                "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"
+            }
+            or not isinstance(frontend_lock.get("sha256"), str)
+            or SHA256.fullmatch(frontend_lock["sha256"]) is None
+            or not isinstance(frontend_lock.get("bytes"), int)
+            or not 0 < frontend_lock["bytes"] <= MAX_LOCK_BYTES
+        )
+        or not isinstance(capability, dict)
+        or set(capability) != {
+            "php", "composer", "php_extensions", "system", "machine", "frontend"
+        }
+        or any(
+            not isinstance(capability.get(field), str)
+            or VERSION.fullmatch(capability[field]) is None
+            for field in ("php", "composer")
+        )
+        or any(
+            not isinstance(capability.get(field), str)
+            or re.fullmatch(r"[a-z0-9_.+-]{1,64}", capability[field]) is None
+            for field in ("system", "machine")
+        )
+        or not isinstance(capability.get("php_extensions"), list)
+        or len(capability["php_extensions"]) > 256
+        or any(
+            not isinstance(extension, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,47}", extension) is None
+            for extension in capability["php_extensions"]
+        )
+        or capability["php_extensions"] != sorted(set(capability["php_extensions"]))
+    ):
+        return False
+    frontend = capability["frontend"]
+    return frontend is None or (
+        isinstance(frontend, dict)
+        and set(frontend) == {"manager", "manager_version", "node_version"}
+        and frontend.get("manager") in LOCKFILES
+        and isinstance(frontend.get("manager_version"), str)
+        and VERSION.fullmatch(frontend["manager_version"]) is not None
+        and (
+            frontend.get("node_version") is None
+            or isinstance(frontend["node_version"], str)
+            and VERSION.fullmatch(frontend["node_version"]) is not None
+        )
+    )
+
+
+def inspect_live_release(apps_root: Path, current_argument: str) -> dict[str, object]:
+    current = Path(current_argument)
+    try:
+        current_details = current.lstat()
+        if (
+            not current.is_absolute()
+            or current.name != "current"
+            or not current.is_relative_to(apps_root)
+            or not current.is_symlink()
+            or current_details.st_uid != os.getuid()
+        ):
+            fail("artifact_release_metadata_invalid")
+        release = current.resolve(strict=True)
+        if (
+            not release.is_relative_to(apps_root)
+            or "releases" not in release.relative_to(apps_root).parts
+            or not release.is_dir()
+            or release.stat().st_uid != os.getuid()
+        ):
+            fail("artifact_release_metadata_invalid")
+        metadata_path = release / ".gimme-artifact.json"
+        details = metadata_path.lstat()
+        if (
+            metadata_path.is_symlink()
+            or not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o444
+            or details.st_size > MAX_RELEASE_METADATA_BYTES
+        ):
+            fail("artifact_release_metadata_invalid")
+        with metadata_path.open("rb") as handle:
+            raw_metadata = handle.read(MAX_RELEASE_METADATA_BYTES + 1)
+        if len(raw_metadata) > MAX_RELEASE_METADATA_BYTES:
+            fail("artifact_release_metadata_invalid")
+        metadata = json.loads(raw_metadata)
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        fail("artifact_release_metadata_invalid")
+    required = {
+        "application", "commit", "build_id", "artifact_digest", "tree_digest",
+        "bytes", "manifest_version", "package_version", "schema_version",
+        "build_secrets_used", "build_secret_count", "packaging_schema", "release_mode",
+        "promotion_seed", "release_contract",
+    }
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != required
+        or not isinstance(metadata.get("application"), str)
+        or NAME.fullmatch(metadata["application"]) is None
+        or not isinstance(metadata.get("commit"), str)
+        or COMMIT.fullmatch(metadata["commit"]) is None
+        or not isinstance(metadata.get("build_id"), str)
+        or BUILD_ID.fullmatch(metadata["build_id"]) is None
+        or any(
+            not isinstance(metadata.get(field), str)
+            or SHA256.fullmatch(metadata[field]) is None
+            for field in ("artifact_digest", "tree_digest")
+        )
+        or not isinstance(metadata.get("bytes"), int)
+        or not 0 < metadata["bytes"] <= MAX_ARCHIVE_BYTES
+        or metadata.get("schema_version") != 2
+        or not isinstance(metadata.get("build_secrets_used"), bool)
+        or not isinstance(metadata.get("build_secret_count"), int)
+        or not 0 <= metadata["build_secret_count"] <= 32
+        or metadata["build_secrets_used"] != (metadata["build_secret_count"] > 0)
+        or any(
+            not isinstance(metadata.get(field), str)
+            or VERSION_ID.fullmatch(metadata[field]) is None
+            for field in ("manifest_version", "package_version")
+        )
+        or metadata.get("packaging_schema") != "laravel_v1"
+        or metadata.get("release_mode") != "artifact"
+        or not valid_promotion_seed(metadata.get("promotion_seed"))
+        or not isinstance(metadata.get("release_contract"), dict)
+        or set(metadata["release_contract"]) != {
+            "schema", "health_sha256", "processes_sha256"
+        }
+        or metadata["release_contract"].get("schema") != "laravel_release_v1"
+        or any(
+            not isinstance(metadata["release_contract"].get(field), str)
+            or SHA256.fullmatch(metadata["release_contract"][field]) is None
+            for field in ("health_sha256", "processes_sha256")
+        )
+    ):
+        fail("artifact_release_metadata_invalid")
+    entries = []
+    for path in release.rglob("*"):
+        if path == metadata_path:
+            continue
+        details = path.lstat()
+        if stat.S_ISREG(details.st_mode) and details.st_nlink != 1:
+            fail("artifact_release_metadata_invalid")
+        entries.append((path.relative_to(release).as_posix(), path))
+    if len(entries) > MAX_FILES:
+        fail("artifact_archive_too_many_files")
+    validate_tree(entries, release)
+    if tree_digest(sorted(entries)) != metadata["tree_digest"]:
+        fail("artifact_tree_digest_mismatch")
+    return metadata
 
 
 def build(request: dict[str, object], credential_argument: str, workspace_root: Path):
@@ -1472,9 +1686,10 @@ def main(arguments: list[str]) -> int:
     signal.signal(signal.SIGINT, interrupted)
     request = parse_request(arguments[1])
     operation = request.get("operation")
-    if operation != "materialize" and len(arguments) != 4:
+    if operation not in {"materialize", "release"} and len(arguments) != 4:
         fail("artifact_invocation_invalid")
-    workspace_root = checked_root(arguments[3])
+    apps_root = checked_apps_root(arguments[3])
+    workspace_root = None if operation == "release" else checked_root(arguments[3])
     if operation == "inspect":
         validate_request(request, {
             "operation", "repository", "commit", "runtimes", "php_extensions", "frontend",
@@ -1499,10 +1714,17 @@ def main(arguments: list[str]) -> int:
     elif operation == "materialize":
         if len(arguments) != 5:
             fail("artifact_invocation_invalid")
-        validate_request(request, {"operation", "artifact", "store"})
+        validate_request(request, {
+            "operation", "artifact", "store", "build_identity", "release_contract",
+        })
         result = materialize_artifact(
-            request, arguments[2], workspace_root, Path(arguments[3]), arguments[4]
+            request, arguments[2], workspace_root, apps_root, arguments[4]
         )
+    elif operation == "release":
+        if len(arguments) != 5:
+            fail("artifact_invocation_invalid")
+        validate_request(request, {"operation"})
+        result = inspect_live_release(apps_root, arguments[4])
     else:
         fail("artifact_operation_invalid")
     emit(result)

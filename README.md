@@ -214,8 +214,10 @@ Example stdio client configuration:
    deploys its reviewed commit directly.
 6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools,
    `deployment_process_status`, and `diagnose_deployment` for operations.
-7. Use `plan_promotion` / `promote_deployment` to deploy the exact current commit from
-   one deployment to another. The destination source is pinned only after success.
+7. Use `plan_promotion` / `promote_deployment` to deploy the exact current source commit or live
+   artifact from one compatible Deployment to another. Artifact promotion reads verified release
+   metadata and never contacts the Build Target. The destination source is pinned only after
+   success.
 8. Use `plan_remove_deployment` / `remove_deployment` for explicit cleanup.
 
 Laravel candidate probes run inside the release before activation. Live HTTPS probes
@@ -257,9 +259,9 @@ catalog. Runtime schemas returned by `tools/list`, `resources/list`, and
 Gimme provides the multi-target foundation, local SOPS, bounded AWS Secrets Manager stores,
 versioned S3-compatible Artifact Stores, deterministic Laravel artifact publication with Composer
 plus npm, pnpm, Yarn, or Bun and protected build-only secrets, and single-Target artifact
-deployment with existing health-gated activation and automatic live rollback. Artifact promotion,
-explicit rollback, traffic splitting, and fleet scheduling remain future work rather than implied
-production guarantees.
+deployment with existing health-gated activation and automatic live rollback. Artifact and source
+promotion reuse the current live release without rebuilding. Explicit artifact rollback, traffic
+splitting, and fleet scheduling remain future work rather than implied production guarantees.
 
 Resource provider coverage:
 

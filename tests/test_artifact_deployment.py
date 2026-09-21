@@ -11,10 +11,15 @@ from pathlib import Path
 import pytest
 from botocore.exceptions import ClientError
 
-from gimme.artifact_deployment_orchestration import ArtifactDeploymentOrchestrator
+from gimme.artifact_deployment_orchestration import (
+    ArtifactDeploymentOrchestrator,
+    release_contract,
+)
+from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
 from gimme.control import ControlState
 from gimme.deployer import CommandResult
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
+from gimme.execution import execution_fingerprint
 
 
 ROOT = Path(__file__).parents[1]
@@ -75,6 +80,42 @@ STORE = {
     "addressing": "virtual_hosted",
     "encryption": {"method": "aes256"},
 }
+BUILD_IDENTITY = {
+    "application": "example",
+    "repository_fingerprint": "repo_" + "1" * 64,
+    "commit": "b" * 40,
+    "composer_lock_sha256": "2" * 64,
+    "composer_lock_bytes": 100,
+    "frontend_lock": None,
+    "capability": {
+        "php": "8.4.1",
+        "composer": "2.8.4",
+        "php_extensions": [],
+        "system": "linux",
+        "machine": "x86_64",
+        "frontend": None,
+    },
+    "build_policy": {},
+    "runtimes": {},
+    "php_extensions": [],
+    "frontend": None,
+    "packaging_version": "laravel_v1",
+    "execution_fingerprint": "exec_" + "3" * 64,
+}
+RELEASE_CONTRACT = {
+    "schema": "laravel_release_v1",
+    "health_sha256": "4" * 64,
+    "processes_sha256": "5" * 64,
+}
+
+
+def materialize_request(artifact: dict[str, object]) -> dict[str, object]:
+    return {
+        "artifact": artifact,
+        "store": STORE,
+        "build_identity": BUILD_IDENTITY,
+        "release_contract": RELEASE_CONTRACT,
+    }
 
 
 def seed_artifact(tmp_path: Path, fake: FakeS3):
@@ -88,7 +129,8 @@ def seed_artifact(tmp_path: Path, fake: FakeS3):
     archive = tmp_path / "artifact.tar.gz"
     artifact_program.create_archive(entries, archive)
     archive_bytes = archive.read_bytes()
-    build_id = "build_v1_" + "a" * 64
+    encoded = json.dumps(BUILD_IDENTITY, sort_keys=True, separators=(",", ":")).encode()
+    build_id = "build_v1_" + hashlib.sha256(b"gimme-build-v1\0" + encoded).hexdigest()
     package_key, manifest_key, _ = artifact_program.object_keys("example", build_id)
     package_version, manifest_version = "package-v1", "manifest-v1"
     manifest = {
@@ -141,7 +183,7 @@ def test_exact_artifact_is_resolved_and_materialized_with_readonly_metadata(
     release.mkdir(parents=True)
     workspace_root = artifact_program.checked_root(str(apps_root))
     result = artifact_program.materialize_artifact(
-        {"artifact": artifact, "store": STORE},
+        materialize_request(artifact),
         "-",
         workspace_root,
         apps_root,
@@ -154,16 +196,45 @@ def test_exact_artifact_is_resolved_and_materialized_with_readonly_metadata(
     assert (release / "artisan").read_text() == "#!/usr/bin/env php\n<?php\n"
     metadata = release / ".gimme-artifact.json"
     assert stat_mode(metadata) == 0o444
-    assert json.loads(metadata.read_text()) == {
+    expected_metadata = {
         "application": "example",
         "commit": manifest["commit"],
         "build_id": build_id,
         "artifact_digest": manifest["artifact_digest"],
         "tree_digest": manifest["tree_digest"],
+        "bytes": manifest["bytes"],
         "manifest_version": manifest_version,
+        "package_version": manifest["package_version"],
+        "schema_version": 2,
+        "build_secrets_used": False,
+        "build_secret_count": 0,
         "packaging_schema": "laravel_v1",
         "release_mode": "artifact",
+        "promotion_seed": {
+            field: BUILD_IDENTITY[field]
+            for field in sorted({
+                "repository_fingerprint", "composer_lock_sha256",
+                "composer_lock_bytes", "frontend_lock", "capability",
+            })
+        },
+        "release_contract": RELEASE_CONTRACT,
     }
+    assert json.loads(metadata.read_text()) == expected_metadata
+    current = release.parent.parent / "current"
+    current.symlink_to(release)
+    assert artifact_program.inspect_live_release(apps_root, str(current)) == expected_metadata
+    metadata.unlink()
+    with pytest.raises(
+        artifact_program.ArtifactFailure, match="artifact_release_metadata_invalid"
+    ):
+        artifact_program.inspect_live_release(apps_root, str(current))
+    metadata.write_text(json.dumps(expected_metadata, sort_keys=True, separators=(",", ":")))
+    os.chmod(metadata, 0o444)
+    (release / "artisan").write_text("tampered")
+    with pytest.raises(
+        artifact_program.ArtifactFailure, match="artifact_tree_digest_mismatch"
+    ):
+        artifact_program.inspect_live_release(apps_root, str(current))
     assert list(workspace_root.iterdir()) == []
 
 
@@ -197,7 +268,7 @@ def test_tree_mismatch_removes_incomplete_release(tmp_path: Path, monkeypatch) -
 
     with pytest.raises(artifact_program.ArtifactFailure, match="artifact_tree_digest_mismatch"):
         artifact_program.materialize_artifact(
-            {"artifact": artifact, "store": STORE},
+            materialize_request(artifact),
             "-",
             workspace_root,
             apps_root,
@@ -226,7 +297,7 @@ def test_interruption_removes_download_and_incomplete_release(
 
     with pytest.raises(KeyboardInterrupt):
         artifact_program.materialize_artifact(
-            {"artifact": artifact, "store": STORE},
+            materialize_request(artifact),
             "-",
             workspace_root,
             apps_root,
@@ -294,7 +365,10 @@ class ExpectedBuild:
             "build": build,
             "target": self.state.targets[build.target],
             "definition": self.state.artifact_stores[build.artifact_store],
-            "identity": {"commit": deployment.source.ref},
+            "identity": {
+                "commit": deployment.source.ref,
+                "capability": {"system": "linux", "machine": "x86_64"},
+            },
             "build_id": "build_v1_" + "a" * 64,
             "build_secret_versions": [],
         }
@@ -391,7 +465,10 @@ class ArtifactSupport:
             "build": build,
             "target": self.state.targets[build.target],
             "definition": self.state.artifact_stores[build.artifact_store],
-            "identity": {"commit": deployment.source.ref},
+            "identity": {
+                "commit": deployment.source.ref,
+                "capability": {"system": "linux", "machine": "x86_64"},
+            },
             "build_id": "build_v1_" + "a" * 64,
             "build_secret_versions": [],
             "destination_target": self.state.targets[deployment.target],
@@ -405,6 +482,8 @@ class ArtifactSupport:
             "operation": "materialize",
             "artifact": context["artifact"],
             "store": STORE,
+            "build_identity": context["identity"],
+            "release_contract": RELEASE_CONTRACT,
         }
 
     def apply_arguments(self, context):
@@ -423,6 +502,15 @@ def release_operations(state: ControlState, support: ArtifactSupport, calls: lis
                 "GIMME_PROCESS_HELPER|ready",
                 "GIMME_PCNTL|ready",
                 "GIMME_POSIX|ready",
+            ])
+        elif task == "gimme:preflight:artifact-runtimes":
+            output = "\n".join([
+                "GIMME_RUNTIME|php|8.4.1",
+                "GIMME_PLATFORM|linux|x86_64",
+                *(
+                    f"GIMME_PHP_EXTENSION|{extension}|ready"
+                    for extension in state.applications["example"].php_extensions
+                ),
             ])
         elif task == "deploy" and kwargs.get("arguments") == ("--plan",):
             output = "artifact deployment task graph"
@@ -517,7 +605,14 @@ def test_runtime_incompatibility_stops_before_plan_render_or_deploy() -> None:
 
     def incompatible(task, name, **kwargs):
         if task == "gimme:preflight:artifact-runtimes":
-            raise RuntimeError("runtime_incompatible")
+            return CommandResult([], 0, "\n".join([
+                "GIMME_RUNTIME|php|8.4.1",
+                "GIMME_PLATFORM|linux|aarch64",
+                *(
+                    f"GIMME_PHP_EXTENSION|{extension}|ready"
+                    for extension in state.applications["example"].php_extensions
+                ),
+            ]))
         return original_run(task, name, **kwargs)
 
     operations = DeploymentReleaseOrchestrator(
@@ -527,7 +622,7 @@ def test_runtime_incompatibility_stops_before_plan_render_or_deploy() -> None:
         }
     )
 
-    with pytest.raises(RuntimeError, match="runtime_incompatible"):
+    with pytest.raises(RuntimeError, match="artifact_runtime_incompatible"):
         operations.plan_deployment("example-local")
 
     assert not any(call[0] == "deploy" for call in calls)
@@ -604,7 +699,7 @@ def test_malicious_archive_is_rejected_and_incomplete_release_removed(
     expected_error = "unsafe_symlink" if kind == "unsafe_symlink" else "artifact_archive_unsafe"
     with pytest.raises(artifact_program.ArtifactFailure, match=expected_error):
         artifact_program.materialize_artifact(
-            {"artifact": artifact, "store": STORE},
+            materialize_request(artifact),
             "-",
             workspace_root,
             apps_root,
@@ -639,7 +734,7 @@ def test_extractor_enforces_archive_bounds(
 
     with pytest.raises(artifact_program.ArtifactFailure, match=code):
         artifact_program.materialize_artifact(
-            {"artifact": artifact, "store": STORE},
+            materialize_request(artifact),
             "-",
             workspace_root,
             apps_root,
@@ -648,3 +743,364 @@ def test_extractor_enforces_archive_bounds(
 
     assert not release.exists()
     assert list(workspace_root.iterdir()) == []
+
+
+def promotion_state() -> ControlState:
+    state = artifact_state()
+    original = state.deployments["example-local"]
+    source = original.model_copy(update={
+        "placement": original.placement.model_copy(update={
+            "instance": "artifact-source",
+            "relative_path": "deployments/artifact-source",
+            "database_identifier": "artifact_source",
+            "cache_prefix": "gimme:artifact-source:",
+            "site_host": "artifact-source.devbox.local",
+        }),
+    })
+    destination = original.model_copy(update={
+        "source": original.source.model_copy(update={"kind": "branch", "ref": "main"}),
+        "placement": original.placement.model_copy(update={
+            "instance": "artifact-destination",
+            "relative_path": "deployments/artifact-destination",
+            "database_identifier": "artifact_destination",
+            "cache_prefix": "gimme:artifact-destination:",
+            "site_host": "artifact-destination.devbox.local",
+        }),
+    })
+    return state.model_copy(update={
+        "deployments": {"artifact-source": source, "artifact-destination": destination}
+    })
+
+
+def test_promotion_build_identity_is_recomputed_without_build_target(tmp_path: Path) -> None:
+    state = promotion_state()
+    deployment = state.deployments["artifact-destination"]
+    application = state.applications[deployment.application]
+    build = application.build
+    assert build is not None
+    seed = {
+        "repository_fingerprint": "repo_" + "1" * 64,
+        "composer_lock_sha256": "2" * 64,
+        "composer_lock_bytes": 100,
+        "frontend_lock": None,
+        "capability": {
+            "php": "8.4.1",
+            "composer": "2.8.4",
+            "php_extensions": application.php_extensions,
+            "system": "linux",
+            "machine": "x86_64",
+            "frontend": None,
+        },
+    }
+    identity = {
+        "application": deployment.application,
+        **seed,
+        "commit": "a" * 40,
+        "build_policy": {
+            "target": build.target,
+            "artifact_store": build.artifact_store,
+            "packaging": build.packaging,
+            "build_secrets_used": bool(build.secrets),
+            "build_secret_count": len(build.secrets),
+            "build_secret_names": sorted(build.secrets),
+        },
+        "runtimes": {
+            runtime: pin.model_dump(mode="json")
+            for runtime, pin in sorted(deployment.runtimes.items())
+        },
+        "php_extensions": application.php_extensions,
+        "frontend": None,
+        "packaging_version": "laravel_v1",
+        "execution_fingerprint": execution_fingerprint(),
+    }
+    metadata = {
+        "application": deployment.application,
+        "commit": "a" * 40,
+        "build_id": ArtifactBuildOrchestrator.build_id(identity),
+        "promotion_seed": seed,
+    }
+    operations = ArtifactDeploymentOrchestrator(
+        store=DesiredState(state, tmp_path),
+        runner=None,
+        build_orchestrator=ArtifactBuildOrchestrator,
+        legacy_server=lambda target: target,
+    )
+
+    expected = operations.expected_from_release("artifact-destination", metadata)
+
+    assert expected["identity"] == identity
+    assert expected["build_id"] == metadata["build_id"]
+
+
+class MemoryStore:
+    def __init__(self, state: ControlState):
+        self.state = state
+
+    def load(self):
+        return self.state
+
+    def save(self, state):
+        self.state = state
+
+    def deployment(self, name):
+        return self.state.deployments[name]
+
+
+class PromotionSupport:
+    def __init__(self, store: MemoryStore):
+        self.store = store
+        self.compatible = True
+        self.reader_denied = False
+        self.manifest_version = "manifest-v1"
+        self.resolve_calls = 0
+
+    def live_release(self, name):
+        state = self.store.load()
+        deployment = state.deployments[name]
+        application = state.applications[deployment.application]
+        return {
+            "application": deployment.application,
+            "commit": "a" * 40,
+            "build_id": "build_v1_" + "a" * 64,
+            "artifact_digest": "b" * 64,
+            "tree_digest": "c" * 64,
+            "bytes": 4096,
+            "manifest_version": self.manifest_version,
+            "package_version": "package-v1",
+            "schema_version": 2,
+            "build_secrets_used": False,
+            "build_secret_count": 0,
+            "packaging_schema": "laravel_v1",
+            "release_mode": "artifact",
+            "promotion_seed": {
+                "repository_fingerprint": "repo_" + "1" * 64,
+                "composer_lock_sha256": "2" * 64,
+                "composer_lock_bytes": 100,
+                "frontend_lock": None,
+                "capability": {
+                    "php": "8.4.1",
+                    "composer": "2.8.4",
+                    "php_extensions": application.php_extensions,
+                    "system": "linux",
+                    "machine": "x86_64",
+                    "frontend": None,
+                },
+            },
+            "release_contract": release_contract(deployment, application),
+        }
+
+    def expected_from_release(self, name, metadata):
+        state = self.store.load()
+        deployment = state.deployments[name]
+        application = state.applications[deployment.application]
+        build = application.build
+        assert build is not None
+        return {
+            "state": state,
+            "deployment": deployment,
+            "application": application,
+            "build": build,
+            "target": state.targets[build.target],
+            "definition": state.artifact_stores[build.artifact_store],
+            "identity": {
+                "commit": metadata["commit"],
+                "capability": {"system": "linux", "machine": "x86_64"},
+            },
+            "build_id": (
+                metadata["build_id"] if self.compatible else "build_v1_" + "f" * 64
+            ),
+            "build_secret_versions": [],
+        }
+
+    def resolve_expected(self, _name, expected):
+        self.resolve_calls += 1
+        if self.reader_denied:
+            raise RuntimeError("artifact_operation_failed")
+        metadata = self.live_release("artifact-source")
+        return {
+            **expected,
+            "destination_target": self.store.load().targets[expected["deployment"].target],
+            "reader_credential_versions": [],
+            "reader_credentials": {},
+            "artifact": DeploymentReleaseOrchestrator._metadata_artifact(metadata),
+        }
+
+    def materialize_request(self, context):
+        return {
+            "operation": "materialize",
+            "artifact": context["artifact"],
+            "store": STORE,
+            "build_identity": context["identity"],
+            "release_contract": release_contract(
+                context["deployment"], context["application"]
+            ),
+        }
+
+    def apply_arguments(self, context):
+        return self.materialize_request(context), nullcontext(None)
+
+
+def promotion_operations(store: MemoryStore, support: PromotionSupport, calls: list):
+    @contextmanager
+    def locks(*_names):
+        yield
+
+    def run(task, name, **kwargs):
+        calls.append((task, name, kwargs))
+        if task == "gimme:preflight:artifact-runtimes":
+            output = "\n".join([
+                "GIMME_RUNTIME|php|8.4.1",
+                "GIMME_PLATFORM|linux|x86_64",
+                *(
+                    f"GIMME_PHP_EXTENSION|{extension}|ready"
+                    for extension in store.load().applications["example"].php_extensions
+                ),
+            ])
+        elif task == "deploy" and kwargs.get("arguments") == ("--plan",):
+            output = "artifact promotion task graph"
+        else:
+            output = "deployed"
+        return CommandResult([], 0, output)
+
+    def assert_plan(expected, actual):
+        if expected["plan_id"] != actual:
+            raise ValueError("plan does not match current state")
+
+    return DeploymentReleaseOrchestrator(
+        store=store,
+        context=lambda name: (
+            store.load(),
+            store.load().deployments[name],
+            store.load().targets[store.load().deployments[name].target],
+            store.load().applications[store.load().deployments[name].application],
+        ),
+        run_deployment=run,
+        secret_plan=lambda *_arguments: ([], []),
+        dns_issues=lambda *_arguments: [],
+        managed_database_issues=lambda *_arguments: [],
+        valkey_runtime=lambda *_arguments: (None, None, None, []),
+        deployment_resource_lock=locks,
+        deployment_resource_locks=locks,
+        assert_plan=assert_plan,
+        replace=lambda state, _field, name, deployment: state.model_copy(update={
+            "deployments": {**state.deployments, name: deployment}
+        }),
+        result=lambda value: value.as_dict(),
+        artifact_deployment=support,
+    )
+
+
+def test_artifact_promotion_reuses_live_publication_without_build_target() -> None:
+    store = MemoryStore(promotion_state())
+    support = PromotionSupport(store)
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+
+    plan = operations.plan_promotion("artifact-source", "artifact-destination")
+    assert plan["ready"] is True
+    assert plan["compatibility"] == {
+        "status": "compatible",
+        "build_id_matches": True,
+        "release_contract_matches": True,
+    }
+    assert plan["artifact"]["manifest_version"] == "manifest-v1"
+    result = operations.promote_deployment(
+        "artifact-source", "artifact-destination", plan["plan_id"]
+    )
+
+    assert result["output"] == "deployed"
+    assert store.deployment("artifact-destination").source.ref == "a" * 40
+    applied = [call for call in calls if call[0] == "deploy" and not call[2].get("arguments")]
+    assert applied[-1][2]["artifact_request"]["artifact"] == plan["artifact"]
+
+
+def test_incompatible_artifact_promotion_is_inspectable_and_does_not_resolve_reader() -> None:
+    store = MemoryStore(promotion_state())
+    support = PromotionSupport(store)
+    support.compatible = False
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+
+    plan = operations.plan_promotion("artifact-source", "artifact-destination")
+
+    assert plan["ready"] is False
+    assert plan["readiness_issues"] == ["artifact_incompatible"]
+    assert support.resolve_calls == 0
+    assert calls == []
+
+
+def test_artifact_promotion_rejects_changed_health_contract_without_remote_mutation() -> None:
+    store = MemoryStore(promotion_state())
+    destination = store.deployment("artifact-destination").model_copy(
+        update={"health": None}
+    )
+    store.state = store.state.model_copy(update={
+        "deployments": {
+            **store.state.deployments,
+            "artifact-destination": destination,
+        }
+    })
+    support = PromotionSupport(store)
+    calls: list = []
+
+    plan = promotion_operations(store, support, calls).plan_promotion(
+        "artifact-source", "artifact-destination"
+    )
+
+    assert plan["compatibility"]["release_contract_matches"] is False
+    assert plan["readiness_issues"] == ["artifact_incompatible"]
+    assert support.resolve_calls == 0
+    assert calls == []
+
+
+def test_artifact_promotion_rejects_stale_source_metadata_before_activation() -> None:
+    store = MemoryStore(promotion_state())
+    support = PromotionSupport(store)
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+    plan = operations.plan_promotion("artifact-source", "artifact-destination")
+    support.manifest_version = "manifest-v2"
+
+    with pytest.raises(ValueError, match="plan does not match current state"):
+        operations.promote_deployment(
+            "artifact-source", "artifact-destination", plan["plan_id"]
+        )
+    assert not any(call[0] == "deploy" and not call[2].get("arguments") for call in calls)
+
+
+def test_artifact_promotion_reader_denial_is_fail_closed() -> None:
+    store = MemoryStore(promotion_state())
+    support = PromotionSupport(store)
+    support.reader_denied = True
+    calls: list = []
+
+    with pytest.raises(RuntimeError, match="^artifact_operation_failed$"):
+        promotion_operations(store, support, calls).plan_promotion(
+            "artifact-source", "artifact-destination"
+        )
+    assert not any(call[0] == "deploy" for call in calls)
+
+
+def test_failed_artifact_promotion_does_not_update_destination_source() -> None:
+    store = MemoryStore(promotion_state())
+    support = PromotionSupport(store)
+    calls: list = []
+    operations = promotion_operations(store, support, calls)
+    plan = operations.plan_promotion("artifact-source", "artifact-destination")
+    before = store.deployment("artifact-destination").source
+    original_run = operations.run_deployment
+
+    def fail_activation(task, name, **kwargs):
+        if task == "deploy" and not kwargs.get("arguments"):
+            raise RuntimeError("health_failed")
+        return original_run(task, name, **kwargs)
+
+    operations = DeploymentReleaseOrchestrator(
+        **{**operations.__dict__, "run_deployment": fail_activation}
+    )
+
+    with pytest.raises(RuntimeError, match="health_failed"):
+        operations.promote_deployment(
+            "artifact-source", "artifact-destination", plan["plan_id"]
+        )
+    assert store.deployment("artifact-destination").source == before

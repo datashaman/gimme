@@ -357,6 +357,7 @@ task('gimme:preflight:artifact-runtimes', function (): void {
         throw new \RuntimeException('PHP version does not match desired state');
     }
     writeln("GIMME_RUNTIME|php|{$actual}");
+    writeln('GIMME_PLATFORM|' . strtolower(PHP_OS_FAMILY) . '|' . strtolower(php_uname('m')));
     foreach (configured_php_extensions() as $extension) {
         run($phpBinary . ' -r ' . escapeshellarg(
             "exit(extension_loaded('{$extension}') ? 0 : 1);",
@@ -892,7 +893,7 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
     $request = json_decode($requestJson, true, flags: JSON_THROW_ON_ERROR);
     if (!is_array($request) || !in_array(
         $request['operation'] ?? null,
-        ['inspect', 'publication', 'build', 'inventory', 'resolve', 'materialize'],
+        ['inspect', 'publication', 'build', 'inventory', 'resolve', 'materialize', 'release'],
         true,
     )) {
         throw new \RuntimeException('Artifact request has an unexpected shape');
@@ -914,9 +915,11 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
             run('chmod 0600 ' . escapeshellarg($remoteCredential));
             $credentialArgument = $remoteCredential;
         }
-        $releaseArgument = $request['operation'] === 'materialize'
-            ? ' ' . escapeshellarg('{{release_path}}')
-            : '';
+        $releaseArgument = match ($request['operation']) {
+            'materialize' => ' ' . escapeshellarg('{{release_path}}'),
+            'release' => ' ' . escapeshellarg(get('deploy_path') . '/current'),
+            default => '',
+        };
         $output = run(
             'python3 ' . escapeshellarg($remoteProgram) . ' ' .
             escapeshellarg(base64_encode($requestJson)) . ' ' .
