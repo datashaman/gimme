@@ -241,8 +241,9 @@ while retaining automated backups, and removes only Resource-owned parameter/sub
 ```
 
 The provisioning policy was exercised against a live account with the AWS-managed `aws/rds`
-and `aws/secretsmanager` keys. The workload activation and rotation additions have deterministic
-adapter coverage but still require the opt-in live harness tracked by #181. The
+and `aws/secretsmanager` keys. Run the zero-cost and separately authorized live matrices in
+[`validate-aws-rds-postgresql-live.md`](validate-aws-rds-postgresql-live.md) for workload
+activation, rotation, retention, Recovery, and cleanup evidence. The
 `RdsParameterGroup` and `RdsModifyAndReboot` statements and the
 `pg:gimme-*` resource on `RdsCreateAndDescribe` were exercised live in `eu-central-1` (create,
 a combined instance class, storage, and security-group modification, re-attaching the
@@ -433,8 +434,9 @@ secret-free phase receipt makes retries resume after either operation without br
 ## Inspect and remove
 
 `inspect_resource` describes the instance through the inspection role and returns a bounded
-identity fingerprint, status, engine version, readiness issues, and allocation status. It does
-not return an endpoint or ARN. If AWS cannot be reached it
+identity fingerprint, status, engine version, topology and protection booleans, lifecycle
+windows and retention, readiness issues, and allocation status. It does not return an endpoint
+or ARN. If AWS cannot be reached it
 returns the last observed state with a bounded `refresh_error` and no drift.
 
 After a successful live read it also reports `drift`: `fields` lists, for each of

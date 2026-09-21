@@ -101,6 +101,7 @@ For guided workflows, see:
 - [`docs/how-to/place-deployments-on-a-fleet.md`](docs/how-to/place-deployments-on-a-fleet.md)
 - [`docs/how-to/prepare-an-artifact-rollout.md`](docs/how-to/prepare-an-artifact-rollout.md)
 - [`docs/how-to/restore-a-postgresql-deployment.md`](docs/how-to/restore-a-postgresql-deployment.md)
+- [`docs/how-to/validate-aws-rds-postgresql-live.md`](docs/how-to/validate-aws-rds-postgresql-live.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
 ## Target bootstrap

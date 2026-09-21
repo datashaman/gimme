@@ -126,6 +126,7 @@ def setup() -> None:
         "avahi-utils",
         "caddy",
         "postgresql",
+        "postgresql-contrib",
         "python3",
         "python3-boto3",
         "valkey-server",
