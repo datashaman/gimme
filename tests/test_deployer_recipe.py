@@ -585,6 +585,55 @@ def test_frontend_build_runs_after_composer_dependencies() -> None:
     assert "after('deploy:update_code', 'gimme:frontend')" not in recipe
 
 
+def test_artifact_mode_replaces_source_and_dependency_tasks() -> None:
+    recipe = deployer_source()
+
+    assert "$hasFrontend = $releaseMode === 'source'" in recipe
+    assert "task('deploy:update_code', static function (): void" in recipe
+    assert "invoke('gimme:artifact:run')" in recipe
+    assert "task('deploy:vendors', static function (): void" in recipe
+    assert "task('gimme:preflight:artifact-runtimes'" in recipe
+    artifact_preflight = recipe.split(
+        "task('gimme:preflight:artifact-runtimes'", 1
+    )[1].split("task('gimme:preflight:frontend'", 1)[0]
+    assert "composer" not in artifact_preflight
+    assert "node" not in artifact_preflight
+    assert "packageManager" not in artifact_preflight
+    assert "GIMME_ARTIFACT_SECRET_FILE" in recipe
+    assert "{{release_path}}" in recipe
+
+
+def test_artifact_plan_preserves_health_activation_process_and_cleanup_order() -> None:
+    plan = rendered_deploy_plan(
+        {
+            "name": "primary",
+            "phases": ["candidate", "live"],
+            "path": "/up",
+            "expected_status": 200,
+            "attempts": 1,
+            "delay_seconds": 0,
+            "timeout_seconds": 3,
+        },
+        {"GIMME_RELEASE_MODE": "artifact"},
+    )
+
+    ordered = [
+        "deploy:update_code",
+        "deploy:env",
+        "deploy:shared",
+        "artisan:optimize",
+        "artisan:migrate",
+        "gimme:health:candidate",
+        "deploy:symlink",
+        "gimme:health:live",
+        "gimme:restart:workers",
+        "deploy:cleanup",
+    ]
+    assert [plan.index(task) for task in ordered] == sorted(
+        plan.index(task) for task in ordered
+    )
+
+
 def test_artisan_task_runs_only_allowlisted_escaped_arguments_in_current_release() -> None:
     recipe = deployer_source()
     task = recipe.split("task('gimme:artisan'", 1)[1].split("task('gimme:service:status'", 1)[0]

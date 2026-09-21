@@ -43,6 +43,7 @@ from gimme.control_plane_registration_orchestration import (
 )
 from gimme.artifact_store_orchestration import ArtifactStoreOrchestrator
 from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
+from gimme.artifact_deployment_orchestration import ArtifactDeploymentOrchestrator
 from gimme.recovery import ComponentDump
 from gimme.recovery_orchestration import RecoveryOrchestrator
 from gimme.resource_orchestration import ManagedResourceOrchestrator
@@ -144,6 +145,15 @@ def _artifact_build_orchestrator() -> ArtifactBuildOrchestrator:
         assert_plan=_assert_plan,
         legacy_server=legacy_server,
         legacy_app=legacy_app,
+    )
+
+
+def _artifact_deployment_orchestrator() -> ArtifactDeploymentOrchestrator:
+    return ArtifactDeploymentOrchestrator(
+        store=store,
+        runner=runner,
+        build_orchestrator=_artifact_build_orchestrator(),
+        legacy_server=legacy_server,
     )
 
 
@@ -250,6 +260,7 @@ def _deployment_release_orchestrator() -> DeploymentReleaseOrchestrator:
         assert_plan=_assert_plan,
         replace=_replace,
         result=_result,
+        artifact_deployment=_artifact_deployment_orchestrator(),
     )
 
 
@@ -473,6 +484,8 @@ def _run_deployment(
     recovery_schedule_authority: dict[str, object] | None = None,
     recovery_schedule_valkey_file: Path | None = None,
     recovery_on_demand_request_id: str | None = None,
+    artifact_request: dict[str, object] | None = None,
+    artifact_secret_file: Path | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -504,12 +517,15 @@ def _run_deployment(
             else deployment.placement.cache_prefix
         ),
         source_kind=deployment.source.kind, sites=target_sites(state, deployment.target),
+        release_mode=deployment.release_mode,
         network_mode=target.network.mode,
         runtimes={key: value.model_dump(mode="json") for key, value in deployment.runtimes.items()},
         resources=bound_resources, mise_version=target.runtimes.mise_version,
         php_extensions=application.php_extensions,
         variables={**deployment.variables, **contract_values}, valkey_probe=probe,
         secret_file=secret_file,
+        artifact_request=artifact_request,
+        artifact_secret_file=artifact_secret_file,
         secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(

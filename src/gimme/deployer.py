@@ -118,6 +118,7 @@ class DeployerRunner:
         database_identifier: str | None = None,
         cache_prefix: str | None = None,
         source_kind: str = "branch",
+        release_mode: str = "source",
         sites: Sequence[dict[str, str]] | None = None,
         network_mode: str = "local_mdns",
         runtimes: dict[str, dict[str, str]] | None = None,
@@ -127,6 +128,7 @@ class DeployerRunner:
         variables: dict[str, str] | None = None,
         valkey_probe: dict[str, object] | None = None,
         secret_file: Path | None = None,
+        artifact_secret_file: Path | None = None,
         secret_manifest: Sequence[dict[str, str]] | None = None,
         artifact_store: dict[str, object] | None = None,
         artifact_probe_role: str | None = None,
@@ -228,6 +230,15 @@ class DeployerRunner:
             if not resolved_secret_file.is_file():
                 raise ValueError("secret_file must be a regular local file")
             environment["GIMME_SECRET_FILE"] = str(resolved_secret_file)
+        if artifact_secret_file is not None:
+            if artifact_secret_file.is_symlink():
+                raise ValueError("artifact_secret_file must be a regular local file")
+            resolved_artifact_secret_file = artifact_secret_file.resolve()
+            if not resolved_artifact_secret_file.is_file():
+                raise ValueError("artifact_secret_file must be a regular local file")
+            environment["GIMME_ARTIFACT_SECRET_FILE"] = str(
+                resolved_artifact_secret_file
+            )
         if secret_manifest is not None:
             environment["GIMME_SECRET_MANIFEST_JSON"] = json.dumps(list(secret_manifest))
         artifact_values = (artifact_store, artifact_probe_role)
@@ -249,7 +260,9 @@ class DeployerRunner:
                 environment["GIMME_ARTIFACT_READER_VERSION"] = artifact_reader_version
         if artifact_request is not None:
             operation = artifact_request.get("operation")
-            if operation not in {"inspect", "publication", "build", "inventory"}:
+            if operation not in {
+                "inspect", "publication", "build", "inventory", "resolve", "materialize",
+            }:
                 raise ValueError("artifact request operation is invalid")
             encoded_request = json.dumps(
                 artifact_request, sort_keys=True, separators=(",", ":")
@@ -361,6 +374,7 @@ class DeployerRunner:
                     "GIMME_FRAMEWORK": app.framework,
                     "GIMME_BRANCH": definition.branch,
                     "GIMME_SOURCE_KIND": source_kind,
+                    "GIMME_RELEASE_MODE": release_mode,
                     "GIMME_APP_ENV": definition.app_env,
                     "GIMME_APP_DEBUG": "true" if definition.app_debug else "false",
                     "GIMME_WORKERS_JSON": json.dumps(
