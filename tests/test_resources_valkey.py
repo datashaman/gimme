@@ -1320,6 +1320,30 @@ def test_registration_rejects_a_node_type_the_account_cannot_use(tmp_path, monke
     server_module.register_resource(NAME, valkey(node_type="cache.m7g.xlarge"))
 
 
+@pytest.mark.parametrize("node_type", ["cache.t4g.small", "cache.m5.large", "cache.r5.large"])
+def test_a_node_family_without_documented_durability_is_refused_before_any_aws_read(
+    tmp_path, monkeypatch, node_type
+) -> None:
+    adapter = FakeValkey()
+    adapter.options = ValkeyOptions(("9.0",), (node_type,))  # AWS lists it; still not durable
+    use_state(tmp_path, monkeypatch, adapter=adapter, registered=False)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("the family gate needs no provider read")
+
+    adapter.live_options = unexpected  # type: ignore[method-assign]
+    with pytest.raises(ResourceError, match="^aws_elasticache_node_type_not_durable$"):
+        server_module.register_resource(NAME, valkey(node_type=node_type))
+    assert NAME not in server_module.store.load().resources
+
+
+def test_an_update_to_a_non_durable_family_is_refused(tmp_path, monkeypatch) -> None:
+    use_state(tmp_path, monkeypatch)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_node_type_not_durable$"):
+        server_module.plan_update_resource(NAME, valkey(node_type="cache.t4g.small"))
+
+
 def test_an_update_checks_the_node_type_only_when_it_changes(tmp_path, monkeypatch) -> None:
     adapter = FakeValkey()
     use_state(tmp_path, monkeypatch, adapter=adapter)
@@ -1500,6 +1524,8 @@ def test_live_options_page_through_versions_and_offerings(monkeypatch) -> None:
         "describe_reserved_cache_nodes_offerings",
         {"ReservedCacheNodesOfferings": [
             {"CacheNodeType": "cache.m7g.large"}, {"CacheNodeType": "not-a-cache-type"},
+            {"CacheNodeType": "cache.t4g.small"}, {"CacheNodeType": "cache.m5.large"},
+            {"CacheNodeType": "cache.c7gn.large"}, {"CacheNodeType": "cache.m7gx.large"},
         ]},
         {"Marker": "more"},
     )
@@ -1510,7 +1536,7 @@ def test_live_options_page_through_versions_and_offerings(monkeypatch) -> None:
         options = adapter.live_options(account, network)
 
     assert options == ValkeyOptions(
-        ("9.0", "9.1", "10.0"), ("cache.m7g.large", "cache.m7g.xlarge")
+        ("9.0", "9.1", "10.0"), ("cache.c7gn.large", "cache.m7g.large", "cache.m7g.xlarge")
     )
     stub.assert_no_pending_responses()
 

@@ -184,13 +184,16 @@ deleting a `default`-named user is allowed, are unverified.
 ```
 
 - `engine_version` is an exact Valkey version, 9.0 or later, in its canonical spelling.
-  `node_type` is `cache.<family>.<size>`. Registering, or updating to, a `node_type` the
-  account does not offer in the network's region is refused with
-  `aws_elasticache_node_type_unavailable`, so registration now reads from AWS through the
-  inspection role. AWS does not say which node types support synchronous durability, so one
-  that does not is only rejected at creation, with a bounded error. Read
-  `gimme://aws-networks/<network>/valkey-options` for the exact Valkey versions and node types
-  the account offers.
+  `node_type` is `cache.<family>.<size>` in a family AWS documents as durable: `r8g`, `r7g`,
+  `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, or `c7gn`. Registering, or updating to, any other family is
+  refused with `aws_elasticache_node_type_not_durable` before any AWS call, and a durable-family
+  type the account does not offer in the network's region is refused with
+  `aws_elasticache_node_type_unavailable`, so registration reads from AWS through the inspection
+  role. AWS has no call that reports durability support per node type, so the family list comes
+  from AWS's documentation ([Durability limitations](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Durability.Limitations.html))
+  and a listed type that still cannot run synchronous durability is rejected at creation with a
+  bounded error. Read `gimme://aws-networks/<network>/valkey-options` for the exact Valkey
+  versions and node types that are both offered by the account and in a durable family.
 - `administration_security_group_id` is the security group of the administration Target and
   `deployment_security_group_ids` maps each Deployment Target that may bind the Resource to its
   security group, exactly as for RDS. They are the only sources allowed to reach the Valkey

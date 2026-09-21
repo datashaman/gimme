@@ -5,6 +5,10 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Limited managed Valkey node types to the instance families AWS documents as durable (`r8g`,
+  `r7g`, `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, `c7gn`). `gimme://aws-networks/{name}/valkey-options`
+  lists only those types the account offers, and registering or updating to another family is
+  refused before any AWS call with `aws_elasticache_node_type_not_durable`.
 - Added schema-v7 deterministic fleet placement. Targets declare bounded Deployment slots;
   reviewed registration can use one explicit Target or a bounded candidate policy; planning
   explains safe rejection reasons and selects by occupied ratio, free slots, then name; apply
