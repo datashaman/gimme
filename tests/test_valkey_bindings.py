@@ -145,7 +145,7 @@ def test_a_v4_cache_binding_becomes_a_cache_use(tmp_path) -> None:
     migrated = migrate(tmp_path, v4())
 
     binding = migrated.deployments["example-local"].resources.valkey
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert binding is not None and (binding.resource, binding.uses) == ("devbox-valkey", ["cache"])
 
 
@@ -218,7 +218,7 @@ def test_v4_state_is_not_loadable_until_migrated(tmp_path) -> None:
 
 
 def test_v6_state_cannot_be_migrated_again(tmp_path) -> None:
-    with pytest.raises(ValueError, match="schema-v6 state already exists"):
+    with pytest.raises(ValueError, match="schema-v7 state already exists"):
         migrate(tmp_path, document())
 
 

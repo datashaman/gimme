@@ -60,7 +60,7 @@ State defaults to `config/state.json`. Set `GIMME_STATE_DIR` to keep operational
 elsewhere; the directory contains:
 
 ```text
-state.json          # schema-v6 desired state, provider accounts, stores, and pins
+state.json          # schema-v7 desired state, fleet capacity, stores, and pins
 secrets.enc.json    # SOPS-encrypted secret values
 .gimme.lock         # local atomic-write lock
 operations.jsonl    # append-only, secret-safe plan/apply/outcome evidence
@@ -75,10 +75,10 @@ reveal private inventory. To make state Git-backed, point `GIMME_STATE_DIR` at a
 separate private repository. Legacy 0.4 manifests remain ignored for the same reason.
 Copy the example for a new installation, or use the migration tools for an older installation:
 
-1. call `plan_state_migration` with an explicit release mode for every Deployment and any
-   Artifact Store/Application build policy required by artifact-mode Deployments;
+1. call `plan_state_migration`; schema-v5 and older inputs also require an explicit release mode
+   for every Deployment and any Artifact Store/Application build policy required by artifact mode;
 2. review its preserved placements and effects;
-3. pass the same explicit policy and exact `plan_id` to `apply_state_migration`;
+3. pass the exact `plan_id` and any required older-schema policy to `apply_state_migration`;
 4. commit the resulting desired state only if that repository is intended to hold
    your operational inventory.
 
@@ -98,6 +98,7 @@ For guided workflows, see:
 - [`docs/how-to/migrate-a-runtime-to-mise.md`](docs/how-to/migrate-a-runtime-to-mise.md)
 - [`docs/how-to/use-aws-secret-stores.md`](docs/how-to/use-aws-secret-stores.md)
 - [`docs/how-to/use-backup-destinations.md`](docs/how-to/use-backup-destinations.md)
+- [`docs/how-to/place-deployments-on-a-fleet.md`](docs/how-to/place-deployments-on-a-fleet.md)
 - [`docs/how-to/restore-a-postgresql-deployment.md`](docs/how-to/restore-a-postgresql-deployment.md)
 - [`docs/explanation/control-plane.md`](docs/explanation/control-plane.md)
 
@@ -203,7 +204,8 @@ Example stdio client configuration:
 
 ## Workflow
 
-1. Register or migrate targets, applications, resources, and deployments.
+1. Register or migrate targets, applications, and resources; use
+   `plan_register_deployment` / `register_deployment` for reviewed explicit or fleet placement.
 2. `inspect_target`, then `plan_target_stack` / `apply_target_stack`.
 3. `plan_deployment_runtimes` / `apply_deployment_runtimes` to install and verify pins.
 4. `plan_deployment_resources` / `apply_deployment_resources` to reconcile routing,
@@ -239,6 +241,7 @@ Laravel's graceful restart model and avoiding a PHP-FPM reload.
 Read-only resources:
 
 - `gimme://state`
+- `gimme://fleet`
 - `gimme://operations`
 - `gimme://targets/{name}`
 - `gimme://applications/{name}`

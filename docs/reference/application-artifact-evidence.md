@@ -24,7 +24,7 @@ The canonical scenario is
 | Source mode remains local/preview only | release-mode validation tests and existing source deployment suite |
 | Two Targets, reader-only operation, Build Target/Git loss, and exact reuse | `test_two_targets_reuse_one_exact_artifact_without_builder_or_repository`; reader-denial and no-publisher-fallback tests |
 | Bounded, safe, non-deleting inventory | inventory empty/degraded/bounds tests in `test_artifact_build.py`; no delete operation exists in the artifact interface |
-| Complete MCP discovery/reference and operator workflow | `test_hard_v6_tool_surface`, [MCP reference](mcp.md), and [operator guide](../how-to/use-application-artifacts.md) |
+| Complete MCP discovery/reference and operator workflow | `test_hard_v7_tool_surface`, [MCP reference](mcp.md), and [operator guide](../how-to/use-application-artifacts.md) |
 | Complete repository verification | `bash scripts/gimme-verify` |
 
 The two-Target scenario reuses one `build_id`, manifest version, package version, archive digest,

@@ -38,6 +38,7 @@ from gimme.control import (
     StateStore,
     TargetConfig,
     TargetNetwork,
+    explicit_placement_decision,
 )
 from gimme.deployer import CommandResult
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
@@ -66,6 +67,7 @@ def sample_state() -> ControlState:
         system_hostname="devbox",
         remote_user="deployer",
         apps_root="/srv/gimme/apps",
+        deployment_slots=2,
         network=TargetNetwork(mode="local_mdns", mdns_name="devbox"),
         stack=StackConfig(package_manager="apt", packages=["git"], services=[]),
     )
@@ -94,6 +96,7 @@ def sample_state() -> ControlState:
             cache_prefix="gimme:example-app:",
             site_host="example-app.devbox.local",
         ),
+        placement_decision=explicit_placement_decision("devbox", target),
     )
     return ControlState(
         targets={"devbox": target},
@@ -499,7 +502,7 @@ def test_resource_retirement_mcp_adapter_uses_current_orchestrator(
     assert seen == ["shared-cache"]
 
 
-async def test_hard_v6_tool_surface() -> None:
+async def test_hard_v7_tool_surface() -> None:
     async with Client(mcp) as client:
         tools = await client.list_tools()
         resources = await client.list_resources()
@@ -515,6 +518,8 @@ async def test_hard_v6_tool_surface() -> None:
         "register_application",
         "register_resource",
         "register_deployment",
+        "plan_register_deployment",
+        "inspect_fleet",
         "plan_target_stack",
         "apply_target_stack",
         "plan_deployment_runtimes",
@@ -561,7 +566,7 @@ async def test_hard_v6_tool_surface() -> None:
         "apply_verify_restore",
     }
     assert {str(resource.uri) for resource in resources} == {
-        "gimme://state", "gimme://operations"
+        "gimme://state", "gimme://operations", "gimme://fleet"
     }
     assert {template.uriTemplate for template in templates} == {
         "gimme://targets/{name}",
@@ -896,11 +901,20 @@ def test_register_deployment_allocates_immutable_placement(tmp_path, monkeypatch
         runtimes=sample_state().deployments["example-app"].runtimes,
         resources=sample_state().deployments["example-app"].resources,
     )
-    result = server_module.register_deployment("example-preview", definition)
+    registration = server_module.plan_register_deployment("example-preview", definition)
+    result = server_module.register_deployment(
+        "example-preview", definition, str(registration["plan_id"])
+    )
     placement = selected.deployment("example-preview").placement
 
     assert result["placement"] == placement.model_dump(mode="json")
     assert placement.relative_path == "deployments/example-preview"
+    events = server_module.list_operations(
+        operation="register_deployment", subject="example-preview"
+    )["events"]
+    assert [event["phase"] for event in events[:3]] == ["outcome", "apply", "plan"]
+    assert events[0]["status"] == "succeeded"
+    assert events[1]["plan_correlation_id"] == events[2]["correlation_id"]
     update = definition.model_copy(update={"source": DeploymentSource(kind="branch", ref="next")})
     plan = server_module.plan_update_deployment("example-preview", update)
     server_module.update_deployment("example-preview", update, str(plan["plan_id"]))
@@ -1311,7 +1325,7 @@ def test_non_artisan_deployment_does_not_receive_partial_artisan_context(
 def test_state_resource_does_not_decrypt_secrets(tmp_path, monkeypatch) -> None:
     use_store(tmp_path, monkeypatch)
     value = server_module.desired_state()
-    assert value["schema_version"] == 6
+    assert value["schema_version"] == 7
     assert "deployments" in value
 
 

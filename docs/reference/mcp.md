@@ -1,7 +1,7 @@
 # MCP reference
 
 Gimme is a local stdio MCP server built with FastMCP. Its desired state is stored in
-schema-v6 JSON; decrypted secrets are never returned by resources or tools.
+schema-v7 JSON; decrypted secrets are never returned by resources or tools.
 
 Runtime schemas returned by MCP discovery are authoritative. This page documents the
 stable intent, mutation boundary, and pairing of each primitive.
@@ -13,8 +13,9 @@ stable intent, mutation boundary, and pairing of each primitive.
   recomputes the plan and rejects stale or altered IDs.
 - Every plan includes an `execution_fingerprint`; executable control-plane or dependency
   changes invalidate its `plan_id` before apply.
-- Target, Application, Resource, and Deployment registration tools create local entries
-  directly. Provider Account and Secret Store registration is plan/apply because it verifies
+- Target, Application, and Resource registration tools create local entries directly. Deployment
+  registration is plan/apply because it reserves bounded capacity and may inspect policy
+  candidates. Provider Account and Secret Store registration is plan/apply because it verifies
   external identity and policy.
 - `rollback_deployment` and `remove_deployment` require exact confirmation text. Rollback uses
   `ROLLBACK <deployment> TO <release>` from its reviewed plan.
@@ -26,6 +27,7 @@ stable intent, mutation boundary, and pairing of each primitive.
 | URI | Contents |
 | --- | --- |
 | `gimme://state` | Complete desired state with artifact auth and build-secret references replaced by bounded public projections |
+| `gimme://fleet` | Desired Target slot capacity, reservations, free slots, and overcommit without live calls |
 | `gimme://operations` | The 50 most recent secret-safe operation events, newest first |
 | `gimme://targets/{name}` | One target and its network, stack, and runtime policy |
 | `gimme://applications/{name}` | One reusable application definition without build-secret names or references |
@@ -39,14 +41,14 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
 
-The parameterized URIs are resource templates. `gimme://state` and
+The parameterized URIs are resource templates. `gimme://state`, `gimme://fleet`, and
 `gimme://operations` are concrete resources.
 
 ## State and inventory tools
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
-| `plan_state_migration` | Read | Inspect installed versions and plan schema-v6 migration from explicit per-Deployment release modes, Artifact Stores, and Application build policies |
+| `plan_state_migration` | Read | Plan schema-v7 migration, preserving placements and assigning no accidental spare Target capacity |
 | `apply_state_migration` | Local write | Apply the exact migration plan atomically |
 | `list_targets` | Read | List registered targets and provisioning policy |
 | `list_applications` | Read | List application source/build definitions without build-secret names or references |
@@ -58,6 +60,7 @@ The parameterized URIs are resource templates. `gimme://state` and
 | `list_artifact_stores` | Read | List bounded Artifact Store policies without credential references or values |
 | `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
+| `inspect_fleet` | Remote read | Inspect bounded Target readiness without changing placement |
 
 ## Operation journal
 
@@ -114,13 +117,33 @@ bounded to 200 records per call.
 | `register_resource` | Local write | Register a named, exact-version PostgreSQL or Valkey resource |
 | `plan_update_resource` | Read | Diff a proposed resource update |
 | `update_resource` | Local write | Apply an exact resource update plan |
-| `register_deployment` | Local write | Register a deployment and allocate immutable placement identities |
+| `plan_register_deployment` | Remote read for policy placement | Explain capacity, eligibility, deterministic selection, and immutable placement effects |
+| `register_deployment` | Local write | Reserve one slot and persist the reviewed immutable placement |
 | `plan_update_deployment` | Read | Diff a deployment update while preserving placement |
 | `update_deployment` | Local write | Apply an exact deployment update plan |
 
+### Fleet placement
+
+Every Target declares `deployment_slots` from 0 through 1024. Each Deployment reserves one slot
+regardless of release or health state. A capacity reduction never evicts or relocates existing
+Deployments; `gimme://fleet` reports overcommit and new admission stops.
+
+Deployment registration chooses either one explicit `target` or a `placement_policy` containing
+1–64 unique registered candidates. Policy planning freshly checks bounded reachability, bootstrap
+and Target policy, network and Resource compatibility, exact system/bundled runtimes, and
+capacity. Supported missing mise-managed pins remain eligible for later installation. Candidate
+failures are fixed safe reason codes and do not fail the plan while another candidate is eligible.
+
+Selection uses lowest occupied-slot ratio, then greatest free slots, then lexical Target name.
+Apply repeats inspection and rejects any changed state or observation before an exclusive
+reload–validate–write reservation. The stored `PlacementDecision` is immutable. Target loss keeps
+the Deployment and slot on the selected Target; automatic relocation and rebalancing are not
+implemented. See [fleet placement](../how-to/place-deployments-on-a-fleet.md).
+
 ### Artifact Stores and release mode
 
-Schema v6 requires every Deployment to declare `release_mode: source | artifact`.
+Schema v7 retains the schema-v6 requirement that every Deployment declares
+`release_mode: source | artifact`.
 `source` is valid only for local and preview stages. Staging and production must use
 `artifact`, which requires the Application to have a Laravel build policy naming one
 registered Deployment-capable Target, one registered Artifact Store, and the bounded

@@ -36,6 +36,7 @@ from gimme.control import (
     TargetNetwork,
     TargetRuntimePolicy,
     WeeklyRecoveryCadence,
+    explicit_placement_decision,
     new_placement,
 )
 
@@ -56,6 +57,7 @@ def target(mode: str = "local_mdns") -> TargetConfig:
         system_hostname="devbox",
         remote_user="deployer",
         apps_root="/srv/gimme/apps",
+        deployment_slots=2,
         network=network,
         stack=StackConfig(package_manager="apt", packages=["git"], services=[]),
     )
@@ -84,6 +86,7 @@ def deployment(target_config: TargetConfig, **updates: object) -> DeploymentConf
         },
         "resources": ResourceBindings(database="devbox-postgres", valkey=LOCAL_VALKEY),
         "placement": new_placement("example-local", target_config),
+        "placement_decision": explicit_placement_decision("devbox", target_config),
     }
     values.update(updates)
     return DeploymentConfig.model_validate(values)
@@ -105,7 +108,7 @@ def test_control_state_references_registered_target_and_application() -> None:
         deployments={"example-local": deployment(devbox)},
     )
 
-    assert state.schema_version == 6
+    assert state.schema_version == 7
     assert state.deployments["example-local"].placement.site_host == (
         "example-local.devbox.local"
     )
@@ -131,6 +134,7 @@ def test_production_policy_is_hard() -> None:
         "placement": new_placement(
             "example-production", public, domain="app.example.test"
         ),
+        "placement_decision": explicit_placement_decision("devbox", public),
     }
 
     with pytest.raises(ValidationError, match="exact commit"):
@@ -231,7 +235,7 @@ def test_state_store_writes_one_atomic_versioned_document(tmp_path: Path) -> Non
     store.save(state)
 
     assert store.load() == state
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 6
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 7
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -240,7 +244,7 @@ def test_canonical_state_example_validates_against_current_schema() -> None:
 
     state = ControlState.model_validate_json(example.read_text())
 
-    assert state.schema_version == 6
+    assert state.schema_version == 7
     assert state.targets["devbox"].runtimes.mise_version == "2026.9.9"
 
 
@@ -318,7 +322,7 @@ def test_schema_v2_migration_pins_observed_versions_without_changing_placement(
         }
     }, {"example-local": "source"})
 
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert migrated.deployments["example-local"].placement.model_dump(mode="json") == old_placement
     assert migrated.deployments["example-local"].runtimes["node"].provider == "system"
     assert migrated.deployments["example-local"].resources.database == "devbox-postgres"
@@ -349,7 +353,7 @@ def test_schema_v3_migration_structures_local_sops_references(tmp_path: Path) ->
         {}, {"example-local": "source"}
     )
 
-    assert migrated.schema_version == 6
+    assert migrated.schema_version == 7
     assert migrated.secret_stores["local-sops"].provider == "sops"
     assert migrated.deployments["example-local"].resources.valkey == ValkeyBinding(
         resource="devbox-valkey", uses=["cache"]
@@ -610,6 +614,7 @@ def _target_with_role(
         system_hostname=alias,
         remote_user="deployer",
         apps_root="/srv/gimme/apps",
+        deployment_slots=0 if role == "administration" else 2,
         network=TargetNetwork(mode="local_mdns", mdns_name=alias),
         stack=StackConfig(package_manager="apt", packages=["git"], services=[]),
         role=role,

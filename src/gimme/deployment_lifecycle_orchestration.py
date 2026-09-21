@@ -8,7 +8,6 @@ from gimme.control import (
     DeploymentRegistration,
     ManualRecoveryCadence,
     legacy_server,
-    new_placement,
     target_sites,
 )
 from gimme.control_plans import deployment_removal_plan, registration_update_plan
@@ -29,32 +28,19 @@ class DeploymentLifecycleOrchestrator:
     recovery_schedule_authority: Callable[..., Any]
     result: Callable[..., dict[str, object]]
 
-    def register_deployment(
-        self, name: str, definition: DeploymentRegistration
-    ) -> dict[str, object]:
-        state = self.store.load()
-        if name in state.deployments:
-            raise ValueError("deployment already exists; use plan_update_deployment")
-        target = state.targets[definition.target]
-        deployment = definition.materialize(
-            new_placement(name, target, domain=definition.domain)
-        )
-        self.store.save(self.replace(state, "deployments", name, deployment))
-        return {
-            "changed": True,
-            "deployment": name,
-            "placement": deployment.placement.model_dump(mode="json"),
-        }
-
     def plan_update_deployment(
         self, name: str, definition: DeploymentRegistration
     ) -> dict[str, object]:
         state = self.store.load()
         current = state.deployments[name]
+        if definition.target != current.target or definition.placement_policy is not None:
+            raise ValueError("deployment placement is immutable")
         placement = current.placement
         if definition.domain is not None and definition.domain != placement.site_host:
             placement = placement.model_copy(update={"site_host": definition.domain})
-        proposed = definition.materialize(placement)
+        proposed = definition.materialize(
+            current.target, placement, current.placement_decision
+        )
         self.replace(state, "deployments", name, proposed)
         return registration_update_plan(
             "deployment_update", name, current, proposed

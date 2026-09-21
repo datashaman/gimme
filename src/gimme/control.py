@@ -8,7 +8,7 @@ import re
 import tempfile
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -722,6 +722,7 @@ class TargetConfig(BaseModel):
     remote_user: str = Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
     apps_root: str
     keep_releases: int = Field(default=5, ge=2, le=20)
+    deployment_slots: int = Field(ge=0, le=1024)
     network: TargetNetwork
     stack: StackConfig
     runtimes: TargetRuntimePolicy = Field(default_factory=TargetRuntimePolicy)
@@ -865,6 +866,77 @@ class Placement(BaseModel):
         return _valid_endpoint(value)
 
 
+class PlacementPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[str] = Field(min_length=1, max_length=64)
+
+    @field_validator("candidates")
+    @classmethod
+    def bounded_candidates(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(
+            TARGET_NAME.fullmatch(name) is None for name in value
+        ):
+            raise ValueError("placement candidates must be unique Target names")
+        return sorted(value)
+
+
+PlacementReason = Annotated[
+    str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64)
+]
+
+
+class PlacementCandidateDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: str = Field(pattern=TARGET_NAME.pattern)
+    deployment_slots: int = Field(ge=0, le=1024)
+    occupied_slots: int = Field(ge=0)
+    free_slots: int = Field(ge=0, le=1024)
+    eligible: bool
+    reasons: list[PlacementReason] = Field(max_length=16)
+
+
+class PlacementDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["explicit", "policy"]
+    candidates: list[str] = Field(min_length=1, max_length=64)
+    selected_target: str = Field(pattern=TARGET_NAME.pattern)
+    selection_rule: Literal["occupied_ratio_free_slots_name_v1"]
+    candidate_results: list[PlacementCandidateDecision] = Field(
+        min_length=1, max_length=64
+    )
+    policy_fingerprint: str = Field(pattern=r"^fleet_[0-9a-f]{64}$")
+    deployment_slots: int = Field(ge=0, le=1024)
+    occupied_slots: int = Field(ge=0)
+    observation_fingerprint: str | None = Field(
+        default=None, pattern=r"^fleet_[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def coherent(self) -> "PlacementDecision":
+        if self.candidates != sorted(set(self.candidates)):
+            raise ValueError("placement decision candidates must be normalized and unique")
+        if self.selected_target not in self.candidates:
+            raise ValueError("selected target must be a placement candidate")
+        if [result.target for result in self.candidate_results] != self.candidates:
+            raise ValueError("placement candidate results must match normalized candidates")
+        selected = next(
+            result for result in self.candidate_results
+            if result.target == self.selected_target
+        )
+        if not selected.eligible or selected.reasons:
+            raise ValueError("selected placement candidate must be eligible")
+        if self.mode == "explicit" and (
+            len(self.candidates) != 1 or self.observation_fingerprint is not None
+        ):
+            raise ValueError("explicit placement must name one unobserved candidate")
+        if self.mode == "policy" and self.observation_fingerprint is None:
+            raise ValueError("policy placement requires an observation fingerprint")
+        return self
+
+
 class DeploymentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -886,6 +958,7 @@ class DeploymentConfig(BaseModel):
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
     recovery: RecoveryPolicy | None = None
     placement: Placement
+    placement_decision: PlacementDecision
 
     @model_validator(mode="after")
     def unique_own_health_probes(self) -> "DeploymentConfig":
@@ -935,7 +1008,8 @@ class DeploymentRegistration(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     application: str = Field(pattern=APP_NAME.pattern)
-    target: str = Field(pattern=TARGET_NAME.pattern)
+    target: str | None = Field(default=None, pattern=TARGET_NAME.pattern)
+    placement_policy: PlacementPolicy | None = None
     stage: Literal["local", "preview", "staging", "production"]
     release_mode: Literal["source", "artifact"]
     source: DeploymentSource
@@ -952,12 +1026,24 @@ class DeploymentRegistration(BaseModel):
     resources: ResourceBindings = Field(default_factory=ResourceBindings)
     recovery: RecoveryPolicy | None = None
 
-    def materialize(self, placement: Placement) -> DeploymentConfig:
-        return DeploymentConfig(**self.model_dump(), placement=placement)
+    @model_validator(mode="after")
+    def exactly_one_placement_selector(self) -> "DeploymentRegistration":
+        if (self.target is None) == (self.placement_policy is None):
+            raise ValueError("choose exactly one explicit target or placement_policy")
+        return self
+
+    def materialize(
+        self, target: str, placement: Placement, decision: PlacementDecision
+    ) -> DeploymentConfig:
+        value = self.model_dump(exclude={"target", "placement_policy"})
+        return DeploymentConfig(
+            **value, target=target, placement=placement, placement_decision=decision
+        )
 
     @classmethod
     def from_deployment(cls, deployment: DeploymentConfig) -> "DeploymentRegistration":
-        return cls.model_validate(deployment.model_dump(exclude={"placement"}))
+        value = deployment.model_dump(exclude={"placement", "placement_decision"})
+        return cls.model_validate(value)
 
     @field_validator("domain")
     @classmethod
@@ -988,7 +1074,7 @@ class DeploymentRegistration(BaseModel):
 class ControlState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[6] = 6
+    schema_version: Literal[7] = 7
     provider_accounts: dict[str, ProviderAccount] = Field(default_factory=dict)
     secret_stores: dict[str, SecretStore] = Field(
         default_factory=lambda: {"local-sops": SopsSecretStore()}
@@ -1125,6 +1211,13 @@ class ControlState(BaseModel):
                 raise ValueError(f"deployment {name} references an unknown application")
             if deployment.target not in self.targets:
                 raise ValueError(f"deployment {name} references an unknown target")
+            if deployment.placement_decision.selected_target != deployment.target:
+                raise ValueError(f"deployment {name} placement decision target is inconsistent")
+            if any(
+                candidate not in self.targets
+                for candidate in deployment.placement_decision.candidates
+            ):
+                raise ValueError(f"deployment {name} placement decision candidate is unknown")
             if self.targets[deployment.target].role != "deployment":
                 raise ValueError(f"deployment {name} target must be a Deployment Target")
             for reference in deployment.secrets.values():
@@ -1296,6 +1389,30 @@ def new_placement(
     )
 
 
+def explicit_placement_decision(
+    target_name: str, target: TargetConfig, *, occupied_slots: int = 0
+) -> PlacementDecision:
+    return PlacementDecision(
+        mode="explicit",
+        candidates=[target_name],
+        selected_target=target_name,
+        selection_rule="occupied_ratio_free_slots_name_v1",
+        candidate_results=[PlacementCandidateDecision(
+            target=target_name,
+            deployment_slots=target.deployment_slots,
+            occupied_slots=occupied_slots,
+            free_slots=max(target.deployment_slots - occupied_slots, 0),
+            eligible=True,
+            reasons=[],
+        )],
+        policy_fingerprint="fleet_" + hashlib.sha256(json.dumps({
+            "mode": "explicit", "candidates": [target_name],
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        deployment_slots=target.deployment_slots,
+        occupied_slots=occupied_slots,
+    )
+
+
 class StateStore:
     def __init__(self, root: Path, legacy_root: Path | None = None) -> None:
         self.root = root.expanduser().resolve()
@@ -1317,7 +1434,7 @@ class StateStore:
         if not self.exists():
             raise RuntimeError("state migration required; call plan_state_migration")
         document = self.raw_state()
-        if document.get("schema_version") != 6:
+        if document.get("schema_version") != 7:
             raise RuntimeError("state migration required; call plan_state_migration")
         return ControlState.model_validate(document)
 
@@ -1334,6 +1451,16 @@ class StateStore:
         with self.lock_path.open("a+") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             self._atomic_json_write(self.state_path, state.model_dump(mode="json"))
+
+    def update(self, operation: Callable[[ControlState], ControlState]) -> ControlState:
+        """Reload, validate, and atomically persist one state transition under one lock."""
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self.lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            current = self.load()
+            updated = operation(current)
+            self._atomic_json_write(self.state_path, updated.model_dump(mode="json"))
+            return updated
 
     def target(self, name: str) -> TargetConfig:
         try:
@@ -1373,6 +1500,9 @@ class StateStore:
             remote_user=server.remote_user,
             apps_root=server.apps_root,
             keep_releases=server.keep_releases,
+            deployment_slots=max(
+                sum(len(app.environments) for app in registry.apps.values()), 1
+            ),
             network=TargetNetwork(mode="local_mdns", mdns_name=server.mdns_name),
             stack=stack,
         )
@@ -1450,6 +1580,9 @@ class StateStore:
                             "https://"
                         ),
                     ),
+                    placement_decision=explicit_placement_decision(
+                        target_name, target, occupied_slots=len(deployments)
+                    ),
                 )
                 if app.framework != "static":
                     resources[f"{target_name}-postgres"] = ResourceConfig(
@@ -1486,16 +1619,22 @@ class StateStore:
         if not self.exists():
             return self.legacy_migration(observations, release_modes, stores, builds)
         document = self.raw_state()
+        if document.get("schema_version") == 7:
+            raise ValueError("schema-v7 state already exists")
         if document.get("schema_version") == 6:
-            raise ValueError("schema-v6 state already exists")
+            migrated = json.loads(json.dumps(document))
+            self._migrate_fleet_policy(migrated)
+            return ControlState.model_validate(migrated)
         if document.get("schema_version") == 5:
             migrated = json.loads(json.dumps(document))
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
+            self._migrate_fleet_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 4:
             migrated = json.loads(json.dumps(document))
             self._migrate_valkey_bindings(migrated)
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
+            self._migrate_fleet_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") == 3:
             migrated = json.loads(json.dumps(document))
@@ -1526,10 +1665,11 @@ class StateStore:
                 deployment["secrets"] = converted
             self._migrate_valkey_bindings(migrated)
             self._migrate_artifact_policy(migrated, release_modes, stores, builds)
+            self._migrate_fleet_policy(migrated)
             return ControlState.model_validate(migrated)
         if document.get("schema_version") != 2:
             raise ValueError(
-                "only schema-v2, schema-v3, schema-v4, or schema-v5 state can be migrated"
+                "only schema-v2 through schema-v6 state can be migrated"
             )
         targets = document.get("targets")
         applications = document.get("applications")
@@ -1612,7 +1752,58 @@ class StateStore:
             target.pop("_gimme_old_toolchains", None)
         self._migrate_valkey_bindings(migrated)
         self._migrate_artifact_policy(migrated, release_modes, stores, builds)
+        self._migrate_fleet_policy(migrated)
         return ControlState.model_validate(migrated)
+
+    @staticmethod
+    def _migrate_fleet_policy(document: dict[str, object]) -> None:
+        targets = document.get("targets")
+        deployments = document.get("deployments")
+        if not isinstance(targets, dict) or not isinstance(deployments, dict):
+            raise ValueError("migrated targets and deployments are invalid")
+        occupied = {
+            name: sum(
+                isinstance(deployment, dict) and deployment.get("target") == name
+                for deployment in deployments.values()
+            )
+            for name in targets
+        }
+        for name, target in targets.items():
+            if not isinstance(target, dict):
+                raise ValueError(f"target {name} is invalid")
+            target["deployment_slots"] = max(occupied[name], 1)
+        seen = {name: 0 for name in targets}
+        for name in sorted(deployments):
+            deployment = deployments[name]
+            if not isinstance(deployment, dict):
+                raise ValueError(f"deployment {name} is invalid")
+            target_name = deployment.get("target")
+            if not isinstance(target_name, str) or target_name not in targets:
+                raise ValueError(f"deployment {name} target is invalid")
+            deployment["placement_decision"] = {
+                "mode": "explicit",
+                "candidates": [target_name],
+                "selected_target": target_name,
+                "selection_rule": "occupied_ratio_free_slots_name_v1",
+                "candidate_results": [{
+                    "target": target_name,
+                    "deployment_slots": targets[target_name]["deployment_slots"],
+                    "occupied_slots": seen[target_name],
+                    "free_slots": max(
+                        targets[target_name]["deployment_slots"] - seen[target_name], 0
+                    ),
+                    "eligible": True,
+                    "reasons": [],
+                }],
+                "policy_fingerprint": "fleet_" + hashlib.sha256(json.dumps({
+                    "mode": "explicit", "candidates": [target_name],
+                }, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                "deployment_slots": targets[target_name]["deployment_slots"],
+                "occupied_slots": seen[target_name],
+                "observation_fingerprint": None,
+            }
+            seen[target_name] += 1
+        document["schema_version"] = 7
 
     @staticmethod
     def _migrate_artifact_policy(
