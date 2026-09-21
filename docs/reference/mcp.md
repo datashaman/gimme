@@ -37,7 +37,7 @@ stable intent, mutation boundary, and pairing of each primitive.
 | `gimme://backup-destinations/{name}` | One bounded S3-compatible Backup Destination policy without credentials |
 | `gimme://artifact-stores/{name}` | One bounded versioned S3-compatible Artifact Store policy without credential references or values |
 | `gimme://resources/{name}` | One named PostgreSQL or Valkey resource |
-| `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
+| `gimme://aws-networks/{name}/valkey-options` | Exact Valkey versions and durable-family node types the registered account offers in one AWS Network's region (a live read, nothing stored) |
 | `gimme://deployments/{name}` | One deployment, including pins, bindings, and placement |
 | `gimme://deployments/{name}/rollout` | One secret-safe Rollout generation with bounded artifact identities, weights, phase, readiness, and background owner |
 | `gimme://operations/{correlation_id}` | One operation trace in chronological order |
@@ -347,8 +347,10 @@ a fixed `aws_elasticache_modify_forbidden_<reason>` code before any change. A bo
 receives the fixed `laravel-cluster-v1` contract and is probed before its release switches
 (see the how-to). Updates are refused locally with a fixed
 `aws_elasticache_update_forbidden_<field>` code for `aws_network`, an engine major version, or
-`security_group_id`, and registering or updating to a `node_type` the account does not offer is
-refused with `aws_elasticache_node_type_unavailable`.
+`security_group_id`. Registering or updating to a `node_type` outside the documented durable
+families (`r8g`, `r7g`, `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, `c7gn`) is refused with
+`aws_elasticache_node_type_not_durable`, and one the account does not offer with
+`aws_elasticache_node_type_unavailable`.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |

@@ -45,7 +45,10 @@ MODIFIABLE_FIELDS = frozenset({
     "EngineVersion", "CacheNodeType", "SnapshotRetentionLimit", "SnapshotWindow",
     "PreferredMaintenanceWindow",
 })
-NODE_TYPE_PREFIX = "cache."
+# AWS documents Durability for these instance families only (ElastiCache User Guide,
+# Durability > Limitations, read 2026-09-21) and has no per-node-type describe call, so this
+# list is the compatibility gate. Widen it only when AWS's page does.
+DURABLE_NODE_FAMILIES = frozenset({"r8g", "r7g", "r6g", "m8g", "m7g", "m6g", "c8gn", "c7gn"})
 UPDATE_ACTIONS_DONE = ("complete", "not-applicable")
 ENGINE_VERSION_FLOOR = 9
 PORT = 6379
@@ -289,6 +292,11 @@ class ElastiCacheAdapter(Protocol):
     ) -> bool: ...
 
 
+def durable_node_type(node_type: str) -> bool:
+    parts = node_type.split(".")
+    return len(parts) == 3 and parts[0] == "cache" and parts[1] in DURABLE_NODE_FAMILIES
+
+
 def _tags(response: dict[str, object]) -> dict[object, object]:
     tags = response.get("TagList") or []
     return {
@@ -512,9 +520,10 @@ class BotoElastiCacheAdapter(AWSAdapter):
 
     def live_options(self, account: AWSProviderAccount, network: AWSNetwork) -> ValkeyOptions:
         """Exact Valkey versions and cache node types the registered account offers in the
-        network's region. ponytail: AWS exposes no per-network or per-durability filter, so
-        the node types are the region's reserved-node offerings; a type that cannot run
-        Durability=sync fails at create with a bounded error."""
+        network's region, limited to the families AWS documents as durable. ponytail: AWS
+        exposes no per-network filter, so the node types are the region's reserved-node
+        offerings; a listed type that still cannot run Durability=sync fails at create with a
+        bounded error."""
         client = self._client(account, network, "elasticache-options")
         try:
             versions = client.get_paginator("describe_cache_engine_versions").paginate(
@@ -538,7 +547,7 @@ class BotoElastiCacheAdapter(AWSAdapter):
                 (v for v in engine_versions if _version_tuple(v)[:1] >= (ENGINE_VERSION_FLOOR,)),
                 key=_version_tuple,
             )),
-            tuple(sorted(t for t in node_types if t.startswith(NODE_TYPE_PREFIX))),
+            tuple(sorted(t for t in node_types if durable_node_type(t))),
         )
 
     def _tolerate_existing(self, operation: str, call: Callable[[], object]) -> None:

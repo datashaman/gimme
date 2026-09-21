@@ -49,6 +49,8 @@ class ManagedResourceOrchestrator:
     def _refuse_unavailable_node_type(
         self, state: ControlState, resource: AWSElastiCacheValkeyResource
     ) -> None:
+        if not resources_valkey_module.durable_node_type(resource.node_type):
+            raise ResourceError("aws_elasticache_node_type_not_durable")
         network = state.aws_networks[resource.aws_network]
         options = self.elasticache_valkey.live_options(
             state.provider_accounts[network.provider_account], network
