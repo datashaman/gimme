@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import re
@@ -30,9 +31,11 @@ ALLOCATION_STATUS = ("active", "detached")
 POLL_BUDGET_SECONDS = 30
 POLL_INTERVAL_SECONDS = 3
 MAX_OBSERVED_BYTES = 32 * 1024
+ABSENT_VALUE: None = None
 MODIFIABLE_FIELDS = frozenset({
     "EngineVersion", "DBInstanceClass", "AllocatedStorage", "VpcSecurityGroupIds",
-    "DBParameterGroupName",
+    "DBParameterGroupName", "BackupRetentionPeriod", "PreferredBackupWindow",
+    "PreferredMaintenanceWindow",
 })
 # The pinned AWS commercial-region RDS trust bundle; see deploy/aws-rds-global-bundle.md.
 RDS_TRUST_BUNDLE_SHA256 = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
@@ -61,6 +64,13 @@ class InstanceObservation:
     pending_allocated_storage_gb: int | None = None
     parameter_group_name: str | None = None
     parameter_group_status: str | None = None
+    multi_az: bool | None = None
+    storage_encrypted: bool | None = None
+    deletion_protection: bool | None = None
+    publicly_accessible: bool | None = None
+    backup_retention_days: int | None = None
+    backup_window: str | None = None
+    maintenance_window: str | None = None
 
     @property
     def converging(self) -> bool:
@@ -97,9 +107,23 @@ class RDSAdapter(Protocol):
         self, account: AWSProviderAccount, region: str, secret_arn: str
     ) -> tuple[str, str]: ...
 
+    def master_secret_version_fingerprint(
+        self, account: AWSProviderAccount, region: str, secret_arn: str
+    ) -> str: ...
+
     def create_workload_secret(
         self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
         tags: dict[str, str], payload: dict[str, str],
+    ) -> tuple[str, str]: ...
+
+    def restore_workload_secret_version(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        restore_version: str, remove_version: str,
+    ) -> None: ...
+
+    def resolve_workload_credential(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        version_id: str,
     ) -> tuple[str, str]: ...
 
 
@@ -221,6 +245,73 @@ class AWSAdapter:
             raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
         return arn, version_id
 
+    def restore_workload_secret_version(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        restore_version: str, remove_version: str,
+    ) -> None:
+        session = self._session(
+            account, account.resolver_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret-rollback",
+        )
+        client = session.client("secretsmanager", region_name=store.region)
+        try:
+            metadata = client.describe_secret(SecretId=f"{store.prefix}/{name}")
+            stages = metadata.get("VersionIdsToStages")
+            if not isinstance(stages, dict):
+                raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
+            restored_stages = stages.get(restore_version, [])
+            removed_stages = stages.get(remove_version, [])
+            if not isinstance(restored_stages, list) or not isinstance(removed_stages, list):
+                raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
+            if "AWSCURRENT" in restored_stages:
+                return
+            if "AWSCURRENT" not in removed_stages:
+                raise ResourceError(f"{self.error_prefix}_workload_secret_rollback_stale")
+            client.update_secret_version_stage(
+                SecretId=f"{store.prefix}/{name}",
+                VersionStage="AWSCURRENT",
+                MoveToVersionId=restore_version,
+                RemoveFromVersionId=remove_version,
+            )
+        except ResourceError:
+            raise
+        except Exception as exc:
+            raise _provider_error(
+                exc, "workload_secret_rollback", self.error_prefix
+            ) from None
+
+    def resolve_workload_credential(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        version_id: str,
+    ) -> tuple[str, str]:
+        session = self._session(
+            account, account.resolver_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret-resolve",
+        )
+        try:
+            response = session.client(
+                "secretsmanager", region_name=store.region
+            ).get_secret_value(
+                SecretId=f"{store.prefix}/{name}", VersionId=version_id
+            )
+            document = json.loads(response.get("SecretString", ""))
+        except Exception as exc:
+            if isinstance(exc, (json.JSONDecodeError, UnicodeError)):
+                raise ResourceError(
+                    f"{self.error_prefix}_workload_secret_invalid"
+                ) from None
+            raise _provider_error(
+                exc, "workload_secret_resolve", self.error_prefix
+            ) from None
+        if (
+            response.get("VersionId") != version_id
+            or not isinstance(document, dict)
+            or set(document) != {"username", "password"}
+            or any(not isinstance(value, str) or not value for value in document.values())
+        ):
+            raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
+        return document["username"], document["password"]
+
 
 
 class BotoRDSAdapter(AWSAdapter):
@@ -289,6 +380,31 @@ class BotoRDSAdapter(AWSAdapter):
             ),
             parameter_group_name=group_name if isinstance(group_name, str) else None,
             parameter_group_status=group_status if isinstance(group_status, str) else None,
+            multi_az=response.get("MultiAZ") if isinstance(response.get("MultiAZ"), bool) else None,
+            storage_encrypted=(
+                response.get("StorageEncrypted")
+                if isinstance(response.get("StorageEncrypted"), bool) else None
+            ),
+            deletion_protection=(
+                response.get("DeletionProtection")
+                if isinstance(response.get("DeletionProtection"), bool) else None
+            ),
+            publicly_accessible=(
+                response.get("PubliclyAccessible")
+                if isinstance(response.get("PubliclyAccessible"), bool) else None
+            ),
+            backup_retention_days=(
+                response.get("BackupRetentionPeriod")
+                if isinstance(response.get("BackupRetentionPeriod"), int) else None
+            ),
+            backup_window=(
+                response.get("PreferredBackupWindow")
+                if isinstance(response.get("PreferredBackupWindow"), str) else None
+            ),
+            maintenance_window=(
+                response.get("PreferredMaintenanceWindow")
+                if isinstance(response.get("PreferredMaintenanceWindow"), str) else None
+            ),
         )
 
     def describe_instance(
@@ -408,7 +524,9 @@ class BotoRDSAdapter(AWSAdapter):
                 VpcSecurityGroupIds=security_group_ids,
                 ManageMasterUserPassword=True,
                 MasterUsername="gimme_admin",
-                BackupRetentionPeriod=7,
+                BackupRetentionPeriod=resource.backup_retention_days,
+                PreferredBackupWindow=resource.backup_window,
+                PreferredMaintenanceWindow=resource.maintenance_window,
                 AutoMinorVersionUpgrade=False,
                 DeletionProtection=True,
                 Tags=[{"Key": "gimme:resource", "Value": resource_name}],
@@ -487,6 +605,27 @@ class BotoRDSAdapter(AWSAdapter):
             raise ResourceError("aws_rds_master_secret_invalid")
         return username, password
 
+    def master_secret_version_fingerprint(
+        self, account: AWSProviderAccount, region: str, secret_arn: str
+    ) -> str:
+        session = self._session(account, account.inspection_role_arn, "rds-master-inspect")
+        try:
+            response = session.client(
+                "secretsmanager", region_name=region
+            ).describe_secret(SecretId=secret_arn)
+        except Exception as exc:
+            raise _provider_error(exc, "master_secret_metadata") from None
+        versions = response.get("VersionIdsToStages")
+        current = [
+            version for version, stages in versions.items()
+            if isinstance(version, str) and isinstance(stages, list) and "AWSCURRENT" in stages
+        ] if isinstance(versions, dict) else []
+        if len(current) != 1:
+            raise ResourceError("aws_rds_master_secret_version_invalid")
+        return "sha256:" + hashlib.sha256(
+            f"{secret_arn}\0{current[0]}".encode()
+        ).hexdigest()
+
 
 def _parameter_group_family(engine_version: str) -> str:
     major = re.match(r"[0-9]+", engine_version)
@@ -509,8 +648,30 @@ def derive_instance_identifier(resource_name: str) -> str:
     return f"gimme-{resource_name[:48]}-{digest}"
 
 
+def identity_fingerprint(identity: str) -> str:
+    return "sha256:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 def generate_workload_password() -> str:
     return secrets_module.token_urlsafe(32)
+
+
+def _derived_database_role(database_identifier: str, suffix: str) -> str:
+    candidate = f"{database_identifier}_{suffix}"
+    if len(candidate) <= 63:
+        return candidate
+    digest = hashlib.sha256(candidate.encode()).hexdigest()[:8]
+    return f"{database_identifier[: 54 - len(suffix)]}_{suffix}_{digest}"
+
+
+def owner_role(database_identifier: str) -> str:
+    return _derived_database_role(database_identifier, "owner")
+
+
+def login_role(database_identifier: str, generation: int) -> str:
+    if not 1 <= generation <= 999_999_999:
+        raise ResourceError("aws_rds_login_generation_invalid")
+    return _derived_database_role(database_identifier, f"g{generation}")
 
 
 def _observed_path(root: Path, resource_name: str) -> Path:
@@ -520,8 +681,20 @@ def _observed_path(root: Path, resource_name: str) -> Path:
 
 
 def _validate_allocation(value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {
+    if isinstance(value, dict) and set(value) == {
         "database_identifier", "secret_arn", "secret_version_id", "status",
+    }:
+        database = str(value.get("database_identifier"))
+        value = {
+            **value,
+            "owner_role": owner_role(database),
+            "login_role": login_role(database, 1),
+            "generation": 1,
+            "extensions": {},
+        }
+    if not isinstance(value, dict) or set(value) != {
+        "database_identifier", "owner_role", "login_role", "generation",
+        "secret_arn", "secret_version_id", "status", "extensions",
     }:
         raise ResourceError("observed_resource_invalid")
     if (
@@ -529,18 +702,37 @@ def _validate_allocation(value: object) -> dict[str, object]:
         or AWS_ARN.fullmatch(str(value.get("secret_arn"))) is None
         or AWS_SECRET_VERSION.fullmatch(str(value.get("secret_version_id"))) is None
         or value.get("status") not in ALLOCATION_STATUS
+        or DB_IDENTIFIER.fullmatch(str(value.get("owner_role"))) is None
+        or DB_IDENTIFIER.fullmatch(str(value.get("login_role"))) is None
+        or not isinstance(value.get("generation"), int)
+        or not 1 <= int(cast(int, value.get("generation"))) <= 999_999_999
+        or not isinstance(value.get("extensions"), dict)
+        or set(cast(dict[str, object], value["extensions"]))
+        - {"pgcrypto", "uuid-ossp", "citext"}
+        or any(
+            not isinstance(version, str)
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
+            for version in cast(dict[str, object], value["extensions"]).values()
+        )
     ):
         raise ResourceError("observed_resource_invalid")
     return value
 
 
 def _validate_observed(document: object) -> dict[str, object]:
-    if not isinstance(document, dict) or set(document) != {
+    base_fields = {
         "schema_version", "resource", "aws_instance_identifier", "identity", "status",
         "phase", "engine_version", "endpoint", "port", "master_secret_arn", "allocations",
+    }
+    added_fields = {
+        "readiness_issues", "administration_verified",
+        "master_secret_version_fingerprint", "extension_versions",
+    }
+    if not isinstance(document, dict) or frozenset(document) not in {
+        frozenset(base_fields), frozenset(base_fields | added_fields)
     }:
         raise ResourceError("observed_resource_invalid")
-    if document.get("schema_version") != 1:
+    if document.get("schema_version") not in {1, 2}:
         raise ResourceError("observed_resource_invalid")
     if RESOURCE_NAME.fullmatch(str(document.get("resource"))) is None:
         raise ResourceError("observed_resource_invalid")
@@ -554,10 +746,44 @@ def _validate_observed(document: object) -> dict[str, object]:
     allocations = document.get("allocations")
     if not isinstance(allocations, dict) or len(allocations) > 256:
         raise ResourceError("observed_resource_invalid")
+    normalized_allocations: dict[str, object] = {}
     for deployment_name, allocation in allocations.items():
         if DEPLOYMENT_NAME.fullmatch(deployment_name) is None:
             raise ResourceError("observed_resource_invalid")
-        _validate_allocation(allocation)
+        normalized_allocations[deployment_name] = _validate_allocation(allocation)
+    document = {**document, "allocations": normalized_allocations}
+    if document["schema_version"] == 1:
+        return {
+            **document,
+            "schema_version": 2,
+            "readiness_issues": ["aws_rds_not_ready_administration"],
+            "administration_verified": False,
+            "master_secret_version_fingerprint": ABSENT_VALUE,
+            "extension_versions": {},
+            "phase": "pending" if document["phase"] == "ready" else document["phase"],
+        }
+    issues = document.get("readiness_issues")
+    if (
+        not isinstance(issues, list)
+        or len(issues) > 16
+        or any(not isinstance(issue, str) or len(issue) > 80 for issue in issues)
+        or not isinstance(document.get("administration_verified"), bool)
+    ):
+        raise ResourceError("observed_resource_invalid")
+    fingerprint = document.get("master_secret_version_fingerprint")
+    if fingerprint is not None and re.fullmatch(r"sha256:[0-9a-f]{64}", str(fingerprint)) is None:
+        raise ResourceError("observed_resource_invalid")
+    extension_versions = document.get("extension_versions")
+    if (
+        not isinstance(extension_versions, dict)
+        or set(extension_versions) - {"pgcrypto", "uuid-ossp", "citext"}
+        or any(
+            not isinstance(version, str)
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
+            for version in extension_versions.values()
+        )
+    ):
+        raise ResourceError("observed_resource_invalid")
     return document
 
 
@@ -599,24 +825,73 @@ def _save_observed(root: Path, resource_name: str, document: dict[str, object]) 
 
 
 def _instance_document(
-    resource_name: str, aws_instance_identifier: str, observation: InstanceObservation,
+    resource_name: str, resource: AWSRDSPostgresResource,
+    aws_instance_identifier: str, observation: InstanceObservation,
     previous_allocations: dict[str, object],
 ) -> dict[str, object]:
-    ready = observation.status == "available" and not observation.converging
-    phase = "ready" if ready else "pending"
+    issues = readiness_issues(resource, observation)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "resource": resource_name,
         "aws_instance_identifier": aws_instance_identifier,
         "identity": observation.identity,
         "status": observation.status,
-        "phase": phase,
+        "phase": "failed" if observation.status == "failed" else "pending",
         "engine_version": observation.engine_version,
         "endpoint": observation.endpoint,
         "port": observation.port,
         "master_secret_arn": observation.master_secret_arn,
+        "master_secret_version_fingerprint": ABSENT_VALUE,
+        "extension_versions": {},
+        "administration_verified": False,
+        "readiness_issues": issues or ["aws_rds_not_ready_administration"],
         "allocations": previous_allocations,
     }
+
+
+def mark_administration_verified(
+    root: Path, resource_name: str, master_secret_version_fingerprint: str,
+    extension_versions: dict[str, str],
+) -> dict[str, object]:
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    if document["readiness_issues"] not in ([], ["aws_rds_not_ready_administration"]):
+        raise ResourceError("aws_rds_resource_not_ready")
+    updated = {
+        **document,
+        "phase": "ready",
+        "administration_verified": True,
+        "readiness_issues": [],
+        "master_secret_version_fingerprint": master_secret_version_fingerprint,
+        "extension_versions": extension_versions,
+    }
+    _save_observed(root, resource_name, updated)
+    return updated
+
+
+def parse_administration_verification(output: str) -> dict[str, str]:
+    prefix = "GIMME_RESOURCE_VERIFIED|postgres|"
+    lines = [line.split("] ", 1)[-1].strip() for line in output.splitlines()]
+    payloads = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    if len(payloads) != 1:
+        raise ResourceError("aws_rds_administration_verification_invalid")
+    try:
+        document = json.loads(base64.b64decode(payloads[0], validate=True))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_rds_administration_verification_invalid") from None
+    candidate = {"extension_versions": document}
+    checked = _validate_observed({
+        "schema_version": 2, "resource": "verification", "aws_instance_identifier": "gimme-v",
+        "identity": None, "status": "available", "phase": "pending", "engine_version": "0",
+        "endpoint": None, "port": None,
+        "master_secret_arn": ABSENT_VALUE,
+        "allocations": {},
+        "readiness_issues": [], "administration_verified": False,
+        "master_secret_version_fingerprint": ABSENT_VALUE,
+        **candidate,
+    })
+    return cast(dict[str, str], checked["extension_versions"])
 
 
 def desired_security_group_ids(resource: AWSRDSPostgresResource) -> tuple[str, ...]:
@@ -681,6 +956,18 @@ def modification_for(
         changes["DBInstanceClass"] = resource.instance_class
     if storage is not None and resource.allocated_storage_gb > storage:
         changes["AllocatedStorage"] = resource.allocated_storage_gb
+    if (
+        live.backup_retention_days is not None
+        and live.backup_retention_days != resource.backup_retention_days
+    ):
+        changes["BackupRetentionPeriod"] = resource.backup_retention_days
+    if live.backup_window is not None and live.backup_window != resource.backup_window:
+        changes["PreferredBackupWindow"] = resource.backup_window
+    if (
+        live.maintenance_window is not None
+        and live.maintenance_window != resource.maintenance_window
+    ):
+        changes["PreferredMaintenanceWindow"] = resource.maintenance_window
     desired_groups = desired_security_group_ids(resource)
     if live.security_group_ids is not None and live.security_group_ids != desired_groups:
         changes["VpcSecurityGroupIds"] = list(desired_groups)
@@ -699,6 +986,11 @@ def instance_drift(
         "engine_version": (resource.engine_version, live.engine_version),
         "instance_class": (resource.instance_class, live.instance_class),
         "allocated_storage_gb": (resource.allocated_storage_gb, live.allocated_storage_gb),
+        "backup_retention_days": (
+            resource.backup_retention_days, live.backup_retention_days
+        ),
+        "backup_window": (resource.backup_window, live.backup_window),
+        "maintenance_window": (resource.maintenance_window, live.maintenance_window),
         "security_group_ids": (
             list(desired_security_group_ids(resource)),
             None if live.security_group_ids is None else list(live.security_group_ids),
@@ -712,6 +1004,25 @@ def instance_drift(
         },
         "modification_pending": live.modification_pending,
     }
+
+
+def readiness_issues(
+    resource: AWSRDSPostgresResource, live: InstanceObservation
+) -> list[str]:
+    """Fixed, bounded reasons an RDS instance cannot accept a Deployment binding."""
+    checks = {
+        "status": live.status == "available" and not live.converging,
+        "multi_az": live.multi_az is True,
+        "storage_encrypted": live.storage_encrypted is True,
+        "deletion_protection": live.deletion_protection is True,
+        "private": live.publicly_accessible is False,
+        "parameter_group": live.parameter_group_status in {"in-sync", "applied"},
+        "master_secret": live.master_secret_arn is not None,
+        "backup_retention": live.backup_retention_days == resource.backup_retention_days,
+        "backup_window": live.backup_window == resource.backup_window,
+        "maintenance_window": live.maintenance_window == resource.maintenance_window,
+    }
+    return [f"aws_rds_not_ready_{name}" for name, ready in checks.items() if not ready]
 
 
 def apply_provision(
@@ -770,18 +1081,15 @@ def apply_provision(
         observed = settle(adapter.reboot_instance(account, network, aws_instance_identifier))
         rebooted = True
     document = _instance_document(
-        resource_name, aws_instance_identifier, observed, previous_allocations
+        resource_name, resource, aws_instance_identifier, observed, previous_allocations
     )
     _save_observed(root, resource_name, document)
     return {
         "resource": resource_name,
-        "aws_instance_identifier": aws_instance_identifier,
-        "identity": observed.identity,
         "status": observed.status,
         "phase": document["phase"],
+        "readiness_issues": document["readiness_issues"],
         "engine_version": observed.engine_version,
-        "endpoint": observed.endpoint,
-        "port": observed.port,
         "modified_fields": modified_fields,
         "rebooted": rebooted,
     }
@@ -790,8 +1098,8 @@ def apply_provision(
 def persist_binding(
     adapter: RDSAdapter, root: Path, account: AWSProviderAccount,
     store: AWSSecretsManagerStore, store_name: str, resource_name: str, deployment_name: str,
-    database_identifier: str, workload_username: str, workload_password: str,
-    endpoint: str, port: int,
+    database_identifier: str, owner: str, workload_username: str, generation: int,
+    extensions: dict[str, str], workload_password: str,
 ) -> dict[str, object]:
     """Create/refresh the tagged Secrets Manager workload secret and record a
     secret-free allocation. Never returns workload_password or workload_username."""
@@ -801,9 +1109,6 @@ def persist_binding(
     payload = {
         "username": workload_username,
         "password": workload_password,
-        "host": endpoint,
-        "port": str(port),
-        "dbname": database_identifier,
     }
     tags = {
         "gimme:secret-store": store_name,
@@ -819,9 +1124,13 @@ def persist_binding(
     allocations: dict[str, object] = dict(cast(dict[str, object], document["allocations"]))
     allocations[deployment_name] = {
         "database_identifier": database_identifier,
+        "owner_role": owner,
+        "login_role": workload_username,
+        "generation": generation,
         "secret_arn": secret_arn,
         "secret_version_id": version_id,
         "status": "active",
+        "extensions": dict(sorted(extensions.items())),
     }
     document = {**document, "allocations": allocations}
     _save_observed(root, resource_name, document)
@@ -830,6 +1139,95 @@ def persist_binding(
         "database": database_identifier,
         "secret_reference": {"store": store_name, "secret": secret_name},
     }
+
+
+def restore_allocation(
+    root: Path, resource_name: str, deployment_name: str, allocation: dict[str, object]
+) -> None:
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, object], document["allocations"]))
+    allocations[deployment_name] = _validate_allocation(allocation)
+    _save_observed(root, resource_name, {**document, "allocations": allocations})
+
+
+def update_allocation_extensions(
+    root: Path, resource_name: str, deployment_name: str, extensions: dict[str, str]
+) -> dict[str, object]:
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, dict[str, object]], document["allocations"]))
+    allocation = allocations.get(deployment_name)
+    if allocation is None:
+        raise ResourceError("aws_rds_binding_missing")
+    updated = _validate_allocation({**allocation, "extensions": extensions})
+    allocations[deployment_name] = updated
+    _save_observed(root, resource_name, {**document, "allocations": allocations})
+    return updated
+
+
+def _rotation_path(root: Path, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None:
+        raise ResourceError("resource_name_invalid")
+    return root / "rotating-postgres-resources" / f"{resource_name}.json"
+
+
+def _validate_rotation(
+    document: object, resource_name: str
+) -> dict[str, object]:
+    if (
+        not isinstance(document, dict)
+        or set(document) != {
+            "schema_version", "resource", "deployment", "phase", "plan", "previous",
+            "candidate_generation", "candidate_login", "candidate",
+        }
+        or document.get("schema_version") != 1
+        or document.get("resource") != resource_name
+        or DEPLOYMENT_NAME.fullmatch(str(document.get("deployment"))) is None
+        or document.get("phase") not in {
+            "prepared", "published", "activated", "rolling_back",
+        }
+        or not isinstance(document.get("plan"), dict)
+        or not isinstance(document.get("previous"), dict)
+        or _validate_allocation(document["previous"]) != document["previous"]
+        or not isinstance(document.get("candidate_generation"), int)
+        or DB_IDENTIFIER.fullmatch(str(document.get("candidate_login"))) is None
+        or (
+            document.get("candidate") is not None
+            and (
+                not isinstance(document["candidate"], dict)
+                or _validate_allocation(document["candidate"]) != document["candidate"]
+            )
+        )
+        or (
+            document.get("phase") in {"published", "activated", "rolling_back"}
+            and document.get("candidate") is None
+        )
+    ):
+        raise ResourceError("aws_rds_rotation_marker_invalid")
+    return cast(dict[str, object], document)
+
+
+def load_rotation(root: Path, resource_name: str) -> dict[str, object] | None:
+    path = _rotation_path(root, resource_name)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_rds_rotation_marker_invalid") from None
+    return _validate_rotation(document, resource_name)
+
+
+def save_rotation(root: Path, resource_name: str, document: dict[str, object]) -> None:
+    _validate_rotation(document, resource_name)
+    _write_json(_rotation_path(root, resource_name), document, resource_name)
+
+
+def clear_rotation(root: Path, resource_name: str) -> None:
+    _rotation_path(root, resource_name).unlink(missing_ok=True)
 
 
 def _tombstone_path(root: Path, resource_name: str) -> Path:

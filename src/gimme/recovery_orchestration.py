@@ -16,6 +16,7 @@ from gimme import recovery as recovery_module
 from gimme import recovery_schedule as recovery_schedule_module
 from gimme.control import (
     AWSElastiCacheValkeyResource,
+    AWSRDSPostgresResource,
     AWSSecretsManagerStore,
     ControlState,
     DeploymentConfig,
@@ -590,7 +591,10 @@ class RecoveryOrchestrator:
         state, deployment, _target, _application = self.context(name)
         if deployment.recovery is None:
             raise ValueError(f"deployment {name} has no Recovery Policy bound")
-        if self.managed_database_issues(state, deployment):
+        database = deployment.resources.database
+        if database is not None and isinstance(
+            state.resources.get(database), AWSRDSPostgresResource
+        ):
             raise ValueError(
                 f"deployment {name} database is a managed resource; "
                 "Recovery Points support target-local PostgreSQL only"

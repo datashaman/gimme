@@ -327,7 +327,8 @@ the IAM roles, and the provisioning and binding workflow.
 
 `register_resource`, `plan_update_resource`, and `update_resource` also accept an AWS
 RDS PostgreSQL resource (provider `aws_rds_postgres`): an exact engine version, instance
-class, allocated storage, an AWS Network (VPC, exactly two private subnets), an
+class, allocated storage, backup/maintenance windows and retention, an AWS Network (VPC,
+exactly two private subnets), an
 Administration Target, fixed security groups, and the AWS Secrets Manager store that
 holds workload credentials. Registration makes no AWS calls; it is a local desired-state
 write like every other Resource.
@@ -369,8 +370,8 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `apply_restore_resource` | Remote write | Create the group from the snapshot only if absent, restore each recorded Deployment credential unchanged, and verify every Deployment before the Resource is `ready`; repeat the same call while `restoring` |
 | `plan_recreate_empty_resource` | Read | Plan replacing a lost managed Valkey replication group with an empty one; reads only local state |
 | `apply_recreate_empty_resource` | Remote write (destructive) | Create an empty group in place of a lost one after exact confirmation `RECREATE EMPTY RESOURCE <name>`, then verify each Deployment as a restore does |
-| `plan_rotate_resource_credential` | Read | Plan replacing one Deployment's Valkey ACL user and Resource Credential; reads only local state |
-| `apply_rotate_resource_credential` | Remote write (destructive) | Rotate with a probed switch, rollback on failure, and deletion of the previous user through the destructive role; never returns a credential |
+| `plan_rotate_resource_credential` | Read | Plan replacing one Deployment's managed PostgreSQL generation login or Valkey ACL user and Resource Credential; reads only local state |
+| `apply_rotate_resource_credential` | Remote write (destructive) | Rotate with a health-probed switch and rollback on failure, then retire the previous login or user; never returns a credential |
 | `plan_forget_resource` | Read | Plan deleting a Retained Resource tombstone |
 | `apply_forget_resource` | Local write | Delete the tombstone after exact confirmation `FORGET <name>`; the retained infrastructure is untouched |
 
@@ -385,20 +386,21 @@ group is `pending-reboot`; a storage decrease, version downgrade, or major misma
 before any change, and the response lists `modified_fields` and `rebooted`. `bind_resource` requires the resource to
 already report `phase: ready`; it resolves the master credential through the account's
 distinct resolver role only at apply time, creates or reconciles the deployment's isolated
-database and role through the Administration Target over `psql` with `verify-full` TLS
+database, stable owner, generation login, and exact allowlisted extensions through the
+Administration Target over `psql` with `verify-full` TLS
 against a pinned AWS trust bundle (`us-gov-*` and `cn-*` regions are refused when registering,
 planning or applying a managed Resource), and stores a
-generation-1 workload credential as a tagged Secrets Manager secret — the response
-contains only the `{store, secret}` reference. Workload credential rotation, Detached
+generation-1 two-field workload credential as a tagged Secrets Manager secret — the response
+contains only the `{store, secret}` reference. Managed Laravel activation uses the normal
+version-pinned secret path and fixed `DB_*` TLS contract; explicit rotation switches and probes
+the next generation before retiring the old login, with rollback on failure. Detached
 Allocation rebind is not implemented yet. A tombstone is deleted only by
 `apply_forget_resource`, which never touches AWS.
 
-Runtime wiring of a managed database into a Deployment is not implemented yet, so a
-Deployment whose database binding is a managed Resource is fenced off rather than half
-working: `plan_deployment_resources` reports a readiness issue (blocking
-`apply_deployment_resources`), `plan_deployment` refuses, and Recovery Points reject it,
-because those tasks assume a target-local PostgreSQL. Only target-local Resources are sent
-to the Deployer recipe.
+Recovery Points still reject a managed database because their PostgreSQL capture path is
+target-local. Managed Resource definitions are not sent to the ordinary package recipe;
+only fixed connection variables and the version-pinned Resource Credential cross the protected
+Deployment activation boundary.
 
 `apply_cleanup_resource` is non-destructive by default: a managed AWS RDS resource is
 left running with its data intact, and Gimme instead writes a secret-free Retained

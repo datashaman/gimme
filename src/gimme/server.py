@@ -39,6 +39,9 @@ from gimme.journal import OperationJournal
 from gimme.managed_valkey_recovery_orchestration import (
     ManagedValkeyRecoveryOrchestrator,
 )
+from gimme.managed_postgres_credential_orchestration import (
+    ManagedPostgresCredentialOrchestrator,
+)
 from gimme.control_plane_registration_orchestration import (
     ControlPlaneRegistrationOrchestrator,
 )
@@ -104,6 +107,9 @@ _suppress_plan_journal: ContextVar[bool] = ContextVar("suppress_plan_journal", d
 # Set only while a restored Resource is being verified against its Deployments, so the
 # still-'restoring' Resource yields its contract values to exactly that verification.
 _restoring_ok: ContextVar[bool] = ContextVar("restoring_ok", default=False)
+_postgres_rotating_ok: ContextVar[bool] = ContextVar(
+    "postgres_rotating_ok", default=False
+)
 _held_deployment_locks: ContextVar[frozenset[str]] = ContextVar(
     "held_deployment_locks", default=frozenset()
 )
@@ -269,6 +275,20 @@ def _managed_valkey_recovery_orchestrator() -> ManagedValkeyRecoveryOrchestrator
     )
 
 
+def _managed_postgres_credential_orchestrator() -> ManagedPostgresCredentialOrchestrator:
+    return ManagedPostgresCredentialOrchestrator(
+        store=store,
+        rds_postgres=rds_postgres,
+        context=_context,
+        deployment_resource_lock=_deployment_resource_lock,
+        assert_plan=_assert_plan,
+        apply_resources=_apply_resources,
+        resource_plan=_resource_plan,
+        runner=runner,
+        rotating_ok=_postgres_rotating_ok,
+    )
+
+
 def _resource_retirement_orchestrator() -> ResourceRetirementOrchestrator:
     """Compose Resource retirement from the current adapters."""
     return ResourceRetirementOrchestrator(
@@ -294,6 +314,7 @@ def _deployment_resource_orchestrator() -> DeploymentResourceOrchestrator:
         backup_destination_credentials=_backup_destination_credentials,
         valkey_capture_credential=_valkey_capture_credential,
         restoring_ok=_restoring_ok.get,
+        postgres_rotating_ok=_postgres_rotating_ok.get,
     )
 
 
@@ -594,6 +615,9 @@ def _run_deployment(
     valkey = deployment.resources.valkey
     valkey_resource = None if valkey is None else state.resources[valkey.resource]
     contract_values, _credentials, probe, _issues = _valkey_runtime(name, state, deployment)
+    postgres_values, _postgres_credentials, _postgres_issues = _postgres_runtime(
+        name, state, deployment
+    )
     bound_resources = {
         kind: resource.model_dump(mode="json")
         for kind, resource_name in (
@@ -624,7 +648,12 @@ def _run_deployment(
         runtimes={key: value.model_dump(mode="json") for key, value in deployment.runtimes.items()},
         resources=bound_resources, mise_version=target.runtimes.mise_version,
         php_extensions=application.php_extensions,
-        variables={**deployment.variables, **contract_values}, valkey_probe=probe,
+        variables={**deployment.variables, **postgres_values, **contract_values},
+        valkey_probe=probe,
+        resource_trust_bundle_sha256=(
+            resources_postgres_module.RDS_TRUST_BUNDLE_SHA256
+            if postgres_values else None
+        ),
         secret_file=secret_file,
         artifact_request=artifact_request,
         artifact_secret_file=artifact_secret_file,
@@ -728,6 +757,12 @@ def _valkey_runtime(
     name: str, state: ControlState, deployment: DeploymentConfig
 ) -> tuple[dict[str, str], dict[str, SecretReference], dict[str, object] | None, list[str]]:
     return _deployment_resource_orchestrator().valkey_runtime(name, state, deployment)
+
+
+def _postgres_runtime(
+    name: str, state: ControlState, deployment: DeploymentConfig
+) -> tuple[dict[str, str], dict[str, SecretReference], list[str]]:
+    return _deployment_resource_orchestrator().postgres_runtime(name, state, deployment)
 
 
 def _secret_plan(name: str, state: ControlState, deployment: DeploymentConfig
@@ -1929,26 +1964,32 @@ def apply_recreate_empty_resource(name: Name, plan_id: PlanId, confirmation: str
 
 
 def _rotation_plan(name: str, deployment: str) -> dict[str, object]:
+    if isinstance(store.load().resources.get(name), AWSRDSPostgresResource):
+        return _managed_postgres_credential_orchestrator().rotation_plan(
+            name, deployment
+        )
     return _managed_valkey_recovery_orchestrator().rotation_plan(name, deployment)
 
 
 @mcp.tool(annotations=READ)
 @_journal_plan("rotate_resource_credential", "name")
 def plan_rotate_resource_credential(name: Name, deployment: Name) -> dict[str, object]:
-    """Plan replacing one Deployment's Valkey ACL user and Resource Credential. Reads only
-    local state; the destructive role is never assumed while planning."""
-    return _managed_valkey_recovery_orchestrator().plan_rotate_resource_credential(
-        name, deployment
-    )
+    """Plan replacing one Deployment's managed PostgreSQL generation login or Valkey ACL
+    user and Resource Credential. Reads only local state."""
+    return _rotation_plan(name, deployment)
 
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("rotate_resource_credential", "name")
 def apply_rotate_resource_credential(name: Name, deployment: Name, plan_id: PlanId
                                      ) -> dict[str, object]:
-    """Rotate the Deployment's credential with a probed switch and automatic rollback. A
-    leftover rotation is finished or rolled back by this same call, which then does nothing
-    else. Never returns a username or password."""
+    """Rotate the Deployment's managed Resource Credential with a health-probed switch and
+    automatic rollback, then retire the previous login or user. Never returns a username or
+    password."""
+    if isinstance(store.load().resources.get(name), AWSRDSPostgresResource):
+        return _managed_postgres_credential_orchestrator().apply_rotation(
+            name, deployment, plan_id
+        )
     return _managed_valkey_recovery_orchestrator().apply_rotate_resource_credential(
         name, deployment, plan_id
     )

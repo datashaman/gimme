@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, cast
 
 from gimme import recovery_schedule as recovery_schedule_module
+from gimme import postgres_contract
+from gimme import resources_postgres as resources_postgres_module
 from gimme import resources_valkey as resources_valkey_module
 from gimme import valkey_contract
 from gimme.control import (
@@ -48,6 +50,7 @@ class DeploymentResourceOrchestrator:
     backup_destination_credentials: Callable[..., Any]
     valkey_capture_credential: Callable[..., Any]
     restoring_ok: Callable[[], bool]
+    postgres_rotating_ok: Callable[[], bool]
 
     def dns_issues(
         self, deployment: DeploymentConfig, target: TargetConfig
@@ -114,6 +117,47 @@ class DeploymentResourceOrchestrator:
             [],
         )
 
+    def postgres_runtime(
+        self, name: str, state: ControlState, deployment: DeploymentConfig
+    ) -> tuple[dict[str, str], dict[str, SecretReference], list[str]]:
+        binding = deployment.resources.database
+        resource = None if binding is None else state.resources.get(binding)
+        if binding is None or not isinstance(resource, AWSRDSPostgresResource):
+            return {}, {}, []
+        marker = resources_postgres_module.load_rotation(self.store.root, binding)
+        if (
+            marker is not None
+            and marker["deployment"] == name
+            and not self.postgres_rotating_ok()
+        ):
+            return {}, {}, ["postgres_credential_rotation_in_progress"]
+        try:
+            observed = resources_postgres_module.load_observed(self.store.root, binding)
+        except ResourceError:
+            observed = None
+        if observed is None or observed["phase"] != "ready":
+            return {}, {}, ["postgres_resource_not_ready"]
+        allocations = cast(dict[str, dict[str, object]], observed["allocations"])
+        allocation = allocations.get(name)
+        if allocation is None or allocation["status"] != "active":
+            return {}, {}, ["postgres_binding_missing"]
+        host, port = observed["endpoint"], observed["port"]
+        if not isinstance(host, str) or not isinstance(port, int):
+            return {}, {}, ["postgres_endpoint_missing"]
+        target = state.targets[deployment.target]
+        return (
+            postgres_contract.contract_variables(
+                host,
+                port,
+                str(allocation["database_identifier"]),
+                f"{target.apps_root}/{postgres_contract.TRUST_BUNDLE_PATH}",
+            ),
+            postgres_contract.credential_references(
+                resource.workload_secret_store, binding, name
+            ),
+            [],
+        )
+
     def secret_plan(
         self, name: str, state: ControlState, deployment: DeploymentConfig
     ) -> tuple[list[dict[str, str]], list[str]]:
@@ -123,6 +167,7 @@ class DeploymentResourceOrchestrator:
                 self.store.secrets_path,
                 {
                     **deployment.secrets,
+                    **self.postgres_runtime(name, state, deployment)[1],
                     **self.valkey_runtime(name, state, deployment)[1],
                 },
                 self.aws_secrets,
@@ -171,19 +216,20 @@ class DeploymentResourceOrchestrator:
             ),
         }
 
-    @staticmethod
     def managed_database_issues(
-        state: ControlState, deployment: DeploymentConfig
+        self, state: ControlState, deployment: DeploymentConfig
     ) -> list[str]:
-        binding = deployment.resources.database
-        if binding is not None and isinstance(
-            state.resources[binding], AWSRDSPostgresResource
-        ):
-            return [
-                f"database is bound to managed resource {binding}; runtime wiring of managed "
-                "database credentials is not implemented yet"
-            ]
-        return []
+        name = next(
+            (
+                candidate
+                for candidate, configured in state.deployments.items()
+                if configured == deployment
+            ),
+            None,
+        )
+        return (
+            [] if name is None else self.postgres_runtime(name, state, deployment)[2]
+        )
 
     def resource_plan(self, name: str) -> dict[str, Any]:
         state, deployment, target, application = self.context(name)
@@ -191,7 +237,7 @@ class DeploymentResourceOrchestrator:
         issues = (
             secret_issues
             + self.dns_issues(deployment, target)
-            + self.managed_database_issues(state, deployment)
+            + self.postgres_runtime(name, state, deployment)[2]
             + self.recovery_schedule_runtime_issues(deployment, target)
             + self.valkey_runtime(name, state, deployment)[3]
         )
@@ -240,6 +286,7 @@ class DeploymentResourceOrchestrator:
             self.store.secrets_path,
             {
                 **deployment.secrets,
+                **self.postgres_runtime(name, state, deployment)[1],
                 **self.valkey_runtime(name, state, deployment)[1],
             },
             cast(list[dict[str, str]], expected["secret_versions"]),

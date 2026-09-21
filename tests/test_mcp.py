@@ -47,8 +47,9 @@ from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.recovery import ObjectMetadata, RecoveryError
 from gimme.recovery import append_restore_event, recovery_point_id, restore_event_key
 from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
-from gimme.secrets import SecretMetadata
+from gimme.secrets import SecretError, SecretMetadata
 import gimme.server as server_module
+import gimme.resources_postgres as resources_postgres_module
 import gimme.control_plans as control_plans_module
 import gimme.deployment_resource_orchestration as deployment_resource_module
 import gimme.recovery as recovery_module
@@ -3434,6 +3435,9 @@ class FakeRDS:
         self.fail_master = fail_master
         self.fail_describe = fail_describe
         self.secret_payloads: dict[str, dict[str, str]] = {}
+        self.secret_versions: dict[str, int] = {}
+        self.secret_history: dict[str, dict[str, dict[str, str]]] = {}
+        self.secret_current: dict[str, str] = {}
 
     def describe_instance(self, account, network, identifier):
         if self.fail_describe:
@@ -3450,6 +3454,11 @@ class FakeRDS:
             instance_class=resource.instance_class,
             allocated_storage_gb=resource.allocated_storage_gb,
             security_group_ids=tuple(sorted(group_ids)),
+            parameter_group_status="in-sync", multi_az=True, storage_encrypted=True,
+            deletion_protection=True, publicly_accessible=False,
+            backup_retention_days=resource.backup_retention_days,
+            backup_window=resource.backup_window,
+            maintenance_window=resource.maintenance_window,
         )
         return self.instances[identifier]
 
@@ -3474,9 +3483,44 @@ class FakeRDS:
             raise ResourceError("aws_rds_master_secret_access_denied")
         return "gimme_admin", MASTER_PASSWORD
 
+    def master_secret_version_fingerprint(self, account, region, secret_arn):
+        return "sha256:" + "a" * 64
+
     def create_workload_secret(self, account, store, name, tags, payload):
+        number = self.secret_versions.get(name, 0) + 1
+        self.secret_versions[name] = number
+        version = f"v{number}"
         self.secret_payloads[name] = payload
-        return f"arn:aws:secretsmanager:{store.region}:123456789012:secret:{name}", "v1"
+        self.secret_history.setdefault(name, {})[version] = dict(payload)
+        self.secret_current[name] = version
+        return f"arn:aws:secretsmanager:{store.region}:123456789012:secret:{name}", version
+
+    def restore_workload_secret_version(
+        self, account, store, name, restore_version, remove_version
+    ):
+        if self.secret_current[name] == restore_version:
+            return
+        assert self.secret_current[name] == remove_version
+        self.secret_current[name] = restore_version
+        self.secret_payloads[name] = dict(self.secret_history[name][restore_version])
+
+    def resolve_workload_credential(self, account, store, name, version_id):
+        document = self.secret_history[name][version_id]
+        return document["username"], document["password"]
+
+
+class FakeRDSSecrets:
+    def __init__(self, adapter: FakeRDS) -> None:
+        self.adapter = adapter
+
+    def describe(self, account, store_name, store, secret):
+        version = self.adapter.secret_current.get(secret)
+        if version is None:
+            raise SecretError("aws_secret_metadata_missing")
+        return SecretMetadata(version, f"arn:{secret}")
+
+    def resolve(self, account, store_name, store, secret, version_id):
+        return json.dumps(self.adapter.secret_history[secret][version_id])
 
 
 def rds_definition(**updates) -> AWSRDSPostgresResource:
@@ -3484,6 +3528,8 @@ def rds_definition(**updates) -> AWSRDSPostgresResource:
         "aws_network": "primary", "administration_target": "adminbox",
         "engine_version": "17.2", "instance_class": "db.t3.medium",
         "allocated_storage_gb": 20, "administration_security_group_id": "sg-0123456789abcdef0",
+        "backup_window": "03:00-04:00", "backup_retention_days": 7,
+        "maintenance_window": "sun:05:00-sun:06:00",
         "deployment_security_group_ids": {"devbox": "sg-0123456789abcdef1"},
         "workload_secret_store": "workload-secrets",
     }
@@ -3543,6 +3589,20 @@ def use_rds_store(tmp_path: Path, monkeypatch, *, bound: bool, recovery: bool = 
     monkeypatch.setattr(server_module, "store", selected)
     adapter = FakeRDS(**adapter_options)
     monkeypatch.setattr(server_module, "rds_postgres", adapter)
+    monkeypatch.setattr(server_module, "aws_secrets", FakeRDSSecrets(adapter))
+    monkeypatch.setattr(
+        server_module.runner,
+        "run",
+        lambda *args, **kwargs: CommandResult(
+            ["dep"],
+            0,
+            "GIMME_RESOURCE_VERIFIED|postgres|"
+            + base64.b64encode(json.dumps({
+                "citext": "1.6", "pgcrypto": "1.3", "uuid-ossp": "1.1",
+            }).encode()).decode()
+            + "\n",
+        ),
+    )
     return adapter
 
 
@@ -3636,6 +3696,252 @@ def test_bind_resource_never_exposes_credentials_anywhere(tmp_path, monkeypatch)
     assert MASTER_PASSWORD not in everything
     assert workload_password not in everything
     assert adapter.secret_payloads["primary-rds/example-app"]["password"] == workload_password
+    assert set(adapter.secret_payloads["primary-rds/example-app"]) == {"username", "password"}
+    assert adapter.secret_payloads["primary-rds/example-app"]["username"].endswith("_g1")
+
+
+def test_managed_postgres_binding_becomes_a_version_pinned_laravel_runtime(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+
+    plan = server_module.plan_deployment_resources("example-app")
+    keys = {item["environment_key"] for item in plan["secret_versions"]}
+    assert {"DB_USERNAME", "DB_PASSWORD"} <= keys
+    assert plan["ready"] is True
+
+    captured: dict[str, object] = {}
+
+    def capture(task, server, **kwargs):
+        if task == "gimme:provision:app":
+            captured.update(kwargs)
+            captured["secret_document"] = json.loads(kwargs["secret_file"].read_text())
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", capture)
+    server_module.apply_deployment_resources("example-app", str(plan["plan_id"]))
+
+    variables = captured["variables"]
+    assert variables["DB_CONNECTION"] == "pgsql"
+    assert variables["DB_HOST"] == "db.example.test"
+    assert variables["DB_SSLMODE"] == "verify-full"
+    assert variables["DB_SSLROOTCERT"].endswith("/.gimme/aws-rds-global-bundle.pem")
+    assert captured["resource_trust_bundle_sha256"] == RDS_TRUST_BUNDLE_SHA256
+    assert set(captured["secret_document"]) == {"DB_USERNAME", "DB_PASSWORD"}
+    assert adapter.secret_payloads["primary-rds/example-app"]["password"] not in str(plan)
+
+
+def test_managed_postgres_binding_pins_allowlisted_extension_versions(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    state = server_module.store.load()
+    application_name = state.deployments["example-app"].application
+    application = state.applications[application_name].model_copy(
+        update={"postgres_extensions": ["pgcrypto", "citext"]}
+    )
+    server_module.store.save(
+        state.model_copy(update={"applications": {application_name: application}})
+    )
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    plan = server_module.plan_bind_resource("example-app")
+    assert plan["postgres_extensions"] == {"citext": "1.6", "pgcrypto": "1.3"}
+    captured: dict[str, object] = {}
+
+    def bind(task, server, **kwargs):
+        captured.update(kwargs)
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", bind)
+    server_module.bind_resource("example-app", str(plan["plan_id"]))
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert captured["resource_extensions"] == {"citext": "1.6", "pgcrypto": "1.3"}
+    assert allocation["extensions"] == {"citext": "1.6", "pgcrypto": "1.3"}
+
+
+def test_rebinding_managed_postgres_reuses_the_active_generation_and_secret(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    first_password = adapter.secret_payloads["primary-rds/example-app"]["password"]
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert allocation["generation"] == 1
+    assert adapter.secret_versions["primary-rds/example-app"] == 1
+    assert adapter.secret_payloads["primary-rds/example-app"]["password"] == first_password
+
+
+def test_managed_postgres_credential_rotation_switches_then_retires_old_login(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    tasks: list[str] = []
+
+    def succeed(task, server, **kwargs):
+        tasks.append(task)
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", succeed)
+    plan = server_module.plan_rotate_resource_credential("primary-rds", "example-app")
+    result = server_module.apply_rotate_resource_credential(
+        "primary-rds", "example-app", str(plan["plan_id"])
+    )
+
+    observed = server_module.inspect_resource("primary-rds")["allocations"]["example-app"]
+    assert result["generation"] == 2 and observed["status"] == "active"
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert allocation["generation"] == 2 and allocation["login_role"].endswith("_g2")
+    assert adapter.secret_current["primary-rds/example-app"] == "v2"
+    assert tasks[-1] == "gimme:resource:retire-postgres-login"
+    assert "password" not in str(result)
+
+
+def test_managed_postgres_rotation_restores_secret_allocation_and_environment_on_failure(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    failed = False
+
+    def fail_candidate_once(task, server, **kwargs):
+        nonlocal failed
+        if task == "gimme:provision:app" and not failed:
+            failed = True
+            raise RuntimeError("candidate health failed")
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_candidate_once)
+    plan = server_module.plan_rotate_resource_credential("primary-rds", "example-app")
+
+    with pytest.raises(ResourceError, match="aws_rds_rotation_activation_failed"):
+        server_module.apply_rotate_resource_credential(
+            "primary-rds", "example-app", str(plan["plan_id"])
+        )
+
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert allocation["generation"] == 1 and allocation["login_role"].endswith("_g1")
+    assert adapter.secret_current["primary-rds/example-app"] == "v1"
+
+
+def test_managed_postgres_rotation_resumes_after_activation_interruption(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    interrupted = False
+
+    def interrupt_once(task, server, **kwargs):
+        nonlocal interrupted
+        if task == "gimme:provision:app" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", interrupt_once)
+    plan = server_module.plan_rotate_resource_credential("primary-rds", "example-app")
+    with pytest.raises(KeyboardInterrupt):
+        server_module.apply_rotate_resource_credential(
+            "primary-rds", "example-app", str(plan["plan_id"])
+        )
+    marker = resources_postgres_module.load_rotation(
+        server_module.store.root, "primary-rds"
+    )
+    assert marker is not None and marker["phase"] == "published"
+
+    result = server_module.apply_rotate_resource_credential(
+        "primary-rds", "example-app", str(plan["plan_id"])
+    )
+    assert result["generation"] == 2
+    assert resources_postgres_module.load_rotation(
+        server_module.store.root, "primary-rds"
+    ) is None
+    assert adapter.secret_versions["primary-rds/example-app"] == 2
+
+
+def test_managed_postgres_rotation_resumes_an_interrupted_rollback(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    activation_calls = 0
+
+    def fail_candidate_and_first_restore(task, server, **kwargs):
+        nonlocal activation_calls
+        if task == "gimme:provision:app":
+            activation_calls += 1
+            if activation_calls <= 2:
+                raise RuntimeError("activation interrupted")
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", fail_candidate_and_first_restore)
+    plan = server_module.plan_rotate_resource_credential("primary-rds", "example-app")
+    with pytest.raises(ResourceError, match="aws_rds_rotation_rollback_failed"):
+        server_module.apply_rotate_resource_credential(
+            "primary-rds", "example-app", str(plan["plan_id"])
+        )
+    marker = resources_postgres_module.load_rotation(
+        server_module.store.root, "primary-rds"
+    )
+    assert marker is not None and marker["phase"] == "rolling_back"
+
+    with pytest.raises(ResourceError, match="aws_rds_rotation_activation_failed"):
+        server_module.apply_rotate_resource_credential(
+            "primary-rds", "example-app", str(plan["plan_id"])
+        )
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert allocation["generation"] == 1
+    assert adapter.secret_current["primary-rds/example-app"] == "v1"
+    assert resources_postgres_module.load_rotation(
+        server_module.store.root, "primary-rds"
+    ) is None
 
 
 def test_failed_database_binding_cleans_protected_credentials_before_raising(
@@ -3922,20 +4228,33 @@ def test_bind_resource_rejects_stale_plans_and_unready_resources(tmp_path, monke
         server_module.bind_resource("example-app", str(plan["plan_id"]))
 
 
+def test_bind_resource_fails_closed_on_live_rds_policy_drift(tmp_path, monkeypatch) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    identifier = next(iter(adapter.instances))
+    adapter.instances[identifier] = dataclasses.replace(
+        adapter.instances[identifier], multi_az=False
+    )
+    inspection = server_module.inspect_resource("primary-rds")
+    assert inspection["phase"] == "pending"
+    assert "aws_rds_not_ready_multi_az" in inspection["readiness_issues"]
+    plan = server_module.plan_bind_resource("example-app")
+
+    with pytest.raises(ResourceError, match="aws_rds_binding_resource_not_ready"):
+        server_module.bind_resource("example-app", str(plan["plan_id"]))
+    assert adapter.secret_payloads == {}
+
+
 def test_bind_resource_fails_closed_when_the_master_credential_is_unavailable(
     tmp_path, monkeypatch
 ) -> None:
     use_rds_store(tmp_path, monkeypatch, bound=True, fail_master=True)
-    server_module.apply_resource(
-        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
-    )
-    monkeypatch.setattr(
-        server_module.runner, "run", lambda *a, **k: pytest.fail("must not reach the target")
-    )
-    plan = server_module.plan_bind_resource("example-app")
-
     with pytest.raises(ResourceError, match="aws_rds_master_secret_access_denied"):
-        server_module.bind_resource("example-app", str(plan["plan_id"]))
+        server_module.apply_resource(
+            "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+        )
     assert server_module.inspect_resource("primary-rds")["allocations"] == {}
 
 
@@ -4008,7 +4327,7 @@ def test_cleanup_is_refused_while_a_deployment_still_references_the_resource(
         server_module.plan_cleanup_resource("primary-rds")
 
 
-def test_managed_database_binding_blocks_local_provisioning_and_release(
+def test_unready_managed_database_binding_blocks_provisioning_and_release(
     tmp_path, monkeypatch
 ) -> None:
     use_rds_store(tmp_path, monkeypatch, bound=True)
@@ -4018,10 +4337,10 @@ def test_managed_database_binding_blocks_local_provisioning_and_release(
 
     plan = server_module.plan_deployment_resources("example-app")
     assert plan["ready"] is False
-    assert "managed resource primary-rds" in " ".join(plan["readiness_issues"])
+    assert plan["readiness_issues"] == ["postgres_resource_not_ready"]
     with pytest.raises(ValueError, match="not ready"):
         server_module.apply_deployment_resources("example-app", str(plan["plan_id"]))
-    with pytest.raises(ValueError, match="managed resource primary-rds"):
+    with pytest.raises(ValueError, match="postgres_resource_not_ready"):
         server_module.plan_deployment("example-app")
 
 

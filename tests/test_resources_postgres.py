@@ -47,6 +47,9 @@ def resource() -> AWSRDSPostgresResource:
         engine_version="17.2",
         instance_class="db.t3.medium",
         allocated_storage_gb=20,
+        backup_window="03:00-04:00",
+        backup_retention_days=7,
+        maintenance_window="sun:05:00-sun:06:00",
         administration_security_group_id="sg-0123456789abcdef0",
         deployment_security_group_ids={"devbox": "sg-0123456789abcdef1"},
         workload_secret_store="workload-secrets",
@@ -85,6 +88,10 @@ class FakeRDSAdapter:
                     endpoint="db.example.test",
                     port=5432,
                     master_secret_arn=instance.master_secret_arn,
+                    multi_az=True, storage_encrypted=True, deletion_protection=True,
+                    publicly_accessible=False, parameter_group_status="in-sync",
+                    backup_retention_days=7, backup_window="03:00-04:00",
+                    maintenance_window="sun:05:00-sun:06:00",
                 )
                 self.instances[aws_instance_identifier] = instance
         return instance
@@ -103,12 +110,19 @@ class FakeRDSAdapter:
             master_secret_arn=(
                 f"arn:aws:secretsmanager:us-east-1:123456789012:secret:{aws_instance_identifier}-master"
             ),
+            multi_az=True, storage_encrypted=True, deletion_protection=True,
+            publicly_accessible=False, parameter_group_status="in-sync",
+            backup_retention_days=7, backup_window="03:00-04:00",
+            maintenance_window="sun:05:00-sun:06:00",
         )
         self.instances[aws_instance_identifier] = observation
         return observation
 
     def resolve_master_credential(self, account, region, secret_arn):
         return "gimme_admin", "master-plaintext-password"
+
+    def master_secret_version_fingerprint(self, account, region, secret_arn):
+        return "sha256:" + "a" * 64
 
     def create_workload_secret(self, account, store, name, tags, payload):
         version = self.secret_versions.get(name, 0) + 1
@@ -183,8 +197,9 @@ def test_apply_provision_creates_once_and_reconciles_idempotently(tmp_path: Path
     first = apply_provision(adapter, tmp_path, account(), network(), resource(), "devbox-postgres")
     second = apply_provision(adapter, tmp_path, account(), network(), resource(), "devbox-postgres")
 
-    assert first["phase"] == "ready"
-    assert second["phase"] == "ready"
+    assert first["phase"] == "pending"
+    assert second["phase"] == "pending"
+    assert first["readiness_issues"] == ["aws_rds_not_ready_administration"]
     assert adapter.create_calls == 1
     assert adapter.describe_calls >= 2
 
@@ -237,7 +252,7 @@ def test_apply_provision_resumes_a_pending_instance_without_recreating(tmp_path:
     )
 
     assert pending["phase"] == "pending"
-    assert resumed["phase"] == "ready"
+    assert resumed["phase"] == "pending"
     assert adapter.create_calls == 1
 
 
@@ -262,10 +277,11 @@ def test_persist_binding_never_returns_the_workload_credential(tmp_path: Path) -
         "devbox-postgres",
         "example-local",
         "gimme_example_local",
-        "gimme_example_local",
+        "gimme_example_local_owner",
+        "gimme_example_local_g1",
+        1,
+        {},
         password,
-        "db.example.test",
-        5432,
     )
 
     assert "password" not in result
@@ -289,10 +305,11 @@ def test_persist_binding_is_idempotent_and_rotates_the_secret_version(tmp_path: 
         "devbox-postgres",
         "example-local",
         "role",
-        "role",
+        "role_owner",
+        "role_g1",
+        1,
+        {},
         "pw-1",
-        "db.example.test",
-        5432,
     )
     second = persist_binding(
         adapter,
@@ -303,10 +320,11 @@ def test_persist_binding_is_idempotent_and_rotates_the_secret_version(tmp_path: 
         "devbox-postgres",
         "example-local",
         "role",
-        "role",
+        "role_owner",
+        "role_g1",
+        1,
+        {},
         "pw-2",
-        "db.example.test",
-        5432,
     )
 
     assert first["secret_reference"] == second["secret_reference"]
@@ -326,10 +344,11 @@ def test_persist_binding_requires_a_provisioned_resource(tmp_path: Path) -> None
             "devbox-postgres",
             "example-local",
             "role",
-            "role",
+            "role_owner",
+            "role_g1",
+            1,
+            {},
             "pw",
-            "db.example.test",
-            5432,
         )
 
 
@@ -343,6 +362,17 @@ def _instance_response(identifier: str, *, tag: str | None, status: str = "avail
         "MasterUserSecret": {
             "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds-master"
         },
+        "MultiAZ": True,
+        "StorageEncrypted": True,
+        "DeletionProtection": True,
+        "PubliclyAccessible": False,
+        "BackupRetentionPeriod": 7,
+        "PreferredBackupWindow": "03:00-04:00",
+        "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
+        "DBParameterGroups": [{
+            "DBParameterGroupName": f"{identifier}-params",
+            "ParameterApplyStatus": "in-sync",
+        }],
         "TagList": [] if tag is None else [{"Key": "gimme:resource", "Value": tag}],
     }
 
@@ -481,7 +511,9 @@ def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) ->
             "VpcSecurityGroupIds": ["sg-0123456789abcdef0", "sg-0123456789abcdef1"],
             "ManageMasterUserPassword": True,
             "MasterUsername": "gimme_admin",
-            "BackupRetentionPeriod": 7,
+                "BackupRetentionPeriod": 7,
+                "PreferredBackupWindow": "03:00-04:00",
+                "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
             "AutoMinorVersionUpgrade": False,
             "DeletionProtection": True,
             "Tags": [{"Key": "gimme:resource", "Value": "devbox-postgres"}],
@@ -797,6 +829,42 @@ def test_workload_secret_rotation_writes_a_new_version_when_the_secret_exists(mo
     assert version.startswith("6f1f3f0e")
 
 
+@pytest.mark.parametrize("already_restored", [False, True])
+def test_workload_secret_rollback_is_idempotent(monkeypatch, already_restored: bool) -> None:
+    secrets_client, stub = _stubbed("secretsmanager")
+    secret_id = "gimme/workload/devbox-postgres/example-local"
+    old_version = "o" * 32
+    new_version = "n" * 32
+    stages = {
+        old_version: ["AWSCURRENT"] if already_restored else ["AWSPREVIOUS"],
+        new_version: ["AWSPREVIOUS"] if already_restored else ["AWSCURRENT"],
+    }
+    stub.add_response(
+        "describe_secret", {"VersionIdsToStages": stages}, {"SecretId": secret_id}
+    )
+    if not already_restored:
+        stub.add_response(
+            "update_secret_version_stage",
+            {},
+            {
+                "SecretId": secret_id,
+                "VersionStage": "AWSCURRENT",
+                "MoveToVersionId": old_version,
+                "RemoveFromVersionId": new_version,
+            },
+        )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: _StubbedSession({"secretsmanager": secrets_client})
+    )
+
+    with stub:
+        adapter.restore_workload_secret_version(
+            account(), workload_store(), "devbox-postgres/example-local",
+            old_version, new_version,
+        )
+
+
 IDENTIFIER = derive_instance_identifier("devbox-postgres")
 
 
@@ -808,6 +876,9 @@ def live_instance(**updates) -> InstanceObservation:
         "instance_class": "db.t3.medium", "allocated_storage_gb": 20,
         "security_group_ids": ("sg-0123456789abcdef0", "sg-0123456789abcdef1"),
         "parameter_group_name": f"{IDENTIFIER}-params", "parameter_group_status": "in-sync",
+        "multi_az": True, "storage_encrypted": True, "deletion_protection": True,
+        "publicly_accessible": False, "backup_retention_days": 7,
+        "backup_window": "03:00-04:00", "maintenance_window": "sun:05:00-sun:06:00",
     }
     values.update(updates)
     return InstanceObservation(**values)  # type: ignore[arg-type]
@@ -955,8 +1026,8 @@ def test_apply_modifies_an_existing_instance_once_and_polls_to_ready(tmp_path: P
         {"DBInstanceClass": "db.m6g.large", "AllocatedStorage": 40}
     ]
     assert first["modified_fields"] == ["AllocatedStorage", "DBInstanceClass"]
-    assert first["phase"] == "ready" and first["rebooted"] is False
-    assert second["modified_fields"] == [] and second["phase"] == "ready"
+    assert first["phase"] == "pending" and first["rebooted"] is False
+    assert second["modified_fields"] == [] and second["phase"] == "pending"
     assert adapter.create_calls == 0
 
 
@@ -996,7 +1067,7 @@ def test_an_unsettled_instance_is_diffed_after_it_settles_not_reported_ready_wit
     result = converge(adapter, tmp_path, instance_class="db.m6g.large")
 
     assert adapter.modify_calls == [{"DBInstanceClass": "db.m6g.large"}]
-    assert result["modified_fields"] == ["DBInstanceClass"] and result["phase"] == "ready"
+    assert result["modified_fields"] == ["DBInstanceClass"] and result["phase"] == "pending"
 
 
 def test_a_parameter_group_pending_reboot_triggers_exactly_one_reboot(tmp_path: Path) -> None:
@@ -1006,7 +1077,7 @@ def test_a_parameter_group_pending_reboot_triggers_exactly_one_reboot(tmp_path: 
     second = converge(adapter, tmp_path)
 
     assert adapter.reboot_calls == 1
-    assert first["rebooted"] is True and first["phase"] == "ready"
+    assert first["rebooted"] is True and first["phase"] == "pending"
     assert second["rebooted"] is False
     assert adapter.modify_calls == []
 

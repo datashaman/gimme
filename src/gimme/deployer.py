@@ -9,7 +9,7 @@ import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from gimme.config import AppConfig, ServerConfig, StackConfig
 from gimme.plans import (
@@ -152,6 +152,9 @@ class DeployerRunner:
         valkey_restore_records: int | None = None,
         resource_endpoint: tuple[str, int] | None = None,
         resource_database: str | None = None,
+        resource_owner: str | None = None,
+        resource_login: str | None = None,
+        resource_extensions: Mapping[str, str] | None = None,
         resource_trust_bundle_sha256: str | None = None,
         recovery_schedule_authority: dict[str, object] | None = None,
         recovery_schedule_valkey_file: Path | None = None,
@@ -349,6 +352,14 @@ class DeployerRunner:
             environment["GIMME_RESOURCE_TRUST_BUNDLE_SHA256"] = resource_trust_bundle_sha256
         if resource_database is not None:
             environment["GIMME_DATABASE_IDENTIFIER"] = resource_database
+        if resource_owner is not None:
+            environment["GIMME_RESOURCE_OWNER"] = resource_owner
+        if resource_login is not None:
+            environment["GIMME_RESOURCE_LOGIN"] = resource_login
+        if resource_extensions is not None:
+            environment["GIMME_RESOURCE_EXTENSIONS_JSON"] = json.dumps(
+                dict(resource_extensions)
+            )
         if recovery_schedule_authority is not None:
             environment["GIMME_RECOVERY_SCHEDULE_JSON"] = json.dumps(
                 recovery_schedule_authority, sort_keys=True, separators=(",", ":")

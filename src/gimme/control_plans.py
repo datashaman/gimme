@@ -16,7 +16,12 @@ from gimme.control import (
     TargetConfig,
 )
 from gimme.execution import execution_fingerprint
-from gimme.resources_postgres import desired_security_group_ids
+from gimme.resources_postgres import (
+    RDS_TRUST_BUNDLE_SHA256,
+    derive_instance_identifier,
+    derive_parameter_group_name,
+    desired_security_group_ids,
+)
 
 
 def exact_plan(value: dict[str, Any]) -> dict[str, Any]:
@@ -538,6 +543,30 @@ def resource_provision_plan(
             "engine_version": resource.engine_version,
             "instance_class": resource.instance_class,
             "allocated_storage_gb": resource.allocated_storage_gb,
+            "backup_window": resource.backup_window,
+            "backup_retention_days": resource.backup_retention_days,
+            "maintenance_window": resource.maintenance_window,
+            "lifecycle": {
+                "retain_on_removal": resource.retain_on_removal,
+                "deletion_protection": True,
+            },
+            "topology": {"multi_az": True, "public_access": False, "storage": "gp3"},
+            "ownership_fingerprint": StateStore.digest({
+                "resource": resource_name,
+                "instance": derive_instance_identifier(resource_name),
+                "parameter_group": derive_parameter_group_name(
+                    derive_instance_identifier(resource_name)
+                ),
+                "aws_network": resource.aws_network,
+            }),
+            "trust_bundle": {
+                "identity": "aws-rds-global-commercial-v1",
+                "sha256": RDS_TRUST_BUNDLE_SHA256,
+            },
+            "master_secret_version_fingerprint": (
+                observed.get("master_secret_version_fingerprint")
+                if observed is not None else None
+            ),
             "security_group_ids": list(desired_security_group_ids(resource)),
             "current_phase": observed["phase"] if observed is not None else "absent",
             "effects": [
@@ -606,21 +635,66 @@ def resource_binding_plan(
     deployment: DeploymentConfig,
     resource_name: str,
     observed: dict[str, Any] | None,
+    postgres_extensions: list[str],
 ) -> dict[str, Any]:
     allocations = observed["allocations"] if observed is not None else {}
+    available_extensions = (
+        observed.get("extension_versions", {}) if observed is not None else {}
+    )
+    extension_versions = {
+        name: available_extensions.get(name) for name in postgres_extensions
+    }
     return exact_plan(
         {
             "kind": "resource_binding",
             "deployment": deployment_name,
             "resource": resource_name,
             "database": deployment.placement.database_identifier,
-            "resource_ready": observed is not None and observed["phase"] == "ready",
+            "resource_ready": (
+                observed is not None
+                and observed["phase"] == "ready"
+                and all(version is not None for version in extension_versions.values())
+            ),
             "already_bound": deployment_name in allocations,
+            "login_generation": (
+                allocations[deployment_name]["generation"]
+                if deployment_name in allocations else 1
+            ),
+            "postgres_extensions": extension_versions,
             "effects": [
-                "create or reconcile the deployment's isolated database and role through "
+                "create or reconcile the deployment's isolated database, stable NOLOGIN "
+                "owner, generation login, and allowlisted extensions through "
                 "the Administration Target",
                 "create or rotate a tagged Secrets Manager workload secret",
                 "never returns, stores, or logs the workload credential",
+            ],
+        }
+    )
+
+
+def postgres_rotation_plan(
+    resource_name: str,
+    deployment_name: str,
+    identity_fingerprint: str,
+    resource_fingerprint: str,
+    current_generation: int,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_credential_rotate",
+            "resource": resource_name,
+            "deployment": deployment_name,
+            "identity_fingerprint": identity_fingerprint,
+            "resource_fingerprint": resource_fingerprint,
+            "current_generation": current_generation,
+            "candidate_generation": current_generation + 1,
+            "effects": [
+                "create one generation-specific least-privilege PostgreSQL login",
+                "write a new two-field Resource Credential secret version",
+                "activate and health-check the candidate Deployment environment",
+                "retire the previous login only after successful activation",
+                "restore the previous secret version, environment, and login on failure",
+                "never return, store locally, or log either credential",
             ],
         }
     )
