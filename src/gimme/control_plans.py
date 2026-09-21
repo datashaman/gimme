@@ -657,8 +657,13 @@ def resource_binding_plan(
             ),
             "already_bound": deployment_name in allocations,
             "login_generation": (
-                allocations[deployment_name]["generation"]
+                int(allocations[deployment_name]["generation"])
+                + (1 if allocations[deployment_name]["status"] == "detached" else 0)
                 if deployment_name in allocations else 1
+            ),
+            "reactivates_detached_allocation": (
+                deployment_name in allocations
+                and allocations[deployment_name]["status"] == "detached"
             ),
             "postgres_extensions": extension_versions,
             "effects": [
@@ -696,6 +701,30 @@ def postgres_rotation_plan(
                 "restore the previous secret version, environment, and login on failure",
                 "never return, store locally, or log either credential",
             ],
+        }
+    )
+
+
+def postgres_allocation_purge_plan(
+    resource_name: str, deployment_name: str, identity_fingerprint: str,
+    allocation_fingerprint: str, evidence: dict[str, object],
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_allocation_purge",
+            "resource": resource_name,
+            "deployment": deployment_name,
+            "confirmation": f"PURGE {deployment_name} FROM {resource_name}",
+            "identity_fingerprint": identity_fingerprint,
+            "allocation_fingerprint": allocation_fingerprint,
+            "recovery_evidence": evidence,
+            "effects": [
+                "delete only this detached Deployment database and its marked roles",
+                "schedule its workload secret for the fixed 30-day recovery window",
+                "remove the Detached Allocation only after both remote phases succeed",
+                "retain the RDS instance, automated backups, and every snapshot",
+            ],
+            "irreversible": True,
         }
     )
 
@@ -787,6 +816,36 @@ def valkey_destroy_plan(
     )
 
 
+def postgres_destroy_plan(
+    resource_name: str, fingerprint: str, final_snapshot: str,
+    allocations: list[dict[str, object]], generation: int = 1,
+) -> dict[str, Any]:
+    return exact_plan(
+        {
+            "kind": "resource_destroy",
+            "resource": resource_name,
+            "confirmation": f"DESTROY RESOURCE {resource_name}",
+            "identity_fingerprint": fingerprint,
+            "generation": generation,
+            "final_snapshot": final_snapshot,
+            "detached_allocations": allocations,
+            "destroys": [
+                "the exact owned RDS instance and all databases it contains",
+                "the Resource-owned parameter group and subnet group after deletion",
+                "the local Resource registration and observation",
+            ],
+            "retains": [
+                "a verified final tagged RDS snapshot",
+                "automated backups for the configured AWS retention period",
+                "every other manual snapshot",
+                "workload credential secrets until separately purged or recovered",
+            ],
+            "authority": "the Provider Account's destructive role, assumed only during apply",
+            "irreversible": True,
+        }
+    )
+
+
 def valkey_restore_plan(
     resource_name: str, snapshot: str | None, deployments: list[str], engine_version: str
 ) -> dict[str, Any]:
@@ -845,7 +904,7 @@ def resource_forget_plan(resource_name: str) -> dict[str, Any]:
         {
             "kind": "resource_forget",
             "resource": resource_name,
-            "confirmation": f"FORGET {resource_name}",
+            "confirmation": f"FORGET RETAINED RESOURCE {resource_name}",
             "effects": [
                 "delete the local Retained Resource tombstone only",
                 "make no remote changes",

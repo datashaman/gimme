@@ -14,16 +14,16 @@ the target design and this page is the current behavior.
 Implemented: registration, provisioning, reviewed maintenance-policy updates, strict live
 readiness and TLS administration verification, isolated Deployment databases and generation
 logins, protected Laravel activation, explicit workload-credential rotation with rollback,
-live inspection with drift reporting, and non-destructive removal.
+manual Recovery Points, detachment and reactivation, guarded allocation purge, retained
+tombstones, separately authorized destruction, and live inspection with drift reporting.
 
 Not implemented yet:
 
-- Detached Allocation rebind and purge (`plan_forget_resource` deletes an RDS Retained
-  Resource tombstone, locally only);
-- destructive deletion. Removal never deletes the instance;
+- unattended scheduled Recovery Points for managed PostgreSQL (use manual on-demand capture);
+- managed PostgreSQL Restore in place (capture is supported; restore/migration remains separate);
 - major-version upgrades, storage decreases, and moving
   a Resource to another Network or region, all of which need a new Resource.
-Differences from the ADR: two roles are used instead of four, the Administration Target
+Differences from the ADR: three roles are used instead of four, the Administration Target
 runs plain `psql` instead of a root-owned helper (verifying the certificate against a bundle
 delivered per bind rather than one that helper installs), and secret-free observations are
 cached in `observed-resources/<name>.json` beside desired state.
@@ -40,7 +40,7 @@ workload secrets. Everything else must already exist and is never edited:
 - an Administration Target: a registered Target with `"role": "administration"` that
   can reach the instance's private endpoint and has `psql` installed. It never hosts a
   Deployment;
-- a Provider Account with the two roles below, and an AWS Secrets Manager Secret Store for
+- a Provider Account with the three roles below, and an AWS Secrets Manager Secret Store for
   workload credentials (see [`use-aws-secret-stores.md`](use-aws-secret-stores.md)).
 
 The instance is never public and always uses gp3 storage, `StorageEncrypted`, the declared
@@ -57,8 +57,9 @@ Multi-AZ doubles the instance cost; Gimme reports structure but does not price i
 
 ## IAM roles
 
-Registration fixes one account ID and two distinct same-account roles. The ambient identity
-that runs Gimme must be able to assume both, and needs no other AWS permission.
+Registration fixes one account ID and distinct same-account inspection, resolver, and optional
+destructive roles. The ambient identity that runs Gimme must be able to assume each configured
+role, and needs no other AWS permission.
 `sts:AssumeRole` cannot be called with root user credentials, so do not run Gimme as root.
 
 The **inspection role** describes and creates the infrastructure and writes workload
@@ -136,6 +137,12 @@ secrets. It does not read secret values. Replace `<region>`, `<account>`, and
       "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<store-prefix>/*"
     },
     {
+      "Sid": "WorkloadSecretInventory",
+      "Effect": "Allow",
+      "Action": "secretsmanager:ListSecrets",
+      "Resource": "*"
+    },
+    {
       "Sid": "RdsManagedMasterSecret",
       "Effect": "Allow",
       "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
@@ -192,6 +199,41 @@ back to the exact previously reviewed workload-secret version:
         "StringEquals": {
           "aws:ResourceTag/gimme:secret-store": "<store-name>"
         }
+      }
+    }
+  ]
+}
+```
+
+The **destructive role** is optional until allocation purge or whole-Resource destruction.
+It schedules owned workload-secret deletion with the fixed 30-day recovery window, disables
+deletion protection, creates and reads the deterministic final snapshot, deletes the instance
+while retaining automated backups, and removes only Resource-owned parameter/subnet groups:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "rds:ModifyDBInstance", "rds:CreateDBSnapshot", "rds:DescribeDBSnapshots",
+        "rds:AddTagsToResource", "rds:DeleteDBInstance", "rds:DeleteDBParameterGroup",
+        "rds:DeleteDBSubnetGroup"
+      ],
+      "Resource": [
+        "arn:aws:rds:<region>:<account>:db:gimme-*",
+        "arn:aws:rds:<region>:<account>:snapshot:gimme-*",
+        "arn:aws:rds:<region>:<account>:pg:gimme-*",
+        "arn:aws:rds:<region>:<account>:subgrp:gimme-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"],
+      "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<store-prefix>/*",
+      "Condition": {
+        "StringEquals": {"aws:ResourceTag/gimme:secret-store": "<store-name>"}
       }
     }
   ]
@@ -321,8 +363,8 @@ Administration Target through the same protected temporary file used for Deploym
 The Target's fixed `psql` program creates a database, a stable `NOLOGIN` owner role, and a
 generation-specific least-privilege `LOGIN` role. Application `postgres_extensions` accepts
 only `pgcrypto`, `uuid-ossp`, and `citext`; planning pins the exact provider-reported default
-version and apply creates that version through fixed SQL. A different installed version fails
-closed instead of being silently upgraded.
+version and apply creates or updates to that reviewed version through fixed SQL. Apply verifies
+the installed version before recording the allocation.
 
 The `psql` connection uses `sslmode=verify-full` against the pinned AWS commercial-region
 global RDS trust bundle (`deploy/aws-rds-global-bundle.pem`, provenance and refresh steps in
@@ -346,7 +388,8 @@ must fail with `certificate verify failed`).
 
 The workload credential is then written to Secrets Manager at
 `<store-prefix>/<resource>/<deployment>` with exactly `username` and `password`, tagged for its
-Secret Store, Resource, and Deployment. The tool returns only the `{store, secret}` reference.
+Secret Store, Resource, Deployment, and login generation. The tool returns only the
+`{store, secret}` reference.
 `plan_deployment_resources` pins that secret version; `apply_deployment_resources` resolves it
 only for the protected Target transfer and injects fixed `DB_*` settings, including
 `DB_SSLMODE=verify-full` and the atomically installed pinned trust-bundle path. The existing
@@ -358,6 +401,34 @@ activates and health-checks the Deployment, and only then drops the previous log
 activation moves `AWSCURRENT` back to the prior secret version, restores the prior allocation
 and environment, and removes the candidate login. No credential, username, endpoint, ARN, or
 raw provider response is returned.
+
+## Capture, detach, reactivate, and purge an allocation
+
+Create a manual Recovery Point before removing a Deployment when you may need to purge its
+managed database later. Managed PostgreSQL capture runs the fixed `pg_dump` program with
+`verify-full` TLS and the Deployment's version-pinned workload credential; the password crosses
+only the protected temporary-file boundary and never appears in arguments or results. Scheduled
+capture and managed PostgreSQL Restore are not implemented yet.
+
+Deleting a Deployment, or updating it away from this Resource, first disables its current login
+through the Administration Target. The database, stable owner, workload secret, and data remain,
+and the observation records a Detached Allocation. When the selected verified Recovery Point was
+captured during the current login generation and no more than 24 hours before detachment, its
+identity is retained as destruction evidence. Detachment still succeeds without that evidence,
+but purge and whole-Resource destruction fail closed.
+
+Binding the same Deployment name back to the same Resource reuses its database and owner, creates
+the next generation login and secret version, and marks the allocation active. A retained
+allocation with that Deployment name on any other managed PostgreSQL Resource blocks binding so
+that Gimme cannot silently fork ownership.
+
+To erase one Detached Allocation, review `plan_purge_resource_allocation`, then call
+`apply_purge_resource_allocation` with the returned plan ID and exact confirmation
+`PURGE <deployment> FROM <resource>`. Gimme rechecks the absence of an active binding, the live
+Resource identity, the recorded allocation generation, and the destination-authoritative
+Recovery Point. It then drops only the marker-verified database and roles with fixed SQL and
+schedules the tagged workload secret for deletion with a fixed 30-day recovery window. A
+secret-free phase receipt makes retries resume after either operation without broadening scope.
 
 ## Inspect and remove
 
@@ -374,13 +445,28 @@ AWS has a pending modification. Drift is informational and is not stored. `apply
 applies it (see [Updating an existing instance](#updating-an-existing-instance)).
 
 `plan_cleanup_resource` and `apply_cleanup_resource` require the exact confirmation
-`RETAIN <name>` and are refused while a Deployment references the Resource. They remove
-only the local registration and write a Retained Resource tombstone. The instance,
-its data, the master secret, and the workload secrets remain in AWS and keep costing money,
-as do its DB subnet group and DB parameter group, which are never deleted automatically.
-To delete them, disable deletion protection and delete the instance yourself, then delete
-the workload secrets, and expect RDS to remove automated backups and snapshots
-asynchronously afterwards.
+`RETAIN <name>` and are refused while a Deployment references the Resource or any retained
+allocation is still active. They remove only the local registration and write a validated,
+secret-free Retained Resource tombstone. The instance, detached databases, master secret,
+workload secrets, subnet group, parameter group, manual snapshots, and automated backups remain
+in AWS and may keep costing money. The tombstone blocks removal of its Provider Account; use
+`apply_forget_resource` with exact confirmation `FORGET RETAINED RESOURCE <name>` only when you
+intend to discard local knowledge. Forgetting never calls AWS and does not make the retained
+infrastructure adoptable again.
+
+Whole-Resource destruction is separate. Every allocation must be detached and carry current
+Recovery Point evidence from its own generation. Review `plan_destroy_resource`, then apply with
+the exact `DESTROY RESOURCE <name>` confirmation. Through the destructive role Gimme rechecks the
+owned live identity and generation, disables deletion protection, creates and verifies the tagged
+deterministic final snapshot, deletes the instance while retaining automated backups, and removes
+only its owned parameter and subnet groups. Retries resume from a local phase marker. Gimme never
+purges automated, manual, or final snapshots; their later retention and deletion are an explicit
+AWS operator responsibility.
+
+If the local observation is missing, apply reconstructs active allocations only when desired
+state, the owned live instance, exact tagged workload-secret metadata, current secret version,
+and the marker-verified database catalog agree unambiguously. A corrupt observation, unmatched
+secret, missing instance, or conflicting identity fails closed without replacing evidence.
 
 ## Failure codes
 

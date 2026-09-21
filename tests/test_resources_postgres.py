@@ -516,7 +516,10 @@ def test_create_instance_sends_a_hardened_botocore_valid_request(monkeypatch) ->
                 "PreferredMaintenanceWindow": "sun:05:00-sun:06:00",
             "AutoMinorVersionUpgrade": False,
             "DeletionProtection": True,
-            "Tags": [{"Key": "gimme:resource", "Value": "devbox-postgres"}],
+            "Tags": [
+                {"Key": "gimme:resource", "Value": "devbox-postgres"},
+                {"Key": "gimme:generation", "Value": "1"},
+            ],
         },
     )
     stub.add_response(
@@ -627,6 +630,103 @@ def test_workload_secret_failure_surfaces_only_a_bounded_code(monkeypatch) -> No
 
     assert str(raised.value) == "aws_rds_workload_secret_create_access_denied"
     assert "workload-pw" not in str(raised.value)
+
+
+def test_workload_secret_inventory_and_guarded_deletion_use_metadata_only(
+    monkeypatch,
+) -> None:
+    client, stub = _stubbed("secretsmanager")
+    name = "gimme/workload/devbox-postgres/example-local"
+    arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:gimme/workload/example"
+    version = "6f1f3f0e-7c3a-4b8e-9c55-0a1b2c3d4e5f"
+    tags = [
+        {"Key": "gimme:secret-store", "Value": "workload-secrets"},
+        {"Key": "gimme:resource", "Value": "devbox-postgres"},
+        {"Key": "gimme:deployment", "Value": "example-local"},
+        {"Key": "gimme:generation", "Value": "2"},
+    ]
+    stub.add_response(
+        "list_secrets",
+        {"SecretList": [{"ARN": arn, "Name": name, "Tags": tags}]},
+        {
+            "Filters": [{"Key": "tag-value", "Values": ["devbox-postgres"]}],
+            "MaxResults": 100,
+        },
+    )
+    stub.add_response(
+        "describe_secret",
+        {
+            "ARN": arn,
+            "Name": name,
+            "Tags": tags,
+            "VersionIdsToStages": {version: ["AWSCURRENT"]},
+        },
+        {"SecretId": arn},
+    )
+    stub.add_response(
+        "describe_secret",
+        {"ARN": arn, "Name": name, "Tags": tags},
+        {"SecretId": name},
+    )
+    stub.add_response(
+        "delete_secret",
+        {"ARN": arn, "Name": name},
+        {"SecretId": name, "RecoveryWindowInDays": 30},
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: _StubbedSession({"secretsmanager": client})
+    )
+    destructive = account().model_copy(update={
+        "destructive_role_arn": "arn:aws:iam::123456789012:role/gimme-destroy"
+    })
+
+    with stub:
+        assert adapter.list_workload_secret_metadata(
+            destructive, workload_store(), "devbox-postgres"
+        ) == [{
+            "deployment": "example-local",
+            "generation": 2,
+            "secret_arn": arn,
+            "secret_version_id": version,
+        }]
+        adapter.schedule_workload_secret_deletion(
+            destructive,
+            workload_store(),
+            "devbox-postgres/example-local",
+            {
+                "gimme:secret-store": "workload-secrets",
+                "gimme:resource": "devbox-postgres",
+                "gimme:deployment": "example-local",
+            },
+        )
+        stub.assert_no_pending_responses()
+
+
+def test_workload_secret_deletion_permission_failure_is_bounded(monkeypatch) -> None:
+    client, stub = _stubbed("secretsmanager")
+    name = "gimme/workload/devbox-postgres/example-local"
+    stub.add_client_error(
+        "describe_secret",
+        service_error_code="AccessDeniedException",
+        service_message="denied for sensitive provider identity",
+        expected_params={"SecretId": name},
+    )
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: _StubbedSession({"secretsmanager": client})
+    )
+    destructive = account().model_copy(update={
+        "destructive_role_arn": "arn:aws:iam::123456789012:role/gimme-destroy"
+    })
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.schedule_workload_secret_deletion(
+            destructive, workload_store(), "devbox-postgres/example-local", {}
+        )
+
+    assert str(raised.value) == "aws_rds_workload_secret_delete_access_denied"
+    assert "sensitive provider identity" not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -863,6 +963,54 @@ def test_workload_secret_rollback_is_idempotent(monkeypatch, already_restored: b
             account(), workload_store(), "devbox-postgres/example-local",
             old_version, new_version,
         )
+
+
+def test_destructive_adapter_tags_final_snapshot_and_preserves_automated_backups(
+    monkeypatch,
+) -> None:
+    identifier = derive_instance_identifier("devbox-postgres")
+    snapshot_id = "gimme-devbox-postgres-g1-final-0123456789ab"
+
+    class Client:
+        created = None
+        deleted = None
+
+        def create_db_snapshot(self, **kwargs):
+            self.created = kwargs
+            return {"DBSnapshot": {
+                "DBSnapshotArn": f"arn:aws:rds:us-east-1:123:snapshot:{snapshot_id}",
+                "Status": "creating", "DBInstanceIdentifier": identifier,
+                "TagList": kwargs["Tags"],
+            }}
+
+        def delete_db_instance(self, **kwargs):
+            self.deleted = kwargs
+
+    client = Client()
+    adapter = BotoRDSAdapter()
+    monkeypatch.setattr(
+        adapter, "_session", lambda *a, **k: _StubbedSession({"rds": client})
+    )
+    destructive = account().model_copy(update={
+        "destructive_role_arn": "arn:aws:iam::123456789012:role/gimme-destroy"
+    })
+
+    snapshot = adapter.create_final_snapshot(
+        destructive, network(), identifier, snapshot_id, "devbox-postgres", 1
+    )
+    adapter.delete_instance_preserving_backups(destructive, network(), identifier)
+
+    assert snapshot.ownership_verified is True and snapshot.generation == 1
+    assert client.created["Tags"] == [
+        {"Key": "gimme:resource", "Value": "devbox-postgres"},
+        {"Key": "gimme:generation", "Value": "1"},
+        {"Key": "gimme:final-snapshot", "Value": snapshot_id},
+    ]
+    assert client.deleted == {
+        "DBInstanceIdentifier": identifier,
+        "SkipFinalSnapshot": True,
+        "DeleteAutomatedBackups": False,
+    }
 
 
 IDENTIFIER = derive_instance_identifier("devbox-postgres")

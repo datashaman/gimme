@@ -490,7 +490,8 @@ For the executable, separately authorized live restore and rotation matrix, see
 ## Forget a retained tombstone
 
 `plan_cleanup_resource` and `apply_cleanup_resource` retain the infrastructure and write a
-tombstone. `plan_forget_resource` and `apply_forget_resource` (confirmation `FORGET <name>`) delete
+tombstone. `plan_forget_resource` and `apply_forget_resource` (confirmation
+`FORGET RETAINED RESOURCE <name>`) delete
 only that local file, and only when no Resource of that name is registered. They make no AWS call
 and do not make the retained group adoptable again; to delete it, use the AWS console or CLI. It works for RDS tombstones too.
 

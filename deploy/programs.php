@@ -76,6 +76,7 @@ function laravel_environment_reconcile_script(): string
 {
     return <<<'PYTHON'
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1033,6 +1034,132 @@ result = subprocess.run(  # nosec B603
 if result.returncode != 0:
     raise SystemExit("managed PostgreSQL login retirement failed")
 print("GIMME_RESOURCE_LOGIN_RETIRED|postgres")
+PYTHON;
+}
+
+
+function managed_postgres_purge_allocation_script(): string
+{
+    return <<<'PYTHON'
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+from pathlib import Path
+
+(
+    host, port, database, owner, login, secret_argument, bundle_argument, expected_digest,
+) = sys.argv[1:9]
+if (
+    not 1 <= int(port) <= 65535
+    or any(
+        re.fullmatch(r"[a-z][a-z0-9_]{0,62}", value) is None
+        for value in (database, owner, login)
+    )
+    or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+):
+    raise SystemExit("unsafe managed PostgreSQL allocation purge input")
+secret_path, bundle_path = Path(secret_argument), Path(bundle_argument)
+for path in (secret_path, bundle_path):
+    if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit("unsafe managed PostgreSQL allocation purge file")
+if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != expected_digest:
+    raise SystemExit("trust bundle digest mismatch")
+secret = json.loads(secret_path.read_text())
+if not isinstance(secret, dict) or set(secret) != {"username", "password"}:
+    raise SystemExit("secret document has an unexpected shape")
+if any(not isinstance(value, str) or not value for value in secret.values()):
+    raise SystemExit("secret document contains an invalid value")
+statements = (
+    f"\\set database '{database}'\n"
+    f"\\set owner '{owner}'\n"
+    f"\\set login '{login}'\n"
+    f"\\set database_marker 'gimme:managed-postgres:{database}:database'\n"
+    f"\\set owner_marker 'gimme:managed-postgres:{database}:owner'\n"
+    f"\\set login_marker 'gimme:managed-postgres:{database}:login'\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database') "
+    "OR EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database' "
+    "AND pg_get_userbyid(datdba) = :'owner' "
+    "AND shobj_description(oid, 'pg_database') = :'database_marker') "
+    "THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner') "
+    "OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'owner' AND "
+    "shobj_description(oid, 'pg_authid') = :'owner_marker') THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login') "
+    "OR EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login' AND "
+    "shobj_description(oid, 'pg_authid') = :'login_marker') THEN 1 ELSE 1 / 0 END;\n"
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+    "WHERE datname = :'database' AND pid <> pg_backend_pid();\n"
+    "SELECT format('DROP DATABASE IF EXISTS %I', :'database') \\gexec\n"
+    "SELECT format('REVOKE %I FROM %I', :'owner', :'login') "
+    "WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'login') \\gexec\n"
+    "SELECT format('DROP ROLE IF EXISTS %I', :'login') \\gexec\n"
+    "SELECT format('DROP ROLE IF EXISTS %I', :'owner') \\gexec\n"
+)
+result = subprocess.run(  # nosec B603
+    ["psql", "-h", host, "-p", port, "-U", secret["username"], "-d", "postgres",
+     "--no-psqlrc", "-v", "ON_ERROR_STOP=1"],
+    input=statements,
+    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": secret["password"],
+         "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(bundle_path)},
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, check=False,
+)
+if result.returncode != 0:
+    raise SystemExit("managed PostgreSQL allocation purge failed")
+print("GIMME_RESOURCE_ALLOCATION_PURGED|postgres|" + database)
+PYTHON;
+}
+
+
+function managed_postgres_dump_script(): string
+{
+    return <<<'PYTHON'
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess  # nosec B404
+import sys
+from pathlib import Path
+
+(
+    host, port, database, secret_argument, bundle_argument, expected_digest, output_argument,
+) = sys.argv[1:8]
+if (
+    not 1 <= int(port) <= 65535
+    or re.fullmatch(r"[a-z][a-z0-9_]{0,62}", database) is None
+    or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+):
+    raise SystemExit("unsafe managed PostgreSQL backup identity")
+secret_path, bundle_path, output_path = map(
+    Path, (secret_argument, bundle_argument, output_argument)
+)
+for path in (secret_path, bundle_path):
+    if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+        raise SystemExit("unsafe managed PostgreSQL backup input")
+if hashlib.sha256(bundle_path.read_bytes()).hexdigest() != expected_digest:
+    raise SystemExit("trust bundle digest mismatch")
+secret = json.loads(secret_path.read_text())
+if not isinstance(secret, dict) or set(secret) != {"username", "password"}:
+    raise SystemExit("secret document has an unexpected shape")
+if any(not isinstance(value, str) or not value for value in secret.values()):
+    raise SystemExit("secret document contains an invalid value")
+result = subprocess.run(  # nosec B603
+    ["pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--no-acl",
+     "-h", host, "-p", port, "-U", secret["username"], "-d", database,
+     "-f", str(output_path)],
+    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PGPASSWORD": secret["password"],
+         "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(bundle_path)},
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    text=True, timeout=1800, check=False,
+)
+if result.returncode != 0:
+    output_path.unlink(missing_ok=True)
+    raise SystemExit("managed PostgreSQL backup capture failed")
 PYTHON;
 }
 

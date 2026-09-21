@@ -241,6 +241,16 @@ class DeploymentResourceOrchestrator:
             + self.recovery_schedule_runtime_issues(deployment, target)
             + self.valkey_runtime(name, state, deployment)[3]
         )
+        if (
+            deployment.recovery is not None
+            and deployment.recovery.cadence.kind != "manual"
+            and deployment.resources.database is not None
+            and isinstance(
+                state.resources.get(deployment.resources.database),
+                AWSRDSPostgresResource,
+            )
+        ):
+            issues.append("managed_postgres_recovery_schedule_unsupported")
         schedule = None
         authority = self.recovery_schedule_authority(name, state, deployment)
         if authority is not None:

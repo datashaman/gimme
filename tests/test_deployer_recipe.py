@@ -48,6 +48,20 @@ def managed_postgres_bind_script() -> str:
     )[1].split("\nPYTHON;", 1)[0]
 
 
+def managed_postgres_purge_script() -> str:
+    recipe = deployer_source()
+    return recipe.split("function managed_postgres_purge_allocation_script", 1)[1].split(
+        "return <<<'PYTHON'", 1
+    )[1].split("\nPYTHON;", 1)[0]
+
+
+def managed_postgres_dump_script() -> str:
+    recipe = deployer_source()
+    return recipe.split("function managed_postgres_dump_script", 1)[1].split(
+        "return <<<'PYTHON'", 1
+    )[1].split("\nPYTHON;", 1)[0]
+
+
 def rendered_deploy_plan(health: dict[str, object], extra: dict[str, str] | None = None) -> str:
     environment = {
         **os.environ,
@@ -1137,6 +1151,79 @@ def test_managed_postgres_bind_script_redacts_secrets_from_failure_output(
     assert "s3cr3t-workload" not in output
     assert "s3cr3t-master" not in output
     assert "[redacted]" in output
+
+
+def test_managed_postgres_purge_script_checks_markers_and_uses_fixed_stdin_sql(
+    tmp_path: Path,
+) -> None:
+    secret_path = tmp_path / "admin.json"
+    secret_path.write_text(json.dumps({
+        "username": "gimme_admin", "password": "s3cr3t-master",
+    }))
+    secret_path.chmod(0o600)
+    log_path = _fake_psql(tmp_path)
+    bundle, digest = _bundle(tmp_path)
+    result = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_purge_script(),
+            "db.example.test", "5432", "gimme_example", "gimme_example_owner",
+            "gimme_example_g2", str(secret_path), str(bundle), digest,
+        ],
+        text=True, capture_output=True, check=False,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "GIMME_RESOURCE_ALLOCATION_PURGED|postgres|gimme_example"
+    call = json.loads(log_path.read_text())
+    sql = call["stdin"]
+    assert "shobj_description(oid, 'pg_database')" in sql
+    assert "shobj_description(oid, 'pg_authid')" in sql
+    assert "pg_terminate_backend" in sql
+    assert "DROP DATABASE IF EXISTS %I" in sql
+    assert "DROP ROLE IF EXISTS %I" in sql
+    assert "s3cr3t-master" not in " ".join(call["argv"])
+    assert "-c" not in call["argv"]
+
+
+def test_managed_postgres_dump_uses_pinned_tls_without_secret_argv(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "pg-dump.json"
+    executable = tmp_path / "pg_dump"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "output=''\nprevious=''\n"
+        "for argument in \"$@\"; do\n"
+        "  if [ \"$previous\" = '-f' ]; then output=\"$argument\"; fi\n"
+        "  previous=\"$argument\"\n"
+        "done\n"
+        f"printf '%s\\n%s\\n%s\\n%s\\n' \"$*\" \"$PGPASSWORD\" \"$PGSSLMODE\" "
+        f"\"$PGSSLROOTCERT\" > {str(log)!r}\n"
+        "printf dump > \"$output\"\n"
+    )
+    executable.chmod(0o700)
+    secret = tmp_path / "secret.json"
+    secret.write_text(json.dumps({"username": "app_g2", "password": "hidden-password"}))
+    secret.chmod(0o600)
+    bundle, digest = _bundle(tmp_path)
+    output = tmp_path / "output.dump"
+
+    result = subprocess.run(
+        [
+            "python3", "-c", managed_postgres_dump_script(), "db.example.test", "5432",
+            "gimme_example", str(secret), str(bundle), digest, str(output),
+        ],
+        text=True, capture_output=True, check=False,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    argv, password, mode, root = log.read_text().splitlines()
+    assert "hidden-password" not in argv
+    assert mode == "verify-full" and root == str(bundle)
+    assert password == "hidden-password"
+    assert output.read_bytes() == b"dump"
 
 
 def test_managed_postgres_bind_script_rejects_unsafe_workload_password_and_database(
