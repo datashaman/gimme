@@ -130,7 +130,9 @@ function stack_state_write_command(
         'network_mode' => getenv('GIMME_NETWORK_MODE') ?: 'local_mdns',
         'remote_user' => $remoteUser,
         'apps_root' => $appsRoot,
-        'sites' => configured_sites($appsRoot, $mdnsName),
+        // An object, so a Target with no Deployments (an administration Target) writes {} and
+        // not the list [] that the privileged helper rejects.
+        'sites' => (object) configured_sites($appsRoot, $mdnsName),
         'mise_version' => configured_mise_version(),
     ], JSON_THROW_ON_ERROR);
     $stateEncoded = escapeshellarg(base64_encode($state));

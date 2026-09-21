@@ -520,6 +520,28 @@ def test_php_recipe_uses_the_collision_safe_environment_instance_identity() -> N
     assert '"{$name}--{$environment}--"' in configured_sites
 
 
+def test_stack_state_writes_no_sites_as_an_object_the_privileged_helper_accepts() -> None:
+    # Found bootstrapping an administration Target: with no Deployments the state said
+    # "sites": [], which gimme-provision-stack rejects with "sites must be an object".
+    script = (
+        'namespace Deployer; require "deploy/configuration.php"; require "deploy/state.php";'
+        ' $c = stack_state_write_command("stack", "/etc/gimme/state.json", "/srv/gimme/apps",'
+        ' "adminbox", "", "deployer");'
+        ' preg_match("/([A-Za-z0-9+\\/=]{60,})/", $c, $m); echo base64_decode($m[1]);'
+    )
+    result = subprocess.run(
+        ["php", "-r", script], cwd=ROOT, text=True, capture_output=True, check=False,
+        env={
+            **os.environ, "GIMME_SITES_JSON": "[]", "GIMME_PACKAGES_JSON": '["acl","git"]',
+            "GIMME_SERVICES_JSON": "[]",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["sites"] == {}
+    assert '"sites":{}' in result.stdout
+
+
 def test_app_resources_allow_php_fpm_to_traverse_shared_directory() -> None:
     recipe = deployer_source()
     task = recipe.split("task('gimme:provision:app'", 1)[1].split("task('gimme:service:status'", 1)[

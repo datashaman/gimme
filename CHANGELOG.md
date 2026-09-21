@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Fixed bootstrapping a Target that has no placed Deployments (an administration Target, or any
+  Target before its first placement): the desired state wrote `"sites": []`, which the privileged
+  helper rejected with `sites must be an object`. It now writes an empty object.
 - Fixed managed Valkey creation failing its first apply with
   `aws_elasticache_create_invalid_state`: AWS refuses a replication group whose new user group is
   still `creating` (`InvalidUserGroupStateFault`, seen on every live create). Create now waits up to
