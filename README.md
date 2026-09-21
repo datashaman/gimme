@@ -212,8 +212,9 @@ Example stdio client configuration:
    `plan_deployment` to review the exact publication (or inspect `artifact_missing`) and Deployer
    task graph, followed by `apply_deployment` with the exact plan. Source mode resolves and
    deploys its reviewed commit directly.
-6. Use `list_releases`, `rollback_deployment`, deployment-scoped Artisan tools,
-   `deployment_process_status`, and `diagnose_deployment` for operations.
+6. Use `list_releases`; `plan_rollback_deployment` / `rollback_deployment` with the exact plan and
+   displayed confirmation; deployment-scoped Artisan tools; `deployment_process_status`; and
+   `diagnose_deployment` for operations.
 7. Use `plan_promotion` / `promote_deployment` to deploy the exact current source commit or live
    artifact from one compatible Deployment to another. Artifact promotion reads verified release
    metadata and never contacts the Build Target. The destination source is pinned only after
@@ -260,8 +261,9 @@ Gimme provides the multi-target foundation, local SOPS, bounded AWS Secrets Mana
 versioned S3-compatible Artifact Stores, deterministic Laravel artifact publication with Composer
 plus npm, pnpm, Yarn, or Bun and protected build-only secrets, and single-Target artifact
 deployment with existing health-gated activation and automatic live rollback. Artifact and source
-promotion reuse the current live release without rebuilding. Explicit artifact rollback, traffic
-splitting, and fleet scheduling remain future work rather than implied production guarantees.
+promotion reuse the current live release without rebuilding, and content-addressed rollback
+verifies retained source or artifact releases before activation. Traffic splitting and fleet
+scheduling remain future work rather than implied production guarantees.
 
 Resource provider coverage:
 

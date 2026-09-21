@@ -340,6 +340,7 @@ task('gimme:preflight:runtimes', function () use ($appsRoot): void {
         }
         writeln("GIMME_RESOURCE|{$kind}|{$match[1]}");
     }
+    writeln('GIMME_PLATFORM|' . strtolower(PHP_OS_FAMILY) . '|' . strtolower(php_uname('m')));
 });
 
 task('gimme:preflight:artifact-runtimes', function (): void {
@@ -893,7 +894,10 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
     $request = json_decode($requestJson, true, flags: JSON_THROW_ON_ERROR);
     if (!is_array($request) || !in_array(
         $request['operation'] ?? null,
-        ['inspect', 'publication', 'build', 'inventory', 'resolve', 'materialize', 'release'],
+        [
+            'inspect', 'publication', 'build', 'inventory', 'resolve', 'materialize',
+            'release', 'rollback',
+        ],
         true,
     )) {
         throw new \RuntimeException('Artifact request has an unexpected shape');
@@ -918,6 +922,7 @@ task('gimme:artifact:run', function () use ($appsRoot): void {
         $releaseArgument = match ($request['operation']) {
             'materialize' => ' ' . escapeshellarg('{{release_path}}'),
             'release' => ' ' . escapeshellarg(get('deploy_path') . '/current'),
+            'rollback' => ' ' . escapeshellarg(get('deploy_path')),
             default => '',
         };
         $output = run(
@@ -945,6 +950,52 @@ if ($app !== '' && $releaseMode === 'artifact') {
     task('deploy:vendors', static function (): void {
     });
 }
+
+task('gimme:rollback', function () use ($framework, $health): void {
+    $candidate = getenv('GIMME_ROLLBACK_RELEASE') ?: '';
+    if (!preg_match('/^[1-9][0-9]{0,19}$/', $candidate)) {
+        throw new \RuntimeException('Rollback release is invalid');
+    }
+    invoke('gimme:artifact:run');
+    $deployPath = get('deploy_path');
+    $currentPath = get('current_path');
+    $current = basename(trim(run('readlink ' . escapeshellarg($currentPath))));
+    if (!preg_match('/^[1-9][0-9]{0,19}$/', $current) || $current === $candidate) {
+        throw new \RuntimeException('Current rollback release is invalid');
+    }
+    $candidatePath = "{$deployPath}/releases/{$candidate}";
+    if (!test('[ -d ' . escapeshellarg($candidatePath) . ' ]') ||
+        test('[ -f ' . escapeshellarg("{$candidatePath}/BAD_RELEASE") . ' ]')) {
+        throw new \RuntimeException('Rollback release is unavailable');
+    }
+    set('release_path', $candidatePath);
+    if ($framework === 'laravel') {
+        invoke('artisan:optimize');
+    }
+    if ($health !== []) {
+        invoke('gimme:health:candidate');
+    }
+    try {
+        run('{{bin/symlink}} ' . escapeshellarg("releases/{$candidate}") . ' ' .
+            escapeshellarg($currentPath));
+        if ($health !== []) {
+            set('rollback_candidate', $current);
+            invoke('gimme:health:live');
+        }
+        invoke('gimme:restart:workers');
+        run('date -u +%Y%m%dT%H%M%SZ > ' .
+            escapeshellarg("{$deployPath}/releases/{$current}/BAD_RELEASE"));
+    } catch (\Throwable $error) {
+        $observed = basename(trim(run('readlink ' . escapeshellarg($currentPath))));
+        if ($observed === $candidate) {
+            run('{{bin/symlink}} ' . escapeshellarg("releases/{$current}") . ' ' .
+                escapeshellarg($currentPath));
+            invoke('gimme:restart:workers');
+        }
+        throw $error;
+    }
+    writeln("GIMME_ROLLBACK_RESULT|{$candidate}");
+});
 
 task('gimme:preflight:stack', function () use ($hostname, $mdnsName, $remoteUser, $appsRoot): void {
     if (configured_package_manager() !== 'apt') {

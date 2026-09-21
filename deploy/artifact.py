@@ -1344,21 +1344,11 @@ def valid_promotion_seed(value: object) -> bool:
     )
 
 
-def inspect_live_release(apps_root: Path, current_argument: str) -> dict[str, object]:
-    current = Path(current_argument)
+def inspect_release_path(apps_root: Path, release: Path) -> dict[str, object]:
     try:
-        current_details = current.lstat()
         if (
-            not current.is_absolute()
-            or current.name != "current"
-            or not current.is_relative_to(apps_root)
-            or not current.is_symlink()
-            or current_details.st_uid != os.getuid()
-        ):
-            fail("artifact_release_metadata_invalid")
-        release = current.resolve(strict=True)
-        if (
-            not release.is_relative_to(apps_root)
+            not release.is_absolute()
+            or not release.is_relative_to(apps_root)
             or "releases" not in release.relative_to(apps_root).parts
             or not release.is_dir()
             or release.stat().st_uid != os.getuid()
@@ -1443,6 +1433,134 @@ def inspect_live_release(apps_root: Path, current_argument: str) -> dict[str, ob
     if tree_digest(sorted(entries)) != metadata["tree_digest"]:
         fail("artifact_tree_digest_mismatch")
     return metadata
+
+
+def inspect_live_release(apps_root: Path, current_argument: str) -> dict[str, object]:
+    current = Path(current_argument)
+    try:
+        details = current.lstat()
+        if (
+            not current.is_absolute()
+            or current.name != "current"
+            or not current.is_relative_to(apps_root)
+            or not current.is_symlink()
+            or details.st_uid != os.getuid()
+        ):
+            fail("artifact_release_metadata_invalid")
+        release = current.resolve(strict=True)
+    except OSError:
+        fail("artifact_release_metadata_invalid")
+    return inspect_release_path(apps_root, release)
+
+
+def rollback_inventory(
+    apps_root: Path, deploy_argument: str, release_mode: object
+) -> dict[str, object]:
+    deploy_path = Path(deploy_argument)
+    if release_mode not in {"source", "artifact"}:
+        fail("rollback_release_invalid")
+    try:
+        resolved_deploy_path = deploy_path.resolve(strict=True)
+        if (
+            not deploy_path.is_absolute()
+            or deploy_path != resolved_deploy_path
+            or not deploy_path.is_relative_to(apps_root)
+            or deploy_path.is_symlink()
+            or not deploy_path.is_dir()
+            or deploy_path.stat().st_uid != os.getuid()
+        ):
+            fail("rollback_release_invalid")
+        current_path = deploy_path / "current"
+        current = current_path.resolve(strict=True)
+        releases = deploy_path / "releases"
+        log_path = deploy_path / ".dep" / "releases_log"
+        if (
+            not releases.is_dir()
+            or releases.is_symlink()
+            or releases.stat().st_uid != os.getuid()
+            or not current_path.is_symlink()
+            or current_path.lstat().st_uid != os.getuid()
+            or not current.is_relative_to(releases)
+            or log_path.is_symlink()
+            or not log_path.is_file()
+            or log_path.stat().st_uid != os.getuid()
+            or log_path.stat().st_size > 1024 * 1024
+        ):
+            fail("rollback_release_invalid")
+        with log_path.open("rb") as handle:
+            raw_log = handle.read(1024 * 1024 + 1)
+        if len(raw_log) > 1024 * 1024:
+            fail("rollback_release_invalid")
+        lines = raw_log.decode().splitlines()[-300:]
+    except (OSError, UnicodeError):
+        fail("rollback_release_invalid")
+    ordered = []
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            fail("rollback_release_invalid")
+        name = item.get("release_name") if isinstance(item, dict) else None
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[1-9][0-9]{0,19}", name) is None
+            or name in ordered
+        ):
+            fail("rollback_release_invalid")
+        candidate = releases / name
+        if candidate.is_dir() and not candidate.is_symlink():
+            ordered.append(name)
+    current_name = current.name
+    if current_name not in ordered:
+        fail("rollback_release_invalid")
+    later = ordered[ordered.index(current_name) + 1:]
+    target_name = next(
+        (name for name in later if not (releases / name / "BAD_RELEASE").exists()),
+        None,
+    )
+    if target_name is None:
+        fail("rollback_release_missing")
+
+    def identity(name: str) -> dict[str, object]:
+        release = (releases / name).resolve(strict=True)
+        if (
+            not release.is_relative_to(releases)
+            or not release.is_dir()
+            or release.stat().st_uid != os.getuid()
+        ):
+            fail("rollback_release_invalid")
+        if release_mode == "artifact":
+            return inspect_release_path(apps_root, release)
+        revision = release / "REVISION"
+        try:
+            details = revision.lstat()
+            if (
+                revision.is_symlink()
+                or not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_size > 65
+            ):
+                fail("rollback_release_invalid")
+            value = revision.read_text().strip()
+        except (OSError, UnicodeError):
+            fail("rollback_release_invalid")
+        if COMMIT.fullmatch(value) is None:
+            fail("rollback_release_invalid")
+        return {"commit": value, "release_mode": "source"}
+
+    inventory = [
+        {"release": name, "bad": (releases / name / "BAD_RELEASE").exists()}
+        for name in ordered
+    ]
+    return {
+        "status": "ready",
+        "release_mode": release_mode,
+        "inventory_sha256": hashlib.sha256(
+            json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "current": {"release": current_name, "identity": identity(current_name)},
+        "target": {"release": target_name, "identity": identity(target_name)},
+    }
 
 
 def build(request: dict[str, object], credential_argument: str, workspace_root: Path):
@@ -1686,10 +1804,12 @@ def main(arguments: list[str]) -> int:
     signal.signal(signal.SIGINT, interrupted)
     request = parse_request(arguments[1])
     operation = request.get("operation")
-    if operation not in {"materialize", "release"} and len(arguments) != 4:
+    if operation not in {"materialize", "release", "rollback"} and len(arguments) != 4:
         fail("artifact_invocation_invalid")
     apps_root = checked_apps_root(arguments[3])
-    workspace_root = None if operation == "release" else checked_root(arguments[3])
+    workspace_root = (
+        None if operation in {"release", "rollback"} else checked_root(arguments[3])
+    )
     if operation == "inspect":
         validate_request(request, {
             "operation", "repository", "commit", "runtimes", "php_extensions", "frontend",
@@ -1725,6 +1845,39 @@ def main(arguments: list[str]) -> int:
             fail("artifact_invocation_invalid")
         validate_request(request, {"operation"})
         result = inspect_live_release(apps_root, arguments[4])
+    elif operation == "rollback":
+        if len(arguments) != 5:
+            fail("artifact_invocation_invalid")
+        expected_fields = {"operation", "release_mode"} | (
+            {"expected"} if "expected" in request else set()
+        )
+        validate_request(request, expected_fields)
+        result = rollback_inventory(apps_root, arguments[4], request["release_mode"])
+        expected = request.get("expected")
+        if expected is not None:
+            observed = {
+                "inventory_sha256": result["inventory_sha256"],
+                "current_release": result["current"]["release"],
+                "target_release": result["target"]["release"],
+                "current_metadata_sha256": hashlib.sha256(json.dumps(
+                    result["current"]["identity"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()).hexdigest(),
+                "target_metadata_sha256": hashlib.sha256(json.dumps(
+                    result["target"]["identity"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()).hexdigest(),
+            }
+            if expected != observed:
+                fail("rollback_plan_stale")
+            result = {
+                "status": "verified",
+                "release_mode": request["release_mode"],
+                "current_release": observed["current_release"],
+                "target_release": observed["target_release"],
+            }
     else:
         fail("artifact_operation_invalid")
     emit(result)

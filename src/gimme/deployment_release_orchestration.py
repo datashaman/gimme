@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -142,37 +144,9 @@ class DeploymentReleaseOrchestrator:
             runtime = None
             rendered = ""
         else:
-            preflight = self.run_deployment(
-                "gimme:preflight:artifact-runtimes", name, timeout=60
+            runtime = self._artifact_runtime(
+                name, deployment, application, artifact_context["identity"]
             )
-            observed: dict[str, object] = {"php_extensions": []}
-            for raw in preflight.output.splitlines():
-                line = raw.split("] ", 1)[-1].strip()
-                if line.startswith("GIMME_RUNTIME|php|"):
-                    observed["php"] = line.rsplit("|", 1)[-1]
-                elif line.startswith("GIMME_PLATFORM|"):
-                    _, system, machine = line.split("|", 2)
-                    observed["system"] = system
-                    observed["machine"] = machine
-                elif line.startswith("GIMME_PHP_EXTENSION|") and line.endswith("|ready"):
-                    observed["php_extensions"].append(line.split("|", 2)[1])
-            capability = artifact_context["identity"]["capability"]
-            expected_observed = {
-                "php": deployment.runtimes["php"].version,
-                "php_extensions": application.php_extensions,
-                "system": capability["system"],
-                "machine": capability["machine"],
-            }
-            observed["php_extensions"] = sorted(observed["php_extensions"])
-            if observed != expected_observed:
-                raise RuntimeError("artifact_runtime_incompatible")
-            runtime = {
-                "declared": {
-                    "php": deployment.runtimes["php"].model_dump(mode="json"),
-                    "php_extensions": application.php_extensions,
-                },
-                "observed": observed,
-            }
             processes, process_issues = self._process_preflight(
                 name, deployment, application
             )
@@ -203,6 +177,92 @@ class DeploymentReleaseOrchestrator:
                 "publication": artifact,
             },
         )
+
+    def _artifact_runtime(self, name, deployment, application, identity):
+        preflight = self.run_deployment(
+            "gimme:preflight:artifact-runtimes", name, timeout=60
+        )
+        observed: dict[str, object] = {"php_extensions": []}
+        for raw in preflight.output.splitlines():
+            line = raw.split("] ", 1)[-1].strip()
+            if line.startswith("GIMME_RUNTIME|php|"):
+                observed["php"] = line.rsplit("|", 1)[-1]
+            elif line.startswith("GIMME_PLATFORM|") and line.count("|") == 2:
+                _, system, machine = line.split("|", 2)
+                observed["system"] = system
+                observed["machine"] = machine
+            elif line.startswith("GIMME_PHP_EXTENSION|") and line.endswith("|ready"):
+                observed["php_extensions"].append(line.split("|", 2)[1])
+        capability = identity["capability"]
+        expected_observed = {
+            "php": deployment.runtimes["php"].version,
+            "php_extensions": application.php_extensions,
+            "system": capability["system"],
+            "machine": capability["machine"],
+        }
+        observed["php_extensions"] = sorted(observed["php_extensions"])
+        if observed != expected_observed:
+            raise RuntimeError("artifact_runtime_incompatible")
+        return {
+            "declared": {
+                "php": deployment.runtimes["php"].model_dump(mode="json"),
+                "php_extensions": application.php_extensions,
+            },
+            "observed": observed,
+        }
+
+    def _source_runtime(self, name, deployment, application, revision):
+        preflight = self.run_deployment(
+            "gimme:preflight:runtimes",
+            name,
+            revision=revision,
+            timeout=60,
+        )
+        observed: dict[str, object] = {
+            "runtimes": {},
+            "php_extensions": [],
+        }
+        for raw in preflight.output.splitlines():
+            line = raw.split("] ", 1)[-1].strip()
+            parts = line.split("|")
+            if (
+                len(parts) == 3
+                and parts[0] == "GIMME_RUNTIME"
+                and parts[1] in deployment.runtimes
+                and parts[2] == deployment.runtimes[parts[1]].version
+            ):
+                observed["runtimes"][parts[1]] = parts[2]
+            elif (
+                len(parts) == 3
+                and parts[0] == "GIMME_PHP_EXTENSION"
+                and parts[1] in application.php_extensions
+                and parts[2] == "ready"
+            ):
+                observed["php_extensions"].append(parts[1])
+            elif (
+                len(parts) == 3
+                and parts[0] == "GIMME_PLATFORM"
+                and all(re.fullmatch(r"[a-z0-9_.+-]{1,64}", item) for item in parts[1:])
+            ):
+                observed["system"], observed["machine"] = parts[1:]
+        observed["php_extensions"] = sorted(observed["php_extensions"])
+        expected_runtimes = {
+            key: value.version for key, value in deployment.runtimes.items()
+        }
+        if (
+            observed.get("runtimes") != expected_runtimes
+            or observed.get("php_extensions") != application.php_extensions
+            or not isinstance(observed.get("system"), str)
+            or not isinstance(observed.get("machine"), str)
+        ):
+            raise RuntimeError("rollback_runtime_invalid")
+        return {
+            "declared": {
+                key: value.model_dump(mode="json")
+                for key, value in deployment.runtimes.items()
+            },
+            "observed": observed,
+        }
 
     @staticmethod
     def _manages_processes(
@@ -255,13 +315,143 @@ class DeploymentReleaseOrchestrator:
     def list_releases(self, name: str) -> dict[str, object]:
         return self.result(self.run_deployment("releases", name))
 
-    def rollback_deployment(self, name: str, confirmation: str) -> dict[str, object]:
-        self._require_source_release(self.store.deployment(name))
-        expected = f"ROLLBACK {name}"
-        if confirmation != expected:
-            raise ValueError(f"confirmation must exactly equal '{expected}'")
+    @staticmethod
+    def _bounded_rollback_identity(mode: str, identity: dict[str, object]):
+        if mode == "artifact":
+            return DeploymentReleaseOrchestrator._metadata_artifact(identity)
+        if set(identity) != {"commit", "release_mode"} or identity.get(
+            "release_mode"
+        ) != "source" or not isinstance(identity.get("commit"), str) or re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?", identity["commit"]
+        ) is None:
+            raise RuntimeError("rollback_release_invalid")
+        return identity
+
+    @staticmethod
+    def _digest(value: object) -> str:
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def plan_rollback_deployment(self, name: str) -> dict[str, object]:
+        state, deployment, target, application = self.context(name)
+        inventory = self.artifact_deployment.rollback_inventory(name)
+        mode = deployment.release_mode
+        current_raw = inventory["current"]["identity"]
+        target_raw = inventory["target"]["identity"]
+        current = self._bounded_rollback_identity(mode, current_raw)
+        selected = self._bounded_rollback_identity(mode, target_raw)
+        _, secret_issues = self.secret_plan(name, state, deployment)
+        issues = (
+            secret_issues
+            + self.dns_issues(deployment, target)
+            + self.managed_database_issues(state, deployment)
+            + self.valkey_runtime(name, state, deployment)[3]
+        )
+        if mode == "artifact":
+            if current_raw.get("application") != deployment.application:
+                raise RuntimeError("rollback_release_incompatible")
+            expected = self.artifact_deployment.expected_from_release(name, target_raw)
+            if (
+                expected["build_id"] != target_raw["build_id"]
+                or target_raw["release_contract"] != release_contract(
+                    deployment, application
+                )
+            ):
+                raise RuntimeError("rollback_release_incompatible")
+            runtime = self._artifact_runtime(
+                name, deployment, application, expected["identity"]
+            )
+        else:
+            runtime = self._source_runtime(
+                name, deployment, application, str(selected["commit"])
+            )
+        processes, process_issues = self._process_preflight(name, deployment, application)
+        primary = (
+            application.default_health
+            if deployment.health == "inherit"
+            else deployment.health
+        )
+        health = [
+            *([primary] if primary is not None else []),
+            *application.health_probes,
+            *deployment.health_probes,
+        ]
+        return exact_plan({
+            "kind": "deployment_rollback",
+            "deployment": name,
+            "release_mode": mode,
+            "inventory_sha256": inventory["inventory_sha256"],
+            "current": {
+                "release": inventory["current"]["release"],
+                "identity": current,
+                "metadata_sha256": self._digest(current_raw),
+            },
+            "target": {
+                "release": inventory["target"]["release"],
+                "identity": selected,
+                "metadata_sha256": self._digest(target_raw),
+            },
+            "runtimes": runtime,
+            "health": [probe.model_dump(mode="json") for probe in health],
+            "processes": processes,
+            "ready": not (issues + process_issues),
+            "readiness_issues": issues + process_issues,
+            "effects": [
+                "regenerate fixed environment-derived caches in the retained release",
+                "gate the atomic symlink switch on candidate health",
+                "restore the prior live release if live health fails",
+                "refresh managed processes only after successful activation",
+            ],
+        })
+
+    def rollback_deployment(
+        self, name: str, plan_id: str, confirmation: str
+    ) -> dict[str, object]:
         with self.deployment_resource_lock(name):
-            return self.result(self.run_deployment("rollback", name))
+            plan = self.plan_rollback_deployment(name)
+            self.assert_plan(plan, plan_id)
+            expected = f"ROLLBACK {name} TO {plan['target']['release']}"
+            if confirmation != expected:
+                raise ValueError(f"confirmation must exactly equal '{expected}'")
+            if not plan["ready"]:
+                raise ValueError("rollback is not ready; inspect readiness_issues")
+            self.run_deployment(
+                "gimme:rollback",
+                name,
+                rollback_release=str(plan["target"]["release"]),
+                artifact_request={
+                    "operation": "rollback",
+                    "release_mode": plan["release_mode"],
+                    "expected": {
+                        "inventory_sha256": plan["inventory_sha256"],
+                        "current_release": plan["current"]["release"],
+                        "target_release": plan["target"]["release"],
+                        "current_metadata_sha256": plan["current"]["metadata_sha256"],
+                        "target_metadata_sha256": plan["target"]["metadata_sha256"],
+                    },
+                },
+                timeout=1800,
+            )
+            def result_release(item):
+                identity = item["identity"]
+                if plan["release_mode"] == "artifact":
+                    identity = {
+                        key: identity[key]
+                        for key in (
+                            "application", "commit", "build_id",
+                            "artifact_digest", "tree_digest", "format",
+                        )
+                    }
+                return {"release": item["release"], "identity": identity}
+
+            return {
+                "status": "rolled_back",
+                "deployment": name,
+                "release_mode": plan["release_mode"],
+                "from": result_release(plan["current"]),
+                "to": result_release(plan["target"]),
+            }
 
     def plan_promotion(self, source: str, destination: str) -> dict[str, object]:
         state, source_deployment, _, _ = self.context(source)

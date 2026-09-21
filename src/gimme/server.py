@@ -487,6 +487,7 @@ def _run_deployment(
     recovery_on_demand_request_id: str | None = None,
     artifact_request: dict[str, object] | None = None,
     artifact_secret_file: Path | None = None,
+    rollback_release: str | None = None,
     timeout: int = 900,
 ) -> CommandResult:
     state, deployment, target, application = _context(name)
@@ -527,6 +528,7 @@ def _run_deployment(
         secret_file=secret_file,
         artifact_request=artifact_request,
         artifact_secret_file=artifact_secret_file,
+        rollback_release=rollback_release,
         secret_manifest=secret_manifest,
         artisan_command=artisan_command, artisan_arguments=artisan_arguments,
         artisan_allowed_commands=(
@@ -1925,9 +1927,20 @@ def list_releases(name: Name) -> dict[str, object]:
 
 @mcp.tool(annotations=CHANGE)
 @_journal_apply("rollback_deployment", "name")
-def rollback_deployment(name: Name, confirmation: str) -> dict[str, object]:
-    """Restore a deployment's prior retained release after exact confirmation."""
-    return _deployment_release_orchestrator().rollback_deployment(name, confirmation)
+def rollback_deployment(
+    name: Name, plan_id: PlanId, confirmation: str
+) -> dict[str, object]:
+    """Apply one exact reviewed retained-release rollback."""
+    return _deployment_release_orchestrator().rollback_deployment(
+        name, plan_id, confirmation
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("rollback_deployment", "name")
+def plan_rollback_deployment(name: Name) -> dict[str, object]:
+    """Plan one exact retained predecessor with health and capability checks."""
+    return _deployment_release_orchestrator().plan_rollback_deployment(name)
 
 
 @mcp.tool(annotations=READ)

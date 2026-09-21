@@ -134,6 +134,7 @@ class DeployerRunner:
         artifact_probe_role: str | None = None,
         artifact_reader_version: str | None = None,
         artifact_request: dict[str, object] | None = None,
+        rollback_release: str | None = None,
         backup_local_path: Path | None = None,
         recovery_action: str | None = None,
         recovery_request_id: str | None = None,
@@ -263,6 +264,7 @@ class DeployerRunner:
             if operation not in {
                 "inspect", "publication", "build", "inventory", "resolve", "materialize",
                 "release",
+                "rollback",
             }:
                 raise ValueError("artifact request operation is invalid")
             encoded_request = json.dumps(
@@ -271,6 +273,10 @@ class DeployerRunner:
             if len(encoded_request.encode()) > 128 * 1024:
                 raise ValueError("artifact request is too large")
             environment["GIMME_ARTIFACT_REQUEST_JSON"] = encoded_request
+        if rollback_release is not None:
+            if re.fullmatch(r"[1-9][0-9]{0,19}", rollback_release) is None:
+                raise ValueError("rollback_release is invalid")
+            environment["GIMME_ROLLBACK_RELEASE"] = rollback_release
         if backup_local_path is not None:
             environment["GIMME_BACKUP_LOCAL_PATH"] = str(backup_local_path)
         if any(value is not None for value in (

@@ -257,6 +257,38 @@ class ArtifactDeploymentOrchestrator:
             raise RuntimeError("artifact_release_metadata_invalid")
         return metadata
 
+    def rollback_inventory(self, name: str) -> dict[str, object]:
+        state = self.store.load()
+        deployment = state.deployments[name]
+        target = state.targets[deployment.target]
+        result = self._run(
+            name,
+            target,
+            {"operation": "rollback", "release_mode": deployment.release_mode},
+            None,
+            60,
+        )
+        inventory = _result(result.output)
+        if (
+            set(inventory) != {
+                "status", "release_mode", "inventory_sha256", "current", "target"
+            }
+            or inventory.get("status") != "ready"
+            or inventory.get("release_mode") != deployment.release_mode
+            or not isinstance(inventory.get("inventory_sha256"), str)
+            or SHA256.fullmatch(inventory["inventory_sha256"]) is None
+            or any(
+                not isinstance(inventory.get(field), dict)
+                or set(inventory[field]) != {"release", "identity"}
+                or not isinstance(inventory[field]["release"], str)
+                or re.fullmatch(r"[1-9][0-9]{0,19}", inventory[field]["release"]) is None
+                or not isinstance(inventory[field]["identity"], dict)
+                for field in ("current", "target")
+            )
+        ):
+            raise RuntimeError("rollback_release_invalid")
+        return inventory
+
     def materialize_request(self, context: dict[str, object]) -> dict[str, object]:
         artifact = context["artifact"]
         definition = context["definition"]
