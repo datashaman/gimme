@@ -566,6 +566,7 @@ async def test_hard_v6_tool_surface() -> None:
     assert {template.uriTemplate for template in templates} == {
         "gimme://targets/{name}",
         "gimme://applications/{name}",
+        "gimme://applications/{name}/artifacts/{build_id}",
         "gimme://resources/{name}",
         "gimme://deployments/{name}",
         "gimme://operations/{correlation_id}",

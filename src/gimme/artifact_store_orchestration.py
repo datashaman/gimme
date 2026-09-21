@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from contextlib import nullcontext
@@ -9,6 +10,7 @@ from typing import Any, Callable, Literal
 
 from gimme.control import AmbientArtifactAuth, S3ArtifactStore, SopsArtifactAuth
 from gimme.control_plans import exact_plan
+from gimme.artifact_public import public_store_policy
 from gimme.secrets import (
     plan_secret_references,
     protected_secret_file,
@@ -90,7 +92,7 @@ class ArtifactStoreOrchestrator:
         target: str,
         role: Literal["publisher", "reader"],
         reader_version: str | None = None,
-    ) -> tuple[Any, S3ArtifactStore, Any, dict[str, object]]:
+    ) -> tuple[Any, S3ArtifactStore, Any, object, dict[str, object]]:
         state = self.store.load()
         definition = state.artifact_stores.get(name)
         selected_target = state.targets.get(target)
@@ -115,11 +117,13 @@ class ArtifactStoreOrchestrator:
             "kind": "artifact_store_verification",
             "artifact_store": name,
             "target": target,
-            "store_policy": definition.model_dump(mode="json"),
+            "store_policy": public_store_policy(definition),
             "target_policy": selected_target.model_dump(mode="json"),
             "role": role,
             "reader_version": reader_version,
-            "credential_versions": planned or [],
+            "credential_versions_sha256": hashlib.sha256(json.dumps(
+                planned or [], sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest(),
             "effects": (
                 [
                     "write and read one encrypted Target-generated probe object",
@@ -131,7 +135,7 @@ class ArtifactStoreOrchestrator:
                 ]
             ),
         })
-        return state, definition, selected_target, plan
+        return state, definition, selected_target, planned, plan
 
     def plan_verification(
         self,
@@ -140,7 +144,7 @@ class ArtifactStoreOrchestrator:
         role: Literal["publisher", "reader"],
         reader_version: str | None = None,
     ) -> dict[str, object]:
-        return self._verification_context(name, target, role, reader_version)[3]
+        return self._verification_context(name, target, role, reader_version)[-1]
 
     def verify(
         self,
@@ -150,13 +154,12 @@ class ArtifactStoreOrchestrator:
         plan_id: str,
         reader_version: str | None = None,
     ) -> dict[str, object]:
-        state, definition, selected_target, expected = self._verification_context(
+        state, definition, selected_target, planned, expected = self._verification_context(
             name, target, role, reader_version
         )
         self.assert_plan(expected, plan_id)
         auth = definition.publisher_auth if role == "publisher" else definition.reader_auth
         references = artifact_auth_references(auth)
-        planned = expected["credential_versions"]
         credentials = {} if references is None else resolve_planned_secret_references(
             state, self.store.secrets_path, references, planned
         )

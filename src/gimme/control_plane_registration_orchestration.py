@@ -11,6 +11,7 @@ from gimme.control import (
     SecretStore,
 )
 from gimme.control_plans import exact_plan
+from gimme.artifact_public import public_store_policy
 from gimme.recovery import preflight_backup_destination
 from gimme.secrets import validate_aws_account, validate_aws_store
 
@@ -319,9 +320,9 @@ class ControlPlaneRegistrationOrchestrator:
             "kind": "artifact_store_update" if update else "artifact_store_registration",
             "name": name,
             "current": (
-                state.artifact_stores[name].model_dump(mode="json") if exists else None
+                public_store_policy(state.artifact_stores[name]) if exists else None
             ),
-            "proposed": proposed.artifact_stores[name].model_dump(mode="json"),
+            "proposed": public_store_policy(proposed.artifact_stores[name]),
             "effects": [
                 "replace local desired state only",
                 "make no Target or object-store changes",

@@ -41,7 +41,14 @@ from gimme.managed_valkey_recovery_orchestration import (
 from gimme.control_plane_registration_orchestration import (
     ControlPlaneRegistrationOrchestrator,
 )
-from gimme.artifact_store_orchestration import ArtifactStoreOrchestrator
+from gimme.artifact_store_orchestration import (
+    ArtifactStoreOrchestrator,
+)
+from gimme.artifact_public import (
+    public_application_policy,
+    public_state,
+    public_store_policy,
+)
 from gimme.artifact_build_orchestration import ArtifactBuildOrchestrator
 from gimme.artifact_deployment_orchestration import ArtifactDeploymentOrchestrator
 from gimme.recovery import ComponentDump
@@ -731,8 +738,8 @@ def _migration_state(
 
 @mcp.resource("gimme://state")
 def desired_state() -> dict[str, object]:
-    """Complete desired state without decrypted secret values."""
-    return store.load().model_dump(mode="json")
+    """Complete desired state without artifact credential or build-secret references."""
+    return public_state(store.load())
 
 
 @mcp.resource("gimme://targets/{name}")
@@ -742,7 +749,13 @@ def target_resource(name: str) -> dict[str, object]:
 
 @mcp.resource("gimme://applications/{name}")
 def application_resource(name: str) -> dict[str, object]:
-    return store.application(name).model_dump(mode="json")
+    return public_application_policy(store.application(name))
+
+
+@mcp.resource("gimme://applications/{name}/artifacts/{build_id}")
+def application_artifact_resource(name: str, build_id: str) -> dict[str, object]:
+    """Read one bounded publication status without object identities or raw manifests."""
+    return _artifact_build_orchestrator().artifact_status(name, build_id)
 
 
 @mcp.resource("gimme://provider-accounts/{name}")
@@ -766,8 +779,8 @@ def backup_destination_resource(name: str) -> dict[str, object]:
 
 @mcp.resource("gimme://artifact-stores/{name}")
 def artifact_store_resource(name: str) -> dict[str, object]:
-    """Read bounded Artifact Store policy; authentication contains references only."""
-    return store.load().artifact_stores[name].model_dump(mode="json")
+    """Read bounded Artifact Store policy without authentication references."""
+    return public_store_policy(store.load().artifact_stores[name])
 
 
 @mcp.resource("gimme://resources/{name}")
@@ -869,8 +882,14 @@ def list_targets() -> dict[str, object]:
 
 @mcp.tool(annotations=READ)
 def list_applications() -> dict[str, object]:
-    """List reusable registered application source and build definitions."""
-    return {"applications": store.load().model_dump(mode="json")["applications"]}
+    """List application policy without build-secret names or references."""
+    state = store.load()
+    return {
+        "applications": {
+            name: public_application_policy(application)
+            for name, application in state.applications.items()
+        }
+    }
 
 
 @mcp.tool(annotations=READ)
@@ -1135,8 +1154,14 @@ def list_backup_destinations() -> dict[str, object]:
 
 @mcp.tool(annotations=READ)
 def list_artifact_stores() -> dict[str, object]:
-    """List bounded Artifact Store policy without resolving credential references."""
-    return {"artifact_stores": store.load().model_dump(mode="json")["artifact_stores"]}
+    """List bounded Artifact Store policy without credential references."""
+    state = store.load()
+    return {
+        "artifact_stores": {
+            name: public_store_policy(definition)
+            for name, definition in state.artifact_stores.items()
+        }
+    }
 
 
 @mcp.tool(annotations=READ)
@@ -1449,9 +1474,13 @@ def plan_update_application(name: Name, definition: ApplicationConfig) -> dict[s
     """Show the exact before/after state for an application update."""
     state = store.load()
     _replace(state, "applications", name, definition)
-    return registration_update_plan(
-        "application_update", name, state.applications[name], definition
-    )
+    return exact_plan({
+        "kind": "application_update",
+        "name": name,
+        "current": public_application_policy(state.applications[name]),
+        "proposed": public_application_policy(definition),
+        "effects": ["replace local Git-backed desired state only", "make no remote changes"],
+    })
 
 
 @mcp.tool(annotations=WRITE)
