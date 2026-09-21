@@ -159,17 +159,31 @@ def run_scenario() -> dict[str, object]:
             stderr=subprocess.DEVNULL,
         )
         password_file.unlink()
+        server_certificate = data / "server.crt"
+        server_key = data / "server.key"
+        shutil.copyfile(certificate, server_certificate)
+        shutil.copyfile(key, server_key)
+        server_certificate.chmod(0o600)
+        server_key.chmod(0o600)
         port = _port()
         options = (
             f"-h 127.0.0.1 -p {port} -c ssl=on "
-            f"-c ssl_cert_file={certificate} -c ssl_key_file={key}"
+            f"-c ssl_cert_file={server_certificate} -c ssl_key_file={server_key}"
         )
-        subprocess.run(
-            [_server_bin("pg_ctl"), "-D", str(data), "-o", options, "-w", "start"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        server_log = data / "server.log"
+        started = subprocess.run(
+            [
+                _server_bin("pg_ctl"), "-D", str(data), "-o", options,
+                "-l", str(server_log), "-w", "start",
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
+        if started.returncode != 0:
+            detail = server_log.read_text()[-4096:] if server_log.is_file() else started.stdout
+            raise RuntimeError(f"disposable PostgreSQL failed to start: {detail.strip()}")
         try:
             digest = hashlib.sha256(ca.read_bytes()).hexdigest()
             master = root / "master.json"
