@@ -240,6 +240,8 @@ recoverable phase. Both release temporary capacity only after verified Target cl
 See [Build once and deploy an Application Artifact](docs/how-to/use-application-artifacts.md)
 for migration, IAM separation, publishing, multi-Target deployment, promotion, rollback,
 reproducibility failures, costs, and retention boundaries.
+See [Artifact Rollout acceptance evidence](docs/reference/rollout-acceptance-evidence.md) for the
+zero-cost operator scenario, failure matrix, and parent-criterion traceability.
 
 Laravel candidate probes run inside the release before activation. Live HTTPS probes
 run after activation and automatically restore the prior release if any live probe

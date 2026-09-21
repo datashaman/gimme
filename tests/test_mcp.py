@@ -111,6 +111,30 @@ def sample_state() -> ControlState:
     )
 
 
+def active_rollout_record() -> Rollout:
+    return Rollout(
+        deployment="example-app",
+        target="devbox",
+        generation=17,
+        phase="active",
+        stable=RolloutArtifact(
+            application="example-app", build_id="build_v1_" + "1" * 64,
+            commit="a" * 40, artifact_digest="2" * 64, tree_digest="3" * 64,
+        ),
+        candidate=RolloutArtifact(
+            application="example-app", build_id="build_v1_" + "4" * 64,
+            commit="b" * 40, artifact_digest="5" * 64, tree_digest="6" * 64,
+        ),
+        backend_ready=True,
+        outcome="ready",
+        candidate_health="ready",
+        policy_fingerprint="rollout_" + "7" * 64,
+        contract_fingerprint="rollout_" + "8" * 64,
+        evidence_fingerprint="rollout_" + "9" * 64,
+        route_fingerprint="rollout_" + "a" * 64,
+    )
+
+
 def use_store(tmp_path: Path, monkeypatch) -> StateStore:
     selected = StateStore(tmp_path / "state")
     selected.save(sample_state())
@@ -1304,27 +1328,7 @@ def test_rollout_blocks_schema_artisan_but_keeps_ordinary_commands_on_stable(
     tmp_path, monkeypatch
 ) -> None:
     selected = use_store(tmp_path, monkeypatch)
-    rollout = Rollout(
-        deployment="example-app",
-        target="devbox",
-        generation=17,
-        phase="active",
-        stable=RolloutArtifact(
-            application="example-app", build_id="build_v1_" + "1" * 64,
-            commit="a" * 40, artifact_digest="2" * 64, tree_digest="3" * 64,
-        ),
-        candidate=RolloutArtifact(
-            application="example-app", build_id="build_v1_" + "4" * 64,
-            commit="b" * 40, artifact_digest="5" * 64, tree_digest="6" * 64,
-        ),
-        backend_ready=True,
-        outcome="ready",
-        candidate_health="ready",
-        policy_fingerprint="rollout_" + "7" * 64,
-        contract_fingerprint="rollout_" + "8" * 64,
-        evidence_fingerprint="rollout_" + "9" * 64,
-        route_fingerprint="rollout_" + "a" * 64,
-    )
+    rollout = active_rollout_record()
     selected.update(lambda state: state.model_copy(update={
         "rollouts": {"example-app": rollout}
     }))
@@ -1332,6 +1336,28 @@ def test_rollout_blocks_schema_artisan_but_keeps_ordinary_commands_on_stable(
     with pytest.raises(ValueError, match="schema-changing Artisan"):
         server_module.plan_artisan("example-app", "migrate", ["--force"])
     assert server_module.plan_artisan("example-app", "about")["kind"] == "artisan"
+
+
+def test_recoverable_rollout_blocks_ordinary_mutation_and_pruning_entrypoints(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    selected.update(lambda state: state.model_copy(update={
+        "rollouts": {"example-app": active_rollout_record()}
+    }))
+    guarded = [
+        lambda: server_module.plan_deployment("example-app"),
+        lambda: server_module.plan_rollback_deployment("example-app"),
+        lambda: server_module.plan_promotion("example-app", "missing"),
+        lambda: server_module.plan_remove_deployment("example-app"),
+        lambda: server_module.plan_update_deployment("example-app", None),
+        lambda: server_module.plan_deployment_resources("example-app"),
+        lambda: server_module.plan_deployment_runtimes("example-app"),
+    ]
+
+    for operation in guarded:
+        with pytest.raises(ValueError, match="operation blocked by rollout"):
+            operation()
 
 
 def test_target_service_status_passes_the_service_as_a_config_override(

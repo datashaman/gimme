@@ -533,6 +533,31 @@ def test_completion_hands_off_background_ownership_and_releases_capacity() -> No
     assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 1
 
 
+def test_operator_sequence_applies_multiple_reviewed_stages_then_completes() -> None:
+    store, rollout, target = active_rollout()
+
+    for stable, candidate in ((90, 10), (50, 50), (0, 100)):
+        plan = rollout.plan_weights("example-local", stable, candidate)
+        result = rollout.apply_weights(
+            "example-local", stable, candidate, plan["plan_id"]
+        )
+        assert (result["stable_weight"], result["candidate_weight"]) == (
+            stable, candidate,
+        )
+        assert result["stable_health"] == "ready"
+        assert result["candidate_health"] == "ready"
+
+    completion = rollout.plan_complete("example-local")
+    result = rollout.complete("example-local", completion["plan_id"])
+
+    assert result["phase"] == "completed"
+    assert result["background_owner"] == "candidate"
+    assert len([
+        call for call in target.calls if call[0] == "gimme:rollout:weights"
+    ]) == 3
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 1
+
+
 def test_completion_requires_all_candidate_traffic() -> None:
     _, rollout, _ = active_rollout()
 
@@ -577,8 +602,16 @@ def test_failed_finalization_keeps_reservation_and_records_degraded() -> None:
     assert current.outcome == "reverse_failed"
     assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 2
 
+    target.fail_finalize = False
+    retry = rollout.plan_reverse("example-local")
+    assert rollout.reverse("example-local", retry["plan_id"])["phase"] == "reversed"
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 1
 
-def test_finalization_retry_finishes_local_state_after_target_interruption() -> None:
+
+@pytest.mark.parametrize("action", ["complete", "reverse"])
+def test_finalization_retry_finishes_local_state_after_target_interruption(
+    action: str,
+) -> None:
     initial, _, _ = active_rollout()
 
     class InterruptingStore(MemoryStore):
@@ -598,15 +631,30 @@ def test_finalization_retry_finishes_local_state_after_target_interruption() -> 
             raise ValueError("stale")
 
     rollout = RolloutOrchestrator(store, ArtifactSupport(store), target, assert_plan)
-    plan = rollout.plan_reverse("example-local")
+    if action == "complete":
+        weights = rollout.plan_weights("example-local", 0, 100)
+        rollout.apply_weights("example-local", 0, 100, weights["plan_id"])
+        store.updates = 0
+        plan = rollout.plan_complete("example-local")
+        apply = rollout.complete
+        terminal = "completed"
+        transition = "completing"
+    else:
+        plan = rollout.plan_reverse("example-local")
+        apply = rollout.reverse
+        terminal = "reversed"
+        transition = "reversing"
     with pytest.raises(KeyboardInterrupt):
-        rollout.reverse("example-local", plan["plan_id"])
-    assert target.observed["phase"] == "reversed"
-    assert store.load().rollouts["example-local"].phase == "reversing"
+        apply("example-local", plan["plan_id"])
+    assert target.observed["phase"] == terminal
+    assert store.load().rollouts["example-local"].phase == transition
 
-    retry = rollout.plan_reverse("example-local")
+    retry = (
+        rollout.plan_complete("example-local")
+        if action == "complete" else rollout.plan_reverse("example-local")
+    )
     assert retry["target_already_applied"] is True
-    assert rollout.reverse("example-local", retry["plan_id"])["phase"] == "reversed"
+    assert apply("example-local", retry["plan_id"])["phase"] == terminal
 
 
 def test_finalization_rejects_target_loss_and_generation_mismatch() -> None:
@@ -626,3 +674,19 @@ def test_finalization_rejects_target_loss_and_generation_mismatch() -> None:
     with pytest.raises(RuntimeError, match="^rollout_target_unavailable$"):
         lost.plan_complete("example-local")
     assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 2
+
+
+def test_public_rollout_surfaces_exclude_protected_operational_data() -> None:
+    _, rollout, _ = active_rollout()
+    surfaces = [
+        rollout.inspect("example-local"),
+        rollout.plan_weights("example-local", 90, 10),
+        rollout.plan_reverse("example-local"),
+    ]
+    encoded = json.dumps(surfaces, sort_keys=True).lower()
+
+    for forbidden in (
+        "private-package", "private-manifest", "signing_key", "cookie_value",
+        "response_body", "access_log", "request_sample", "socket", "192.0.2.",
+    ):
+        assert forbidden not in encoded
