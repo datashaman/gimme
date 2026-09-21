@@ -113,11 +113,48 @@ network, identity, and lifecycle boundaries. It must use content-addressed plan/
 keep secrets out of plans and observations, and expose bounded status rather than raw provider
 output. Privileged Target operations remain behind existing policy-bound helpers.
 
+### Target Capability Profiles
+
+For engines that run on registered Ubuntu Targets, a **Target Capability Profile** is the
+host-oriented counterpart to an Execution Profile. It is a named, versioned, policy-bound
+declaration of the exact reviewed machine capabilities a Target may host. It replaces a generic
+"server type" or caller-provided package list with a small fixed catalog, for example:
+
+| Target Capability Profile | Permitted materialization |
+| --- | --- |
+| `laravel-app` | Laravel web, worker, scheduler, and supported realtime roles |
+| `laravel-web` | Laravel web and supported realtime roles only |
+| `laravel-worker` | Laravel worker and scheduler roles only |
+| `postgresql` | PostgreSQL Resource provider only |
+| `mysql` | MySQL or MariaDB Resource provider only |
+| `valkey` | Valkey Resource provider only |
+| `memcached` | Memcached Resource provider only |
+| `meilisearch` | Meilisearch Resource provider only |
+| `edge-routing` | approved routing/load-balancer behavior only |
+
+Each profile selects reviewed package, runtime, service, filesystem, and network policy. It does
+not expose arbitrary packages, services, unit files, ports, paths, web-server configuration, or
+database configuration as desired-state or MCP input. A Target's existing exact APT stack and mise
+policy become the profile's validated realization rather than a second free-form configuration
+surface.
+
+Target Capability Profiles are not universal runtime roles. A `worker` Process Role rendered by
+ECS/Fargate is a service/task and needs no `laravel-worker` Target Capability Profile; a managed
+RDS MariaDB Resource needs no `mysql` Target Capability Profile. Conversely, one Target may be
+eligible for a `laravel-app` Execution Profile without being allowed to provide a database
+Resource. Capability Profiles say what a machine may host; Execution Profiles say how a
+Deployment is run; Resources say what service is bound; routing topology says how traffic reaches
+the `web` role.
+
 ### Initial profile sequence
 
 The reference Execution Profile is `ubuntu-systemd`, expressed using the current Target and
 Deployment Replica model. Introducing the abstraction must first make this existing behavior
 conform to the renderer contract without changing its operational guarantees.
+
+The same vertical slice introduces the implicit `laravel-app` Target Capability Profile for
+existing Deployment Targets. It must be derived losslessly from their current fixed package and
+runtime policy, so adopting the profile changes neither remote state nor admission behavior.
 
 The next candidate is `docker-compose`, because it tests container materialization while retaining
 the registered Target execution boundary. `ecs-fargate` is the first candidate managed/cloud
@@ -148,6 +185,12 @@ profile explicit. That migration must be lossless, preserve immutable Target pla
 Deployment Replica identities, and produce no remote change when the derived profile exactly
 matches current policy.
 
+Existing Deployment Targets likewise use an implicit `laravel-app` Target Capability Profile until
+the Target schema can name the profile explicitly. Resource-provider and Administration Targets
+must receive the appropriate distinct Capability Profile as part of their own future migration;
+Gimme must not infer that an application Target may host a data or edge role merely because its
+current package state happens to contain compatible software.
+
 The first implementation may add profile identity to planning and observations, but it must not
 expand the MCP input surface or weaken existing Target, Resource, artifact, secret, rollout,
 recovery, or HA invariants. Engine changes, profile migration, and any new Resource provider each
@@ -174,6 +217,8 @@ require their own content-addressed plan/apply contracts and accepted architectu
 - Every engine must state its supported capability matrix and fail closed on unsupported intent.
 - The current systemd implementation becomes the first compatibility test for the abstraction,
   rather than being discarded for a theoretical universal scheduler.
+- Target capability admission can remain a fixed, safe catalog while runtime execution expands
+  beyond machines; a Capability Profile never becomes a disguised arbitrary provisioning API.
 - Provider expansion and execution expansion can proceed independently: an AWS Resource can be
   consumed from an Ubuntu Target before ECS exists, and an ECS renderer can initially consume only
   already-supported Resource contracts.
