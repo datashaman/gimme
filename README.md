@@ -326,18 +326,28 @@ promotion reuse the current live release without rebuilding, and content-address
 verifies retained source or artifact releases before activation. Traffic splitting and fleet
 scheduling remain future work rather than implied production guarantees.
 
-Resource provider coverage:
+Resource provider and module coverage:
 
-| Resource | Local (target-local) | AWS (managed) |
-| --- | --- | --- |
-| PostgreSQL | ✅ | ✅ (RDS; see [ADR 0008](docs/adr/0008-aws-rds-postgresql-resources.md)) |
-| Valkey | ✅ | provisioning, updates, bindings, Laravel contract, inspection, destruction, restore, and credential rotation (ElastiCache; see [ADR 0009](docs/adr/0009-synchronously-durable-aws-valkey.md)) |
+| Resource module | Local (target-local) | AWS (managed) | Completion and next boundary |
+| --- | --- | --- | --- |
+| PostgreSQL | ✅ | ✅ RDS PostgreSQL | **Available.** Registration, provisioning, reviewed updates, Deployment bindings, credential rotation, Recovery Point capture, detach/reactivate, guarded purge, retained tombstones, destruction, and drift inspection. Scheduled capture, in-place restore, major upgrades, and cross-Network/region moves remain separate work. See [ADR 0008](docs/adr/0008-aws-rds-postgresql-resources.md). |
+| Valkey | ✅ | ✅ ElastiCache Valkey | **Available, AWS live validation pending.** Provisioning, reviewed updates, typed Laravel bindings, inspection/drift, snapshots/restore, retention-by-default cleanup, destruction, and credential rotation. The AWS calls have so far been exercised with botocore stubs, not a live account. See [ADR 0009](docs/adr/0009-synchronously-durable-aws-valkey.md). |
+| MySQL | — | — | **Planned.** A precise MySQL Resource contract; target-local and managed-provider implementations are separate slices. |
+| MariaDB | — | — | **Planned.** A precise MariaDB Resource contract, distinct from MySQL despite protocol compatibility; Amazon RDS for MariaDB is a candidate managed implementation. |
+| Memcached | — | — | **Planned.** Ephemeral-cache Resource contract, intentionally distinct from Valkey. |
+| DynamoDB-backed cache | — | — | **Planned (AWS).** Bounded table, TTL, region, and workload-identity contract; not an alias for Memcached or Valkey. |
+| Meilisearch | — | — | **Planned.** Bounded search Resource contract rather than a generic package installation. |
+| Application object storage | — | — | **Planned.** Application-facing binding; distinct from the available Artifact Store and Backup Destination contracts. |
+| SQS-compatible queue | — | — | **Planned.** External queue binding. Database- and Valkey-backed Laravel workers are already supported through current Deployment process behavior. |
 
-The managed AWS RDS PostgreSQL provider covers registration, provisioning, deployment
-binding, and non-destructive-by-default cleanup for a single generation of credentials.
-Workload credential rotation, Detached Allocation rebind, and destructive instance deletion
-are not yet implemented; a Retained Resource tombstone can be forgotten. See
-[`docs/reference/mcp.md`](docs/reference/mcp.md#managed-aws-rds-postgresql-resources).
+✅ means the provider/module has a supported schema and content-addressed plan/apply workflow.
+**Planned** records direction only; it is not an implementation commitment. Gimme never exposes a
+provider's entire API: every module remains a bounded contract with derived ownership and no
+arbitrary provider configuration.
+
+See [`docs/how-to/use-aws-rds-postgresql.md`](docs/how-to/use-aws-rds-postgresql.md) and
+[`docs/how-to/use-aws-elasticache-valkey.md`](docs/how-to/use-aws-elasticache-valkey.md) for
+the implemented AWS provider boundaries.
 
 ## Development
 
