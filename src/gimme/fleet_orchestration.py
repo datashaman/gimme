@@ -30,7 +30,7 @@ def fleet_state(state: ControlState) -> dict[str, object]:
         name: sorted(
             rollout.deployment
             for rollout in state.rollouts.values()
-            if rollout.target == name
+            if rollout.target == name and rollout.phase not in {"completed", "reversed"}
         )
         for name in state.targets
     }

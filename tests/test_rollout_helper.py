@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import importlib.util
+import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -105,6 +106,33 @@ def test_root_state_rejects_unbounded_instance_path() -> None:
         helper.root_state("../../private")
 
 
+def test_finalize_policy_requires_rotation_and_candidate_100_for_completion() -> None:
+    helper = load_helper()
+    value = {
+        **policy(0, 100),
+        "action": "complete",
+        "candidate_build_id": "build_v1_" + "4" * 64,
+        "affinity_generation": 18,
+    }
+
+    assert helper.validate_finalize_policy(value)["action"] == "complete"
+    with pytest.raises(RuntimeError, match="rotate affinity"):
+        helper.validate_finalize_policy({**value, "affinity_generation": 17})
+    with pytest.raises(RuntimeError, match="candidate weight 100"):
+        helper.validate_finalize_policy({**value, "stable_weight": 10, "candidate_weight": 90})
+
+
+def test_normal_route_removes_affinity_and_uses_current_release() -> None:
+    helper = load_helper()
+
+    route = helper.normal_site(policy())
+
+    assert "lb_policy cookie" not in route
+    assert "current/public" in route
+    assert "resolve_root_symlink" in route
+    assert "hide .git* .env* .hg* .svn" in route
+
+
 def transition_harness(tmp_path: Path, monkeypatch, *, fail_runs: set[int]):
     helper = load_helper()
     public_root = tmp_path / "gimme"
@@ -193,3 +221,146 @@ def test_route_rollback_failure_is_fixed_and_redacted(tmp_path: Path, monkeypatc
         helper.main_weights("example-local")
 
     assert public.read_text() == prior
+
+
+def finalization_harness(tmp_path: Path, monkeypatch):
+    helper = load_helper()
+    deploy = tmp_path / "deployment"
+    stable = deploy / "releases" / "1"
+    candidate = deploy / "rollouts" / "17" / "candidate"
+    stable.mkdir(parents=True)
+    candidate.mkdir(parents=True)
+    (candidate / ".gimme-artifact.json").write_text(json.dumps({
+        "build_id": "build_v1_" + "4" * 64
+    }))
+    current = deploy / "current"
+    current.symlink_to("releases/1")
+    (deploy / ".dep").mkdir()
+    (deploy / ".dep" / "releases_log").write_text('{"release_name":"1"}\n')
+    (deploy / ".dep" / "latest_release").write_text("1\n")
+    caddy = tmp_path / "caddy"
+    rollouts = tmp_path / "caddy-rollouts"
+    pools = tmp_path / "pools"
+    caddy.mkdir()
+    rollouts.mkdir()
+    pools.mkdir()
+    public = caddy / "example-local.caddy"
+    prior = "example.test { reverse_proxy 127.0.0.1:21002 }\n"
+    public.write_text(prior)
+    internal = rollouts / "example-local-17.caddy"
+    internal.write_text("prior internal\n")
+    pool = pools / "gimme-rollout-example-local-17.conf"
+    pool.write_text("prior pool\n")
+    value = {
+        **policy(0, 100),
+        "action": "complete",
+        "affinity_generation": 18,
+        "candidate_build_id": "build_v1_" + "4" * 64,
+        "deploy_path": "/srv/gimme/example-local",
+        "candidate": candidate,
+        "account": type(
+            "Account", (), {"pw_name": "deployer", "pw_uid": 1000, "pw_gid": 1000}
+        )(),
+    }
+    real_path = Path
+
+    def mapped_path(raw):
+        text = str(raw)
+        return {
+            "/srv/gimme/example-local": deploy,
+            "/etc/caddy/gimme": caddy,
+            "/etc/caddy/gimme-rollouts": rollouts,
+            "/etc/php/8.4/fpm/pool.d": pools,
+        }.get(text, real_path(raw))
+
+    commands: list[list[str]] = []
+
+    def run(argv):
+        commands.append(argv)
+        if argv[0] == "/usr/bin/cp":
+            import shutil
+
+            shutil.copytree(Path(argv[-2]), Path(argv[-1]), symlinks=True)
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr(helper, "Path", mapped_path)
+    monkeypatch.setattr(helper, "ROOT_STATE", tmp_path / "root-state")
+    monkeypatch.setattr(helper, "APPS_ROOT", tmp_path / "apps")
+    monkeypatch.setattr(helper, "load", lambda *_args: value)
+    monkeypatch.setattr(helper, "internal_sites", lambda _value: ("internal\n", 21001, 21002))
+    monkeypatch.setattr(helper, "run", run)
+    monkeypatch.setattr(helper, "reconcile_processes", lambda _instance: None)
+    monkeypatch.setattr(helper, "signing_key", lambda *_args: "b" * 64)
+    monkeypatch.setattr(helper, "emit_state", lambda _value: None)
+    monkeypatch.setattr(helper.os, "chown", lambda *_args: None)
+    monkeypatch.setattr(helper.os, "lchown", lambda *_args: None)
+    return helper, deploy, current, public, prior, candidate, pool, commands
+
+
+def test_completion_public_health_failure_restores_release_route_and_current(
+    tmp_path: Path, monkeypatch
+) -> None:
+    helper, deploy, current, public, prior, candidate, _, _ = finalization_harness(
+        tmp_path, monkeypatch
+    )
+    public_probes = 0
+
+    def probe(*_args, public=False, **_kwargs):
+        nonlocal public_probes
+        if public:
+            public_probes += 1
+            if public_probes == 1:
+                raise RuntimeError("public health failed")
+
+    monkeypatch.setattr(helper, "probe", probe)
+
+    with pytest.raises(RuntimeError, match="rollout finalization failed"):
+        helper.main_finalize("example-local")
+
+    assert current.readlink() == Path("releases/1")
+    assert public.read_text() == prior
+    assert candidate.is_dir()
+    assert not (deploy / "releases" / str(8_000_000_017)).exists()
+
+
+def test_completion_cleanup_failure_rolls_back_candidate_pool_and_route(
+    tmp_path: Path, monkeypatch
+) -> None:
+    helper, _, current, public, prior, candidate, pool, commands = finalization_harness(
+        tmp_path, monkeypatch
+    )
+    original_run = helper.run
+
+    def fail_cleanup(argv):
+        if argv == ["/usr/bin/systemctl", "reload", "php8.4-fpm.service"] and not pool.exists():
+            raise RuntimeError("cleanup failed")
+        return original_run(argv)
+
+    monkeypatch.setattr(helper, "run", fail_cleanup)
+    monkeypatch.setattr(helper, "probe", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="rollout finalization failed"):
+        helper.main_finalize("example-local")
+
+    assert current.readlink() == Path("releases/1")
+    assert public.read_text() == prior
+    assert candidate.is_dir()
+    assert pool.read_text() == "prior pool\n"
+    assert commands
+
+
+def test_completion_rollback_failure_is_fixed_and_redacted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    helper, *_ = finalization_harness(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        helper,
+        "probe",
+        lambda *_args, **kwargs: (
+            (_ for _ in ()).throw(RuntimeError("private response body"))
+            if kwargs.get("public") else None
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="^rollout finalization rollback failed$"):
+        helper.main_finalize("example-local")

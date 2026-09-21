@@ -28,6 +28,8 @@ from gimme.control import (
     Placement,
     RecoveryPolicy,
     ResourceBindings,
+    Rollout,
+    RolloutArtifact,
     ValkeyBinding,
     ResourceConfig,
     RuntimePin,
@@ -525,6 +527,10 @@ async def test_hard_v7_tool_surface() -> None:
         "start_rollout",
         "plan_rollout_weights",
         "apply_rollout_weights",
+        "plan_complete_rollout",
+        "complete_rollout",
+        "plan_reverse_rollout",
+        "reverse_rollout",
         "plan_target_stack",
         "apply_target_stack",
         "plan_deployment_runtimes",
@@ -1292,6 +1298,40 @@ def test_artisan_is_deployment_scoped_and_plan_gated(tmp_path, monkeypatch) -> N
     server_module.run_artisan("example-app", "migrate", str(plan["plan_id"]), ["--force"])
     assert calls[-1]["artisan_command"] == "migrate"
     assert calls[-1]["artisan_arguments"] == ["--force"]
+
+
+def test_rollout_blocks_schema_artisan_but_keeps_ordinary_commands_on_stable(
+    tmp_path, monkeypatch
+) -> None:
+    selected = use_store(tmp_path, monkeypatch)
+    rollout = Rollout(
+        deployment="example-app",
+        target="devbox",
+        generation=17,
+        phase="active",
+        stable=RolloutArtifact(
+            application="example-app", build_id="build_v1_" + "1" * 64,
+            commit="a" * 40, artifact_digest="2" * 64, tree_digest="3" * 64,
+        ),
+        candidate=RolloutArtifact(
+            application="example-app", build_id="build_v1_" + "4" * 64,
+            commit="b" * 40, artifact_digest="5" * 64, tree_digest="6" * 64,
+        ),
+        backend_ready=True,
+        outcome="ready",
+        candidate_health="ready",
+        policy_fingerprint="rollout_" + "7" * 64,
+        contract_fingerprint="rollout_" + "8" * 64,
+        evidence_fingerprint="rollout_" + "9" * 64,
+        route_fingerprint="rollout_" + "a" * 64,
+    )
+    selected.update(lambda state: state.model_copy(update={
+        "rollouts": {"example-app": rollout}
+    }))
+
+    with pytest.raises(ValueError, match="schema-changing Artisan"):
+        server_module.plan_artisan("example-app", "migrate", ["--force"])
+    assert server_module.plan_artisan("example-app", "about")["kind"] == "artisan"
 
 
 def test_target_service_status_passes_the_service_as_a_config_override(

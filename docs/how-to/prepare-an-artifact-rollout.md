@@ -17,6 +17,12 @@ is healthy and the desired source resolves to a different published artifact.
    `apply_rollout_weights`.
 6. Inspect again. Confirm desired weights, `affinity_generation`, backend eligibility, bounded
    health, `route_fingerprint`, `phase`, and `drift` before requesting another transition.
+7. To accept the candidate, first apply `0/100`, then call `plan_complete_rollout` and pass its
+   unchanged `plan_id` to `complete_rollout`. Completion promotes the exact candidate to the
+   ordinary retained release inventory and hands it workers, Horizon, and scheduler ownership.
+8. To abandon a `preparing`, `active`, or `degraded` generation, call `plan_reverse_rollout` and
+   pass its unchanged `plan_id` to `reverse_rollout`. Reversal restores stable-only web and
+   background service and retires the candidate.
 
 Preparation cannot send traffic to the candidate. It materializes the exact reviewed publication
 without Git, Composer, Node, dependency installation, frontend building, or database migrations.
@@ -36,6 +42,20 @@ backends plus the public route afterward. If health, Caddy validation, or reload
 restores the exact prior route and verifies stable service. Desired weights remain unchanged. Caddy
 active health can temporarily exclude an unhealthy backend without autonomously changing weights,
 promoting, or completing the Rollout.
+
+Completion and reversal persist a transition phase before touching the Target. They rotate
+affinity and release the temporary Target slot only after route, process, health, and cleanup
+converge. If the caller is interrupted after the Target finishes, request a fresh plan and retry;
+the matching terminal Target record finishes local state without creating another release or
+reservation. A Target outage or generation mismatch fails closed and keeps the Deployment on its
+Target with the slot reserved. If rollback itself is degraded, restore the Target and retry the
+same generation rather than editing state manually.
+
+Rollouts never run database migrations. Schema-changing Artisan commands are blocked while a
+generation is active or recoverable. Other explicitly allowlisted Artisan commands continue to
+address stable `current`; all shared mutations serialize under the Deployment lock. Ordinary
+resource/secret/process reconciliation remains blocked while it cannot activate and verify both
+web revisions transactionally.
 
 If the call is interrupted or fails, inspection reports `preparing` or `degraded`. Request a fresh
 plan and call `start_rollout` again. The plan retains the same generation only when stable,

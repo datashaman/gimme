@@ -12,6 +12,7 @@ import os
 import pwd
 import re
 import secrets
+import shutil
 import stat
 import subprocess  # nosec B404 -- fixed executable vectors only
 import sys
@@ -45,6 +46,8 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
         "/usr/bin/systemctl",
         "/usr/bin/caddy",
         "/usr/bin/curl",
+        "/usr/bin/cp",
+        "/usr/local/sbin/gimme-provision-processes",
     }
     if not argv or argv[0] not in allowed:
         fail("rollout helper attempted an unexpected executable")
@@ -114,7 +117,7 @@ def load(instance: str, version: int = 1) -> dict[str, Any]:
             "stable_weight", "candidate_weight", "route_fingerprint", "framework",
             "site_host", "network_mode", "deploy_path", "php_version", "health",
             "stable_identity", "candidate_identity",
-        }
+        } | ({"action", "candidate_build_id"} if version == 3 else set())
     )
     if not isinstance(value, dict) or set(value) != expected:
         fail("invalid rollout desired state document")
@@ -139,7 +142,8 @@ def load(instance: str, version: int = 1) -> dict[str, Any]:
     ):
         fail("rollout deploy path escapes applications root")
     candidate = deploy_path / "rollouts" / str(value["generation"]) / "candidate"
-    if not candidate.is_dir() or candidate.is_symlink():
+    candidate_required = version != 3 or value.get("action") == "complete"
+    if candidate_required and (not candidate.is_dir() or candidate.is_symlink()):
         fail("rollout candidate tree is unavailable")
     return {**value, "candidate": candidate, "account": account}
 
@@ -150,7 +154,9 @@ def require_int(value: Any, name: str, minimum: int, maximum: int) -> int:
     return value
 
 
-def validate_weight_policy(value: dict[str, Any]) -> dict[str, Any]:
+def validate_weight_policy(
+    value: dict[str, Any], *, affinity_matches_generation: bool = True
+) -> dict[str, Any]:
     stable = require_int(value["stable_weight"], "stable_weight", 0, 100)
     candidate = require_int(value["candidate_weight"], "candidate_weight", 0, 100)
     if stable + candidate != 100:
@@ -159,7 +165,7 @@ def validate_weight_policy(value: dict[str, Any]) -> dict[str, Any]:
     affinity = require_int(
         value["affinity_generation"], "affinity_generation", 1, 2_147_483_647
     )
-    if affinity != generation:
+    if affinity_matches_generation and affinity != generation:
         fail("affinity generation must match rollout generation")
     if value["framework"] not in {"laravel", "static"}:
         fail("invalid rollout framework")
@@ -198,6 +204,22 @@ def validate_weight_policy(value: dict[str, Any]) -> dict[str, Any]:
             ),
         })
     value["health"] = validated_health
+    return value
+
+
+def validate_finalize_policy(value: dict[str, Any]) -> dict[str, Any]:
+    validate_weight_policy(value, affinity_matches_generation=False)
+    if value["action"] not in {"complete", "reverse"}:
+        fail("invalid rollout finalization action")
+    if value["affinity_generation"] == value["generation"]:
+        fail("rollout finalization must rotate affinity")
+    if (
+        not isinstance(value["candidate_build_id"], str)
+        or re.fullmatch(r"build_v1_[0-9a-f]{64}", value["candidate_build_id"]) is None
+    ):
+        fail("invalid rollout candidate build")
+    if value["action"] == "complete" and value["candidate_weight"] != 100:
+        fail("completion requires candidate weight 100")
     return value
 
 
@@ -305,8 +327,15 @@ def internal_sites(value: dict[str, Any]) -> tuple[str, int, int]:
     deploy_path = Path(value["deploy_path"])
     candidate = deploy_path / "rollouts" / str(generation) / "candidate"
     current = deploy_path / "current"
+    try:
+        stable = current.resolve(strict=True)
+    except OSError:
+        fail("stable rollout release is unavailable")
+    releases = deploy_path / "releases"
+    if not stable.is_relative_to(releases) or not stable.is_dir():
+        fail("stable rollout release is invalid")
     if value["framework"] == "laravel":
-        stable_root = current / "public"
+        stable_root = stable / "public"
         candidate_root = candidate / "public"
         stable_socket = f"/run/php/php{value['php_version']}-fpm.sock"
         candidate_socket = f"/run/php/gimme-rollout-{instance}-{generation}.sock"
@@ -318,7 +347,7 @@ def internal_sites(value: dict[str, Any]) -> tuple[str, int, int]:
         )
     else:
         body = (
-            f"http://127.0.0.1:{stable_port} {{\n\troot * {current}\n\tfile_server\n}}\n"
+            f"http://127.0.0.1:{stable_port} {{\n\troot * {stable}\n\tfile_server\n}}\n"
             f"http://127.0.0.1:{candidate_port} {{\n\troot * {candidate}\n\tfile_server\n}}\n"
         )
     return body, stable_port, candidate_port
@@ -425,7 +454,7 @@ def main_weights(instance: str) -> None:
         probe(f"http://127.0.0.1:{stable_port}", value["site_host"], value)
         probe(f"http://127.0.0.1:{candidate_port}", value["site_host"], value)
         probe(f"https://{value['site_host']}", value["site_host"], value, public=True)
-    except Exception:
+    except BaseException:
         try:
             atomic_write(public_path, previous, stat.S_IMODE(previous_stat.st_mode))
             os.chown(public_path, previous_stat.st_uid, previous_stat.st_gid)
@@ -435,7 +464,7 @@ def main_weights(instance: str) -> None:
             probe(
                 f"https://{value['site_host']}", value["site_host"], value, public=True
             )
-        except Exception:
+        except BaseException:
             fail("rollout route rollback failed")
         fail("rollout route transition failed")
     state = safe_target_state(value)
@@ -444,6 +473,209 @@ def main_weights(instance: str) -> None:
     atomic_write(ROOT_STATE / f"{instance}.json", json.dumps(
         state, sort_keys=True, separators=(",", ":")
     ), 0o600)
+    emit_state(state)
+
+
+def normal_site(value: dict[str, Any]) -> str:
+    deploy_path = Path(value["deploy_path"])
+    root = deploy_path / "current"
+    if value["framework"] == "laravel":
+        root = root / "public"
+        handler = (
+            f"\tphp_fastcgi unix//run/php/php{value['php_version']}-fpm.sock {{\n"
+            "\t\tresolve_root_symlink\n\t}\n"
+        )
+    else:
+        handler = ""
+    tls = "\ttls internal\n" if value["network_mode"] == "local_mdns" else ""
+    return (
+        f"{value['site_host']} {{\n{tls}\troot * {root}\n\tencode zstd gzip\n"
+        f"{handler}\tfile_server {{\n\t\thide .git* .env* .hg* .svn\n\t}}\n}}\n"
+    )
+
+
+def reconcile_processes(instance: str) -> None:
+    state = APPS_ROOT / ".gimme" / "processes" / f"{instance}.json"
+    if state.is_file() and not state.is_symlink():
+        run(["/usr/local/sbin/gimme-provision-processes", instance, "refresh"])
+
+
+def replace_current(current: Path, target: str, account: pwd.struct_passwd) -> None:
+    temporary = current.parent / f".gimme-current-{secrets.token_hex(8)}"
+    try:
+        temporary.symlink_to(target)
+        os.lchown(temporary, account.pw_uid, account.pw_gid)
+        os.replace(temporary, current)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def main_finalize(instance: str) -> None:
+    value = validate_finalize_policy(load(instance, 3))
+    action = value["action"]
+    deploy_path = Path(value["deploy_path"])
+    current = deploy_path / "current"
+    releases = deploy_path / "releases"
+    public_path = Path("/etc/caddy/gimme") / f"{instance}.caddy"
+    internal_path = (
+        Path("/etc/caddy/gimme-rollouts")
+        / f"{instance}-{value['generation']}.caddy"
+    )
+    pool_path = (
+        Path(f"/etc/php/{value['php_version']}/fpm/pool.d")
+        / f"gimme-rollout-{instance}-{value['generation']}.conf"
+    )
+    if not current.is_symlink() or not public_path.is_file() or public_path.is_symlink():
+        fail("rollout finalization prerequisites are unavailable")
+    previous_current = os.readlink(current)
+    stable_release = current.resolve(strict=True)
+    if not stable_release.is_relative_to(releases):
+        fail("rollout stable release is invalid")
+    previous_public = public_path.read_text()
+    previous_public_stat = public_path.stat()
+    previous_internal = internal_path.read_text() if internal_path.is_file() else None
+    previous_pool = pool_path.read_text() if pool_path.is_file() else None
+    log_path = deploy_path / ".dep" / "releases_log"
+    latest_path = deploy_path / ".dep" / "latest_release"
+    previous_log = log_path.read_text() if log_path.is_file() else None
+    previous_latest = latest_path.read_text() if latest_path.is_file() else None
+    key_path = ROOT_STATE / f"{instance}.key"
+    key_generation_path = ROOT_STATE / f"{instance}.generation"
+    previous_key = key_path.read_text() if key_path.is_file() else None
+    previous_key_generation = (
+        key_generation_path.read_text() if key_generation_path.is_file() else None
+    )
+    internal, stable_port, candidate_port = internal_sites(value)
+    atomic_write(internal_path, internal)
+    run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+    run(["/usr/bin/systemctl", "reload", "caddy.service"])
+    selected_port = candidate_port if action == "complete" else stable_port
+    probe(f"http://127.0.0.1:{selected_port}", value["site_host"], value)
+
+    release_path: Path | None = None
+    retired_path: Path | None = None
+    try:
+        if action == "complete":
+            candidate = value["candidate"]
+            metadata_path = candidate / ".gimme-artifact.json"
+            metadata = json.loads(metadata_path.read_text())
+            if metadata.get("build_id") != value["candidate_build_id"]:
+                fail("rollout candidate metadata is stale")
+            release_name = str(8_000_000_000 + value["generation"])
+            release_path = releases / release_name
+            if release_path.exists():
+                fail("rollout promoted release already exists")
+            run(["/usr/bin/cp", "-a", "--", str(candidate), str(release_path)])
+            record = json.dumps({
+                "created_at": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                "release_name": release_name,
+                "user": value["account"].pw_name,
+                "target": value["site_host"],
+            }, sort_keys=True, separators=(",", ":"))
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write(log_path, (previous_log or "") + record + "\n")
+            atomic_write(latest_path, release_name + "\n")
+            replace_current(current, f"releases/{release_name}", value["account"])
+            reconcile_processes(instance)
+
+        atomic_write(public_path, normal_site(value), 0o644)
+        run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+        run(["/usr/bin/systemctl", "reload", "caddy.service"])
+        probe(f"https://{value['site_host']}", value["site_host"], value, public=True)
+
+        if action == "reverse":
+            reconcile_processes(instance)
+        generation_root = deploy_path / "rollouts" / str(value["generation"])
+        if generation_root.exists():
+            retired_path = generation_root.with_name(
+                f".{value['generation']}.retired-{secrets.token_hex(8)}"
+            )
+            os.replace(generation_root, retired_path)
+        internal_path.unlink(missing_ok=True)
+        if value["framework"] == "laravel":
+            pool_path.unlink(missing_ok=True)
+            run([
+                "/usr/bin/systemctl", "reload",
+                f"php{value['php_version']}-fpm.service",
+            ])
+        run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+        run(["/usr/bin/systemctl", "reload", "caddy.service"])
+        probe(f"https://{value['site_host']}", value["site_host"], value, public=True)
+        signing_key(instance, value["affinity_generation"])
+        terminal = "completed" if action == "complete" else "reversed"
+        terminal_value = {
+            **value,
+            "phase": terminal,
+            "stable_weight": 0 if action == "complete" else 100,
+            "candidate_weight": 100 if action == "complete" else 0,
+        }
+        state = safe_target_state(terminal_value, terminal)
+        state["phase"] = terminal
+        state["stable_health"] = "ready"
+        state["candidate_health"] = (
+            "ready" if action == "complete" else "unavailable"
+        )
+        ROOT_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write(
+            ROOT_STATE / f"{instance}.json",
+            json.dumps(state, sort_keys=True, separators=(",", ":")),
+            0o600,
+        )
+    except BaseException:
+        try:
+            if retired_path is not None and retired_path.exists():
+                os.replace(
+                    retired_path,
+                    deploy_path / "rollouts" / str(value["generation"]),
+                )
+            if previous_internal is not None:
+                atomic_write(internal_path, previous_internal)
+            else:
+                internal_path.unlink(missing_ok=True)
+            if previous_pool is not None:
+                atomic_write(pool_path, previous_pool)
+                run([
+                    "/usr/bin/systemctl", "reload",
+                    f"php{value['php_version']}-fpm.service",
+                ])
+            if action == "complete":
+                replace_current(current, previous_current, value["account"])
+                reconcile_processes(instance)
+            atomic_write(
+                public_path,
+                previous_public,
+                stat.S_IMODE(previous_public_stat.st_mode),
+            )
+            os.chown(public_path, previous_public_stat.st_uid, previous_public_stat.st_gid)
+            run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+            run(["/usr/bin/systemctl", "reload", "caddy.service"])
+            probe(
+                f"https://{value['site_host']}", value["site_host"], value,
+                public=True,
+            )
+            if release_path is not None and release_path.exists():
+                shutil.rmtree(release_path)
+            if previous_log is None:
+                log_path.unlink(missing_ok=True)
+            else:
+                atomic_write(log_path, previous_log)
+            if previous_latest is None:
+                latest_path.unlink(missing_ok=True)
+            else:
+                atomic_write(latest_path, previous_latest)
+            if previous_key is not None:
+                atomic_write(key_path, previous_key, 0o600)
+            else:
+                key_path.unlink(missing_ok=True)
+            if previous_key_generation is not None:
+                atomic_write(key_generation_path, previous_key_generation, 0o600)
+            else:
+                key_generation_path.unlink(missing_ok=True)
+        except BaseException:
+            fail("rollout finalization rollback failed")
+        fail("rollout finalization failed")
+    if retired_path is not None:
+        shutil.rmtree(retired_path, ignore_errors=True)
     emit_state(state)
 
 
@@ -459,6 +691,8 @@ def main() -> None:
         emit_state({"configured": False} if state is None else state)
     elif len(sys.argv) == 3 and sys.argv[1] == "weights":
         main_weights(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] in {"complete", "reverse"}:
+        main_finalize(sys.argv[2])
     else:
         fail("rollout helper action is invalid")
 

@@ -127,6 +127,10 @@ bounded to 200 records per call.
 | `start_rollout` | Remote write | Reserve one temporary slot, materialize an isolated candidate backend, and directly health-check it at zero traffic |
 | `plan_rollout_weights` | Remote read | Review integer weights totaling 100, exact artifacts, affinity generation, route fingerprint, and effects |
 | `apply_rollout_weights` | Remote write | Preflight both backends, install and verify signed sticky routing, then persist the reviewed weights |
+| `plan_complete_rollout` | Remote read | Review the exact 100%-candidate generation, process handoff, route convergence, cleanup, retention, and capacity effects |
+| `complete_rollout` | Remote write | Promote the healthy candidate to an ordinary live release, hand off background ownership, retire temporary routing, and release capacity |
+| `plan_reverse_rollout` | Remote read | Review stable restoration, candidate retirement, route/process rollback, retention, and capacity effects |
+| `reverse_rollout` | Remote write | Restore verified stable-only service, retire the candidate, rotate affinity, and release capacity |
 
 ### Fleet placement
 
@@ -282,6 +286,27 @@ requests. Existing cohorts and clients that reject cookies can make the observed
 differ from configured weights. Inspection reports desired weights, affinity generation,
 eligibility, bounded health, route fingerprint, phase, and safe drift without exposing backend
 addresses, bodies, cookies, request samples, or secrets.
+
+Completion requires a healthy candidate at `0/100`. `plan_complete_rollout` /
+`complete_rollout` copy that exact verified artifact into an ordinary retained release, switch
+`current`, reconcile workers/Horizon/scheduler to the promoted release, restore the ordinary public
+route, verify public health, rotate affinity, and retire the temporary backend. The temporary slot
+is released only after the Target reports `completed`. A failed transaction restores the prior
+current release, process owner, route, release inventory, and capacity reservation.
+
+`plan_reverse_rollout` / `reverse_rollout` may restore a `preparing`, `active`, or `degraded`
+generation. Reversal requires verified stable service, restores the ordinary stable route and
+background ownership, rotates affinity, retires the candidate, and releases the slot only after
+the Target reports `reversed`. Both operations persist `completing` or `reversing` before remote
+mutation; a matching terminal Target record lets an interrupted caller finish local convergence
+without duplicating releases, routes, processes, keys, or reservations. Missing or mismatched
+generations fail closed, and Target loss retains placement and capacity.
+
+No Rollout operation runs migrations. While a Rollout remains recoverable, built-in
+schema-changing Artisan commands are rejected; other explicitly allowlisted commands run against
+the stable `current` release and serialize under the Deployment lock. Ordinary Deployment,
+runtime, Resource, secret, and process reconciliation remains blocked unless it can preserve both
+revisions transactionally.
 
 Artifact rollback uses `plan_rollback_deployment` and `rollback_deployment` with the exact plan ID
 and displayed confirmation. It revalidates retained readonly metadata, the canonical tree,

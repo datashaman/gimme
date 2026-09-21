@@ -206,6 +206,18 @@ def test_reconcile_writes_and_starts_only_declared_queue_instances(
     helper["reconcile"]()
     assert "process.units_changed=no" in capsys.readouterr().out
 
+    commands.clear()
+    monkeypatch.setitem(helper, "succeeds", lambda _command: True)
+    monkeypatch.setattr(
+        helper["sys"],
+        "argv",
+        ["gimme-provision-processes", "example-app", "refresh"],
+    )
+    helper["reconcile"]()
+    assert ["systemctl", "restart", "gimme-worker-example-app@1.service"] in commands
+    assert ["systemctl", "restart", "gimme-worker-example-app@2.service"] in commands
+    assert ["systemctl", "restart", "gimme-scheduler-example-app.timer"] in commands
+
 
 def test_teardown_does_not_require_a_current_release(tmp_path, monkeypatch) -> None:
     helper = helper_namespace()

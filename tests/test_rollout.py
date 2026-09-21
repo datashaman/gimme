@@ -146,6 +146,7 @@ class RoutingTarget:
         self.store = store
         self.observed: dict[str, object] = {"configured": False}
         self.fail_weights = False
+        self.fail_finalize = False
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     def __call__(self, task: str, name: str, **kwargs) -> CommandResult:
@@ -178,6 +179,29 @@ class RoutingTarget:
                 "candidate_identity": policy["candidate_identity"],
                 "route_fingerprint": policy["route_fingerprint"],
                 "outcome": "ready",
+            }
+            return CommandResult([], 0, target_output(self.observed))
+        if task in {"gimme:rollout:complete", "gimme:rollout:reverse"}:
+            if self.fail_finalize:
+                raise RuntimeError("private finalization failure")
+            policy = kwargs["rollout_policy"]
+            completed = task.endswith(":complete")
+            terminal = "completed" if completed else "reversed"
+            self.observed = {
+                "configured": True,
+                "generation": policy["generation"],
+                "phase": terminal,
+                "affinity_generation": policy["affinity_generation"],
+                "stable_weight": 0 if completed else 100,
+                "candidate_weight": 100 if completed else 0,
+                "stable_eligible": not completed,
+                "candidate_eligible": completed,
+                "stable_health": "ready",
+                "candidate_health": "ready" if completed else "unavailable",
+                "stable_identity": policy["stable_identity"],
+                "candidate_identity": policy["candidate_identity"],
+                "route_fingerprint": policy["route_fingerprint"],
+                "outcome": terminal,
             }
             return CommandResult([], 0, target_output(self.observed))
         raise AssertionError(task)
@@ -492,3 +516,113 @@ def test_weight_transition_rejects_route_drift_and_target_loss() -> None:
     target.observed = {"not": "safe"}
     with pytest.raises(RuntimeError, match="rollout_target_state_invalid"):
         rollout.plan_weights("example-local", 90, 10)
+
+
+def test_completion_hands_off_background_ownership_and_releases_capacity() -> None:
+    store, rollout, _ = active_rollout()
+    weights = rollout.plan_weights("example-local", 0, 100)
+    rollout.apply_weights("example-local", 0, 100, weights["plan_id"])
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 2
+
+    plan = rollout.plan_complete("example-local")
+    result = rollout.complete("example-local", plan["plan_id"])
+
+    assert result["phase"] == "completed"
+    assert result["background_owner"] == "candidate"
+    assert result["affinity_generation"] != result["generation"]
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 1
+
+
+def test_completion_requires_all_candidate_traffic() -> None:
+    _, rollout, _ = active_rollout()
+
+    with pytest.raises(ValueError, match="100% healthy candidate"):
+        rollout.plan_complete("example-local")
+
+
+@pytest.mark.parametrize("phase", ["preparing", "active", "degraded"])
+def test_reversal_restores_stable_and_releases_capacity(phase: str) -> None:
+    store, rollout, _ = active_rollout()
+    current = store.load().rollouts["example-local"]
+    if phase != "active":
+        store.state = store.state.model_copy(update={
+            "rollouts": {
+                **store.state.rollouts,
+                "example-local": current.model_copy(update={
+                    "phase": phase,
+                    "outcome": "preparing" if phase == "preparing" else "prepare_failed",
+                    "backend_ready": phase != "preparing",
+                }),
+            }
+        })
+    plan = rollout.plan_reverse("example-local")
+    result = rollout.reverse("example-local", plan["plan_id"])
+
+    assert result["phase"] == "reversed"
+    assert result["background_owner"] == "stable"
+    assert (result["stable_weight"], result["candidate_weight"]) == (100, 0)
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 1
+
+
+def test_failed_finalization_keeps_reservation_and_records_degraded() -> None:
+    store, rollout, target = active_rollout()
+    target.fail_finalize = True
+    plan = rollout.plan_reverse("example-local")
+
+    with pytest.raises(RuntimeError, match="^rollout_reverse_failed$"):
+        rollout.reverse("example-local", plan["plan_id"])
+
+    current = store.load().rollouts["example-local"]
+    assert current.phase == "degraded"
+    assert current.outcome == "reverse_failed"
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 2
+
+
+def test_finalization_retry_finishes_local_state_after_target_interruption() -> None:
+    initial, _, _ = active_rollout()
+
+    class InterruptingStore(MemoryStore):
+        updates = 0
+
+        def update(self, operation):
+            self.updates += 1
+            if self.updates == 2:
+                raise KeyboardInterrupt
+            return super().update(operation)
+
+    store = InterruptingStore(initial.load())
+    target = RoutingTarget(store)
+
+    def assert_plan(expected, actual):
+        if expected["plan_id"] != actual:
+            raise ValueError("stale")
+
+    rollout = RolloutOrchestrator(store, ArtifactSupport(store), target, assert_plan)
+    plan = rollout.plan_reverse("example-local")
+    with pytest.raises(KeyboardInterrupt):
+        rollout.reverse("example-local", plan["plan_id"])
+    assert target.observed["phase"] == "reversed"
+    assert store.load().rollouts["example-local"].phase == "reversing"
+
+    retry = rollout.plan_reverse("example-local")
+    assert retry["target_already_applied"] is True
+    assert rollout.reverse("example-local", retry["plan_id"])["phase"] == "reversed"
+
+
+def test_finalization_rejects_target_loss_and_generation_mismatch() -> None:
+    store, rollout, target = active_rollout()
+    plan = rollout.plan_weights("example-local", 0, 100)
+    rollout.apply_weights("example-local", 0, 100, plan["plan_id"])
+    target.observed["generation"] = target.observed["generation"] + 1
+    with pytest.raises(RuntimeError, match="rollout_target_state_invalid"):
+        rollout.plan_complete("example-local")
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("private SSH failure")
+
+    lost = RolloutOrchestrator(
+        store, ArtifactSupport(store), unavailable, lambda *_args: None
+    )
+    with pytest.raises(RuntimeError, match="^rollout_target_unavailable$"):
+        lost.plan_complete("example-local")
+    assert fleet_state(store.load())["targets"]["devbox"]["occupied_slots"] == 2

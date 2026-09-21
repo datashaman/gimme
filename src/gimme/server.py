@@ -326,7 +326,11 @@ def _rollout_orchestrator() -> RolloutOrchestrator:
 
 
 def _require_no_rollout(*names: str) -> None:
-    active = sorted(set(names) & set(store.load().rollouts))
+    state = store.load()
+    active = sorted(
+        name for name in set(names) & set(state.rollouts)
+        if state.rollouts[name].phase not in {"completed", "reversed"}
+    )
     if active:
         raise ValueError(f"operation blocked by rollout: {active[0]}")
 
@@ -334,6 +338,8 @@ def _require_no_rollout(*names: str) -> None:
 def _require_no_rollout_dependency(kind: str, name: str) -> None:
     state = store.load()
     for rollout_name, rollout in sorted(state.rollouts.items()):
+        if rollout.phase in {"completed", "reversed"}:
+            continue
         deployment = state.deployments[rollout_name]
         application = state.applications[deployment.application]
         matches = (
@@ -2199,6 +2205,36 @@ def apply_rollout_weights(
 
 
 @mcp.tool(annotations=READ)
+@_journal_plan("complete_rollout", "name")
+def plan_complete_rollout(name: Name) -> dict[str, object]:
+    """Plan candidate promotion, process handoff, cleanup, and capacity release."""
+    return _rollout_orchestrator().plan_complete(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("complete_rollout", "name")
+def complete_rollout(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Promote a verified 100%-candidate Rollout transactionally."""
+    with _deployment_resource_lock(name):
+        return _rollout_orchestrator().complete(name, plan_id)
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("reverse_rollout", "name")
+def plan_reverse_rollout(name: Name) -> dict[str, object]:
+    """Plan stable restoration, candidate retirement, and capacity release."""
+    return _rollout_orchestrator().plan_reverse(name)
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("reverse_rollout", "name")
+def reverse_rollout(name: Name, plan_id: PlanId) -> dict[str, object]:
+    """Restore stable-only service and retire a Rollout transactionally."""
+    with _deployment_resource_lock(name):
+        return _rollout_orchestrator().reverse(name, plan_id)
+
+
+@mcp.tool(annotations=READ)
 @_journal_plan("artisan", "name")
 def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -> dict[str, object]:
     """Plan an allowlisted structured Artisan invocation in one deployment."""
@@ -2206,6 +2242,14 @@ def plan_artisan(name: Name, command: str, arguments: list[str] | None = None) -
     allowed = application.artisan.allowed_commands if application.artisan is not None else []
     if command not in allowed:
         raise ValueError("Artisan command is not allowlisted")
+    rollout = store.load().rollouts.get(name)
+    if rollout is not None and rollout.phase not in {"completed", "reversed"}:
+        if rollout.phase in {"completing", "reversing"}:
+            raise ValueError("Artisan is blocked during a Rollout transition")
+        if command.startswith("migrate") or command in {
+            "db:seed", "db:wipe", "schema:dump",
+        }:
+            raise ValueError("schema-changing Artisan is blocked by Rollout")
     args = arguments or []
     if len(args) > 32 or any(not value or len(value) > 256 for value in args):
         raise ValueError("Artisan arguments are invalid")

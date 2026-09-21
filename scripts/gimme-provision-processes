@@ -396,9 +396,10 @@ def remove(path: Path) -> bool:
 def reconcile() -> None:
     if os.geteuid() != 0:
         fail("gimme-provision-processes must run as root")
-    if len(sys.argv) != 2:
-        fail("gimme-provision-processes requires exactly one application name")
+    if len(sys.argv) not in {2, 3} or (len(sys.argv) == 3 and sys.argv[2] != "refresh"):
+        fail("gimme-provision-processes requires an application and optional refresh")
     application = require_string(sys.argv[1], "application name", APP_NAME)
+    refresh = len(sys.argv) == 3
     sudo_user = require_string(os.environ.get("SUDO_USER"), "SUDO_USER", UNIX_USER)
     account = pwd.getpwnam(sudo_user)
     state = load_state(application, sudo_user, account.pw_uid)
@@ -478,13 +479,15 @@ def reconcile() -> None:
     for unit in sorted(desired_instances):
         if not succeeds(["systemctl", "is-enabled", "--quiet", unit]):
             run(["systemctl", "enable", unit])
-        if unit in changed_units or not succeeds(["systemctl", "is-active", "--quiet", unit]):
+        if refresh or unit in changed_units or not succeeds(
+            ["systemctl", "is-active", "--quiet", unit]
+        ):
             run(["systemctl", "restart", unit])
 
     if worker is not None and worker["enabled"] and worker["driver"] == "horizon":
         if not succeeds(["systemctl", "is-enabled", "--quiet", horizon_unit.name]):
             run(["systemctl", "enable", horizon_unit.name])
-        if horizon_unit.name in changed_units or not succeeds(
+        if refresh or horizon_unit.name in changed_units or not succeeds(
             ["systemctl", "is-active", "--quiet", horizon_unit.name]
         ):
             run(["systemctl", "restart", horizon_unit.name])
@@ -492,7 +495,7 @@ def reconcile() -> None:
     if scheduler is not None and scheduler["enabled"]:
         if not succeeds(["systemctl", "is-enabled", "--quiet", scheduler_timer.name]):
             run(["systemctl", "enable", scheduler_timer.name])
-        if scheduler_timer.name in changed_units or not succeeds(
+        if refresh or scheduler_timer.name in changed_units or not succeeds(
             ["systemctl", "is-active", "--quiet", scheduler_timer.name]
         ):
             run(["systemctl", "restart", scheduler_timer.name])
