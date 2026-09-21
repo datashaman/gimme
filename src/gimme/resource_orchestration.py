@@ -112,6 +112,11 @@ class ManagedResourceOrchestrator:
         if resource_name is None:
             raise ValueError(f"deployment {name} has no bound database resource")
         self._managed_resource(resource_name)
+        conflicts = resources_postgres_module.find_allocation_resources(
+            self.store.root, name, exclude=resource_name
+        )
+        if conflicts:
+            raise ResourceError("aws_rds_detached_allocation_conflict")
         observed = resources_postgres_module.load_observed(self.store.root, resource_name)
         return resource_binding_plan(
             name, deployment, resource_name, observed, application.postgres_extensions
@@ -221,9 +226,14 @@ class ManagedResourceOrchestrator:
         database_identifier = deployment.placement.database_identifier
         allocations = cast(dict[str, dict[str, object]], observed["allocations"])
         existing = allocations.get(name)
-        if existing is None:
-            generation = 1
-            owner = resources_postgres_module.owner_role(database_identifier)
+        if existing is None or existing["status"] == "detached":
+            generation = 1 if existing is None else int(existing["generation"]) + 1
+            owner = (
+                resources_postgres_module.owner_role(database_identifier)
+                if existing is None else str(existing["owner_role"])
+            )
+            if existing is not None and existing["database_identifier"] != database_identifier:
+                raise ResourceError("aws_rds_detached_allocation_identity_mismatch")
             login = resources_postgres_module.login_role(database_identifier, generation)
             workload_password = resources_postgres_module.generate_workload_password()
         else:
@@ -265,7 +275,7 @@ class ManagedResourceOrchestrator:
                 timeout=120,
             )
             extensions = cast(dict[str, str], expected["postgres_extensions"])
-            if existing is not None:
+            if existing is not None and existing["status"] == "active":
                 resources_postgres_module.update_allocation_extensions(
                     self.store.root, resource_name, name, extensions
                 )
@@ -329,6 +339,33 @@ class ManagedResourceOrchestrator:
                 raise ResourceError("aws_rds_rotate_in_progress")
             network = state.aws_networks[resource.aws_network]
             account = state.provider_accounts[network.provider_account]
+            prior_observed = resources_postgres_module.load_observed(
+                self.store.root, name
+            )
+            reconstruction: list[dict[str, object]] = []
+            if prior_observed is None:
+                workload_store = cast(
+                    AWSSecretsManagerStore,
+                    state.secret_stores[resource.workload_secret_store],
+                )
+                reconstruction = self.rds_postgres.list_workload_secret_metadata(
+                    account, workload_store, name
+                )
+                desired_bindings = {
+                    deployment_name
+                    for deployment_name, deployment in state.deployments.items()
+                    if deployment.resources.database == name
+                }
+                if any(
+                    str(item["deployment"]) not in desired_bindings
+                    for item in reconstruction
+                ):
+                    raise ResourceError("aws_rds_reconstruction_ambiguous")
+                if reconstruction and self.rds_postgres.describe_instance(
+                    account, network,
+                    resources_postgres_module.derive_instance_identifier(name),
+                ) is None:
+                    raise ResourceError("aws_rds_reconstruction_instance_missing")
             result = resources_postgres_module.apply_provision(
                 self.rds_postgres, self.store.root, account, network, resource, name
             )
@@ -375,6 +412,72 @@ class ManagedResourceOrchestrator:
                     readiness_issues=[],
                     administration_verified=True,
                 )
+                if reconstruction:
+                    current = resources_postgres_module.load_observed(
+                        self.store.root, name
+                    )
+                    if current is None:
+                        raise ResourceError("observed_resource_missing")
+                    extensions_available = cast(
+                        dict[str, str], current["extension_versions"]
+                    )
+                    workload_store = cast(
+                        AWSSecretsManagerStore,
+                        state.secret_stores[resource.workload_secret_store],
+                    )
+                    admin_target = state.targets[resource.administration_target]
+                    for metadata in reconstruction:
+                        deployment_name = str(metadata["deployment"])
+                        configured = state.deployments[deployment_name]
+                        application = state.applications[configured.application]
+                        extensions = {
+                            extension: extensions_available[extension]
+                            for extension in application.postgres_extensions
+                            if extension in extensions_available
+                        }
+                        if len(extensions) != len(application.postgres_extensions):
+                            raise ResourceError("aws_rds_reconstruction_extension_missing")
+                        database = configured.placement.database_identifier
+                        generation = int(metadata["generation"])
+                        owner = resources_postgres_module.owner_role(database)
+                        login = resources_postgres_module.login_role(database, generation)
+                        actual_login, workload_password = (
+                            self.rds_postgres.resolve_workload_credential(
+                                account, workload_store, f"{name}/{deployment_name}",
+                                str(metadata["secret_version_id"]),
+                            )
+                        )
+                        if actual_login != login:
+                            raise ResourceError("aws_rds_reconstruction_identity_mismatch")
+                        with protected_secret_file({
+                            "master_username": username,
+                            "master_password": password,
+                            "workload_username": login,
+                            "workload_password": workload_password,
+                        }) as secret_file:
+                            self.runner.run(
+                                "gimme:resource:bind-postgres",
+                                legacy_server(admin_target),
+                                stack=admin_target.stack,
+                                resource_endpoint=(
+                                    str(current["endpoint"]), int(current["port"])
+                                ),
+                                resource_database=database,
+                                resource_owner=owner,
+                                resource_login=login,
+                                resource_extensions=extensions,
+                                secret_file=secret_file,
+                                resource_trust_bundle_sha256=(
+                                    resources_postgres_module.RDS_TRUST_BUNDLE_SHA256
+                                ),
+                                timeout=120,
+                            )
+                        resources_postgres_module.record_binding_metadata(
+                            self.store.root, name, deployment_name, database, owner,
+                            login, generation, extensions, str(metadata["secret_arn"]),
+                            str(metadata["secret_version_id"]),
+                        )
+                    result["reconstructed_allocations"] = len(reconstruction)
             return {"changed": True, **result}
 
     def inspect_resource(self, name: Name) -> dict[str, object]:
@@ -457,6 +560,14 @@ class ManagedResourceOrchestrator:
                 deployment_name: {
                     "database": allocation["database_identifier"],
                     "status": allocation["status"],
+                    "generation": allocation["generation"],
+                    "detached_at": allocation["detached_at"],
+                    "recovery_ready": (
+                        allocation["status"] == "detached"
+                        and resources_postgres_module.recovery_evidence_is_fresh(
+                            allocation
+                        )
+                    ),
                 }
                 for deployment_name, allocation in cast(
                     dict[str, dict[str, object]], observed["allocations"]

@@ -56,6 +56,7 @@ class RecoveryOrchestrator:
     assert_plan: Callable[..., Any]
     run_deployment: Callable[..., Any]
     valkey_runtime: Callable[..., Any]
+    postgres_capture_credential: Callable[..., Any]
     bounded_marker_values: Callable[..., Any]
     journal: Callable[..., Any]
 
@@ -102,11 +103,13 @@ class RecoveryOrchestrator:
             restore()
 
     def _capture_postgres_dump(
-        self, name: str, local_path: Path, resource_version: str
+        self, name: str, local_path: Path, resource_version: str,
+        secret_file: Path | None = None,
     ) -> ComponentDump:
         try:
             result = self.run_deployment(
-                "gimme:backup:dump-postgres", name, backup_local_path=local_path, timeout=1800
+                "gimme:backup:dump-postgres", name, backup_local_path=local_path,
+                secret_file=secret_file, timeout=1800,
             )
         except Exception:
             raise RecoveryError("recovery_capture_failed") from None
@@ -373,6 +376,14 @@ class RecoveryOrchestrator:
     ) -> dict[str, object] | None:
         if deployment.recovery is None:
             return None
+        database_name = deployment.resources.database
+        if (
+            not cleanup
+            and deployment.recovery.cadence.kind != "manual"
+            and database_name is not None
+            and isinstance(state.resources.get(database_name), AWSRDSPostgresResource)
+        ):
+            return None
         destination_name = deployment.recovery.destination
         resource_provenance: dict[str, dict[str, str]] = {}
         for component, resource_name in (
@@ -591,14 +602,6 @@ class RecoveryOrchestrator:
         state, deployment, _target, _application = self.context(name)
         if deployment.recovery is None:
             raise ValueError(f"deployment {name} has no Recovery Policy bound")
-        database = deployment.resources.database
-        if database is not None and isinstance(
-            state.resources.get(database), AWSRDSPostgresResource
-        ):
-            raise ValueError(
-                f"deployment {name} database is a managed resource; "
-                "Recovery Points support target-local PostgreSQL only"
-            )
         destination_name = deployment.recovery.destination
         destination = state.backup_destinations[destination_name]
         return (state, deployment, destination_name, destination)
@@ -622,6 +625,51 @@ class RecoveryOrchestrator:
         )
         self.assert_plan(expected, plan_id)
         _, credentials = self.backup_destination_credentials(state, destination)
+        database_name = deployment.resources.database
+        database_resource = (
+            state.resources.get(database_name) if database_name is not None else None
+        )
+        if isinstance(database_resource, AWSRDSPostgresResource):
+            if deployment.recovery.valkey:
+                raise RecoveryError("managed_postgres_recovery_valkey_unsupported")
+            with self.deployment_resource_lock(name):
+                manifest = recovery_module.find_recovery_point(
+                    destination_name, destination, credentials, self.backup_s3,
+                    name, point_id,
+                )
+                changed = manifest is None
+                if manifest is None:
+                    with tempfile.TemporaryDirectory(
+                        prefix="gimme-managed-postgres-recovery-"
+                    ) as directory:
+                        path = Path(directory) / "postgres.dump"
+                        credential = self.postgres_capture_credential(
+                            state, name, database_resource
+                        )
+                        with protected_secret_file(credential) as postgres_file:
+                            dump = self._capture_postgres_dump(
+                                name, path, database_resource.engine_version,
+                                postgres_file,
+                            )
+                        manifest = recovery_module.create_recovery_point(
+                            destination_name, destination, credentials, self.backup_s3,
+                            name, point_id, [dump],
+                        )
+                verified = recovery_module.find_recovery_point(
+                    destination_name, destination, credentials, self.backup_s3,
+                    name, point_id,
+                )
+                if verified is None:
+                    raise RecoveryError("recovery_verification_failed")
+                retention = recovery_module.enforce_recovery_retention(
+                    destination_name, destination, credentials, self.backup_s3,
+                    name, deployment.recovery.retain_last, point_id,
+                )
+                return {
+                    "changed": changed,
+                    "recovery_point": recovery_module.public_recovery_point(verified),
+                    "retention": retention,
+                }
         with self.deployment_resource_lock(name):
             authority = self._recovery_schedule_authority(name, state, deployment)
             if authority is None:

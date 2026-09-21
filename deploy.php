@@ -1693,6 +1693,48 @@ task('gimme:resource:retire-postgres-login', function (): void {
     }
 });
 
+task('gimme:resource:purge-postgres-allocation', function (): void {
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    if ($localSecretFile === '' || !is_file($localSecretFile) || is_link($localSecretFile)) {
+        throw new \RuntimeException('A safe secret file is required to purge PostgreSQL allocation');
+    }
+    $host = required_env('GIMME_RESOURCE_ENDPOINT');
+    $port = required_env('GIMME_RESOURCE_PORT');
+    $database = required_env('GIMME_DATABASE_IDENTIFIER');
+    $owner = required_env('GIMME_RESOURCE_OWNER');
+    $login = required_env('GIMME_RESOURCE_LOGIN');
+    $bundleDigest = required_env('GIMME_RESOURCE_TRUST_BUNDLE_SHA256');
+    if (!valid_endpoint($host) || !preg_match('/^[1-9][0-9]{0,4}$/', $port) ||
+        (int) $port > 65535 ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $database) ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $owner) ||
+        !preg_match('/^[a-z][a-z0-9_]{0,62}$/', $login) ||
+        !preg_match('/^[0-9a-f]{64}$/', $bundleDigest)) {
+        throw new \RuntimeException('Unsafe managed PostgreSQL allocation purge identity');
+    }
+    $remoteDirectory = '/tmp/.gimme-resource-purge';
+    $suffix = bin2hex(random_bytes(8));
+    $remoteSecretFile = "{$remoteDirectory}/.{$suffix}.json";
+    $remoteBundleFile = "{$remoteDirectory}/.{$suffix}.pem";
+    run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
+    try {
+        upload($localSecretFile, $remoteSecretFile);
+        upload(__DIR__ . '/deploy/aws-rds-global-bundle.pem', $remoteBundleFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+        $program = escapeshellarg(base64_encode(managed_postgres_purge_allocation_script()));
+        run(
+            'printf %s ' . $program . ' | base64 -d | python3 - ' .
+            escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+            escapeshellarg($database) . ' ' . escapeshellarg($owner) . ' ' .
+            escapeshellarg($login) . ' ' . escapeshellarg($remoteSecretFile) . ' ' .
+            escapeshellarg($remoteBundleFile) . ' ' . escapeshellarg($bundleDigest),
+            timeout: 180,
+        );
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteSecretFile) . ' ' . escapeshellarg($remoteBundleFile));
+    }
+});
+
 task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
     $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');
@@ -1704,12 +1746,49 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     run('install -d -m 0700 ' . escapeshellarg($backupDirectory));
     $sha256 = '';
     $bytes = '';
+    $managedSecret = '';
     try {
-        run(
-            'pg_dump --format=custom --no-owner --no-privileges --no-acl --role=' .
-            escapeshellarg($database) . ' -d ' .
-            escapeshellarg($database) . ' -f ' . escapeshellarg($remotePath)
-        );
+        $variables = json_decode(getenv('GIMME_VARIABLES_JSON') ?: '{}', true);
+        if (!is_array($variables)) {
+            throw new \RuntimeException('Invalid deployment variable contract');
+        }
+        if (($variables['DB_CONNECTION'] ?? null) === 'pgsql' &&
+            array_key_exists('DB_SSLMODE', $variables)) {
+            $host = $variables['DB_HOST'] ?? null;
+            $port = $variables['DB_PORT'] ?? null;
+            $managedDatabase = $variables['DB_DATABASE'] ?? null;
+            $sslMode = $variables['DB_SSLMODE'] ?? null;
+            $bundle = $variables['DB_SSLROOTCERT'] ?? null;
+            $expectedBundle = "{$appsRoot}/.gimme/aws-rds-global-bundle.pem";
+            $bundleDigest = getenv('GIMME_RESOURCE_TRUST_BUNDLE_SHA256') ?: '';
+            $localSecret = getenv('GIMME_SECRET_FILE') ?: '';
+            if (!is_string($host) || !valid_endpoint($host) ||
+                !is_string($port) || !preg_match('/^[1-9][0-9]{0,4}$/', $port) ||
+                (int) $port > 65535 || $managedDatabase !== $database ||
+                $sslMode !== 'verify-full' || $bundle !== $expectedBundle ||
+                !preg_match('/^[0-9a-f]{64}$/', $bundleDigest) ||
+                $localSecret === '' || !is_file($localSecret) || is_link($localSecret)) {
+                throw new \RuntimeException('Unsafe managed PostgreSQL backup contract');
+            }
+            $managedSecret = "{$backupDirectory}/." . bin2hex(random_bytes(8)) . '.json';
+            upload($localSecret, $managedSecret);
+            run('chmod 0600 ' . escapeshellarg($managedSecret));
+            $program = escapeshellarg(base64_encode(managed_postgres_dump_script()));
+            run(
+                'printf %s ' . $program . ' | base64 -d | python3 - ' .
+                escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+                escapeshellarg($database) . ' ' . escapeshellarg($managedSecret) . ' ' .
+                escapeshellarg($expectedBundle) . ' ' . escapeshellarg($bundleDigest) . ' ' .
+                escapeshellarg($remotePath),
+                timeout: 1800,
+            );
+        } else {
+            run(
+                'pg_dump --format=custom --no-owner --no-privileges --no-acl --role=' .
+                escapeshellarg($database) . ' -d ' .
+                escapeshellarg($database) . ' -f ' . escapeshellarg($remotePath)
+            );
+        }
         run('chmod 0600 ' . escapeshellarg($remotePath));
         $sha256 = trim(run('sha256sum ' . escapeshellarg($remotePath) . " | cut -d' ' -f1"));
         $bytes = trim(run('stat -c %s ' . escapeshellarg($remotePath)));
@@ -1718,7 +1797,10 @@ task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
         }
         download($remotePath, $localPath);
     } finally {
-        run('rm -f ' . escapeshellarg($remotePath));
+        run(
+            'rm -f ' . escapeshellarg($remotePath) .
+            ($managedSecret === '' ? '' : ' ' . escapeshellarg($managedSecret))
+        );
     }
     writeln("GIMME_BACKUP|{$sha256}|{$bytes}");
 });

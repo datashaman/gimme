@@ -26,6 +26,7 @@ class DeploymentLifecycleOrchestrator:
     replace: Callable[..., Any]
     delete: Callable[..., Any]
     recovery_schedule_authority: Callable[..., Any]
+    detach_postgres_allocation: Callable[..., Any]
     result: Callable[..., dict[str, object]]
 
     def plan_update_deployment(
@@ -53,6 +54,11 @@ class DeploymentLifecycleOrchestrator:
             expected = self.plan_update_deployment(name, definition)
             self.assert_plan(expected, plan_id)
             proposed = DeploymentConfig.model_validate(expected["proposed"])
+            current = self.store.load().deployments[name]
+            if current.resources.database != proposed.resources.database:
+                old_database = current.resources.database
+                if old_database is not None:
+                    self.detach_postgres_allocation(name, old_database)
             self.store.save(
                 self.replace(self.store.load(), "deployments", name, proposed)
             )
@@ -103,6 +109,8 @@ class DeploymentLifecycleOrchestrator:
             result = self.run_deployment(
                 "gimme:remove:deployment", name, timeout=1800
             )
+            if deployment.resources.database is not None:
+                self.detach_postgres_allocation(name, deployment.resources.database)
             state = self.delete(self.store.load(), "deployments", name)
             self.store.save(state)
             (self.store.root / "applied-secrets" / f"{name}.json").unlink(

@@ -13,6 +13,7 @@ from gimme.control import (
 from gimme.control_plans import exact_plan
 from gimme.artifact_public import public_store_policy
 from gimme.recovery import preflight_backup_destination
+from gimme.resources_postgres import list_retained
 from gimme.secrets import validate_aws_account, validate_aws_store
 
 
@@ -101,6 +102,11 @@ class ControlPlaneRegistrationOrchestrator:
         )
         if stores:
             raise ValueError("provider account is still referenced by a secret store")
+        if any(
+            retained["provider_account"] == name
+            for retained in list_retained(self.store.root)
+        ):
+            raise ValueError("provider account is still referenced by a retained resource")
         return exact_plan(
             {
                 "kind": "provider_account_removal",

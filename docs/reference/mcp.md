@@ -359,8 +359,10 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
-| `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey Resource and its data; reads only local state and never assumes the destructive role |
-| `apply_destroy_resource` | Remote write (destructive) | Delete the replication group with a final snapshot and what Gimme created around it, through the Provider Account's destructive role, after exact confirmation `DESTROY RESOURCE <name>` |
+| `plan_purge_resource_allocation` | Read | Plan purging one detached managed PostgreSQL allocation with current Recovery Point evidence |
+| `apply_purge_resource_allocation` | Remote write (destructive) | Delete the exact detached database and roles, then schedule its workload secret for the fixed 30-day recovery window after exact confirmation `PURGE <deployment> FROM <resource>` |
+| `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey or AWS RDS PostgreSQL Resource and its data; reads only local state and never assumes the destructive role |
+| `apply_destroy_resource` | Remote write (destructive) | Destroy the reviewed Resource through the Provider Account's destructive role after exact confirmation `DESTROY RESOURCE <name>`; Valkey and RDS both preserve a verified final snapshot, and RDS also retains automated backups |
 | `plan_purge_final_snapshot` | Read | Plan deleting only the deterministic final snapshot retained after a destroyed Valkey Resource; reads a local receipt only |
 | `apply_purge_final_snapshot` | Remote write (destructive) | Delete that exact final snapshot through the destructive role after exact confirmation `PURGE FINAL SNAPSHOT <name>` |
 | `plan_purge_retained_secrets` | Read | Plan deleting only Gimme-owned Valkey credentials recorded after a destroyed Resource |
@@ -373,7 +375,7 @@ refused with `aws_elasticache_node_type_unavailable`.
 | `plan_rotate_resource_credential` | Read | Plan replacing one Deployment's managed PostgreSQL generation login or Valkey ACL user and Resource Credential; reads only local state |
 | `apply_rotate_resource_credential` | Remote write (destructive) | Rotate with a health-probed switch and rollback on failure, then retire the previous login or user; never returns a credential |
 | `plan_forget_resource` | Read | Plan deleting a Retained Resource tombstone |
-| `apply_forget_resource` | Local write | Delete the tombstone after exact confirmation `FORGET <name>`; the retained infrastructure is untouched |
+| `apply_forget_resource` | Local write | Delete the tombstone after exact confirmation `FORGET RETAINED RESOURCE <name>`; the retained infrastructure is untouched |
 
 `apply_resource` creates the instance with `ManageMasterUserPassword=True` so the master
 credential is generated and stored by AWS, never by Gimme, and polls for at most 30
@@ -393,22 +395,29 @@ planning or applying a managed Resource), and stores a
 generation-1 two-field workload credential as a tagged Secrets Manager secret — the response
 contains only the `{store, secret}` reference. Managed Laravel activation uses the normal
 version-pinned secret path and fixed `DB_*` TLS contract; explicit rotation switches and probes
-the next generation before retiring the old login, with rollback on failure. Detached
-Allocation rebind is not implemented yet. A tombstone is deleted only by
+the next generation before retiring the old login, with rollback on failure. Deleting a
+Deployment disables its current login and retains a Detached Allocation; rebinding the same
+Deployment to the same Resource reuses its database and owner with a new login generation, while
+a retained allocation on another Resource blocks the bind. A tombstone is deleted only by
 `apply_forget_resource`, which never touches AWS.
 
-Recovery Points still reject a managed database because their PostgreSQL capture path is
-target-local. Managed Resource definitions are not sent to the ordinary package recipe;
-only fixed connection variables and the version-pinned Resource Credential cross the protected
-Deployment activation boundary.
+Manual Recovery Points capture a managed database through the fixed Deployment Target dump
+program with `verify-full` TLS and its version-pinned Resource Credential. Scheduled managed
+capture and managed PostgreSQL Restore remain unsupported. Managed Resource definitions are not
+sent to the ordinary package recipe; only fixed connection variables and the version-pinned
+Resource Credential cross the protected Deployment activation boundary.
 
 `apply_cleanup_resource` is non-destructive by default: a managed AWS RDS resource is
 left running with its data intact, and Gimme instead writes a secret-free Retained
-Resource tombstone recording the resource's AWS Network so it can be re-adopted later;
-only the local registration is removed. Destructive RDS instance deletion is a deliberately
-separate, not-yet-implemented capability; an ElastiCache Valkey Resource can be destroyed with
-`plan_destroy_resource` and `apply_destroy_resource` (see its how-to). Cleanup is refused while any Deployment still
-references the resource.
+Resource tombstone recording its account, network, secret store, identity, and detached
+allocation count; only the local registration is removed. The tombstone blocks Provider Account
+removal and can be discarded locally only with the exact forget confirmation. Cleanup is refused
+while a Deployment references the Resource or any allocation remains active. Detached allocation
+purge requires current generation-matched Recovery Point evidence and drops only its marked
+database and roles before scheduling the tagged workload secret for the fixed 30-day recovery
+window. Whole-Resource RDS destruction requires every allocation to be detached with evidence,
+then disables deletion protection, verifies a tagged final snapshot, retains automated backups,
+and removes only owned instance dependents. Neither path deletes snapshots.
 
 ## Target and runtime tools
 

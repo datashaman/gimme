@@ -6,7 +6,7 @@ import re
 import shutil  # noqa: F401 -- preserved monkeypatch seam for Recovery capacity tests
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from inspect import signature
 from pathlib import Path
@@ -127,6 +127,7 @@ def _recovery_orchestrator() -> RecoveryOrchestrator:
         assert_plan=_assert_plan,
         run_deployment=_run_deployment,
         valkey_runtime=_valkey_runtime,
+        postgres_capture_credential=_postgres_capture_credential,
         bounded_marker_values=_bounded_marker_values,
         journal=_journal,
     )
@@ -213,6 +214,9 @@ def _deployment_lifecycle_orchestrator() -> DeploymentLifecycleOrchestrator:
         replace=_replace,
         delete=_delete,
         recovery_schedule_authority=_recovery_schedule_authority,
+        detach_postgres_allocation=(
+            _resource_retirement_orchestrator().detach_postgres_allocation
+        ),
         result=_result,
     )
 
@@ -294,6 +298,10 @@ def _resource_retirement_orchestrator() -> ResourceRetirementOrchestrator:
     return ResourceRetirementOrchestrator(
         store=store,
         elasticache_valkey=elasticache_valkey,
+        rds_postgres=rds_postgres,
+        runner=runner,
+        postgres_recovery_evidence=_postgres_recovery_evidence,
+        deployment_resource_lock=_deployment_resource_lock,
         assert_plan=_assert_plan,
         delete=_delete,
     )
@@ -1215,6 +1223,114 @@ def _backup_destination_credentials(
     return planned, credentials
 
 
+def _postgres_recovery_evidence(
+    deployment_name: str, allocation: dict[str, object]
+) -> dict[str, object] | None:
+    """Select recent destination-authoritative PostgreSQL evidence before detachment."""
+    state = store.load()
+    deployment = state.deployments.get(deployment_name)
+    recorded = allocation.get("recovery_evidence")
+    if recorded is not None and isinstance(recorded, dict):
+        destination_name = str(recorded.get("destination"))
+    elif deployment is not None and deployment.recovery is not None:
+        destination_name = deployment.recovery.destination
+    else:
+        return None
+    if destination_name not in state.backup_destinations:
+        return None
+    destination = state.backup_destinations[destination_name]
+    try:
+        _, credentials = _backup_destination_credentials(state, destination)
+        inventory = recovery_module.list_recovery_points(
+            destination_name, destination, credentials, backup_s3, deployment_name
+        )
+    except Exception:
+        return None
+    now = datetime.now(UTC)
+    evidence_cutoff = now
+    if isinstance(recorded, dict) and allocation.get("detached_at") is not None:
+        try:
+            evidence_cutoff = datetime.fromisoformat(str(allocation["detached_at"]))
+        except ValueError:
+            return None
+    activated_at = None
+    if allocation.get("activated_at") is not None:
+        try:
+            activated_at = datetime.fromisoformat(str(allocation["activated_at"]))
+        except ValueError:
+            return None
+    candidates: list[tuple[datetime, dict[str, object]]] = []
+    for point in cast(list[dict[str, object]], inventory["recovery_points"]):
+        if point.get("state") != "verified":
+            continue
+        components = cast(list[dict[str, object]], point.get("components", []))
+        postgres = next(
+            (item for item in components if item.get("kind") == "postgres"), None
+        )
+        if postgres is None:
+            continue
+        try:
+            captured_at = datetime.fromisoformat(str(postgres["captured_at"]))
+        except (KeyError, ValueError):
+            continue
+        if (
+            captured_at.tzinfo is None
+            or not evidence_cutoff - timedelta(hours=24) <= captured_at <= evidence_cutoff
+            or (activated_at is not None and captured_at < activated_at)
+        ):
+            continue
+        candidates.append((captured_at, point))
+    if not candidates:
+        return None
+    if isinstance(recorded, dict):
+        for captured_at, point in candidates:
+            candidate = {
+                "recovery_point_id": point["recovery_point_id"],
+                "destination": destination_name,
+                "captured_at": captured_at.astimezone(UTC).isoformat(),
+                "generation": allocation["generation"],
+            }
+            if candidate == recorded:
+                return candidate
+        return None
+    captured_at, point = max(candidates, key=lambda item: item[0])
+    return {
+        "recovery_point_id": point["recovery_point_id"],
+        "destination": destination_name,
+        "captured_at": captured_at.astimezone(UTC).isoformat(),
+        "generation": allocation["generation"],
+    }
+
+
+def _postgres_capture_credential(
+    state: ControlState, deployment_name: str, resource: AWSRDSPostgresResource
+) -> dict[str, str]:
+    resource_name = state.deployments[deployment_name].resources.database
+    if resource_name is None or state.resources.get(resource_name) != resource:
+        raise ResourceError("aws_rds_recovery_binding_missing")
+    observed = resources_postgres_module.load_observed(store.root, resource_name)
+    allocation = (
+        None if observed is None
+        else cast(dict[str, dict[str, object]], observed["allocations"]).get(
+            deployment_name
+        )
+    )
+    if allocation is None or allocation["status"] != "active":
+        raise ResourceError("aws_rds_recovery_binding_missing")
+    secret_store = cast(
+        AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]
+    )
+    network = state.aws_networks[resource.aws_network]
+    account = state.provider_accounts[network.provider_account]
+    username, password = rds_postgres.resolve_workload_credential(
+        account, secret_store, f"{resource_name}/{deployment_name}",
+        str(allocation["secret_version_id"]),
+    )
+    if username != allocation["login_role"]:
+        raise ResourceError("aws_rds_recovery_credential_mismatch")
+    return {"username": username, "password": password}
+
+
 def _backup_destination_registration_plan(
     name: str, definition: S3BackupDestination, *, update: bool
 ) -> dict[str, object]:
@@ -1810,6 +1926,28 @@ def apply_cleanup_resource(name: Name, plan_id: PlanId, confirmation: str) -> di
     A managed AWS resource and its data are left intact as a Retained Resource."""
     return _resource_retirement_orchestrator().apply_cleanup_resource(
         name, plan_id, confirmation
+    )
+
+
+@mcp.tool(annotations=READ)
+@_journal_plan("purge_resource_allocation", "name")
+def plan_purge_resource_allocation(
+    name: Name, deployment: Name
+) -> dict[str, object]:
+    """Plan deleting one detached managed PostgreSQL allocation with Recovery evidence."""
+    return _resource_retirement_orchestrator().plan_purge_resource_allocation(
+        name, deployment
+    )
+
+
+@mcp.tool(annotations=CHANGE)
+@_journal_apply("purge_resource_allocation", "name")
+def apply_purge_resource_allocation(
+    name: Name, deployment: Name, plan_id: PlanId, confirmation: str
+) -> dict[str, object]:
+    """Purge one evidenced detached database and schedule its secret for recovery deletion."""
+    return _resource_retirement_orchestrator().apply_purge_resource_allocation(
+        name, deployment, plan_id, confirmation
     )
 
 

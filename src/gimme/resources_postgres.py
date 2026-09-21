@@ -9,6 +9,7 @@ import secrets as secrets_module
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable, NoReturn, Protocol, cast
 
@@ -30,6 +31,7 @@ INSTANCE_PHASE = ("pending", "ready", "failed")
 ALLOCATION_STATUS = ("active", "detached")
 POLL_BUDGET_SECONDS = 30
 POLL_INTERVAL_SECONDS = 3
+DELETION_RECOVERY_DAYS = 30
 MAX_OBSERVED_BYTES = 32 * 1024
 ABSENT_VALUE: None = None
 MODIFIABLE_FIELDS = frozenset({
@@ -71,6 +73,8 @@ class InstanceObservation:
     backup_retention_days: int | None = None
     backup_window: str | None = None
     maintenance_window: str | None = None
+    ownership_verified: bool | None = None
+    generation: int | None = None
 
     @property
     def converging(self) -> bool:
@@ -80,6 +84,15 @@ class InstanceObservation:
             self.pending_engine_version, self.pending_instance_class,
             self.pending_allocated_storage_gb,
         ))
+
+
+@dataclass(frozen=True)
+class SnapshotObservation:
+    identity: str
+    status: str
+    instance_identifier: str
+    ownership_verified: bool
+    generation: int
 
 
 class RDSAdapter(Protocol):
@@ -126,6 +139,37 @@ class RDSAdapter(Protocol):
         version_id: str,
     ) -> tuple[str, str]: ...
 
+    def schedule_workload_secret_deletion(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        expected_tags: dict[str, str],
+    ) -> None: ...
+
+    def list_workload_secret_metadata(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore,
+        resource_name: str,
+    ) -> list[dict[str, object]]: ...
+
+    def disable_deletion_protection(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> InstanceObservation: ...
+
+    def describe_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, snapshot_id: str,
+    ) -> SnapshotObservation | None: ...
+
+    def create_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+        snapshot_id: str, resource_name: str, generation: int,
+    ) -> SnapshotObservation: ...
+
+    def delete_instance_preserving_backups(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> None: ...
+
+    def delete_instance_dependents(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> bool: ...
+
 
 def _provider_error(
     exc: Exception, operation: str, prefix: str = "aws_rds"
@@ -142,6 +186,12 @@ def _provider_error(
             # (DBInstanceNotFound vs DBSubnetGroupNotFoundFault), so both are mapped.
             "DBInstanceNotFound": "missing",
             "DBInstanceNotFoundFault": "missing",
+            "DBSnapshotNotFound": "missing",
+            "DBSnapshotNotFoundFault": "missing",
+            "DBParameterGroupNotFound": "missing",
+            "DBParameterGroupNotFoundFault": "missing",
+            "DBSubnetGroupNotFound": "missing",
+            "DBSubnetGroupNotFoundFault": "missing",
             "ResourceNotFoundException": "missing",
             "DBInstanceAlreadyExists": "already_exists",
             "DBInstanceAlreadyExistsFault": "already_exists",
@@ -149,6 +199,8 @@ def _provider_error(
             "DBSubnetGroupAlreadyExistsFault": "already_exists",
             "DBParameterGroupAlreadyExists": "already_exists",
             "DBParameterGroupAlreadyExistsFault": "already_exists",
+            "DBSnapshotAlreadyExists": "already_exists",
+            "DBSnapshotAlreadyExistsFault": "already_exists",
             "ResourceExistsException": "already_exists",
             # ElastiCache wire codes mostly omit the "Fault" suffix its shapes carry.
             "ReplicationGroupNotFoundFault": "missing",
@@ -167,6 +219,8 @@ def _provider_error(
             "InvalidUserGroupState": "invalid_state",
             "InvalidCacheParameterGroupState": "invalid_state",
             "InvalidDBInstanceState": "invalid_state",
+            "InvalidDBParameterGroupState": "invalid_state",
+            "InvalidDBSubnetGroupState": "invalid_state",
             "InvalidDBInstanceStateFault": "invalid_state",
             "SnapshotAlreadyExistsFault": "snapshot_exists",
             "SnapshotAlreadyExists": "snapshot_exists",
@@ -312,6 +366,138 @@ class AWSAdapter:
             raise ResourceError(f"{self.error_prefix}_workload_secret_invalid")
         return document["username"], document["password"]
 
+    def schedule_workload_secret_deletion(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
+        expected_tags: dict[str, str],
+    ) -> None:
+        if account.destructive_role_arn is None:
+            raise ResourceError(f"{self.error_prefix}_destroy_role_missing")
+        session = self._session(
+            account, account.destructive_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret-delete",
+        )
+        client = session.client("secretsmanager", region_name=store.region)
+        secret_id = f"{store.prefix}/{name}"
+        try:
+            metadata = client.describe_secret(SecretId=secret_id)
+            tags = metadata.get("Tags")
+            actual_tags = {
+                item["Key"]: item["Value"]
+                for item in tags
+                if isinstance(item, dict)
+                and isinstance(item.get("Key"), str)
+                and isinstance(item.get("Value"), str)
+            } if isinstance(tags, list) else {}
+            if any(actual_tags.get(key) != value for key, value in expected_tags.items()):
+                raise ResourceError(f"{self.error_prefix}_workload_secret_ownership_mismatch")
+            if metadata.get("DeletedDate") is not None:
+                return
+            client.delete_secret(
+                SecretId=secret_id, RecoveryWindowInDays=DELETION_RECOVERY_DAYS
+            )
+        except ResourceError:
+            raise
+        except Exception as exc:
+            raise _provider_error(
+                exc, "workload_secret_delete", self.error_prefix
+            ) from None
+
+    def list_workload_secret_metadata(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore,
+        resource_name: str,
+    ) -> list[dict[str, object]]:
+        session = self._session(
+            account, account.inspection_role_arn,
+            f"{self.error_prefix.removeprefix('aws_')}-workload-secret-inspect",
+        )
+        client = session.client("secretsmanager", region_name=store.region)
+        try:
+            response = client.list_secrets(
+                Filters=[{"Key": "tag-value", "Values": [resource_name]}],
+                MaxResults=100,
+            )
+        except Exception as exc:
+            raise _provider_error(
+                exc, "workload_secret_list", self.error_prefix
+            ) from None
+        if response.get("NextToken") is not None:
+            raise ResourceError(f"{self.error_prefix}_workload_secret_inventory_too_large")
+        secrets = response.get("SecretList")
+        if not isinstance(secrets, list) or len(secrets) > 256:
+            raise ResourceError(f"{self.error_prefix}_workload_secret_inventory_invalid")
+        inventory: list[dict[str, object]] = []
+        for item in secrets:
+            if not isinstance(item, dict) or item.get("DeletedDate") is not None:
+                continue
+            tags = item.get("Tags")
+            tag_map = {
+                tag["Key"]: tag["Value"]
+                for tag in tags
+                if isinstance(tag, dict)
+                and isinstance(tag.get("Key"), str)
+                and isinstance(tag.get("Value"), str)
+            } if isinstance(tags, list) else {}
+            if tag_map.get("gimme:resource") != resource_name:
+                continue
+            deployment = tag_map.get("gimme:deployment")
+            generation = tag_map.get("gimme:generation")
+            arn = item.get("ARN")
+            name = item.get("Name")
+            if (
+                not isinstance(deployment, str)
+                or DEPLOYMENT_NAME.fullmatch(deployment) is None
+                or not isinstance(generation, str)
+                or re.fullmatch(r"[1-9][0-9]{0,8}", generation) is None
+                or not isinstance(arn, str)
+                or AWS_ARN.fullmatch(arn) is None
+                or name != f"{store.prefix}/{resource_name}/{deployment}"
+            ):
+                raise ResourceError(f"{self.error_prefix}_workload_secret_inventory_invalid")
+            try:
+                metadata = client.describe_secret(SecretId=arn)
+            except Exception as exc:
+                raise _provider_error(
+                    exc, "workload_secret_metadata", self.error_prefix
+                ) from None
+            metadata_tags = metadata.get("Tags")
+            metadata_tag_map = {
+                tag["Key"]: tag["Value"]
+                for tag in metadata_tags
+                if isinstance(tag, dict)
+                and isinstance(tag.get("Key"), str)
+                and isinstance(tag.get("Value"), str)
+            } if isinstance(metadata_tags, list) else {}
+            versions = metadata.get("VersionIdsToStages")
+            current = [
+                version for version, stages in versions.items()
+                if isinstance(version, str)
+                and isinstance(stages, list)
+                and "AWSCURRENT" in stages
+            ] if isinstance(versions, dict) else []
+            if (
+                metadata.get("ARN") != arn
+                or metadata.get("Name") != name
+                or any(
+                    metadata_tag_map.get(key) != tag_map.get(key)
+                    for key in (
+                        "gimme:secret-store", "gimme:resource",
+                        "gimme:deployment", "gimme:generation",
+                    )
+                )
+                or len(current) != 1
+                or AWS_SECRET_VERSION.fullmatch(current[0]) is None
+            ):
+                raise ResourceError(f"{self.error_prefix}_workload_secret_inventory_invalid")
+            inventory.append({
+                "deployment": deployment,
+                "generation": int(generation),
+                "secret_arn": arn,
+                "secret_version_id": current[0],
+            })
+        if len({str(item["deployment"]) for item in inventory}) != len(inventory):
+            raise ResourceError(f"{self.error_prefix}_workload_secret_inventory_ambiguous")
+        return sorted(inventory, key=lambda item: str(item["deployment"]))
+
 
 
 class BotoRDSAdapter(AWSAdapter):
@@ -330,12 +516,19 @@ class BotoRDSAdapter(AWSAdapter):
             item.get("Key"): item.get("Value") for item in tags if isinstance(item, dict)
         } if isinstance(tags, list) else {}
         owner = ownership.get("gimme:resource")
+        generation_value = ownership.get("gimme:generation")
         if (
             not isinstance(owner, str)
             or RESOURCE_NAME.fullmatch(owner) is None
             or derive_instance_identifier(owner) != aws_instance_identifier
         ):
             raise ResourceError("aws_rds_instance_ownership_mismatch")
+        generation = (
+            int(generation_value)
+            if isinstance(generation_value, str)
+            and re.fullmatch(r"[1-9][0-9]{0,8}", generation_value)
+            else None
+        )
         endpoint = response.get("Endpoint")
         address = endpoint.get("Address") if isinstance(endpoint, dict) else None
         port = endpoint.get("Port") if isinstance(endpoint, dict) else None
@@ -405,6 +598,8 @@ class BotoRDSAdapter(AWSAdapter):
                 response.get("PreferredMaintenanceWindow")
                 if isinstance(response.get("PreferredMaintenanceWindow"), str) else None
             ),
+            ownership_verified=True,
+            generation=generation,
         )
 
     def describe_instance(
@@ -492,7 +687,7 @@ class BotoRDSAdapter(AWSAdapter):
         parameter_group_family = _parameter_group_family(resource.engine_version)
         session = self._session(account, account.inspection_role_arn, "rds-create")
         client = session.client("rds", region_name=network.region)
-        subnet_group_name = f"{aws_instance_identifier}-subnets"
+        subnet_group_name = derive_subnet_group_name(aws_instance_identifier)
         parameter_group_name = derive_parameter_group_name(aws_instance_identifier)
         try:
             client.create_db_subnet_group(
@@ -529,7 +724,10 @@ class BotoRDSAdapter(AWSAdapter):
                 PreferredMaintenanceWindow=resource.maintenance_window,
                 AutoMinorVersionUpgrade=False,
                 DeletionProtection=True,
-                Tags=[{"Key": "gimme:resource", "Value": resource_name}],
+                Tags=[
+                    {"Key": "gimme:resource", "Value": resource_name},
+                    {"Key": "gimme:generation", "Value": "1"},
+                ],
             )
         except Exception as exc:
             error = _provider_error(exc, "create")
@@ -626,6 +824,150 @@ class BotoRDSAdapter(AWSAdapter):
             f"{secret_arn}\0{current[0]}".encode()
         ).hexdigest()
 
+    def _destroy_client(self, account: AWSProviderAccount, region: str):
+        if account.destructive_role_arn is None:
+            raise ResourceError("aws_rds_destroy_role_missing")
+        return self._session(
+            account, account.destructive_role_arn, "rds-destroy"
+        ).client("rds", region_name=region)
+
+    def disable_deletion_protection(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> InstanceObservation:
+        try:
+            self._destroy_client(account, network.region).modify_db_instance(
+                DBInstanceIdentifier=identifier,
+                DeletionProtection=False,
+                ApplyImmediately=True,
+            )
+        except Exception as exc:
+            raise _provider_error(exc, "destroy_disable_protection") from None
+        observed = self.describe_instance(account, network, identifier)
+        if observed is None:
+            raise ResourceError("aws_rds_destroy_identity_changed")
+        return observed
+
+    @staticmethod
+    def _snapshot_observation(
+        response: dict[str, object], snapshot_id: str
+    ) -> SnapshotObservation:
+        identity = response.get("DBSnapshotArn")
+        status = response.get("Status")
+        instance = response.get("DBInstanceIdentifier")
+        tags = response.get("TagList")
+        tag_map = {
+            item["Key"]: item["Value"]
+            for item in tags
+            if isinstance(item, dict)
+            and isinstance(item.get("Key"), str)
+            and isinstance(item.get("Value"), str)
+        } if isinstance(tags, list) else {}
+        generation_value = tag_map.get("gimme:generation")
+        if (
+            not isinstance(identity, str)
+            or not isinstance(status, str)
+            or not isinstance(instance, str)
+            or not isinstance(generation_value, str)
+            or re.fullmatch(r"[1-9][0-9]{0,8}", generation_value) is None
+        ):
+            raise ResourceError("aws_rds_final_snapshot_invalid")
+        return SnapshotObservation(
+            identity=identity,
+            status=status,
+            instance_identifier=instance,
+            ownership_verified=(
+                isinstance(tag_map.get("gimme:resource"), str)
+                and snapshot_id.startswith(
+                    f"gimme-{tag_map['gimme:resource']}-g{generation_value}-final-"
+                )
+                and tag_map.get("gimme:final-snapshot") == snapshot_id
+            ),
+            generation=int(generation_value),
+        )
+
+    def describe_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, snapshot_id: str,
+    ) -> SnapshotObservation | None:
+        try:
+            response = self._destroy_client(
+                account, network.region
+            ).describe_db_snapshots(DBSnapshotIdentifier=snapshot_id)
+        except Exception as exc:
+            error = _provider_error(exc, "final_snapshot_describe")
+            if "missing" in str(error):
+                return None
+            raise error from None
+        snapshots = response.get("DBSnapshots") or []
+        if not isinstance(snapshots, list) or len(snapshots) != 1:
+            raise ResourceError("aws_rds_final_snapshot_invalid")
+        return self._snapshot_observation(snapshots[0], snapshot_id)
+
+    def create_final_snapshot(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+        snapshot_id: str, resource_name: str, generation: int,
+    ) -> SnapshotObservation:
+        try:
+            response = self._destroy_client(
+                account, network.region
+            ).create_db_snapshot(
+                DBSnapshotIdentifier=snapshot_id,
+                DBInstanceIdentifier=identifier,
+                Tags=[
+                    {"Key": "gimme:resource", "Value": resource_name},
+                    {"Key": "gimme:generation", "Value": str(generation)},
+                    {"Key": "gimme:final-snapshot", "Value": snapshot_id},
+                ],
+            )
+        except Exception as exc:
+            error = _provider_error(exc, "final_snapshot_create")
+            if "already_exists" not in str(error):
+                raise error from None
+            observed = self.describe_final_snapshot(account, network, snapshot_id)
+            if observed is None:
+                raise ResourceError("aws_rds_final_snapshot_invalid")
+            return observed
+        snapshot = response.get("DBSnapshot")
+        if not isinstance(snapshot, dict):
+            raise ResourceError("aws_rds_final_snapshot_invalid")
+        return self._snapshot_observation(snapshot, snapshot_id)
+
+    def delete_instance_preserving_backups(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> None:
+        try:
+            self._destroy_client(account, network.region).delete_db_instance(
+                DBInstanceIdentifier=identifier,
+                SkipFinalSnapshot=True,
+                DeleteAutomatedBackups=False,
+            )
+        except Exception as exc:
+            error = _provider_error(exc, "destroy_instance")
+            if "missing" not in str(error):
+                raise error from None
+
+    def delete_instance_dependents(
+        self, account: AWSProviderAccount, network: AWSNetwork, identifier: str,
+    ) -> bool:
+        client = self._destroy_client(account, network.region)
+        pending = False
+        for operation, argument, value in (
+            (client.delete_db_parameter_group, "DBParameterGroupName",
+             derive_parameter_group_name(identifier)),
+            (client.delete_db_subnet_group, "DBSubnetGroupName",
+             derive_subnet_group_name(identifier)),
+        ):
+            try:
+                operation(**{argument: value})
+            except Exception as exc:
+                error = _provider_error(exc, "destroy_dependent")
+                if "missing" in str(error):
+                    continue
+                if "invalid_state" in str(error) or "unavailable" in str(error):
+                    pending = True
+                    continue
+                raise error from None
+        return not pending
+
 
 def _parameter_group_family(engine_version: str) -> str:
     major = re.match(r"[0-9]+", engine_version)
@@ -636,6 +978,10 @@ def _parameter_group_family(engine_version: str) -> str:
 
 def derive_parameter_group_name(aws_instance_identifier: str) -> str:
     return f"{aws_instance_identifier}-params"
+
+
+def derive_subnet_group_name(aws_instance_identifier: str) -> str:
+    return f"{aws_instance_identifier}-subnets"
 
 
 def derive_instance_identifier(resource_name: str) -> str:
@@ -650,6 +996,16 @@ def derive_instance_identifier(resource_name: str) -> str:
 
 def identity_fingerprint(identity: str) -> str:
     return "sha256:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
+def final_snapshot_id(resource_name: str, fingerprint: str, generation: int = 1) -> str:
+    if (
+        RESOURCE_NAME.fullmatch(resource_name) is None
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
+        or not 1 <= generation <= 999_999_999
+    ):
+        raise ResourceError("aws_rds_final_snapshot_identity_invalid")
+    return f"gimme-{resource_name}-g{generation}-final-{fingerprint[-12:]}"
 
 
 def generate_workload_password() -> str:
@@ -691,12 +1047,53 @@ def _validate_allocation(value: object) -> dict[str, object]:
             "login_role": login_role(database, 1),
             "generation": 1,
             "extensions": {},
+            "activated_at": None,
+            "detached_at": None,
+            "recovery_evidence": None,
+        }
+    elif isinstance(value, dict) and set(value) == {
+        "database_identifier", "owner_role", "login_role", "generation",
+        "secret_arn", "secret_version_id", "status", "extensions",
+    }:
+        value = {
+            **value, "activated_at": None, "detached_at": None,
+            "recovery_evidence": None,
         }
     if not isinstance(value, dict) or set(value) != {
         "database_identifier", "owner_role", "login_role", "generation",
         "secret_arn", "secret_version_id", "status", "extensions",
+        "activated_at", "detached_at", "recovery_evidence",
     }:
         raise ResourceError("observed_resource_invalid")
+    evidence = value.get("recovery_evidence")
+    if evidence is not None:
+        if not isinstance(evidence, dict) or set(evidence) != {
+            "recovery_point_id", "destination", "captured_at", "generation",
+        }:
+            raise ResourceError("observed_resource_invalid")
+        try:
+            captured_at = datetime.fromisoformat(str(evidence.get("captured_at")))
+        except ValueError:
+            raise ResourceError("observed_resource_invalid") from None
+        if (
+            re.fullmatch(r"rp_[0-9a-f]{20}", str(evidence.get("recovery_point_id"))) is None
+            or RESOURCE_NAME.fullmatch(str(evidence.get("destination"))) is None
+            or captured_at.tzinfo is None
+            or evidence.get("generation") != value.get("generation")
+        ):
+            raise ResourceError("observed_resource_invalid")
+    detached_at_value = value.get("detached_at")
+    try:
+        activated_at = (
+            None if value.get("activated_at") is None
+            else datetime.fromisoformat(str(value["activated_at"]))
+        )
+        detached_at = (
+            None if detached_at_value is None
+            else datetime.fromisoformat(str(detached_at_value))
+        )
+    except ValueError:
+        raise ResourceError("observed_resource_invalid") from None
     if (
         DB_IDENTIFIER.fullmatch(str(value.get("database_identifier"))) is None
         or AWS_ARN.fullmatch(str(value.get("secret_arn"))) is None
@@ -714,6 +1111,11 @@ def _validate_allocation(value: object) -> dict[str, object]:
             or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
             for version in cast(dict[str, object], value["extensions"]).values()
         )
+        or (detached_at is not None and detached_at.tzinfo is None)
+        or (activated_at is not None and activated_at.tzinfo is None)
+        or (value.get("status") == "active" and detached_at is not None)
+        or (value.get("status") == "active" and evidence is not None)
+        or (value.get("status") == "detached" and detached_at is None)
     ):
         raise ResourceError("observed_resource_invalid")
     return value
@@ -1095,6 +1497,157 @@ def apply_provision(
     }
 
 
+def _destroy_marker_path(root: Path, resource_name: str) -> Path:
+    if RESOURCE_NAME.fullmatch(resource_name) is None:
+        raise ResourceError("resource_name_invalid")
+    return root / "destroying-postgres-resources" / f"{resource_name}.json"
+
+
+def _save_destroy_marker(
+    root: Path, resource_name: str, phase: str, fingerprint: str, snapshot: str,
+    generation: int,
+) -> None:
+    if phase not in {"disabling_protection", "snapshotting", "deleting", "cleaning"}:
+        raise ResourceError("aws_rds_destroy_marker_invalid")
+    _write_json(_destroy_marker_path(root, resource_name), {
+        "schema_version": 1,
+        "resource": resource_name,
+        "phase": phase,
+        "identity_fingerprint": fingerprint,
+        "final_snapshot": snapshot,
+        "generation": generation,
+    }, resource_name)
+
+
+def load_destroy_marker(root: Path, resource_name: str) -> dict[str, object] | None:
+    path = _destroy_marker_path(root, resource_name)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_rds_destroy_marker_invalid") from None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {
+            "schema_version", "resource", "phase", "identity_fingerprint",
+            "final_snapshot", "generation",
+        }
+        or document.get("schema_version") != 1
+        or document.get("resource") != resource_name
+        or document.get("phase") not in {
+            "disabling_protection", "snapshotting", "deleting", "cleaning",
+        }
+        or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(document.get("identity_fingerprint"))
+        ) is None
+        or not isinstance(document.get("final_snapshot"), str)
+        or not isinstance(document.get("generation"), int)
+    ):
+        raise ResourceError("aws_rds_destroy_marker_invalid")
+    return document
+
+
+def apply_destroy(
+    adapter: RDSAdapter, root: Path, account: AWSProviderAccount, network: AWSNetwork,
+    resource_name: str, expected_fingerprint: str, snapshot_id: str,
+    generation: int = 1, *, sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Resumably destroy one exactly-owned RDS instance after a verified final snapshot."""
+    observed = load_observed(root, resource_name)
+    if observed is None:
+        raise ResourceError("aws_rds_destroy_not_observed")
+    if identity_fingerprint(str(observed["identity"])) != expected_fingerprint:
+        raise ResourceError("aws_rds_destroy_identity_changed")
+    identifier = derive_instance_identifier(resource_name)
+    live = adapter.describe_instance(account, network, identifier)
+    if live is not None:
+        if (
+            identity_fingerprint(live.identity) != expected_fingerprint
+            or live.ownership_verified is not True
+            or live.generation != generation
+        ):
+            raise ResourceError("aws_rds_destroy_identity_changed")
+        if live.status not in {"available", "modifying", "deleting"}:
+            raise ResourceError("aws_rds_destroy_invalid_state")
+        if live.deletion_protection is True:
+            _save_destroy_marker(
+                root, resource_name, "disabling_protection", expected_fingerprint,
+                snapshot_id, generation,
+            )
+            adapter.disable_deletion_protection(account, network, identifier)
+            return {
+                "resource": resource_name, "phase": "disabling_protection",
+                "destroyed": False, "final_snapshot": snapshot_id,
+            }
+        if live.deletion_protection is not False:
+            raise ResourceError("aws_rds_destroy_deletion_protection_unknown")
+        snapshot = adapter.describe_final_snapshot(account, network, snapshot_id)
+        if snapshot is None:
+            if live.status != "available":
+                return {
+                    "resource": resource_name, "phase": "waiting_for_instance",
+                    "destroyed": False, "final_snapshot": snapshot_id,
+                }
+            snapshot = adapter.create_final_snapshot(
+                account, network, identifier, snapshot_id, resource_name, generation
+            )
+        if (
+            snapshot.instance_identifier != identifier
+            or not snapshot.ownership_verified
+            or snapshot.generation != generation
+        ):
+            raise ResourceError("aws_rds_final_snapshot_ownership_mismatch")
+        if snapshot.status != "available":
+            _save_destroy_marker(
+                root, resource_name, "snapshotting", expected_fingerprint,
+                snapshot_id, generation,
+            )
+            return {
+                "resource": resource_name, "phase": "snapshotting", "destroyed": False,
+                "final_snapshot": snapshot_id,
+            }
+        if live.status == "available":
+            adapter.delete_instance_preserving_backups(account, network, identifier)
+            live = adapter.describe_instance(account, network, identifier)
+        _save_destroy_marker(
+            root, resource_name, "deleting", expected_fingerprint, snapshot_id, generation
+        )
+        deadline = now() + POLL_BUDGET_SECONDS
+        while live is not None and now() < deadline:
+            sleep(POLL_INTERVAL_SECONDS)
+            live = adapter.describe_instance(account, network, identifier)
+        if live is not None:
+            return {
+                "resource": resource_name, "phase": "deleting", "destroyed": False,
+                "final_snapshot": snapshot_id,
+            }
+    snapshot = adapter.describe_final_snapshot(account, network, snapshot_id)
+    if (
+        snapshot is None
+        or snapshot.status != "available"
+        or snapshot.instance_identifier != identifier
+        or not snapshot.ownership_verified
+        or snapshot.generation != generation
+    ):
+        raise ResourceError("aws_rds_final_snapshot_unverified")
+    _save_destroy_marker(
+        root, resource_name, "cleaning", expected_fingerprint, snapshot_id, generation
+    )
+    if not adapter.delete_instance_dependents(account, network, identifier):
+        return {
+            "resource": resource_name, "phase": "cleaning", "destroyed": False,
+            "final_snapshot": snapshot_id,
+        }
+    _observed_path(root, resource_name).unlink(missing_ok=True)
+    _destroy_marker_path(root, resource_name).unlink(missing_ok=True)
+    return {
+        "resource": resource_name, "phase": "destroyed", "destroyed": True,
+        "final_snapshot": snapshot_id,
+    }
+
+
 def persist_binding(
     adapter: RDSAdapter, root: Path, account: AWSProviderAccount,
     store: AWSSecretsManagerStore, store_name: str, resource_name: str, deployment_name: str,
@@ -1114,6 +1667,7 @@ def persist_binding(
         "gimme:secret-store": store_name,
         "gimme:resource": resource_name,
         "gimme:deployment": deployment_name,
+        "gimme:generation": str(generation),
     }
     secret_arn, version_id = adapter.create_workload_secret(
         account, store, secret_name, tags, payload
@@ -1131,6 +1685,9 @@ def persist_binding(
         "secret_version_id": version_id,
         "status": "active",
         "extensions": dict(sorted(extensions.items())),
+        "activated_at": datetime.now(UTC).isoformat(),
+        "detached_at": None,
+        "recovery_evidence": None,
     }
     document = {**document, "allocations": allocations}
     _save_observed(root, resource_name, document)
@@ -1139,6 +1696,36 @@ def persist_binding(
         "database": database_identifier,
         "secret_reference": {"store": store_name, "secret": secret_name},
     }
+
+
+def record_binding_metadata(
+    root: Path, resource_name: str, deployment_name: str,
+    database_identifier: str, owner: str, login: str, generation: int,
+    extensions: dict[str, str], secret_arn: str, secret_version_id: str,
+) -> dict[str, object]:
+    """Reconstruct one active allocation after its provider and catalog evidence agreed."""
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, object], document["allocations"]))
+    if deployment_name in allocations:
+        raise ResourceError("aws_rds_reconstruction_ambiguous")
+    allocation = _validate_allocation({
+        "database_identifier": database_identifier,
+        "owner_role": owner,
+        "login_role": login,
+        "generation": generation,
+        "secret_arn": secret_arn,
+        "secret_version_id": secret_version_id,
+        "status": "active",
+        "extensions": extensions,
+        "activated_at": datetime.now(UTC).isoformat(),
+        "detached_at": None,
+        "recovery_evidence": None,
+    })
+    allocations[deployment_name] = allocation
+    _save_observed(root, resource_name, {**document, "allocations": allocations})
+    return allocation
 
 
 def restore_allocation(
@@ -1150,6 +1737,92 @@ def restore_allocation(
     allocations = dict(cast(dict[str, object], document["allocations"]))
     allocations[deployment_name] = _validate_allocation(allocation)
     _save_observed(root, resource_name, {**document, "allocations": allocations})
+
+
+def detach_allocation(
+    root: Path, resource_name: str, deployment_name: str,
+    evidence: dict[str, object] | None, *, detached_at: datetime | None = None,
+) -> dict[str, object]:
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, dict[str, object]], document["allocations"]))
+    allocation = allocations.get(deployment_name)
+    if allocation is None:
+        raise ResourceError("aws_rds_binding_missing")
+    if allocation["status"] == "detached":
+        return allocation
+    moment = (detached_at or datetime.now(UTC)).astimezone(UTC)
+    checked_evidence = None
+    if evidence is not None:
+        checked_evidence = {
+            **evidence,
+            "generation": allocation["generation"],
+        }
+    updated = _validate_allocation({
+        **allocation,
+        "status": "detached",
+        "detached_at": moment.isoformat(),
+        "recovery_evidence": checked_evidence,
+    })
+    allocations[deployment_name] = updated
+    _save_observed(root, resource_name, {**document, "allocations": allocations})
+    return updated
+
+
+def remove_allocation(root: Path, resource_name: str, deployment_name: str) -> None:
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, object], document["allocations"]))
+    allocations.pop(deployment_name, None)
+    _save_observed(root, resource_name, {**document, "allocations": allocations})
+
+
+def recovery_evidence_is_fresh(allocation: dict[str, object]) -> bool:
+    checked = _validate_allocation(allocation)
+    evidence = cast(dict[str, object] | None, checked["recovery_evidence"])
+    if checked["status"] != "detached" or evidence is None:
+        return False
+    detached_at = datetime.fromisoformat(str(checked["detached_at"]))
+    captured_at = datetime.fromisoformat(str(evidence["captured_at"]))
+    activated_at = (
+        None if checked["activated_at"] is None
+        else datetime.fromisoformat(str(checked["activated_at"]))
+    )
+    return (
+        detached_at - timedelta(hours=24) <= captured_at <= detached_at
+        and (activated_at is None or activated_at <= captured_at)
+    )
+
+
+def find_allocation_resources(
+    root: Path, deployment_name: str, *, exclude: str | None = None,
+) -> list[tuple[str, dict[str, object]]]:
+    """Find RDS observations that still claim a Deployment, including retained Resources."""
+    directory = root / "observed-resources"
+    if not directory.is_dir():
+        return []
+    found: list[tuple[str, dict[str, object]]] = []
+    for path in sorted(directory.glob("*.json")):
+        resource_name = path.stem
+        if resource_name == exclude or RESOURCE_NAME.fullmatch(resource_name) is None:
+            continue
+        try:
+            if path.is_symlink() or path.stat().st_size > MAX_OBSERVED_BYTES:
+                continue
+            raw = json.loads(path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict) or "aws_instance_identifier" not in raw:
+            continue
+        observed = _validate_observed(raw)
+        allocation = cast(dict[str, dict[str, object]], observed["allocations"]).get(
+            deployment_name
+        )
+        if allocation is not None:
+            found.append((resource_name, allocation))
+    return found
 
 
 def update_allocation_extensions(
@@ -1230,24 +1903,90 @@ def clear_rotation(root: Path, resource_name: str) -> None:
     _rotation_path(root, resource_name).unlink(missing_ok=True)
 
 
+def _allocation_purge_path(
+    root: Path, resource_name: str, deployment_name: str
+) -> Path:
+    if (
+        RESOURCE_NAME.fullmatch(resource_name) is None
+        or DEPLOYMENT_NAME.fullmatch(deployment_name) is None
+    ):
+        raise ResourceError("aws_rds_allocation_purge_identity_invalid")
+    return root / "purging-postgres-allocations" / f"{resource_name}--{deployment_name}.json"
+
+
+def _validate_allocation_purge(
+    document: object, resource_name: str, deployment_name: str
+) -> dict[str, object]:
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "resource", "deployment", "phase", "plan"}
+        or document.get("schema_version") != 1
+        or document.get("resource") != resource_name
+        or document.get("deployment") != deployment_name
+        or document.get("phase") not in {
+            "prepared", "database_deleted", "secret_scheduled",
+        }
+        or not isinstance(document.get("plan"), dict)
+    ):
+        raise ResourceError("aws_rds_allocation_purge_marker_invalid")
+    return cast(dict[str, object], document)
+
+
+def load_allocation_purge(
+    root: Path, resource_name: str, deployment_name: str
+) -> dict[str, object] | None:
+    path = _allocation_purge_path(root, resource_name, deployment_name)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ResourceError("aws_rds_allocation_purge_marker_invalid") from None
+    return _validate_allocation_purge(document, resource_name, deployment_name)
+
+
+def save_allocation_purge(
+    root: Path, resource_name: str, deployment_name: str, document: dict[str, object]
+) -> None:
+    _validate_allocation_purge(document, resource_name, deployment_name)
+    _write_json(
+        _allocation_purge_path(root, resource_name, deployment_name), document, resource_name
+    )
+
+
+def clear_allocation_purge(
+    root: Path, resource_name: str, deployment_name: str
+) -> None:
+    _allocation_purge_path(root, resource_name, deployment_name).unlink(missing_ok=True)
+
+
 def _tombstone_path(root: Path, resource_name: str) -> Path:
     if RESOURCE_NAME.fullmatch(resource_name) is None:
         raise ResourceError("resource_name_invalid")
     return root / "retained-resources" / f"{resource_name}.json"
 
 
-def retain_resource(root: Path, resource_name: str, aws_network: str) -> dict[str, object]:
+def retain_resource(
+    root: Path, resource_name: str, provider_account: str, aws_network: str,
+    workload_secret_store: str,
+) -> dict[str, object]:
     """Record a secret-free Retained Resource tombstone. Ordinary removal never
     deletes the underlying RDS instance or its data; this is inventory only."""
     observed = load_observed(root, resource_name)
     tombstone = {
         "schema_version": 1,
         "resource": resource_name,
+        "provider_account": provider_account,
         "aws_network": aws_network,
-        "aws_instance_identifier": (
-            observed["aws_instance_identifier"] if observed is not None else None
+        "workload_secret_store": workload_secret_store,
+        "identity_fingerprint": (
+            identity_fingerprint(str(observed["identity"]))
+            if observed is not None else None
         ),
-        "identity": observed["identity"] if observed is not None else None,
+        "detached_allocations": (
+            len(cast(dict[str, object], observed["allocations"]))
+            if observed is not None else 0
+        ),
     }
     _write_json(_tombstone_path(root, resource_name), tombstone, resource_name)
     return tombstone
@@ -1264,6 +2003,51 @@ def load_retained(root: Path, resource_name: str) -> dict[str, object] | None:
     if not path.is_file() or path.is_symlink():
         return None
     try:
-        return json.loads(path.read_text())
+        document = json.loads(path.read_text())
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ResourceError("retained_resource_invalid") from None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {
+            "schema_version", "resource", "provider_account", "aws_network",
+            "workload_secret_store", "identity_fingerprint", "detached_allocations",
+        }
+        or document.get("schema_version") != 1
+        or document.get("resource") != resource_name
+        or any(
+            RESOURCE_NAME.fullmatch(str(document.get(key))) is None
+            for key in ("provider_account", "aws_network", "workload_secret_store")
+        )
+        or (
+            document.get("identity_fingerprint") is not None
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(document.get("identity_fingerprint"))
+            ) is None
+        )
+        or isinstance(document.get("detached_allocations"), bool)
+        or not isinstance(document.get("detached_allocations"), int)
+        or not 0 <= int(document["detached_allocations"]) <= 256
+    ):
+        raise ResourceError("retained_resource_invalid")
+    return document
+
+
+def list_retained(root: Path) -> list[dict[str, object]]:
+    directory = root / "retained-resources"
+    if not directory.is_dir():
+        return []
+    retained: list[dict[str, object]] = []
+    for path in sorted(directory.glob("*.json")):
+        if RESOURCE_NAME.fullmatch(path.stem) is None:
+            raise ResourceError("retained_resource_invalid")
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ResourceError("retained_resource_invalid") from None
+        if isinstance(raw, dict) and "replication_group_id" in raw:
+            continue
+        document = load_retained(root, path.stem)
+        if document is None:
+            raise ResourceError("retained_resource_invalid")
+        retained.append(document)
+    return retained

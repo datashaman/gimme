@@ -2686,7 +2686,9 @@ def test_forgetting_deletes_only_a_local_tombstone(tmp_path, monkeypatch) -> Non
     with pytest.raises(ValueError, match="confirmation must exactly equal"):
         server_module.apply_forget_resource(NAME, str(plan["plan_id"]), "forget")
     assert tombstone.is_file()
-    result = server_module.apply_forget_resource(NAME, str(plan["plan_id"]), f"FORGET {NAME}")
+    result = server_module.apply_forget_resource(
+        NAME, str(plan["plan_id"]), f"FORGET RETAINED RESOURCE {NAME}"
+    )
 
     assert result["changed"] is True and result["resource"] == NAME
     assert not tombstone.exists()
@@ -3002,7 +3004,9 @@ def test_a_corrupt_tombstone_can_still_be_forgotten(tmp_path, monkeypatch) -> No
     tombstone.write_text("{not json")
 
     plan = server_module.plan_forget_resource(NAME)
-    server_module.apply_forget_resource(NAME, str(plan["plan_id"]), f"FORGET {NAME}")
+    server_module.apply_forget_resource(
+        NAME, str(plan["plan_id"]), f"FORGET RETAINED RESOURCE {NAME}"
+    )
 
     assert not tombstone.exists()
 

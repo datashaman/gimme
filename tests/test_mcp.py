@@ -46,7 +46,9 @@ from gimme.deployer import CommandResult
 from gimme.deployment_release_orchestration import DeploymentReleaseOrchestrator
 from gimme.recovery import ObjectMetadata, RecoveryError
 from gimme.recovery import append_restore_event, recovery_point_id, restore_event_key
-from gimme.resources_postgres import RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError
+from gimme.resources_postgres import (
+    RDS_TRUST_BUNDLE_SHA256, InstanceObservation, ResourceError, SnapshotObservation,
+)
 from gimme.secrets import SecretError, SecretMetadata
 import gimme.server as server_module
 import gimme.resources_postgres as resources_postgres_module
@@ -696,6 +698,7 @@ def test_recovery_orchestrator_owns_component_selection() -> None:
         assert_plan=unused,
         run_deployment=unused,
         valkey_runtime=unused,
+        postgres_capture_credential=unused,
         bounded_marker_values=unused,
         journal=unused,
     )
@@ -3438,6 +3441,10 @@ class FakeRDS:
         self.secret_versions: dict[str, int] = {}
         self.secret_history: dict[str, dict[str, dict[str, str]]] = {}
         self.secret_current: dict[str, str] = {}
+        self.secret_tags: dict[str, dict[str, str]] = {}
+        self.deleted_secrets: list[tuple[str, int]] = []
+        self.snapshots: dict[str, SnapshotObservation] = {}
+        self.delete_instance_calls = 0
 
     def describe_instance(self, account, network, identifier):
         if self.fail_describe:
@@ -3459,6 +3466,7 @@ class FakeRDS:
             backup_retention_days=resource.backup_retention_days,
             backup_window=resource.backup_window,
             maintenance_window=resource.maintenance_window,
+            ownership_verified=True, generation=1,
         )
         return self.instances[identifier]
 
@@ -3493,6 +3501,7 @@ class FakeRDS:
         self.secret_payloads[name] = payload
         self.secret_history.setdefault(name, {})[version] = dict(payload)
         self.secret_current[name] = version
+        self.secret_tags[name] = dict(tags)
         return f"arn:aws:secretsmanager:{store.region}:123456789012:secret:{name}", version
 
     def restore_workload_secret_version(
@@ -3507,6 +3516,52 @@ class FakeRDS:
     def resolve_workload_credential(self, account, store, name, version_id):
         document = self.secret_history[name][version_id]
         return document["username"], document["password"]
+
+    def schedule_workload_secret_deletion(self, account, store, name, expected_tags):
+        if (name, 30) not in self.deleted_secrets:
+            self.deleted_secrets.append((name, 30))
+
+    def list_workload_secret_metadata(self, account, store, resource_name):
+        return [
+            {
+                "deployment": tags["gimme:deployment"],
+                "generation": int(tags["gimme:generation"]),
+                "secret_arn": (
+                    f"arn:aws:secretsmanager:{store.region}:123456789012:secret:{name}"
+                ),
+                "secret_version_id": self.secret_current[name],
+            }
+            for name, tags in sorted(self.secret_tags.items())
+            if tags.get("gimme:resource") == resource_name
+            and name not in {secret for secret, _days in self.deleted_secrets}
+        ]
+
+    def disable_deletion_protection(self, account, network, identifier):
+        self.instances[identifier] = dataclasses.replace(
+            self.instances[identifier], deletion_protection=False
+        )
+        return self.instances[identifier]
+
+    def describe_final_snapshot(self, account, network, snapshot_id):
+        return self.snapshots.get(snapshot_id)
+
+    def create_final_snapshot(
+        self, account, network, identifier, snapshot_id, resource_name, generation
+    ):
+        snapshot = SnapshotObservation(
+            identity=f"arn:aws:rds:{network.region}:123456789012:snapshot:{snapshot_id}",
+            status="available", instance_identifier=identifier,
+            ownership_verified=True, generation=generation,
+        )
+        self.snapshots[snapshot_id] = snapshot
+        return snapshot
+
+    def delete_instance_preserving_backups(self, account, network, identifier):
+        self.delete_instance_calls += 1
+        self.instances.pop(identifier, None)
+
+    def delete_instance_dependents(self, account, network, identifier):
+        return True
 
 
 class FakeRDSSecrets:
@@ -3944,6 +3999,287 @@ def test_managed_postgres_rotation_resumes_an_interrupted_rollback(
     ) is None
 
 
+def test_managed_postgres_detach_reactivate_and_guarded_purge(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True, recovery=True)
+    state = server_module.store.load()
+    original_deployment = state.deployments["example-app"]
+    server_module.store.save(state.model_copy(update={
+        "provider_accounts": {
+            "main": state.provider_accounts["main"].model_copy(update={
+                "destructive_role_arn": (
+                    "arn:aws:iam::123456789012:role/gimme-destroy"
+                )
+            })
+        }
+    }))
+    backup = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", backup)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+
+    def publish_recovery(request: str) -> None:
+        body = f"postgres-{request}".encode()
+        path = tmp_path / f"{request}.dump"
+        path.write_bytes(body)
+        recovery_module.create_recovery_point(
+            "primary",
+            server_module.store.load().backup_destinations["primary"],
+            None,
+            backup,
+            "example-app",
+            recovery_module.recovery_point_id("example-app", "primary", request),
+            [recovery_module.ComponentDump(
+                kind="postgres", local_path=path,
+                sha256=hashlib.sha256(body).hexdigest(), bytes=len(body),
+                resource_version="17.2",
+            )],
+        )
+
+    publish_recovery("before-first-detach")
+    tasks: list[str] = []
+
+    def succeed(task, server, **kwargs):
+        tasks.append(task)
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", succeed)
+    removal = server_module.plan_remove_deployment("example-app")
+    server_module.remove_deployment(
+        "example-app", str(removal["plan_id"]), str(removal["confirmation"])
+    )
+    detached = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert detached["status"] == "detached"
+    assert detached["generation"] == 1
+    assert detached["recovery_evidence"]["recovery_point_id"].startswith("rp_")
+    assert "gimme:resource:retire-postgres-login" in tasks
+
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={
+        "deployments": {"example-app": original_deployment}
+    }))
+    rebind = server_module.plan_bind_resource("example-app")
+    assert rebind["reactivates_detached_allocation"] is True
+    assert rebind["login_generation"] == 2
+    server_module.bind_resource("example-app", str(rebind["plan_id"]))
+    active = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert active["status"] == "active" and active["generation"] == 2
+    assert active["recovery_evidence"] is None
+
+    publish_recovery("before-second-detach")
+    removal = server_module.plan_remove_deployment("example-app")
+    server_module.remove_deployment(
+        "example-app", str(removal["plan_id"]), str(removal["confirmation"])
+    )
+    purge = server_module.plan_purge_resource_allocation(
+        "primary-rds", "example-app"
+    )
+    assert purge["confirmation"] == "PURGE example-app FROM primary-rds"
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_purge_resource_allocation(
+            "primary-rds", "example-app", str(purge["plan_id"]), "PURGE"
+        )
+    original_clear = resources_postgres_module.clear_allocation_purge
+    clear_calls = 0
+
+    def interrupt_after_allocation_removal(*args, **kwargs):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise RuntimeError("interrupted after allocation removal")
+        return original_clear(*args, **kwargs)
+
+    monkeypatch.setattr(
+        resources_postgres_module,
+        "clear_allocation_purge",
+        interrupt_after_allocation_removal,
+    )
+    with pytest.raises(RuntimeError, match="interrupted after allocation removal"):
+        server_module.apply_purge_resource_allocation(
+            "primary-rds", "example-app", str(purge["plan_id"]),
+            str(purge["confirmation"]),
+        )
+    marker = resources_postgres_module.load_allocation_purge(
+        server_module.store.root, "primary-rds", "example-app"
+    )
+    assert marker is not None and marker["phase"] == "secret_scheduled"
+
+    result = server_module.apply_purge_resource_allocation(
+        "primary-rds", "example-app", str(purge["plan_id"]),
+        str(purge["confirmation"]),
+    )
+    assert result["changed"] is False
+    assert result["secret_recovery_window_days"] == 30
+    assert adapter.deleted_secrets == [("primary-rds/example-app", 30)]
+    assert resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"] == {}
+    assert tasks[-1] == "gimme:resource:purge-postgres-allocation"
+
+
+def test_managed_postgres_destroy_requires_evidence_and_retains_final_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True, recovery=True)
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={
+        "provider_accounts": {
+            "main": state.provider_accounts["main"].model_copy(update={
+                "destructive_role_arn": (
+                    "arn:aws:iam::123456789012:role/gimme-destroy"
+                )
+            })
+        }
+    }))
+    backup = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", backup)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    body = b"final-postgres-recovery"
+    dump = tmp_path / "final.dump"
+    dump.write_bytes(body)
+    recovery_module.create_recovery_point(
+        "primary", server_module.store.load().backup_destinations["primary"], None,
+        backup, "example-app",
+        recovery_module.recovery_point_id("example-app", "primary", "before-destroy"),
+        [recovery_module.ComponentDump(
+            kind="postgres", local_path=dump,
+            sha256=hashlib.sha256(body).hexdigest(), bytes=len(body),
+            resource_version="17.2",
+        )],
+    )
+    monkeypatch.setattr(
+        server_module.runner, "run", lambda *a, **k: CommandResult(["dep"], 0, "")
+    )
+    removal = server_module.plan_remove_deployment("example-app")
+    server_module.remove_deployment(
+        "example-app", str(removal["plan_id"]), str(removal["confirmation"])
+    )
+    plan = server_module.plan_destroy_resource("primary-rds")
+    assert plan["confirmation"] == "DESTROY RESOURCE primary-rds"
+    assert len(plan["detached_allocations"]) == 1
+
+    first = server_module.apply_destroy_resource(
+        "primary-rds", str(plan["plan_id"]), str(plan["confirmation"])
+    )
+    assert first["phase"] == "disabling_protection" and first["destroyed"] is False
+    second = server_module.apply_destroy_resource(
+        "primary-rds", str(plan["plan_id"]), str(plan["confirmation"])
+    )
+    assert second["destroyed"] is True
+    assert "primary-rds" not in server_module.store.load().resources
+    assert second["final_snapshot"] in adapter.snapshots
+    assert adapter.snapshots[second["final_snapshot"]].status == "available"
+    assert adapter.delete_instance_calls == 1
+
+
+def test_managed_postgres_reconstructs_unambiguous_active_allocation(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    observed_path = (
+        server_module.store.root / "observed-resources" / "primary-rds.json"
+    )
+    observed_path.unlink()
+
+    plan = server_module.plan_apply_resource("primary-rds")
+    result = server_module.apply_resource("primary-rds", str(plan["plan_id"]))
+
+    assert result["reconstructed_allocations"] == 1
+    allocation = resources_postgres_module.load_observed(
+        server_module.store.root, "primary-rds"
+    )["allocations"]["example-app"]
+    assert allocation["status"] == "active" and allocation["generation"] == 1
+    assert allocation["login_role"].endswith("_g1")
+
+
+def test_managed_postgres_creates_a_verified_manual_recovery_point(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = use_rds_store(tmp_path, monkeypatch, bound=True, recovery=True)
+    backup = FakeS3()
+    monkeypatch.setattr(server_module, "backup_s3", backup)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    captured: dict[str, object] = {}
+
+    def capture(task, server, **kwargs):
+        if task == "gimme:backup:dump-postgres":
+            body = b"managed-postgres-dump"
+            kwargs["backup_local_path"].write_bytes(body)
+            captured["credential"] = json.loads(kwargs["secret_file"].read_text())
+            captured["variables"] = kwargs["variables"]
+            return CommandResult(
+                ["dep"], 0,
+                f"GIMME_BACKUP|{hashlib.sha256(body).hexdigest()}|{len(body)}\n",
+            )
+        return CommandResult(["dep"], 0, "")
+
+    monkeypatch.setattr(server_module.runner, "run", capture)
+    plan = server_module.plan_create_recovery_point("example-app", "managed-manual")
+    result = server_module.create_recovery_point(
+        "example-app", "managed-manual", str(plan["plan_id"])
+    )
+
+    assert result["changed"] is True
+    assert result["recovery_point"]["components"][0]["resource_version"] == "17.2"
+    assert captured["credential"] == adapter.secret_payloads["primary-rds/example-app"]
+    assert captured["variables"]["DB_SSLMODE"] == "verify-full"
+    assert server_module.list_recovery_points("example-app")["recovery_points"][0][
+        "state"
+    ] == "verified"
+
+
+def test_managed_postgres_reconstruction_refuses_unmatched_or_corrupt_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    use_rds_store(tmp_path, monkeypatch, bound=True)
+    server_module.apply_resource(
+        "primary-rds", str(server_module.plan_apply_resource("primary-rds")["plan_id"])
+    )
+    server_module.bind_resource(
+        "example-app", str(server_module.plan_bind_resource("example-app")["plan_id"])
+    )
+    observed_path = (
+        server_module.store.root / "observed-resources" / "primary-rds.json"
+    )
+    observed_path.unlink()
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={"deployments": {}}))
+    plan = server_module.plan_apply_resource("primary-rds")
+    with pytest.raises(ResourceError, match="aws_rds_reconstruction_ambiguous"):
+        server_module.apply_resource("primary-rds", str(plan["plan_id"]))
+    assert not observed_path.exists(), "ambiguous reconstruction must not overwrite evidence"
+
+    observed_path.parent.mkdir(parents=True, exist_ok=True)
+    observed_path.write_text("{not-json")
+    with pytest.raises(ResourceError, match="observed_resource_invalid"):
+        server_module.plan_apply_resource("primary-rds")
+
+
 def test_failed_database_binding_cleans_protected_credentials_before_raising(
     tmp_path, monkeypatch
 ) -> None:
@@ -4314,8 +4650,44 @@ def test_cleanup_retains_a_managed_resource_and_requires_exact_confirmation(
         True, "primary-rds", True,
     )
     assert "primary-rds" not in server_module.store.load().resources
-    assert (server_module.store.root / "retained-resources" / "primary-rds.json").is_file()
+    tombstone = server_module.store.root / "retained-resources" / "primary-rds.json"
+    assert json.loads(tombstone.read_text()) == {
+        "schema_version": 1,
+        "resource": "primary-rds",
+        "provider_account": "main",
+        "aws_network": "primary",
+        "workload_secret_store": "workload-secrets",
+        "identity_fingerprint": resources_postgres_module.identity_fingerprint(
+            adapter.instances["gimme-primary-rds"].identity
+        ),
+        "detached_allocations": 0,
+    }
     assert adapter.instances, "cleanup must never delete the provider instance"
+
+    state = server_module.store.load()
+    server_module.store.save(state.model_copy(update={
+        "secret_stores": {
+            name: store
+            for name, store in state.secret_stores.items()
+            if name != "workload-secrets"
+        },
+        "aws_networks": {},
+    }))
+    with pytest.raises(ValueError, match="retained resource"):
+        server_module.plan_remove_provider_account("main")
+    forget = server_module.plan_forget_resource("primary-rds")
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        server_module.apply_forget_resource(
+            "primary-rds", str(forget["plan_id"]), "FORGET primary-rds"
+        )
+    server_module.apply_forget_resource(
+        "primary-rds", str(forget["plan_id"]),
+        "FORGET RETAINED RESOURCE primary-rds",
+    )
+    assert not tombstone.exists()
+    assert server_module.plan_remove_provider_account("main")["kind"] == (
+        "provider_account_removal"
+    )
 
 
 def test_cleanup_is_refused_while_a_deployment_still_references_the_resource(
@@ -4360,8 +4732,8 @@ def test_deployment_tasks_send_only_target_local_resources_to_the_recipe(
     assert set(captured["resources"]) == {"cache"}
 
 
-def test_recovery_points_are_refused_for_managed_databases(tmp_path, monkeypatch) -> None:
+def test_recovery_points_are_plannable_for_managed_databases(tmp_path, monkeypatch) -> None:
     use_rds_store(tmp_path, monkeypatch, bound=True, recovery=True)
 
-    with pytest.raises(ValueError, match="target-local PostgreSQL only"):
-        server_module.plan_create_recovery_point("example-app", "req-1")
+    plan = server_module.plan_create_recovery_point("example-app", "req-1")
+    assert plan["kind"] == "recovery_point_creation"
