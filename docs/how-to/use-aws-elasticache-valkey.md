@@ -656,8 +656,11 @@ datapoint): `memory_usage_percent`, `connections`, `evictions`, `replica_lag_sec
 durability), and `metric_traffic_management` (above 0). Metrics change no phase and trigger no
 sizing, admission control, or scaling. A failed CloudWatch read returns a bounded `metrics_error`
 (for example `aws_elasticache_metrics_access_denied`) and everything else as usual. The metric
-names and the `CacheClusterId` dimension come from AWS's documentation and are unverified until
-run against a live account.
+names and the `CacheClusterId` dimension were verified against a live `cache.m7g.large`
+Multi-AZ group (see [Validate ElastiCache Valkey against AWS](validate-aws-elasticache-live.md#what-a-live-run-has-verified)):
+all seven returned a datapoint within minutes of the group becoming available. While a group is
+not `available` (a failover or an ACL change), inspection reports `pending` with no metrics and no
+`security_group` issue, because attached groups are read only from an available group.
 
 `plan_cleanup_resource` and `apply_cleanup_resource` require `RETAIN <name>` and remove only the
 local registration, writing a Retained Resource tombstone. The replication group, its data,

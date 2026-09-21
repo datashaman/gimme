@@ -50,6 +50,48 @@ the isolated Gimme state directory. A failed teardown is an operational failure:
 objects intact, report their identifiers to the operator, and retry the same bounded cleanup rather
 than broadening the target selection.
 
+## What a live run has verified
+
+One run on 2026-09-21 (`eu-central-1`, a default account with the run's tagged VPC, two private
+subnets, three security groups, an IAM operator user, and the three roles) drove the managed
+lifecycle through Gimme's own tools against a `cache.m7g.large`, engine 9.0.0, one-shard,
+two-node Multi-AZ group, then removed every object. The AWS account root cannot call
+`sts:AssumeRole`, so a run needs an IAM operator user with an access key that may assume only the
+run's three roles; delete both at teardown.
+
+Verified against AWS:
+
+- Create, inspect, and bind. The first create apply stopped once with
+  `aws_elasticache_create_invalid_state` (not root-caused; the new user group may still have been
+  settling), and repeating the same apply created the group. All seven CloudWatch metrics named in the Valkey how-to returned a
+  datapoint within minutes of `available`, with the `CacheClusterId` dimension.
+- Detach. `modify_user` accepts the access string `off ~* -@all`, and removing the user from the
+  user group leaves it with no group. The group is `modifying` for about a minute afterwards, and
+  a rebind in that window is refused with `aws_elasticache_binding_resource_not_ready`; the same
+  apply succeeds once the group is `available`.
+- Rebind. Generation 2 gets a new ACL user, and the previous user is recorded in
+  `retired_user_ids`.
+- Purge, AWS steps: the current and the retired ACL user are deleted and the credential secret
+  is scheduled for deletion (Secrets Manager returns its tags under `Tags`). ElastiCache can
+  still be modifying the user, and the first apply then stops with
+  `aws_elasticache_rotate_delete_unavailable`; repeating the same confirmed apply resumes from the
+  saved phase.
+- Failover. `TestFailover` is accepted and the group is `modifying` for about nine minutes with
+  no `CurrentRole` on either member; inspection reports `pending`, then `ready` with no issues.
+  Attached security groups are unreadable in that window, which used to be reported as a false
+  `security_group` issue (fixed).
+- Destroy. `deleting` lasts about 15 minutes, one repeat may stop with
+  `aws_elasticache_destroy_delete_unavailable`, and the group, its users, user group, subnet and
+  parameter groups are then gone. The final-snapshot and retained-secret purges complete.
+- A reviewed plan is bound to the repository's execution sources: editing a tracked source file
+  mid-run makes a pending destroy plan stale (`plan_id is invalid or stale`) until it is re-planned.
+  Do not change the checkout during a run.
+
+Not verified, because each needs a real administration Target (an EC2 instance in the VPC): the
+`gimme:stop:processes` step of detach and unbind, the key-purge program against a live cluster
+(the run stubbed that one step and still resolved the real admin credential), activation probes,
+credential rotation, restore, and the recovery matrix below.
+
 ## Run the executable recovery matrix
 
 The isolated state must contain one deployed application bound to one managed Valkey Resource.

@@ -615,6 +615,13 @@ def test_a_mismatched_snapshot_window_is_a_snapshot_policy_issue() -> None:
     assert structural_issues(valkey(), observed, GROUP_ID) == ["snapshot_policy"]
 
 
+def test_a_modifying_group_with_unread_security_groups_reports_no_drift() -> None:
+    # Live AWS: attached groups are read only while available, so modifying has none to compare.
+    modifying = observation(status="modifying", security_group_ids=None, ingress_sources=None)
+
+    assert structural_issues(valkey(), modifying, GROUP_ID) == []
+
+
 def test_a_group_that_is_not_available_is_pending_not_degraded(tmp_path) -> None:
     result = provision(
         FakeValkey(
