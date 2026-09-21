@@ -309,6 +309,43 @@ from `deployment_security_group_ids` while a Deployment on it is bound, and movi
 `workload_secret_store` once credentials exist, are refused by `plan_update_resource`, and a
 bound Resource cannot be removed.
 
+## Unbind and rebind a Deployment
+
+A Deployment leaves a managed Valkey Resource when `update_deployment` moves it to another
+Resource or `remove_deployment` removes it. (A non-static Deployment always binds a Valkey
+Resource, so it can be moved but not left without one.) The plan lists the effects, and apply does
+them in this order, each step safe to repeat:
+
+1. **Stop the Deployment's managed worker and scheduler processes** (`gimme:stop:processes`, an
+   update only; removal already stops them). The task writes the process state with both
+   configurations null and runs the existing privileged process helper, which disables every
+   unit. No privileged helper changes, and nothing else on the Target does. The next
+   `apply_deployment_resources` or release provisions the processes from the Deployment's own
+   configuration again.
+2. **Disable its ACL user** with the inspection role: the access string becomes `off ~* -@all`
+   and the user leaves the Resource's user group (`aws_elasticache_user_disable_<reason>`,
+   `aws_elasticache_user_group_unbind_<reason>`). The user is not deleted: unbinding needs no
+   destructive authority, and the user is deleted at destruction. A user that is already gone
+   counts as done.
+3. **Record a Detached Allocation** in the local observation: status `detached`, when access
+   disablement began, whether the Deployment's Recovery Policy included Valkey
+   (`recovery_expected`), and, if it did, the newest verified Valkey Component Backup captured
+   within the 24 hours before that moment. A missing backup never blocks unbinding; destruction
+   decides.
+
+Every namespaced key and the Resource Credential secret are kept. A failure part-way changes
+no desired state, and repeating the same update or removal finishes it. `inspect_resource`
+reports `binding_count` for active allocations and `detached_count` for detached ones, never
+an identifier.
+
+**Rebind** the same Deployment to the same Resource with `plan_bind_resource` then
+`bind_resource`. The plan shows `reactivates_detached_allocation`. A new ACL user is created
+with the next generation (a new user id and username), joins the user group, and gets a new
+credential version; the retained keys are reachable again, and the previous user is recorded
+under `retired_user_ids` (at most 8, `aws_elasticache_binding_retired_users_full`) so
+destruction removes it. A rotation or another unfinished operation on the Resource blocks
+both directions (`aws_elasticache_*_in_progress`).
+
 ## The Laravel contract and activation probes
 
 A Deployment bound to a managed Resource receives the fixed `laravel-cluster-v1` contract. Gimme
@@ -383,8 +420,14 @@ registration. Nothing else changes, and there is no tombstone because nothing is
 Preconditions, all checked again at apply:
 
 - the Provider Account has a `destructive_role_arn` (`aws_elasticache_destroy_role_missing`);
-- no Deployment references the Resource, and the observation records no allocation for a
-  Deployment that still exists (`aws_elasticache_destroy_bindings_remain`);
+- no Deployment references the Resource, and no allocation for a Deployment that still exists
+  is active (`aws_elasticache_destroy_bindings_remain`);
+- every Detached Allocation is resolved: its Recovery Policy did not include Valkey (the plan then
+  warns that recovery is not guaranteed and lists the Deployment under `detached_allocations`), or
+  it carries a verified Valkey Component Backup captured within 24 hours before disablement that
+  is still present at the destination when the plan is made
+  (`aws_elasticache_destroy_recovery_evidence_missing`,
+  `aws_elasticache_destroy_recovery_evidence_stale`);
 - the Resource has been provisioned and observed (`aws_elasticache_destroy_not_observed`; run
   `inspect_resource` to refresh a lost cache);
 - the live group is the one that was planned: the same identity as observed when the plan was
@@ -529,7 +572,8 @@ ones.
 `inspect_resource` describes the group live and returns `phase`, `status`, `engine_version`,
 `effective_durability`, `issues`, `drift`, `topology` (shards, members, Multi-AZ, automatic
 failover, TLS, and encryption at rest), `snapshot_policy`, `maintenance_window`,
-`pending_service_updates` (unfinished updates AWS lists for the group), and `binding_count`. It
+`pending_service_updates` (unfinished updates AWS lists for the group), `binding_count` (active
+allocations), and `detached_count`. It
 never returns an endpoint, address, ARN, node or user identifier, or secret identifier. If AWS
 cannot be reached it returns the last cached state with a bounded `refresh_error`, and none of
 the live-only fields.
@@ -563,7 +607,7 @@ Provider failures become fixed `aws_elasticache_<operation>_<reason>` codes, for
 `invalid_state`, `throttled`, `revoked`, and `unavailable`, and AWS messages, ARNs, and values
 are never included. Operations include `subnet_group`, `parameter_group`,
 `parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
-`user_describe`, `user_bind`, `user_group_bind`, `user_restore`, `user_group_restore`, `snapshots`,
+`user_describe`, `user_bind`, `user_disable`, `user_group_unbind`, `user_group_bind`, `user_restore`, `user_group_restore`, `snapshots`,
 `credential_read`, `rotate_user`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
 `options`, `metrics`, `modify`, and `create`.
 `aws_elasticache_group_ownership_mismatch` and

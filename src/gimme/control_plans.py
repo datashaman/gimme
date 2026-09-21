@@ -92,6 +92,8 @@ def registration_update_plan(
     name: str,
     current: BaseModel,
     proposed: BaseModel,
+    *,
+    effects: list[str] | None = None,
 ) -> dict[str, Any]:
     current_value = current.model_dump(mode="json")
     proposed_value = proposed.model_dump(mode="json")
@@ -101,9 +103,20 @@ def registration_update_plan(
             "name": name,
             "current": current_value,
             "proposed": proposed_value,
-            "effects": ["replace local Git-backed desired state only", "make no remote changes"],
+            "effects": effects
+            or ["replace local Git-backed desired state only", "make no remote changes"],
         }
     )
+
+
+def valkey_unbind_effects() -> list[str]:
+    """What dropping or moving a managed Valkey binding does before desired state is replaced."""
+    return [
+        "stop the Deployment's managed worker and scheduler processes",
+        "disable its ElastiCache ACL user and remove it from the Resource's user group",
+        "keep every namespaced key and its Resource Credential secret as a Detached Allocation",
+        "then replace local Git-backed desired state",
+    ]
 
 
 def target_stack_plan(
@@ -734,6 +747,7 @@ def valkey_binding_plan(
     profile: str, observed: dict[str, Any] | None, database: dict[str, Any] | None,
 ) -> dict[str, Any]:
     allocations = observed["allocations"] if observed is not None else {}
+    recorded = allocations.get(deployment_name)
     return exact_plan(
         {
             "kind": "resource_binding",
@@ -745,7 +759,10 @@ def valkey_binding_plan(
                 "namespaces": namespaces,
                 "acl_profile": profile,
                 "resource_ready": observed is not None and observed["phase"] == "ready",
-                "already_bound": deployment_name in allocations,
+                "already_bound": recorded is not None and recorded["status"] == "active",
+                "reactivates_detached_allocation": (
+                    recorded is not None and recorded["status"] == "detached"
+                ),
             },
             "effects": [
                 "create or reconcile this Deployment's own ElastiCache ACL user, limited to its "
@@ -754,6 +771,9 @@ def valkey_binding_plan(
                 "write a Resource Credential secret holding exactly a username and a generated "
                 "48-character password to the workload Secret Store; an existing credential is "
                 "kept",
+                "a Detached Allocation is restored with a new ACL-user generation and a new "
+                "credential version; its retained keys become reachable again and the disabled "
+                "user is deleted only at purge or destroy",
                 "refuse a Resource that a fresh live read does not report ready, degraded "
                 "included",
                 "never edit the Valkey security group, and never return, store, or log the "
@@ -788,8 +808,10 @@ def resource_cleanup_plan(
 
 
 def valkey_destroy_plan(
-    resource_name: str, fingerprint: str, final_snapshot: str, users: int
+    resource_name: str, fingerprint: str, final_snapshot: str, users: int,
+    allocations: list[dict[str, object]] | None = None,
 ) -> dict[str, Any]:
+    detached = allocations or []
     return exact_plan(
         {
             "kind": "resource_destroy",
@@ -797,6 +819,12 @@ def valkey_destroy_plan(
             "confirmation": f"DESTROY RESOURCE {resource_name}",
             "identity_fingerprint": fingerprint,
             "final_snapshot": final_snapshot,
+            "detached_allocations": detached,
+            "warnings": [
+                f"recovery of {item['deployment']} is not guaranteed: its Recovery Policy did "
+                "not include Valkey, so no verified Component Backup exists for it"
+                for item in detached if item["recovery_point_id"] is None
+            ],
             "destroys": [
                 "the ElastiCache replication group and all its data",
                 "its automatic snapshots",
@@ -918,6 +946,8 @@ def deployment_removal_plan(
     name: str,
     deployment: DeploymentConfig,
     target: TargetConfig,
+    *,
+    managed_valkey: bool = False,
 ) -> dict[str, Any]:
     return exact_plan(
         {
@@ -932,8 +962,17 @@ def deployment_removal_plan(
             "effects": [
                 "remove the deployment route and mDNS publisher when applicable",
                 "stop and remove its managed processes",
-                "remove its database, Valkey namespace, releases, and storage",
+                "remove its database, releases, and storage"
+                if managed_valkey
+                else "remove its database, Valkey namespace, releases, and storage",
                 "remove its local desired-state registration after remote cleanup succeeds",
+                *(
+                    [
+                        "disable its managed Valkey ACL user, keeping every namespaced key and "
+                        "its Resource Credential secret as a Detached Allocation"
+                    ]
+                    if managed_valkey else []
+                ),
             ],
         }
     )

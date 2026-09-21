@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from gimme.control import (
     AWSElastiCacheValkeyResource, AWSProviderAccount, AWSSecretsManagerStore, ControlState,
-    MANAGED_VALKEY_ENV_KEYS, ResourceBindings, StateStore, ValkeyBinding,
+    DeploymentRegistration, MANAGED_VALKEY_ENV_KEYS, ResourceBindings, StateStore, ValkeyBinding,
 )
 from gimme.resources_postgres import ResourceError
 from gimme.resources_valkey import (
@@ -107,6 +107,7 @@ class FakeValkey:
         # deployment -> credential versions, oldest first; the last one is current
         self.credentials: dict[str, list[str]] = {}
         self.removed_users: list[str] = []
+        self.events: list[str] = []
         self.remove_error: ResourceError | None = None
         self.begin_error: ResourceError | None = None
         self.metrics: dict[str, float | None] = dict.fromkeys(METRIC_KEYS)
@@ -201,6 +202,9 @@ class FakeValkey:
             versions.append(expected_username)
         arn = f"arn:aws:secretsmanager:eu-central-1:123456789012:secret:{deployment_name}"
         return arn, self._version(deployment_name)
+
+    def disable_binding(self, account, network, group_id, user_id):
+        self.events.append(f"disable:{user_id}")
 
     def remove_user(self, account, network, resource_name, user_id):
         assert account.destructive_role_arn is not None
@@ -4284,3 +4288,477 @@ def test_a_rotation_of_a_deployment_that_no_longer_binds_the_resource_is_refused
 
     with pytest.raises(ResourceError, match="^aws_elasticache_rotate_binding_missing$"):
         server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)
+
+
+# --- detachment and same-Resource rebinding -----------------------------------------------
+
+USER_G1 = derive_binding_user_id(GROUP_ID, DEPLOYMENT, 1)
+USER_G2 = derive_binding_user_id(GROUP_ID, DEPLOYMENT, 2)
+
+
+def detachable(tmp_path, monkeypatch) -> tuple[FakeValkey, list[dict[str, object]]]:
+    adapter = bound_and_ready(tmp_path, monkeypatch)
+    calls = capture_runs(monkeypatch)
+    real = server_module.runner.run
+    monkeypatch.setattr(server_module.runner, "run", lambda task, *a, **k: (
+        adapter.events.append(task), real(task, *a, **k))[1])
+    return adapter, calls
+
+
+def moved(**updates) -> DeploymentRegistration:
+    """The Deployment now uses another Resource: a non-static Deployment cannot bind none."""
+    current = server_module.store.deployment(DEPLOYMENT)
+    return DeploymentRegistration.from_deployment(current).model_copy(update={
+        "resources": ResourceBindings(
+            database="devbox-postgres",
+            valkey=ValkeyBinding(resource="devbox-valkey", uses=["cache", "queue"]),
+        ), **updates,
+    })
+
+
+def unbind(**updates) -> dict[str, object]:
+    definition = moved(**updates)
+    plan = server_module.plan_update_deployment(DEPLOYMENT, definition)
+    return server_module.update_deployment(DEPLOYMENT, definition, str(plan["plan_id"]))
+
+
+def recovering_valkey(monkeypatch, evidence: bool) -> list[datetime.datetime]:
+    """The Deployment's Recovery Policy includes Valkey; `evidence` says whether a verified
+    Component Backup is found. Returns the cutoffs it was asked about."""
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["recovery"]["valkey"] = True
+    server_module.store.save(ControlState.model_validate(document))
+    cutoffs: list[datetime.datetime] = []
+
+    def find(kind, deployment, allocation, *, cutoff=None):
+        assert kind == "valkey" and deployment == DEPLOYMENT
+        recorded = allocation.get("recovery_evidence")
+        if recorded is not None:
+            return recorded if evidence else None
+        cutoffs.append(cutoff)
+        return None if not evidence else {
+            "recovery_point_id": "rp_" + "a" * 20, "destination": "primary",
+            "captured_at": (cutoff - datetime.timedelta(hours=1)).isoformat(),
+            "generation": allocation.get("generation", 1),
+        }
+
+    monkeypatch.setattr(server_module, "_recovery_evidence", find)
+    return cutoffs
+
+
+def test_moving_the_binding_disables_the_user_and_keeps_keys_and_credential(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, calls = detachable(tmp_path, monkeypatch)
+    plan = server_module.plan_update_deployment(DEPLOYMENT, moved())
+    assert any("Detached Allocation" in effect for effect in plan["effects"])
+
+    result = unbind()
+
+    detached = allocation()
+    assert result["changed"] is True and result["deployment"] == DEPLOYMENT
+    assert detached["status"] == "detached" and detached["user_id"] == USER_G1
+    assert detached["recovery_expected"] is False and detached["recovery_evidence"] is None
+    assert adapter.events == [f"disable:{USER_G1}"]
+    assert adapter.removed_users == [] and adapter.deleted_secrets == []
+    assert adapter.delete_calls == []
+    assert server_module.store.deployment(DEPLOYMENT).resources.valkey.resource == "devbox-valkey"
+    assert "gimme:stop:processes" not in [call["task"] for call in calls]
+
+
+def test_a_deployment_with_managed_processes_is_stopped_before_its_user_is_disabled(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    running = server_module.store.deployment(DEPLOYMENT).model_copy(
+        update={"workers": HorizonWorkerConfig()}
+    )
+    server_module.store.save(server_module.store.load().model_copy(update={
+        "deployments": {**server_module.store.load().deployments, DEPLOYMENT: running}
+    }))
+
+    unbind(workers=HorizonWorkerConfig())
+
+    assert adapter.events == ["gimme:stop:processes", f"disable:{USER_G1}"]
+
+
+def test_removing_the_deployment_detaches_its_allocation(tmp_path, monkeypatch) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    plan = server_module.plan_remove_deployment(DEPLOYMENT)
+    assert any("Detached Allocation" in effect for effect in plan["effects"])
+
+    server_module.remove_deployment(DEPLOYMENT, str(plan["plan_id"]), str(plan["confirmation"]))
+
+    assert allocation()["status"] == "detached"
+    assert adapter.events.index("gimme:remove:deployment") < adapter.events.index(
+        f"disable:{USER_G1}"
+    )
+    assert "gimme:stop:processes" not in adapter.events
+    assert DEPLOYMENT not in server_module.store.load().deployments
+
+
+def test_a_detach_records_fresh_evidence_when_the_policy_includes_valkey(
+    tmp_path, monkeypatch
+) -> None:
+    detachable(tmp_path, monkeypatch)
+    cutoffs = recovering_valkey(monkeypatch, evidence=True)
+
+    unbind(recovery=server_module.store.deployment(DEPLOYMENT).recovery.model_copy(
+        update={"valkey": False}))
+
+    detached = allocation()
+    assert detached["recovery_expected"] is True and len(cutoffs) == 1
+    assert cast(dict, detached["recovery_evidence"])["recovery_point_id"] == "rp_" + "a" * 20
+    assert resources_valkey_module.recovery_evidence_is_fresh(detached)
+    assert datetime.datetime.fromisoformat(str(detached["detached_at"])) == cutoffs[0]
+
+
+def test_missing_evidence_never_blocks_a_detach_but_is_recorded(tmp_path, monkeypatch) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    recovering_valkey(monkeypatch, evidence=False)
+
+    unbind(recovery=server_module.store.deployment(DEPLOYMENT).recovery.model_copy(
+        update={"valkey": False}))
+
+    detached = allocation()
+    assert detached["status"] == "detached" and detached["recovery_expected"] is True
+    assert detached["recovery_evidence"] is None
+    assert not resources_valkey_module.recovery_evidence_is_fresh(detached)
+    assert adapter.events == [f"disable:{USER_G1}"]
+
+
+def test_a_repeated_detach_is_a_no_op(tmp_path, monkeypatch) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    unbind()
+    first = allocation()
+
+    result = server_module._resource_retirement_orchestrator().detach_valkey_allocation(
+        DEPLOYMENT, NAME, server_module.store.deployment(DEPLOYMENT), stop_processes=True,
+    )
+
+    assert result == {"detached": True, "already_detached": True}
+    assert allocation() == first and adapter.events == [f"disable:{USER_G1}"]
+
+
+def test_an_unfinished_detach_is_finished_by_repeating_the_update(tmp_path, monkeypatch) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    real = adapter.disable_binding
+    monkeypatch.setattr(adapter, "disable_binding", lambda *a: (_ for _ in ()).throw(
+        ResourceError("aws_elasticache_user_disable_throttled")))
+    definition = moved()
+    plan = server_module.plan_update_deployment(DEPLOYMENT, definition)
+    with pytest.raises(ResourceError, match="user_disable_throttled"):
+        server_module.update_deployment(DEPLOYMENT, definition, str(plan["plan_id"]))
+    assert allocation()["status"] == "active"
+    assert server_module.store.deployment(DEPLOYMENT).resources.valkey is not None
+
+    monkeypatch.setattr(adapter, "disable_binding", real)
+    server_module.update_deployment(DEPLOYMENT, definition, str(plan["plan_id"]))
+
+    assert allocation()["status"] == "detached"
+
+
+def test_a_detach_is_refused_while_the_resource_is_busy(tmp_path, monkeypatch) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    resources_valkey_module.write_marker(
+        server_module.store.root, "rotating", NAME, {"schema_version": 1, "resource": NAME}
+    )
+    definition = moved()
+    plan = server_module.plan_update_deployment(DEPLOYMENT, definition)
+
+    with pytest.raises(ResourceError, match="_in_progress$"):
+        server_module.update_deployment(DEPLOYMENT, definition, str(plan["plan_id"]))
+
+    assert adapter.events == [] and allocation()["status"] == "active"
+
+
+def test_a_rebind_restores_the_namespace_with_a_new_user_generation(
+    tmp_path, monkeypatch
+) -> None:
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    unbind()
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": NAME, "uses": ["cache", "queue"]}
+    server_module.store.save(ControlState.model_validate(document))
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+    valkey_plan = cast(dict[str, object], plan["valkey"])
+    assert valkey_plan["already_bound"] is False
+    assert valkey_plan["reactivates_detached_allocation"] is True
+
+    server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+    rebound = allocation()
+    assert rebound["status"] == "active" and rebound["generation"] == 2
+    assert rebound["user_id"] == USER_G2 and rebound["retired_user_ids"] == [USER_G1]
+    assert not resources_valkey_module.DETACHED_FIELDS & set(rebound)
+    assert adapter.binding_calls[-1] == (DEPLOYMENT, False)
+    assert adapter.credentials[DEPLOYMENT][-1] == binding_username(DEPLOYMENT, 2)
+
+
+def test_destruction_targets_include_retired_users(tmp_path, monkeypatch) -> None:
+    detachable(tmp_path, monkeypatch)
+    unbind()
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": NAME, "uses": ["cache"]}
+    server_module.store.save(ControlState.model_validate(document))
+    bind()
+
+    _fingerprint, users = resources_valkey_module.destruction_targets(
+        server_module.store.root, NAME
+    )
+
+    assert USER_G1 in users and USER_G2 in users
+
+
+def test_a_rebind_is_refused_when_eight_users_are_already_retired(tmp_path, monkeypatch) -> None:
+    detachable(tmp_path, monkeypatch)
+    unbind()
+    path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    document = json.loads(path.read_text())
+    document["allocations"][DEPLOYMENT]["retired_user_ids"] = [
+        f"gimme-u-{index:024x}" for index in range(8)
+    ]
+    path.write_text(json.dumps(document))
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": NAME, "uses": ["cache"]}
+    server_module.store.save(ControlState.model_validate(document))
+    plan = server_module.plan_bind_resource(DEPLOYMENT)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_binding_retired_users_full$"):
+        server_module.bind_resource(DEPLOYMENT, str(plan["plan_id"]))
+
+
+def test_a_detached_allocation_takes_no_rotation(tmp_path, monkeypatch) -> None:
+    detachable(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["provider_accounts"]["main"]["destructive_role_arn"] = DESTROYER
+    server_module.store.save(ControlState.model_validate(document))
+    unbind()
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_rotate_binding_missing$"):
+        server_module.plan_rotate_resource_credential(NAME, DEPLOYMENT)
+
+
+def test_inspection_counts_active_and_detached_allocations_separately(
+    tmp_path, monkeypatch
+) -> None:
+    detachable(tmp_path, monkeypatch)
+    assert server_module.inspect_resource(NAME)["binding_count"] == 1
+    unbind()
+
+    inspected = server_module.inspect_resource(NAME)
+
+    assert inspected["binding_count"] == 0 and inspected["detached_count"] == 1
+    assert inspected["allocations"] == {DEPLOYMENT: {"status": "detached"}}
+    assert USER_G1 not in json.dumps(inspected)
+
+
+def written_allocation(tmp_path, monkeypatch, change) -> None:
+    detachable(tmp_path, monkeypatch)
+    path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    document = json.loads(path.read_text())
+    document["allocations"][DEPLOYMENT] = change(document["allocations"][DEPLOYMENT])
+    path.write_text(json.dumps(document))
+
+
+def detached_record(record: dict, **updates) -> dict:
+    return {
+        **record, "status": "detached", "detached_at": "2026-01-01T00:00:00+00:00",
+        "recovery_expected": False, "recovery_evidence": None, **updates,
+    }
+
+
+def evidence(**updates) -> dict:
+    return {
+        "recovery_point_id": "rp_" + "a" * 20, "destination": "primary",
+        "captured_at": "2025-12-31T23:00:00+00:00", "generation": 1, **updates,
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda record: record,
+        lambda record: detached_record(record),
+        lambda record: detached_record(
+            record, recovery_expected=True, recovery_evidence=evidence()
+        ),
+        lambda record: {**record, "generation": 2, "retired_user_ids": [USER_G1]},
+    ],
+)
+def test_allocation_records_old_and_new_validate(tmp_path, monkeypatch, change) -> None:
+    written_allocation(tmp_path, monkeypatch, change)
+
+    assert load_observed(server_module.store.root, NAME) is not None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda record: {**record, "detached_at": "2026-01-01T00:00:00+00:00"},
+        lambda record: {key: value for key, value in detached_record(record).items()
+                        if key != "recovery_evidence"},
+        lambda record: detached_record(record, detached_at="2026-01-01T00:00:00"),
+        lambda record: detached_record(record, detached_at="yesterday"),
+        lambda record: detached_record(record, recovery_expected="yes"),
+        lambda record: detached_record(record, recovery_evidence=evidence(generation=2)),
+        lambda record: detached_record(record, recovery_evidence=evidence(recovery_point_id="x")),
+        lambda record: detached_record(record, recovery_evidence={**evidence(), "extra": 1}),
+        lambda record: {
+            **record, "retired_user_ids": [f"gimme-u-{index:024x}" for index in range(9)]
+        },
+        lambda record: {**record, "retired_user_ids": ["not-a-user"]},
+        lambda record: {**record, "generation": 0},
+    ],
+)
+def test_a_malformed_detached_or_retired_record_makes_the_cache_invalid(
+    tmp_path, monkeypatch, change
+) -> None:
+    written_allocation(tmp_path, monkeypatch, change)
+
+    with pytest.raises(ResourceError, match="^observed_resource_invalid$"):
+        load_observed(server_module.store.root, NAME)
+
+
+def test_disabling_a_binding_uses_only_the_inspection_role_and_is_idempotent(
+    monkeypatch,
+) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_response("modify_user", {}, {"UserId": USER_ID, "AccessString": "off ~* -@all"})
+    stub.add_response(
+        "describe_user_groups",
+        {"UserGroups": [{"UserGroupId": derive_user_group_id(GROUP_ID), "UserIds": [USER_ID]}]},
+        {"UserGroupId": derive_user_group_id(GROUP_ID)},
+    )
+    stub.add_response(
+        "modify_user_group", {},
+        {"UserGroupId": derive_user_group_id(GROUP_ID), "UserIdsToRemove": [USER_ID]},
+    )
+    stub.add_response("modify_user", {}, {"UserId": USER_ID, "AccessString": "off ~* -@all"})
+    stub.add_response(
+        "describe_user_groups",
+        {"UserGroups": [{"UserGroupId": derive_user_group_id(GROUP_ID), "UserIds": []}]},
+        {"UserGroupId": derive_user_group_id(GROUP_ID)},
+    )
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _store = context()
+
+    with stub:
+        adapter.disable_binding(account, network, GROUP_ID, USER_ID)
+        adapter.disable_binding(account, network, GROUP_ID, USER_ID)
+
+
+def test_a_user_that_is_already_gone_counts_as_disabled(monkeypatch) -> None:
+    client, stub = stubbed("elasticache")
+    stub.add_client_error("modify_user", "UserNotFound")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _store = context()
+
+    with stub:
+        adapter.disable_binding(account, network, GROUP_ID, USER_ID)
+
+
+@pytest.mark.parametrize("stage", ["disable", "group"])
+def test_a_disable_failure_is_a_bounded_code(monkeypatch, stage) -> None:
+    client, stub = stubbed("elasticache")
+    if stage == "disable":
+        stub.add_client_error("modify_user", "AccessDenied", f"denied {PASSWORD}")
+    else:
+        stub.add_response("modify_user", {}, {"UserId": USER_ID, "AccessString": "off ~* -@all"})
+        stub.add_client_error("describe_user_groups", "Throttling", f"slow {PASSWORD}")
+    adapter = adapter_with(monkeypatch, ("elasticache", (client, stub)))
+    account, network, _store = context()
+
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.disable_binding(account, network, GROUP_ID, USER_ID)
+
+    assert re.fullmatch(
+        r"aws_elasticache_user_(disable|group_unbind)_[a-z_]+", str(raised.value)
+    )
+    assert PASSWORD not in repr(raised.value)
+
+
+# --- destruction with Detached Allocations --------------------------------------------------
+
+
+def detached_and_destroyable(tmp_path, monkeypatch, *, expected: bool | None = None):
+    """Bound, then moved off the Resource so its allocation is detached, on an account with a
+    destructive role. `expected` None keeps the Recovery Policy without Valkey."""
+    adapter, _calls = detachable(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["provider_accounts"]["main"]["destructive_role_arn"] = DESTROYER
+    server_module.store.save(ControlState.model_validate(document))
+    if expected is None:
+        unbind()
+    else:
+        recovering_valkey(monkeypatch, evidence=expected)
+        unbind(recovery=server_module.store.deployment(DEPLOYMENT).recovery.model_copy(
+            update={"valkey": False}))
+    return adapter
+
+
+def test_a_detached_allocation_without_a_valkey_policy_is_resolved_with_a_warning(
+    tmp_path, monkeypatch, instant
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+
+    plan = server_module.plan_destroy_resource(NAME)
+
+    assert plan["detached_allocations"] == [{
+        "deployment": DEPLOYMENT, "generation": 1, "recovery_point_id": None, "captured_at": None,
+    }]
+    assert any("not guaranteed" in warning for warning in plan["warnings"])
+    assert USER_G1 not in json.dumps(plan)
+
+    destroy()
+
+    assert USER_G1 in adapter.removed_users or USER_G1 in [
+        user for _name, users in adapter.dependents_calls for user in users
+    ]
+
+
+def test_a_detached_allocation_with_fresh_evidence_is_resolved_and_names_it(
+    tmp_path, monkeypatch
+) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch, expected=True)
+
+    plan = server_module.plan_destroy_resource(NAME)
+
+    [item] = plan["detached_allocations"]
+    assert item["recovery_point_id"] == "rp_" + "a" * 20 and item["generation"] == 1
+    assert plan["warnings"] == []
+
+
+def test_a_destruction_is_refused_when_recovery_was_expected_but_no_evidence_was_taken(
+    tmp_path, monkeypatch
+) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch, expected=False)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_recovery_evidence_missing$"):
+        server_module.plan_destroy_resource(NAME)
+
+
+def test_a_destruction_is_refused_when_the_recorded_evidence_no_longer_exists(
+    tmp_path, monkeypatch
+) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch, expected=True)
+    monkeypatch.setattr(server_module, "_recovery_evidence", lambda *a, **k: None)
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_recovery_evidence_stale$"):
+        server_module.plan_destroy_resource(NAME)
+
+
+def test_an_unfinished_unbind_still_blocks_destruction(tmp_path, monkeypatch) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch)
+    path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    document = json.loads(path.read_text())
+    for key in ("detached_at", "recovery_expected", "recovery_evidence"):
+        del document["allocations"][DEPLOYMENT][key]
+    document["allocations"][DEPLOYMENT]["status"] = "active"
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_bindings_remain$"):
+        server_module.plan_destroy_resource(NAME)

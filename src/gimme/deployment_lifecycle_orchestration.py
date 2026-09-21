@@ -4,13 +4,18 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from gimme.control import (
+    AWSElastiCacheValkeyResource,
     DeploymentConfig,
     DeploymentRegistration,
     ManualRecoveryCadence,
     legacy_server,
     target_sites,
 )
-from gimme.control_plans import deployment_removal_plan, registration_update_plan
+from gimme.control_plans import (
+    deployment_removal_plan,
+    registration_update_plan,
+    valkey_unbind_effects,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,7 @@ class DeploymentLifecycleOrchestrator:
     delete: Callable[..., Any]
     recovery_schedule_authority: Callable[..., Any]
     detach_postgres_allocation: Callable[..., Any]
+    detach_valkey_allocation: Callable[..., Any]
     result: Callable[..., dict[str, object]]
 
     def plan_update_deployment(
@@ -43,8 +49,20 @@ class DeploymentLifecycleOrchestrator:
             current.target, placement, current.placement_decision
         )
         self.replace(state, "deployments", name, proposed)
+        old_valkey = current.resources.valkey
+        unbinds = (
+            old_valkey is not None
+            and isinstance(
+                state.resources.get(old_valkey.resource), AWSElastiCacheValkeyResource
+            )
+            and (
+                proposed.resources.valkey is None
+                or proposed.resources.valkey.resource != old_valkey.resource
+            )
+        )
         return registration_update_plan(
-            "deployment_update", name, current, proposed
+            "deployment_update", name, current, proposed,
+            effects=valkey_unbind_effects() if unbinds else None,
         )
 
     def update_deployment(
@@ -59,6 +77,19 @@ class DeploymentLifecycleOrchestrator:
                 old_database = current.resources.database
                 if old_database is not None:
                     self.detach_postgres_allocation(name, old_database)
+            old_valkey = current.resources.valkey
+            if old_valkey is not None and (
+                proposed.resources.valkey is None
+                or proposed.resources.valkey.resource != old_valkey.resource
+            ):
+                _state, _current, _target, application = self.context(name)
+                self.detach_valkey_allocation(
+                    name, old_valkey.resource, current,
+                    stop_processes=(
+                        application.framework == "laravel"
+                        and (current.workers is not None or current.scheduler is not None)
+                    ),
+                )
             self.store.save(
                 self.replace(self.store.load(), "deployments", name, proposed)
             )
@@ -66,7 +97,15 @@ class DeploymentLifecycleOrchestrator:
 
     def plan_remove_deployment(self, name: str) -> dict[str, object]:
         _state, deployment, target, _application = self.context(name)
-        return deployment_removal_plan(name, deployment, target)
+        state = self.store.load()
+        return deployment_removal_plan(
+            name, deployment, target,
+            managed_valkey=deployment.resources.valkey is not None
+            and isinstance(
+                state.resources.get(deployment.resources.valkey.resource),
+                AWSElastiCacheValkeyResource,
+            ),
+        )
 
     def remove_deployment(
         self, name: str, plan_id: str, confirmation: str
@@ -111,6 +150,11 @@ class DeploymentLifecycleOrchestrator:
             )
             if deployment.resources.database is not None:
                 self.detach_postgres_allocation(name, deployment.resources.database)
+            if deployment.resources.valkey is not None:
+                self.detach_valkey_allocation(
+                    name, deployment.resources.valkey.resource, deployment,
+                    stop_processes=False,
+                )
             state = self.delete(self.store.load(), "deployments", name)
             self.store.save(state)
             (self.store.root / "applied-secrets" / f"{name}.json").unlink(

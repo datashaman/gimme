@@ -129,10 +129,13 @@ def apply_restore(
         "resource": resource_name, "snapshot": snapshot_name, "restored": False,
         "phase": "restoring", "status": live.status,
     }
+    # A detached allocation has no live credential or Deployment to prove.
+    active = sorted(name for name, item in _allocations(root, resource_name).items()
+                    if item["status"] == "active")
     if live.status != "available":
-        return {**result, "verified": [], "pending": sorted(allocations)}
+        return {**result, "verified": [], "pending": active}
     verified = list(cast(list[str], marker.get("verified") or []))
-    for deployment in sorted(allocations):
+    for deployment in active:
         if deployment in verified:
             continue
         try:
@@ -197,6 +200,7 @@ def _finish_rotation(
 ) -> None:
     allocations = _allocations(root, resource_name)
     allocations[deployment] = {
+        **allocations[deployment],
         "user_id": marker["to_user"], "secret_arn": marker["to_arn"],
         "secret_version_id": marker["to_version"], "status": "active",
         "generation": marker["generation"],

@@ -1365,3 +1365,18 @@ def test_pinned_rds_trust_bundle_matches_its_digest_and_holds_only_root_cas() ->
         subject = re.search(r"subject=(.*)", described).group(1)  # type: ignore[union-attr]
         issuer = re.search(r"issuer=(.*)", described).group(1)  # type: ignore[union-attr]
         assert subject == issuer and "CA:TRUE" in described, "the bundle must hold roots only"
+
+
+def test_the_stop_processes_task_disables_every_unit_and_changes_nothing_else() -> None:
+    recipe = deployer_source()
+    task = recipe[recipe.index("task('gimme:stop:processes'"):]
+    task = task[: task.index("task('gimme:processes:status'")]
+
+    # Both configurations are null, which the privileged helper reconciles to disabled units.
+    assert task.index("process_state_write_command(") < task.index(
+        "sudo -n /usr/local/sbin/gimme-provision-processes"
+    )
+    assert "        null,\n        null,\n        configured_php_binary()," in task
+    assert "Process management requires a Laravel application" in task
+    for untouched in (".env", "artisan", "composer", "symlink", "restart"):
+        assert untouched not in task

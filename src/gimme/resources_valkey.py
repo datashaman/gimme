@@ -98,7 +98,17 @@ LARAVEL_COMMANDS = (
     "+punsubscribe", "+ping", "+echo", "+auth", "+hello", "+time", "+client|setinfo",
     "+client|setname", "+cluster|slots", "+cluster|shards", "+cluster|nodes", "+cluster|info",
 )
-BINDING_STATUS = ("active",)
+BINDING_STATUS = ("active", "detached")
+# A detached user can never authenticate or run a command; DEFAULT_ACCESS_STRING is the same
+# fixed, AWS-accepted string that disables the default user.
+DISABLED_ACCESS_STRING = DEFAULT_ACCESS_STRING
+USER_ID = re.compile(r"^gimme-u-[0-9a-f]{24}$")
+RECOVERY_POINT_ID = re.compile(r"^rp_[0-9a-f]{20}$")
+ALLOCATION_REQUIRED = frozenset({"user_id", "secret_arn", "secret_version_id", "status"})
+DETACHED_FIELDS = frozenset({"detached_at", "recovery_expected", "recovery_evidence"})
+ALLOCATION_OPTIONAL = frozenset({"generation", "retired_user_ids"}) | DETACHED_FIELDS
+# Disabled users left behind by rebinding, deleted with the destructive role at purge or destroy.
+MAX_RETIRED_USERS = 8
 
 
 def validate_update(
@@ -290,6 +300,10 @@ class ElastiCacheAdapter(Protocol):
     def recent_metrics(
         self, account: AWSProviderAccount, network: AWSNetwork, member_ids: tuple[str, ...]
     ) -> dict[str, float | None]: ...
+
+    def disable_binding(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str, user_id: str
+    ) -> None: ...
 
     def begin_rotation(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
@@ -787,6 +801,32 @@ class BotoElastiCacheAdapter(AWSAdapter):
         except Exception as exc:
             raise _provider_error(exc, "user_group_bind", self.error_prefix) from None
         return written
+
+    def disable_binding(
+        self, account: AWSProviderAccount, network: AWSNetwork, group_id: str, user_id: str
+    ) -> None:
+        """Stop one Deployment's ACL user from authenticating, then take it out of the group.
+        Access is disabled first so a failure part-way still fails closed. Idempotent, and a
+        user that is already gone counts as done. The user itself is kept: it is deleted with the
+        destructive role at purge or destroy, so detaching needs no destructive authority."""
+        client = self._client(account, network, "elasticache-detach")
+        try:
+            client.modify_user(UserId=user_id, AccessString=DISABLED_ACCESS_STRING)
+        except Exception as exc:
+            error = _provider_error(exc, "user_disable", self.error_prefix)
+            if "missing" in str(error):
+                return
+            raise error from None
+        user_group = derive_user_group_id(group_id)
+        try:
+            described = client.describe_user_groups(UserGroupId=user_group)
+            if any(
+                user_id in (group.get("UserIds") or [])
+                for group in described.get("UserGroups") or []
+            ):
+                client.modify_user_group(UserGroupId=user_group, UserIdsToRemove=[user_id])
+        except Exception as exc:
+            raise _provider_error(exc, "user_group_unbind", self.error_prefix) from None
 
     def _destructive_client(self, account: AWSProviderAccount, network: AWSNetwork):
         """The only place the destructive role is assumed, and only while applying."""
@@ -1311,6 +1351,54 @@ def group_drift(
     }
 
 
+def _valid_recovery_evidence(evidence: object, generation: int) -> bool:
+    if evidence is None:
+        return True
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "recovery_point_id", "destination", "captured_at", "generation"
+    }:
+        return False
+    try:
+        captured_at = datetime.fromisoformat(str(evidence["captured_at"]))
+    except ValueError:
+        return False
+    return (
+        RECOVERY_POINT_ID.fullmatch(str(evidence["recovery_point_id"])) is not None
+        and RESOURCE_NAME.fullmatch(str(evidence["destination"])) is not None
+        and captured_at.tzinfo is not None and evidence["generation"] == generation
+    )
+
+
+def _valid_allocation(item: object) -> bool:
+    """One Deployment allocation. Records written before detachment existed carry only the
+    required fields (and `generation` after a rotation) and stay valid."""
+    if (
+        not isinstance(item, dict)
+        or not ALLOCATION_REQUIRED <= set(item) <= ALLOCATION_REQUIRED | ALLOCATION_OPTIONAL
+        or item["status"] not in BINDING_STATUS
+    ):
+        return False
+    generation = item.get("generation", 1)
+    retired = item.get("retired_user_ids", [])
+    if (
+        isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        or not isinstance(retired, list) or len(retired) > MAX_RETIRED_USERS
+        or any(not isinstance(user, str) or USER_ID.fullmatch(user) is None for user in retired)
+    ):
+        return False
+    if item["status"] == "active":
+        return not DETACHED_FIELDS & set(item)
+    if not DETACHED_FIELDS <= set(item) or not isinstance(item["recovery_expected"], bool):
+        return False
+    try:
+        detached_at = datetime.fromisoformat(str(item["detached_at"]))
+    except ValueError:
+        return False
+    return detached_at.tzinfo is not None and _valid_recovery_evidence(
+        item["recovery_evidence"], generation
+    )
+
+
 def _validate_observed(document: object) -> dict[str, object]:
     if isinstance(document, dict) and "allocations" not in document:
         # A cache written before bindings existed: it is replaceable, so upgrade it in place.
@@ -1330,12 +1418,7 @@ def _validate_observed(document: object) -> dict[str, object]:
         or not isinstance(issues, list) or any(item not in ISSUES for item in issues)
         or (port is not None and not isinstance(port, int))
         or not isinstance(allocations, dict) or any(
-            DEPLOYMENT_NAME.fullmatch(str(name)) is None or not isinstance(item, dict)
-            or set(item) - {"generation"} != {
-                "user_id", "secret_arn", "secret_version_id", "status"
-            }
-            or item["status"] not in BINDING_STATUS
-            or not isinstance(item.get("generation", 1), int) or item.get("generation", 1) < 1
+            DEPLOYMENT_NAME.fullmatch(str(name)) is None or not _valid_allocation(item)
             for name, item in allocations.items()
         )
     ):
@@ -1479,15 +1562,25 @@ def apply_binding(
     allocations = dict(cast(dict[str, object], document["allocations"]))
     existing = cast(dict[str, dict[str, object]], allocations).get(deployment_name)
     generation = int(cast(int, existing.get("generation", 1))) if existing else 1
+    rebinding = existing is not None and existing["status"] == "detached"
+    retired = list(cast(list[str], existing.get("retired_user_ids", []))) if existing else []
+    if rebinding:
+        # The detached user stays disabled; the namespace is restored under a new generation
+        # with a new user and password, and the old user is deleted at purge or destroy.
+        if len(retired) >= MAX_RETIRED_USERS:
+            raise ResourceError("aws_elasticache_binding_retired_users_full")
+        generation += 1
+        retired.append(str(existing["user_id"]))  # type: ignore[index]
     written = adapter.ensure_binding(
         account, network, store, store_name, resource_name, group_id, deployment_name,
-        keep_credential=deployment_name in allocations, generation=generation,
+        keep_credential=existing is not None and not rebinding, generation=generation,
     )
     if written is not None:
         user_id, secret_arn, version_id = written
         allocations[deployment_name] = {
             "user_id": user_id, "secret_arn": secret_arn, "secret_version_id": version_id,
             "status": "active", **({"generation": generation} if generation > 1 else {}),
+            **({"retired_user_ids": retired} if retired else {}),
         }
         _write_json(
             _observed_path(root, resource_name),
@@ -1498,6 +1591,51 @@ def apply_binding(
         "namespaces": namespace_prefixes(deployment_name, uses),
         "secret_reference": {"store": store_name, "secret": f"{resource_name}/{deployment_name}"},
     }
+
+
+def detach_allocation(
+    root: Path, resource_name: str, deployment_name: str, *, recovery_expected: bool,
+    evidence: dict[str, object] | None, detached_at: datetime,
+) -> dict[str, object]:
+    """Record one Deployment's allocation as detached. Every namespaced key and the credential
+    secret are kept. `detached_at` is when access disablement began, so the Component Backup
+    evidence (captured within 24 hours before it) is judged against that moment. Idempotent."""
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, dict[str, object]], document["allocations"]))
+    allocation = allocations.get(deployment_name)
+    if allocation is None:
+        raise ResourceError("aws_elasticache_binding_missing")
+    if allocation["status"] == "detached":
+        return allocation
+    updated = {
+        **allocation,
+        "status": "detached",
+        "detached_at": detached_at.astimezone(UTC).isoformat(),
+        "recovery_expected": recovery_expected,
+        "recovery_evidence": (
+            None if evidence is None
+            else {**evidence, "generation": int(cast(int, allocation.get("generation", 1)))}
+        ),
+    }
+    allocations[deployment_name] = updated
+    _write_json(
+        _observed_path(root, resource_name),
+        _validate_observed({**document, "allocations": allocations}), resource_name,
+    )
+    return updated
+
+
+def recovery_evidence_is_fresh(allocation: dict[str, object]) -> bool:
+    """A detached allocation whose recorded Component Backup was captured within the 24 hours
+    before access disablement."""
+    evidence = allocation.get("recovery_evidence")
+    if allocation["status"] != "detached" or not isinstance(evidence, dict):
+        return False
+    detached_at = datetime.fromisoformat(str(allocation["detached_at"]))
+    captured_at = datetime.fromisoformat(str(evidence["captured_at"]))
+    return detached_at - timedelta(hours=24) <= captured_at <= detached_at
 
 
 def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, object]:
@@ -1695,10 +1833,14 @@ def destruction_targets(root: Path, resource_name: str) -> tuple[str, list[str]]
     if observed is None:
         raise ResourceError("aws_elasticache_destroy_not_observed")
     group_id = derive_group_id(resource_name)
-    allocations = cast(dict[str, dict[str, str]], observed["allocations"])
+    allocations = cast(dict[str, dict[str, object]], observed["allocations"])
     users = [
         _derived(group_id, "default"), _derived(group_id, "admin"),
-        *sorted(item["user_id"] for item in allocations.values()),
+        *sorted(str(item["user_id"]) for item in allocations.values()),
+        *sorted(
+            user for item in allocations.values()
+            for user in cast(list[str], item.get("retired_user_ids", []))
+        ),
     ]
     return identity_fingerprint(str(observed["identity"])), users
 

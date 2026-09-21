@@ -2544,6 +2544,31 @@ BASH;
     );
 });
 
+task('gimme:stop:processes', function () use ($app, $instance, $appsRoot, $remoteUser): void {
+    if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
+        throw new \RuntimeException('Process management requires a Laravel application');
+    }
+    // Detaching a Valkey allocation stops every managed process from saved state: the privileged
+    // helper disables all worker and scheduler units when both are null. Nothing else changes,
+    // and the next provision task rewrites the state from the Deployment's own configuration.
+    $statePath = "{$appsRoot}/.gimme/processes/{$instance}.json";
+    run('bash -c ' . escapeshellarg(process_state_write_command(
+        $statePath,
+        $instance,
+        $appsRoot,
+        get('deploy_path'),
+        $remoteUser,
+        null,
+        null,
+        configured_php_binary(),
+    )));
+    run(
+        'sudo -n /usr/local/sbin/gimme-provision-processes ' . escapeshellarg($instance),
+        forceOutput: true,
+        timeout: 1800,
+    );
+});
+
 task('gimme:processes:status', function () use ($app, $instance): void {
     if ($app === '' || (getenv('GIMME_FRAMEWORK') ?: 'common') !== 'laravel') {
         throw new \RuntimeException('Process management requires a Laravel application');

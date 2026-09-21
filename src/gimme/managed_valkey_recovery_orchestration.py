@@ -119,7 +119,9 @@ class ManagedValkeyRecoveryOrchestrator:
         observed = resources_valkey_module.load_observed(self.store.root, name)
         if (
             observed is None
-            or deployment not in cast(dict[str, object], observed["allocations"])
+            or cast(dict[str, dict[str, object]], observed["allocations"]).get(
+                deployment, {}
+            ).get("status") != "active"
             or not self.binds(state, deployment, name)
         ):
             raise ResourceError("aws_elasticache_rotate_binding_missing")
