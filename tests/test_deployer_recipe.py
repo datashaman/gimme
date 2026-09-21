@@ -863,7 +863,8 @@ def test_privileged_helper_is_narrowly_allowlisted() -> None:
 
     assert "len(sys.argv) != 1" in helper
     assert "len(sys.argv) != 2" in process_helper
-    assert "len(sys.argv) != 2" in rollout_helper
+    assert 'sys.argv[1] == "weights"' in rollout_helper
+    assert 'sys.argv[1] == "inspect"' in rollout_helper
     assert "len(sys.argv) != 2" in schedule_helper
     assert "len(sys.argv) != 4" in recovery_helper
     assert "ALLOWED_PACKAGES" in helper

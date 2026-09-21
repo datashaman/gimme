@@ -1045,6 +1045,51 @@ task('gimme:rollout:prepare', function () use (
     writeln('GIMME_ROLLOUT_RESULT|ready');
 });
 
+task('gimme:rollout:inspect', function () use ($instance): void {
+    $output = run(
+        'sudo -n /usr/local/sbin/gimme-provision-rollout inspect ' .
+        escapeshellarg($instance),
+        timeout: 60,
+    );
+    if (!preg_match('/^GIMME_ROLLOUT_STATE\|[A-Za-z0-9+\/=]{1,8192}$/', trim($output))) {
+        throw new \RuntimeException('Invalid Rollout Target state');
+    }
+    writeln(trim($output));
+});
+
+task('gimme:rollout:weights', function () use ($appsRoot, $instance): void {
+    $policyJson = required_env('GIMME_ROLLOUT_POLICY_JSON');
+    $policy = json_decode($policyJson, true, flags: JSON_THROW_ON_ERROR);
+    if (!is_array($policy) || array_keys($policy) !== [
+        'affinity_generation', 'candidate_identity', 'candidate_weight', 'deploy_path',
+        'framework', 'generation', 'health', 'network_mode', 'php_version',
+        'route_fingerprint', 'site_host', 'stable_identity', 'stable_weight',
+    ]) {
+        throw new \RuntimeException('Rollout route policy has an unexpected shape');
+    }
+    $statePath = "{$appsRoot}/.gimme/rollouts/{$instance}.json";
+    $document = json_encode([
+        'version' => 2,
+        'instance' => $instance,
+        ...$policy,
+    ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+    run('install -d -m 0700 ' . escapeshellarg(dirname($statePath)));
+    run('printf %s ' . escapeshellarg(base64_encode($document)) .
+        ' | base64 -d > ' . escapeshellarg("{$statePath}.tmp") .
+        ' && chmod 0600 ' . escapeshellarg("{$statePath}.tmp") .
+        ' && mv ' . escapeshellarg("{$statePath}.tmp") . ' ' . escapeshellarg($statePath));
+    $output = run(
+        'sudo -n /usr/local/sbin/gimme-provision-rollout weights ' .
+        escapeshellarg($instance),
+        forceOutput: true,
+        timeout: 1800,
+    );
+    if (!preg_match('/^GIMME_ROLLOUT_STATE\|[A-Za-z0-9+\/=]{1,8192}$/', trim($output))) {
+        throw new \RuntimeException('Invalid Rollout route result');
+    }
+    writeln(trim($output));
+});
+
 task('gimme:rollback', function () use ($framework, $health): void {
     $candidate = getenv('GIMME_ROLLBACK_RELEASE') ?: '';
     if (!preg_match('/^[1-9][0-9]{0,19}$/', $candidate)) {

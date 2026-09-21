@@ -4,16 +4,19 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import grp
 import json
 import os
 import pwd
 import re
+import secrets
 import stat
 import subprocess  # nosec B404 -- fixed executable vectors only
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,20 +27,30 @@ INSTANCE = re.compile(r"^[a-z][a-z0-9-]{0,93}$")
 USER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,31}$")
 PHP_VERSION = re.compile(r"^[0-9]+\.[0-9]+$")
 MAX_STATE_BYTES = 16 * 1024
+ROOT_STATE = Path("/var/lib/gimme/rollouts")
+FINGERPRINT = re.compile(r"^rollout_[0-9a-f]{64}$")
+SITE_HOST = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])$"
+)
+HEALTH_PATH = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{0,255}$")
 
 
 def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
-def run(argv: list[str]) -> None:
+def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
     allowed = {
         "/usr/bin/systemctl",
         "/usr/bin/caddy",
+        "/usr/bin/curl",
     }
     if not argv or argv[0] not in allowed:
         fail("rollout helper attempted an unexpected executable")
-    subprocess.run(argv, check=True)  # nosec B603
+    return subprocess.run(  # nosec B603
+        argv, check=True, text=True, capture_output=True
+    )
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o644) -> bool:
@@ -74,7 +87,7 @@ def ensure_log(path: Path, uid: int, gid: int) -> None:
         os.close(descriptor)
 
 
-def load(instance: str) -> dict[str, Any]:
+def load(instance: str, version: int = 1) -> dict[str, Any]:
     sudo_user = os.environ.get("SUDO_USER", "")
     if INSTANCE.fullmatch(instance) is None or USER.fullmatch(sudo_user) is None:
         fail("invalid rollout identity")
@@ -91,17 +104,25 @@ def load(instance: str) -> dict[str, Any]:
     ):
         fail("unsafe rollout desired state")
     value = json.loads(state_path.read_text())
-    expected = {
-        "version", "instance", "generation", "framework", "remote_user",
-        "apps_root", "deploy_path", "php_version",
-    }
+    expected = (
+        {
+            "version", "instance", "generation", "framework", "remote_user",
+            "apps_root", "deploy_path", "php_version",
+        }
+        if version == 1 else {
+            "version", "instance", "generation", "affinity_generation",
+            "stable_weight", "candidate_weight", "route_fingerprint", "framework",
+            "site_host", "network_mode", "deploy_path", "php_version", "health",
+            "stable_identity", "candidate_identity",
+        }
+    )
     if not isinstance(value, dict) or set(value) != expected:
         fail("invalid rollout desired state document")
     if (
-        value["version"] != 1
+        value["version"] != version
         or value["instance"] != instance
-        or value["remote_user"] != sudo_user
-        or value["apps_root"] != str(APPS_ROOT)
+        or (version == 1 and value["remote_user"] != sudo_user)
+        or (version == 1 and value["apps_root"] != str(APPS_ROOT))
         or value["framework"] not in {"laravel", "static"}
         or isinstance(value["generation"], bool)
         or not isinstance(value["generation"], int)
@@ -123,15 +144,81 @@ def load(instance: str) -> dict[str, Any]:
     return {**value, "candidate": candidate, "account": account}
 
 
-def main() -> None:
-    if os.geteuid() != 0 or len(sys.argv) != 2:
-        fail("rollout helper requires root and one instance")
-    value = load(sys.argv[1])
+def require_int(value: Any, name: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        fail(f"invalid {name}")
+    return value
+
+
+def validate_weight_policy(value: dict[str, Any]) -> dict[str, Any]:
+    stable = require_int(value["stable_weight"], "stable_weight", 0, 100)
+    candidate = require_int(value["candidate_weight"], "candidate_weight", 0, 100)
+    if stable + candidate != 100:
+        fail("rollout weights must total 100")
+    generation = require_int(value["generation"], "generation", 1, 2_147_483_647)
+    affinity = require_int(
+        value["affinity_generation"], "affinity_generation", 1, 2_147_483_647
+    )
+    if affinity != generation:
+        fail("affinity generation must match rollout generation")
+    if value["framework"] not in {"laravel", "static"}:
+        fail("invalid rollout framework")
+    if value["network_mode"] not in {"local_mdns", "public_dns"}:
+        fail("invalid rollout network mode")
+    for field in ("route_fingerprint", "stable_identity", "candidate_identity"):
+        if not isinstance(value[field], str) or FINGERPRINT.fullmatch(value[field]) is None:
+            fail(f"invalid {field}")
+    if value["stable_identity"] == value["candidate_identity"]:
+        fail("rollout backend identities must differ")
+    if not isinstance(value["site_host"], str) or SITE_HOST.fullmatch(value["site_host"]) is None:
+        fail("invalid rollout site host")
+    health = value["health"]
+    if not isinstance(health, list) or not 1 <= len(health) <= 8:
+        fail("invalid rollout health policy")
+    validated_health = []
+    for probe in health:
+        if not isinstance(probe, dict) or set(probe) != {
+            "path", "expected_status", "timeout_seconds", "attempts", "delay_seconds"
+        }:
+            fail("invalid rollout health probe")
+        path = probe["path"]
+        if not isinstance(path, str) or HEALTH_PATH.fullmatch(path) is None:
+            fail("invalid rollout health path")
+        validated_health.append({
+            "path": path,
+            "expected_status": require_int(
+                probe["expected_status"], "expected_status", 100, 599
+            ),
+            "timeout_seconds": require_int(
+                probe["timeout_seconds"], "timeout_seconds", 1, 60
+            ),
+            "attempts": require_int(probe["attempts"], "attempts", 1, 10),
+            "delay_seconds": require_int(
+                probe["delay_seconds"], "delay_seconds", 0, 60
+            ),
+        })
+    value["health"] = validated_health
+    return value
+
+
+def backend_port(identity: str) -> int:
+    digest = hashlib.sha256(identity.encode()).digest()
+    return 20_000 + int.from_bytes(digest[:2], "big") % 20_000
+
+
+def emit_state(value: dict[str, Any]) -> None:
+    encoded = base64.b64encode(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+    print(f"GIMME_ROLLOUT_STATE|{encoded}")
+
+
+def main_prepare(instance: str) -> None:
+    value = load(instance)
     instance = value["instance"]
     generation = value["generation"]
     identity = f"{instance}-{generation}"
-    digest = hashlib.sha256(identity.encode()).digest()
-    port = 20_000 + int.from_bytes(digest[:2], "big") % 20_000
+    port = backend_port(identity)
     candidate: Path = value["candidate"]
     logs = candidate.parent / "logs"
     runtime = candidate.parent / "runtime"
@@ -178,5 +265,207 @@ def main() -> None:
     print("GIMME_ROLLOUT_BACKEND|ready")
 
 
+def root_state(instance: str) -> dict[str, Any] | None:
+    if INSTANCE.fullmatch(instance) is None:
+        fail("invalid rollout identity")
+    path = ROOT_STATE / f"{instance}.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or path.stat().st_size > MAX_STATE_BYTES:
+        fail("unsafe root rollout state")
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        fail("invalid root rollout state")
+    return value
+
+
+def signing_key(instance: str, generation: int) -> str:
+    ROOT_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ROOT_STATE, 0o700)
+    path = ROOT_STATE / f"{instance}.key"
+    generation_path = ROOT_STATE / f"{instance}.generation"
+    current_generation = generation_path.read_text() if generation_path.is_file() else ""
+    if path.is_file() and not path.is_symlink() and current_generation == str(generation):
+        key = path.read_text()
+        if re.fullmatch(r"[0-9a-f]{64}", key):
+            return key
+    key = secrets.token_hex(32)
+    atomic_write(path, key, 0o600)
+    atomic_write(generation_path, str(generation), 0o600)
+    return key
+
+
+def internal_sites(value: dict[str, Any]) -> tuple[str, int, int]:
+    instance = value["instance"]
+    generation = value["generation"]
+    candidate_port = backend_port(f"{instance}-{generation}")
+    stable_port = backend_port(f"stable-{instance}-{generation}")
+    if stable_port == candidate_port:
+        fail("rollout backend identity collision")
+    deploy_path = Path(value["deploy_path"])
+    candidate = deploy_path / "rollouts" / str(generation) / "candidate"
+    current = deploy_path / "current"
+    if value["framework"] == "laravel":
+        stable_root = current / "public"
+        candidate_root = candidate / "public"
+        stable_socket = f"/run/php/php{value['php_version']}-fpm.sock"
+        candidate_socket = f"/run/php/gimme-rollout-{instance}-{generation}.sock"
+        body = (
+            f"http://127.0.0.1:{stable_port} {{\n\troot * {stable_root}\n"
+            f"\tphp_fastcgi unix//{stable_socket}\n\tfile_server\n}}\n"
+            f"http://127.0.0.1:{candidate_port} {{\n\troot * {candidate_root}\n"
+            f"\tphp_fastcgi unix//{candidate_socket}\n\tfile_server\n}}\n"
+        )
+    else:
+        body = (
+            f"http://127.0.0.1:{stable_port} {{\n\troot * {current}\n\tfile_server\n}}\n"
+            f"http://127.0.0.1:{candidate_port} {{\n\troot * {candidate}\n\tfile_server\n}}\n"
+        )
+    return body, stable_port, candidate_port
+
+
+def public_site(
+    value: dict[str, Any], stable_port: int, candidate_port: int, key: str
+) -> str:
+    upstreams, weights = [], []
+    if value["stable_weight"] > 0:
+        upstreams.append(f"127.0.0.1:{stable_port}")
+        weights.append(str(value["stable_weight"]))
+    if value["candidate_weight"] > 0:
+        upstreams.append(f"127.0.0.1:{candidate_port}")
+        weights.append(str(value["candidate_weight"]))
+    cookie = "__Host-gimme-" + hashlib.sha256(value["instance"].encode()).hexdigest()[:16]
+    probe = value["health"][0]
+    tls = "\ttls internal\n" if value["network_mode"] == "local_mdns" else ""
+    return (
+        f"{value['site_host']} {{\n{tls}\tencode zstd gzip\n"
+        f"\treverse_proxy {' '.join(upstreams)} {{\n"
+        f"\t\tlb_policy cookie {cookie} {key} {{\n"
+        f"\t\t\tfallback weighted_round_robin {' '.join(weights)}\n\t\t}}\n"
+        f"\t\thealth_uri {probe['path']}\n"
+        f"\t\thealth_status {probe['expected_status']}\n"
+        "\t\thealth_interval 10s\n\t\thealth_timeout 5s\n"
+        f"\t\thealth_headers {{\n\t\t\tHost {value['site_host']}\n\t\t}}\n"
+        "\t\tfail_duration 30s\n\t\tmax_fails 2\n"
+        "\t\tlb_retries 1\n\t\tlb_try_duration 1s\n\t\tlb_try_interval 100ms\n"
+        "\t\tlb_retry_match {\n\t\t\tmethod GET HEAD\n\t\t}\n"
+        f"\t\theader_down Set-Cookie \"^({cookie}=[0-9a-f]{{64}}; Path=/; Secure; "
+        "HttpOnly); SameSite=None$\" \"$1; SameSite=Lax\"\n"
+        "\t}\n}\n"
+    )
+
+
+def probe(url: str, host: str, policy: dict[str, Any], *, public: bool = False) -> None:
+    for item in policy["health"]:
+        target = url + item["path"]
+        command = [
+            "/usr/bin/curl", "--silent", "--output", "/dev/null", "--write-out",
+            "%{http_code}", "--max-time", str(item["timeout_seconds"]),
+        ]
+        if public and policy["network_mode"] == "local_mdns":
+            command.extend([
+                "--resolve", f"{host}:443:127.0.0.1", "--cacert",
+                str(APPS_ROOT / ".caddy-local-root.crt"),
+            ])
+        elif not public:
+            command.extend(["--header", f"Host: {host}"])
+        command.append(target)
+        for attempt in range(item["attempts"]):
+            try:
+                result = run(command)
+                if result.stdout == str(item["expected_status"]):
+                    break
+            except subprocess.CalledProcessError:
+                pass
+            if attempt + 1 == item["attempts"]:
+                fail("rollout health failed")
+            time.sleep(item["delay_seconds"])
+
+
+def safe_target_state(value: dict[str, Any], outcome: str = "ready") -> dict[str, Any]:
+    return {
+        "configured": True,
+        "generation": value["generation"],
+        "phase": "active",
+        "affinity_generation": value["affinity_generation"],
+        "stable_weight": value["stable_weight"],
+        "candidate_weight": value["candidate_weight"],
+        "stable_eligible": value["stable_weight"] > 0,
+        "candidate_eligible": value["candidate_weight"] > 0,
+        "stable_health": "ready",
+        "candidate_health": "ready",
+        "stable_identity": value["stable_identity"],
+        "candidate_identity": value["candidate_identity"],
+        "route_fingerprint": value["route_fingerprint"],
+        "outcome": outcome,
+    }
+
+
+def main_weights(instance: str) -> None:
+    value = validate_weight_policy(load(instance, 2))
+    internal, stable_port, candidate_port = internal_sites(value)
+    internal_path = Path("/etc/caddy/gimme-rollouts") / f"{instance}-{value['generation']}.caddy"
+    public_path = Path("/etc/caddy/gimme") / f"{instance}.caddy"
+    if not public_path.is_file() or public_path.is_symlink():
+        fail("rollout public route is unavailable")
+    previous = public_path.read_text()
+    previous_stat = public_path.stat()
+    atomic_write(internal_path, internal)
+    run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+    run(["/usr/bin/systemctl", "reload", "caddy.service"])
+    probe(f"http://127.0.0.1:{stable_port}", value["site_host"], value)
+    probe(f"http://127.0.0.1:{candidate_port}", value["site_host"], value)
+    key = signing_key(instance, value["generation"])
+    proposed = public_site(value, stable_port, candidate_port, key)
+    try:
+        atomic_write(public_path, proposed, 0o640)
+        os.chown(public_path, 0, pwd.getpwnam("caddy").pw_gid)
+        run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+        run(["/usr/bin/systemctl", "reload", "caddy.service"])
+        probe(f"http://127.0.0.1:{stable_port}", value["site_host"], value)
+        probe(f"http://127.0.0.1:{candidate_port}", value["site_host"], value)
+        probe(f"https://{value['site_host']}", value["site_host"], value, public=True)
+    except Exception:
+        try:
+            atomic_write(public_path, previous, stat.S_IMODE(previous_stat.st_mode))
+            os.chown(public_path, previous_stat.st_uid, previous_stat.st_gid)
+            run(["/usr/bin/caddy", "validate", "--config", "/etc/caddy/Caddyfile"])
+            run(["/usr/bin/systemctl", "reload", "caddy.service"])
+            probe(f"http://127.0.0.1:{stable_port}", value["site_host"], value)
+            probe(
+                f"https://{value['site_host']}", value["site_host"], value, public=True
+            )
+        except Exception:
+            fail("rollout route rollback failed")
+        fail("rollout route transition failed")
+    state = safe_target_state(value)
+    ROOT_STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ROOT_STATE, 0o700)
+    atomic_write(ROOT_STATE / f"{instance}.json", json.dumps(
+        state, sort_keys=True, separators=(",", ":")
+    ), 0o600)
+    emit_state(state)
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        fail("rollout helper requires root and one instance")
+    if len(sys.argv) == 2:
+        main_prepare(sys.argv[1])
+    elif len(sys.argv) == 3 and sys.argv[1] == "prepare":
+        main_prepare(sys.argv[2])
+    elif len(sys.argv) == 3 and sys.argv[1] == "inspect":
+        state = root_state(sys.argv[2])
+        emit_state({"configured": False} if state is None else state)
+    elif len(sys.argv) == 3 and sys.argv[1] == "weights":
+        main_weights(sys.argv[2])
+    else:
+        fail("rollout helper action is invalid")
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("rollout helper failed", file=sys.stderr)
+        raise SystemExit(1) from None

@@ -62,7 +62,7 @@ The parameterized URIs are resource templates. `gimme://state`, `gimme://fleet`,
 | `list_recovery_points` | Destination read | Read-only, destination-authoritative inventory of one deployment's Recovery Points |
 | `list_operations` | Read | List recent journal events with exact operation, subject, and correlation filters |
 | `inspect_fleet` | Remote read | Inspect bounded Target readiness without changing placement |
-| `inspect_rollout` | Read | Inspect one active or recoverable Rollout without target paths, sockets, ports, output, or credentials |
+| `inspect_rollout` | Remote read | Inspect desired routing and bounded Target health/drift without paths, ports, output, cookies, or credentials |
 
 ## Operation journal
 
@@ -125,6 +125,8 @@ bounded to 200 records per call.
 | `update_deployment` | Local write | Apply an exact deployment update plan |
 | `plan_start_rollout` | Remote read | Verify stable and candidate artifacts, compatibility, capacity, runtime, and the exact zero-traffic preparation effects |
 | `start_rollout` | Remote write | Reserve one temporary slot, materialize an isolated candidate backend, and directly health-check it at zero traffic |
+| `plan_rollout_weights` | Remote read | Review integer weights totaling 100, exact artifacts, affinity generation, route fingerprint, and effects |
+| `apply_rollout_weights` | Remote write | Preflight both backends, install and verify signed sticky routing, then persist the reviewed weights |
 
 ### Fleet placement
 
@@ -242,7 +244,7 @@ the fixed `secret_leak_detected` outcome before publication. Secret values and r
 bounded count. A secret-induced output difference is therefore rejected by the existing
 `non_reproducible_build` rule.
 
-### Zero-traffic Rollout preparation
+### Artifact Rollout preparation and traffic
 
 `plan_start_rollout` is limited to artifact-mode staging and production Deployments. It reads the
 verified live stable release, resolves the different exact artifact implied by current desired
@@ -261,6 +263,25 @@ planned and retried idempotently. `inspect_rollout` and the Rollout resource exp
 Ordinary deploy, promotion, rollback, Deployment removal, and Deployment update remain blocked
 while either an active or recoverable Rollout exists. Later rollout slices own traffic shifting,
 completion, reversal, and cleanup; preparation cannot assign candidate traffic.
+
+`plan_rollout_weights` / `apply_rollout_weights` move an active, ready generation between reviewed
+integer weights from 0 through 100 that total 100. Apply directly probes stable and candidate,
+atomically installs only derived Gimme Caddy policy, and verifies both direct backends and the
+public route. Desired weights change only after verification. A validation, reload, or health
+failure restores the exact prior route and verifies stable service.
+
+The Target owns a generation-scoped signing key that never enters desired state, MCP responses,
+journals, logs, diagnostics, or errors. New cookie-accepting clients receive a Deployment-derived
+cookie with `Secure`, `HttpOnly`, `SameSite=Lax`, and `Path=/`. Valid cohorts remain sticky while
+their backend has nonzero weight and is healthy; a zero-weight backend is omitted and cannot be
+selected by an old cookie. Caddy may temporarily exclude an unhealthy backend, but it never changes
+desired weights or promotes a release. Connection retries are restricted to GET and HEAD.
+
+Weights govern new cookie-accepting cohorts, not a guaranteed instantaneous percentage of global
+requests. Existing cohorts and clients that reject cookies can make the observed request ratio
+differ from configured weights. Inspection reports desired weights, affinity generation,
+eligibility, bounded health, route fingerprint, phase, and safe drift without exposing backend
+addresses, bodies, cookies, request samples, or secrets.
 
 Artifact rollback uses `plan_rollback_deployment` and `rollback_deployment` with the exact plan ID
 and displayed confirmation. It revalidates retained readonly metadata, the canonical tree,

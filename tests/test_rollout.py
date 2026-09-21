@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from contextlib import nullcontext
 from pathlib import Path
@@ -131,6 +132,70 @@ def operations(state: ControlState, calls: list, *, fail_prepare: bool = False):
             raise ValueError("stale")
 
     return store, RolloutOrchestrator(store, artifacts, run, assert_plan)
+
+
+def target_output(value: dict[str, object]) -> str:
+    encoded = base64.b64encode(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+    return f"GIMME_ROLLOUT_STATE|{encoded}"
+
+
+class RoutingTarget:
+    def __init__(self, store: MemoryStore):
+        self.store = store
+        self.observed: dict[str, object] = {"configured": False}
+        self.fail_weights = False
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def __call__(self, task: str, name: str, **kwargs) -> CommandResult:
+        self.calls.append((task, kwargs))
+        if task == "gimme:preflight:artifact-runtimes":
+            extensions = self.store.load().applications["example"].php_extensions
+            return CommandResult([], 0, "\n".join([
+                "GIMME_RUNTIME|php|8.4.1",
+                "GIMME_PLATFORM|linux|x86_64",
+                *(f"GIMME_PHP_EXTENSION|{item}|ready" for item in extensions),
+            ]))
+        if task == "gimme:rollout:inspect":
+            return CommandResult([], 0, target_output(self.observed))
+        if task == "gimme:rollout:weights":
+            if self.fail_weights:
+                raise RuntimeError("private target failure with 192.0.2.8")
+            policy = kwargs["rollout_policy"]
+            self.observed = {
+                "configured": True,
+                "generation": policy["generation"],
+                "phase": "active",
+                "affinity_generation": policy["affinity_generation"],
+                "stable_weight": policy["stable_weight"],
+                "candidate_weight": policy["candidate_weight"],
+                "stable_eligible": policy["stable_weight"] > 0,
+                "candidate_eligible": policy["candidate_weight"] > 0,
+                "stable_health": "ready",
+                "candidate_health": "ready",
+                "stable_identity": policy["stable_identity"],
+                "candidate_identity": policy["candidate_identity"],
+                "route_fingerprint": policy["route_fingerprint"],
+                "outcome": "ready",
+            }
+            return CommandResult([], 0, target_output(self.observed))
+        raise AssertionError(task)
+
+
+def active_rollout() -> tuple[MemoryStore, RolloutOrchestrator, RoutingTarget]:
+    store, starter = operations(rollout_state(), [])
+    plan = starter.plan_start("example-local")
+    starter.start("example-local", plan["plan_id"])
+    target = RoutingTarget(store)
+
+    def assert_plan(expected, actual):
+        if expected["plan_id"] != actual:
+            raise ValueError("stale")
+
+    return store, RolloutOrchestrator(
+        store, ArtifactSupport(store), target, assert_plan
+    ), target
 
 
 def test_start_persists_one_zero_traffic_reservation_and_prepares_backend() -> None:
@@ -304,3 +369,126 @@ def test_recoverable_generation_rejects_changed_deployment_policy() -> None:
 
     with pytest.raises(ValueError, match="generation conflicts"):
         rollout.plan_start("example-local")
+
+
+def test_weight_transition_is_reviewed_and_persists_only_after_target_success() -> None:
+    store, rollout, target = active_rollout()
+
+    plan = rollout.plan_weights("example-local", 90, 10)
+    assert plan["current_weights"] == {"stable": 100, "candidate": 0}
+    assert plan["proposed_weights"] == {"stable": 90, "candidate": 10}
+    assert store.load().rollouts["example-local"].candidate_weight == 0
+
+    result = rollout.apply_weights("example-local", 90, 10, plan["plan_id"])
+
+    assert result["stable_weight"] == 90
+    assert result["candidate_weight"] == 10
+    assert result["affinity_generation"] == result["generation"]
+    assert result["candidate_eligible"] is True
+    policy = next(
+        kwargs["rollout_policy"]
+        for task, kwargs in target.calls
+        if task == "gimme:rollout:weights"
+    )
+    assert "signing" not in json.dumps(policy).lower()
+    assert "cookie" not in json.dumps(policy).lower()
+
+
+@pytest.mark.parametrize(
+    ("stable", "candidate"),
+    [(-1, 101), (101, -1), (50, 49), (True, 99)],
+)
+def test_invalid_rollout_weights_are_rejected(stable, candidate) -> None:
+    _, rollout, _ = active_rollout()
+
+    with pytest.raises(ValueError, match="totaling 100"):
+        rollout.plan_weights("example-local", stable, candidate)
+
+
+def test_failed_weight_transition_keeps_desired_weights_and_redacts_target_error() -> None:
+    store, rollout, target = active_rollout()
+    plan = rollout.plan_weights("example-local", 75, 25)
+    target.fail_weights = True
+
+    with pytest.raises(RuntimeError, match="^rollout_weight_transition_failed$"):
+        rollout.apply_weights("example-local", 75, 25, plan["plan_id"])
+
+    current = store.load().rollouts["example-local"]
+    assert (current.stable_weight, current.candidate_weight) == (100, 0)
+
+
+def test_candidate_traffic_requires_ready_direct_health() -> None:
+    store, rollout, _ = active_rollout()
+    current = store.load().rollouts["example-local"]
+    store.state = store.state.model_copy(update={
+        "rollouts": {
+            **store.state.rollouts,
+            "example-local": current.model_copy(update={"candidate_health": "unavailable"}),
+        }
+    })
+
+    with pytest.raises(ValueError, match="ready candidate backend"):
+        rollout.plan_weights("example-local", 90, 10)
+
+
+def test_rollout_inspection_reports_target_loss_without_private_output() -> None:
+    store, _, _ = active_rollout()
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("ssh output included 192.0.2.9 and a private cookie")
+
+    rollout = RolloutOrchestrator(
+        store, ArtifactSupport(store), unavailable, lambda *_args: None
+    )
+    result = rollout.inspect("example-local")
+
+    assert result["drift"] == "target_unavailable"
+    assert result["stable_health"] == "unknown"
+    assert result["candidate_health"] == "unknown"
+    assert "192.0.2.9" not in json.dumps(result)
+
+
+def test_weight_retry_recovers_after_target_success_before_local_persist() -> None:
+    class InterruptingStore(MemoryStore):
+        interrupt = True
+
+        def update(self, operation):
+            if self.interrupt:
+                self.interrupt = False
+                raise KeyboardInterrupt
+            return super().update(operation)
+
+    initial, _, _ = active_rollout()
+    store = InterruptingStore(initial.load())
+    target = RoutingTarget(store)
+
+    def assert_plan(expected, actual):
+        if expected["plan_id"] != actual:
+            raise ValueError("stale")
+
+    rollout = RolloutOrchestrator(
+        store, ArtifactSupport(store), target, assert_plan,
+    )
+    plan = rollout.plan_weights("example-local", 80, 20)
+    with pytest.raises(KeyboardInterrupt):
+        rollout.apply_weights("example-local", 80, 20, plan["plan_id"])
+
+    assert store.load().rollouts["example-local"].candidate_weight == 0
+    retry = rollout.plan_weights("example-local", 80, 20)
+    assert retry["retry"] is True
+    assert rollout.apply_weights(
+        "example-local", 80, 20, retry["plan_id"]
+    )["candidate_weight"] == 20
+
+
+def test_weight_transition_rejects_route_drift_and_target_loss() -> None:
+    _, rollout, target = active_rollout()
+    plan = rollout.plan_weights("example-local", 50, 50)
+    rollout.apply_weights("example-local", 50, 50, plan["plan_id"])
+    target.observed["route_fingerprint"] = "rollout_" + "3" * 64
+    with pytest.raises(ValueError, match="route is drifted"):
+        rollout.plan_weights("example-local", 90, 10)
+
+    target.observed = {"not": "safe"}
+    with pytest.raises(RuntimeError, match="rollout_target_state_invalid"):
+        rollout.plan_weights("example-local", 90, 10)

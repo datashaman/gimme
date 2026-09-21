@@ -523,6 +523,8 @@ async def test_hard_v7_tool_surface() -> None:
         "inspect_rollout",
         "plan_start_rollout",
         "start_rollout",
+        "plan_rollout_weights",
+        "apply_rollout_weights",
         "plan_target_stack",
         "apply_target_stack",
         "plan_deployment_runtimes",
