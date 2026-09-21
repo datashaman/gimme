@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Extended managed Valkey `inspect_resource` with topology, snapshot and maintenance policy,
+  binding count, pending service updates, and one bounded CloudWatch read (memory, connections,
+  evictions, replica lag, durability lag, durability-buffer rejections, traffic management) that
+  yields fixed warning codes and never changes readiness or exposes node identifiers. The
+  inspection role needs `cloudwatch:GetMetricData`.
 - Limited managed Valkey node types to the instance families AWS documents as durable (`r8g`,
   `r7g`, `r6g`, `m8g`, `m7g`, `m6g`, `c8gn`, `c7gn`). `gimme://aws-networks/{name}/valkey-options`
   lists only those types the account offers, and registering or updating to another family is

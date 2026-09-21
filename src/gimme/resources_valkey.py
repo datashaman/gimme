@@ -6,6 +6,7 @@ import re
 import secrets as secrets_module
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable, NoReturn, Protocol, cast
 
@@ -50,6 +51,23 @@ MODIFIABLE_FIELDS = frozenset({
 # list is the compatibility gate. Widen it only when AWS's page does.
 DURABLE_NODE_FAMILIES = frozenset({"r8g", "r7g", "r6g", "m8g", "m7g", "m6g", "c8gn", "c7gn"})
 UPDATE_ACTIONS_DONE = ("complete", "not-applicable")
+# Bounded, read-only CloudWatch inspection (AWS/ElastiCache, per member node): stable output
+# key, metric name, and the limit above which a fixed warning code is reported. Metrics only
+# warn: Gimme does no sizing, admission control, or scaling. DurabilityLag and the buffer count
+# are always 0 for synchronous durability, so any non-zero value is worth a warning.
+METRICS = (
+    ("memory_usage_percent", "DatabaseMemoryUsagePercentage", 80, "metric_memory_high"),
+    ("connections", "CurrConnections", None, None),
+    ("evictions", "Evictions", 0, "metric_evictions"),
+    ("replica_lag_seconds", "ReplicationLag", 5, "metric_replica_lag"),
+    ("durability_lag_ms", "DurabilityLag", 0, "metric_durability_lag"),
+    ("durability_rejections", "DurabilityBufferExceededErrorCount", 0,
+     "metric_durability_rejections"),
+    ("traffic_management_active", "TrafficManagementActive", 0, "metric_traffic_management"),
+)
+METRICS_WINDOW = timedelta(minutes=15)
+METRICS_PERIOD_SECONDS = 300
+METRICS_MAX_MEMBERS = 8
 ENGINE_VERSION_FLOOR = 9
 PORT = 6379
 # The default user can never authenticate; the administrative identity is limited to
@@ -208,6 +226,8 @@ class GroupObservation:
     pending_engine_version: str | None = None
     pending_node_type: str | None = None
     service_update_overdue: bool = False
+    pending_service_updates: int = 0
+    member_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -267,6 +287,10 @@ class ElastiCacheAdapter(Protocol):
         resource_name: str, secret_names: list[str],
     ) -> int: ...
 
+    def recent_metrics(
+        self, account: AWSProviderAccount, network: AWSNetwork, member_ids: tuple[str, ...]
+    ) -> dict[str, float | None]: ...
+
     def begin_rotation(
         self, account: AWSProviderAccount, network: AWSNetwork, store: AWSSecretsManagerStore,
         store_name: str, resource_name: str, group_id: str, deployment_name: str, generation: int,
@@ -295,6 +319,15 @@ class ElastiCacheAdapter(Protocol):
 def durable_node_type(node_type: str) -> bool:
     parts = node_type.split(".")
     return len(parts) == 3 and parts[0] == "cache" and parts[1] in DURABLE_NODE_FAMILIES
+
+
+def metric_warnings(metrics: dict[str, float | None]) -> list[str]:
+    """Fixed warning codes for metrics above their limits. Never affects readiness."""
+    return [
+        code for key, _name, limit, code in METRICS
+        if code is not None and limit is not None
+        and (value := metrics.get(key)) is not None and value > limit
+    ]
 
 
 def _tags(response: dict[str, object]) -> dict[object, object]:
@@ -365,7 +398,9 @@ class BotoElastiCacheAdapter(AWSAdapter):
         ))
         cluster: dict[str, object] = {}
         # Only an available group can be degraded, so a polling describe skips this call.
-        overdue = status == "available" and self._service_update_overdue(client, group_id)
+        pending_updates, overdue = (
+            self._service_updates(client, group_id) if status == "available" else (0, False)
+        )
         if member_ids:
             try:
                 clusters = client.describe_cache_clusters(CacheClusterId=member_ids[0])
@@ -420,6 +455,8 @@ class BotoElastiCacheAdapter(AWSAdapter):
             pending_engine_version=_text(pending.get("EngineVersion")),
             pending_node_type=_text(pending.get("CacheNodeType")),
             service_update_overdue=overdue,
+            pending_service_updates=pending_updates,
+            member_ids=tuple(member for member in member_ids if isinstance(member, str)),
         )
 
     def _ingress_sources(
@@ -453,21 +490,61 @@ class BotoElastiCacheAdapter(AWSAdapter):
             sources.add(source if isinstance(source, str) else "unknown")
         return tuple(sorted(sources))
 
-    def _service_update_overdue(self, client, group_id: str) -> bool:
-        """True when AWS says a service update missed its recommended apply-by date and is
-        not finished. ponytail: one bounded page of 50 actions for one group."""
+    def _service_updates(self, client, group_id: str) -> tuple[int, bool]:
+        """Unfinished service updates for one group, and whether one missed its recommended
+        apply-by date. ponytail: one bounded page of 50 actions."""
         try:
             response = client.describe_update_actions(
                 ReplicationGroupIds=[group_id], ServiceUpdateStatus=["available"], MaxRecords=50,
             )
         except Exception as exc:
             raise _provider_error(exc, "update_actions", self.error_prefix) from None
-        actions = response.get("UpdateActions") or []
-        return any(
-            isinstance(action, dict) and action.get("SlaMet") == "no"
+        pending = [
+            action for action in response.get("UpdateActions") or []
+            if isinstance(action, dict)
             and action.get("UpdateActionStatus") not in UPDATE_ACTIONS_DONE
-            for action in actions
-        )
+        ]
+        return len(pending), any(action.get("SlaMet") == "no" for action in pending)
+
+    def recent_metrics(
+        self, account: AWSProviderAccount, network: AWSNetwork, member_ids: tuple[str, ...]
+    ) -> dict[str, float | None]:
+        """Maximum of each fixed metric over the last 15 minutes across the group's nodes, or
+        None without a datapoint. One bounded read through the inspection role; no caller input."""
+        session = self._session(account, account.inspection_role_arn, "elasticache-metrics")
+        client = session.client("cloudwatch", region_name=network.region)
+        members = member_ids[:METRICS_MAX_MEMBERS]
+        queries = [
+            {
+                "Id": f"m{index}n{node}",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/ElastiCache", "MetricName": name,
+                        "Dimensions": [{"Name": "CacheClusterId", "Value": member}],
+                    },
+                    "Period": METRICS_PERIOD_SECONDS, "Stat": "Maximum",
+                },
+            }
+            for index, (_key, name, _limit, _code) in enumerate(METRICS)
+            for node, member in enumerate(members)
+        ]
+        end = datetime.now(UTC)
+        found: dict[str, list[float]] = {key: [] for key, *_ in METRICS}
+        try:
+            pages = client.get_paginator("get_metric_data").paginate(
+                MetricDataQueries=queries, StartTime=end - METRICS_WINDOW, EndTime=end,
+            ) if queries else []
+            for page in pages:
+                for result in page.get("MetricDataResults") or []:
+                    identifier = str(result.get("Id"))
+                    key = METRICS[int(identifier[1:].split("n")[0])][0]
+                    found[key].extend(
+                        float(value) for value in result.get("Values") or []
+                        if isinstance(value, (int, float))
+                    )
+        except Exception as exc:
+            raise _provider_error(exc, "metrics", self.error_prefix) from None
+        return {key: max(values) if values else None for key, values in found.items()}
 
     def describe_group(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str

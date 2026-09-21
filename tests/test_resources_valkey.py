@@ -20,8 +20,8 @@ from gimme.resources_valkey import (
     ADMIN_ACCESS_STRING, BotoElastiCacheAdapter, GroupObservation, ISSUES, LARAVEL_COMMANDS,
     MODIFIABLE_FIELDS, SnapshotInfo, ValkeyOptions, apply_binding, apply_destroy, apply_provision,
     binding_username, derive_binding_user_id, derive_group_id, derive_user_group_id, group_drift,
-    laravel_access_string, load_observed, modification_for, namespace_prefixes,
-    structural_issues,
+    laravel_access_string, load_observed, metric_warnings, modification_for,
+    namespace_prefixes, structural_issues,
 )
 from gimme.config import HorizonWorkerConfig
 from gimme.deployer import CommandResult
@@ -64,6 +64,7 @@ def observation(**updates) -> GroupObservation:
         snapshot_window="03:00-04:00", maintenance_window="sun:05:00-sun:06:00",
         automatic_minor_upgrade=False, endpoint="cfg.example.cache.amazonaws.com", port=6379,
         security_group_ids=(GROUP_SG,), ingress_sources=(ADMIN_SG, DEVBOX_SG),
+        member_ids=(f"{GROUP_ID}-0001-001", f"{GROUP_ID}-0001-002"),
     )
     values.update(updates)
     return GroupObservation(**values)  # type: ignore[arg-type]
@@ -74,6 +75,7 @@ FIELDS = {
     "SnapshotRetentionLimit": "snapshot_retention_days", "SnapshotWindow": "snapshot_window",
     "PreferredMaintenanceWindow": "maintenance_window",
 }
+METRIC_KEYS = tuple(key for key, *_ in resources_valkey_module.METRICS)
 OPTIONS = ValkeyOptions(("9.0", "9.1"), ("cache.m7g.large", "cache.m7g.xlarge"))
 
 
@@ -107,6 +109,9 @@ class FakeValkey:
         self.removed_users: list[str] = []
         self.remove_error: ResourceError | None = None
         self.begin_error: ResourceError | None = None
+        self.metrics: dict[str, float | None] = dict.fromkeys(METRIC_KEYS)
+        self.metrics_error: ResourceError | None = None
+        self.metrics_calls: list[tuple[str, ...]] = []
         self._polls = 0
 
     def describe_group(self, account, network, group_id):
@@ -136,6 +141,12 @@ class FakeValkey:
 
     def live_options(self, account, network):
         return self.options
+
+    def recent_metrics(self, account, network, member_ids):
+        self.metrics_calls.append(member_ids)
+        if self.metrics_error is not None:
+            raise self.metrics_error
+        return dict(self.metrics)
 
     def ensure_binding(
         self, account, network, store, store_name, resource_name, group_id, deployment_name,
@@ -620,6 +631,85 @@ def test_inspect_reports_live_state_without_endpoints_or_identifiers(
     text = json.dumps(result)
     for secret in ("cfg.example.cache.amazonaws.com", ARN, GROUP_ID, "6379"):
         assert secret not in text
+
+
+def test_inspect_reports_topology_policy_pending_updates_and_metric_warnings(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = FakeValkey(observation(pending_service_updates=2))
+    adapter.metrics = {**dict.fromkeys(METRIC_KEYS), "memory_usage_percent": 91.5,
+                       "connections": 12, "evictions": 0, "durability_lag_ms": 3}
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+
+    result = server_module.inspect_resource(NAME)
+
+    assert result["phase"] == "ready" and result["issues"] == []
+    assert result["topology"] == {
+        "shards": 1, "members": 2, "multi_az": True, "automatic_failover": True,
+        "transit_encryption": True, "at_rest_encryption": True,
+    }
+    assert result["snapshot_policy"] == {"retention_days": 7, "window": "03:00-04:00"}
+    assert result["maintenance_window"] == "sun:05:00-sun:06:00"
+    assert result["pending_service_updates"] == 2
+    assert result["metrics"] == adapter.metrics
+    assert result["warnings"] == ["metric_memory_high", "metric_durability_lag"]
+    assert adapter.metrics_calls == [observation().member_ids]
+    text = json.dumps(result)
+    for hidden in (observation().member_ids[0], GROUP_ID, ARN, "cfg.example", "6379"):
+        assert hidden not in text
+
+
+def test_a_metrics_failure_neither_fails_nor_degrades_inspection(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey(observation())
+    adapter.metrics_error = ResourceError("aws_elasticache_metrics_access_denied")
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+
+    result = server_module.inspect_resource(NAME)
+
+    assert result["phase"] == "ready" and result["issues"] == []
+    assert result["metrics_error"] == "aws_elasticache_metrics_access_denied"
+    assert "metrics" not in result and "warnings" not in result
+
+
+def test_inspection_reads_no_metrics_without_a_live_available_group(tmp_path, monkeypatch) -> None:
+    adapter = FakeValkey(observation(status="creating", member_ids=()))
+    use_state(tmp_path, monkeypatch, adapter=adapter)
+    server_module.inspect_resource(NAME)
+
+    cached = FakeValkey(observation())
+    use_state(tmp_path, monkeypatch, adapter=cached)
+    plan = server_module.plan_apply_resource(NAME)
+    server_module.apply_resource(NAME, str(plan["plan_id"]))
+    cached.metrics_calls.clear()
+
+    def denied(*args, **kwargs):
+        raise ResourceError("aws_elasticache_describe_access_denied")
+
+    cached.describe_group = denied  # type: ignore[method-assign]
+    result = server_module.inspect_resource(NAME)
+
+    assert result["source"] == "cache"
+    assert adapter.metrics_calls == [] and cached.metrics_calls == []
+    assert not {"metrics", "warnings", "topology"} & set(result)
+
+
+@pytest.mark.parametrize(
+    ("metrics", "expected"),
+    [
+        ({}, []),
+        ({"memory_usage_percent": 80}, []),
+        ({"memory_usage_percent": 80.1}, ["metric_memory_high"]),
+        ({"evictions": 1}, ["metric_evictions"]),
+        ({"replica_lag_seconds": 5}, []),
+        ({"replica_lag_seconds": 5.5}, ["metric_replica_lag"]),
+        ({"durability_lag_ms": 1, "durability_rejections": 1},
+         ["metric_durability_lag", "metric_durability_rejections"]),
+        ({"traffic_management_active": 1}, ["metric_traffic_management"]),
+        ({"connections": 100000, "evictions": None}, []),
+    ],
+)
+def test_metric_warnings_use_fixed_limits(metrics, expected) -> None:
+    assert metric_warnings(metrics) == expected
 
 
 def test_inspect_falls_back_to_the_cache_with_a_bounded_refresh_error(
@@ -1390,15 +1480,17 @@ def test_describe_reads_pending_values_and_overdue_service_updates(monkeypatch) 
 
     assert observed == observation(
         pending_engine_version="9.1", pending_node_type="cache.m7g.xlarge",
-        service_update_overdue=True,
+        service_update_overdue=True, pending_service_updates=2,
     )
 
 
 @pytest.mark.parametrize(
-    "action", [{"SlaMet": "n/a", "UpdateActionStatus": "not-applied"},
-               {"SlaMet": "no", "UpdateActionStatus": "not-applicable"}],
+    ("action", "pending"), [({"SlaMet": "n/a", "UpdateActionStatus": "not-applied"}, 1),
+                            ({"SlaMet": "no", "UpdateActionStatus": "not-applicable"}, 0)],
 )
-def test_only_an_unfinished_action_past_its_apply_by_date_is_overdue(monkeypatch, action) -> None:
+def test_only_an_unfinished_action_past_its_apply_by_date_is_overdue(
+    monkeypatch, action, pending
+) -> None:
     client, stub = stubbed("elasticache")
     ec2, ec2_stub = stubbed("ec2")
     expect_describe(stub, ec2_stub, actions=[action])
@@ -1406,7 +1498,10 @@ def test_only_an_unfinished_action_past_its_apply_by_date_is_overdue(monkeypatch
     account, network, _ = context()
 
     with stub, ec2_stub:
-        assert adapter.describe_group(account, network, GROUP_ID).service_update_overdue is False
+        observed = adapter.describe_group(account, network, GROUP_ID)
+
+    assert observed.service_update_overdue is False
+    assert observed.pending_service_updates == pending
 
 
 def test_a_service_update_read_failure_is_bounded_and_fails_the_describe(monkeypatch) -> None:
@@ -1539,6 +1634,85 @@ def test_live_options_page_through_versions_and_offerings(monkeypatch) -> None:
         ("9.0", "9.1", "10.0"), ("cache.c7gn.large", "cache.m7g.large", "cache.m7g.xlarge")
     )
     stub.assert_no_pending_responses()
+
+
+MEMBERS = observation().member_ids
+
+
+def metric_queries(members=MEMBERS) -> list[dict[str, object]]:
+    return [
+        {
+            "Id": f"m{index}n{node}",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/ElastiCache", "MetricName": name,
+                    "Dimensions": [{"Name": "CacheClusterId", "Value": member}],
+                },
+                "Period": 300, "Stat": "Maximum",
+            },
+        }
+        for index, (_key, name, _limit, _code) in enumerate(resources_valkey_module.METRICS)
+        for node, member in enumerate(members)
+    ]
+
+
+def test_recent_metrics_asks_for_the_fixed_queries_and_takes_the_maximum(monkeypatch) -> None:
+    from botocore.stub import ANY
+
+    client, stub = stubbed("cloudwatch")
+    stub.add_response(
+        "get_metric_data",
+        {"NextToken": "more", "MetricDataResults": [
+            {"Id": "m0n0", "Values": [41.0, 55.5]}, {"Id": "m0n1", "Values": [12.0]},
+            {"Id": "m2n0", "Values": [0.0]},
+        ]},
+        {"MetricDataQueries": metric_queries(), "StartTime": ANY, "EndTime": ANY},
+    )
+    stub.add_response(
+        "get_metric_data",
+        {"MetricDataResults": [
+            {"Id": "m1n1", "Values": [3]}, {"Id": "m3n1", "Values": [0.25]},
+            {"Id": "m6n0", "Values": []},
+        ]},
+        {"MetricDataQueries": metric_queries(), "StartTime": ANY, "EndTime": ANY,
+         "NextToken": "more"},
+    )
+    adapter = adapter_with(monkeypatch, ("cloudwatch", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        metrics = adapter.recent_metrics(account, network, MEMBERS)
+
+    stub.assert_no_pending_responses()
+    assert metrics == {
+        "memory_usage_percent": 55.5, "connections": 3.0, "evictions": 0.0,
+        "replica_lag_seconds": 0.25, "durability_lag_ms": None,
+        "durability_rejections": None, "traffic_management_active": None,
+    }
+
+
+def test_recent_metrics_is_bounded_in_members_and_failures(monkeypatch) -> None:
+    from botocore.stub import ANY
+
+    client, stub = stubbed("cloudwatch")
+    many = tuple(f"{GROUP_ID}-0001-{index:03d}" for index in range(1, 30))
+    stub.add_response(
+        "get_metric_data", {"MetricDataResults": []},
+        {"MetricDataQueries": metric_queries(many[:8]), "StartTime": ANY, "EndTime": ANY},
+    )
+    stub.add_client_error(
+        "get_metric_data", "AccessDenied", service_message="arn:aws:iam::123:role/secret"
+    )
+    adapter = adapter_with(monkeypatch, ("cloudwatch", (client, stub)))
+    account, network, _ = context()
+
+    with stub:
+        assert set(adapter.recent_metrics(account, network, many).values()) == {None}
+        with pytest.raises(ResourceError) as raised:
+            adapter.recent_metrics(account, network, MEMBERS)
+
+    assert str(raised.value) == "aws_elasticache_metrics_access_denied"
+    assert "secret" not in str(raised.value)
 
 
 def test_live_options_failures_are_bounded(monkeypatch) -> None:
