@@ -3361,6 +3361,26 @@ def test_a_restore_recreates_from_the_snapshot_keeping_every_credential_then_ver
     assert "password" not in json.dumps(result).lower()
 
 
+def test_a_restore_reads_the_group_when_the_adapter_only_acknowledges_the_create(
+    tmp_path, monkeypatch, instant
+) -> None:
+    # The real adapter's create_group returns None (AWS accepting the call is the
+    # acknowledgement); a live restore crashed on `live.status` right after creating the group.
+    adapter, _calls = lost(tmp_path, monkeypatch, instant)
+    real_create = adapter.create_group
+
+    def acknowledged_only(*args, **kwargs):
+        real_create(*args, **kwargs)
+        return None
+
+    monkeypatch.setattr(adapter, "create_group", acknowledged_only)
+
+    result = restore()
+
+    assert result["restored"] is True and result["phase"] == "ready"
+    assert adapter.create_calls == 1
+
+
 @pytest.mark.parametrize(
     ("snapshot", "code"),
     [

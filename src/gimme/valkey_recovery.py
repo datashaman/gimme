@@ -103,6 +103,11 @@ def apply_restore(
             account, network, resource, resource_name, group_id, store, store_name,
             snapshot_name=snapshot_name, restore_users=restore_targets(root, resource_name),
         )
+        # The real adapter returns nothing: AWS accepting the create is the acknowledgement.
+        if live is None:
+            live = adapter.describe_group(account, network, group_id)
+            if live is None:
+                raise ResourceError("aws_elasticache_group_missing_after_create")
     marker = cast(dict[str, object], marker)  # a live group is only reached with a marker
     deadline = now() + POLL_BUDGET_SECONDS
     while live.status not in ("available", "create-failed") and now() < deadline:
