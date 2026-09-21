@@ -168,6 +168,7 @@ def run_scenario() -> dict[str, object]:
         port = _port()
         options = (
             f"-h 127.0.0.1 -p {port} -c ssl=on "
+            f"-c unix_socket_directories={data} "
             f"-c ssl_cert_file={server_certificate} -c ssl_key_file={server_key}"
         )
         server_log = data / "server.log"
