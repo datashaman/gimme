@@ -636,7 +636,30 @@ class ManagedResourceOrchestrator:
                 effective_durability=live.effective_durability,
                 issues=issues,
                 drift=resources_valkey_module.group_drift(resource, live),
+                topology={
+                    "shards": live.shards, "members": live.members, "multi_az": live.multi_az,
+                    "automatic_failover": live.automatic_failover,
+                    "transit_encryption": live.transit_encryption,
+                    "at_rest_encryption": live.at_rest_encryption,
+                },
+                snapshot_policy={
+                    "retention_days": live.snapshot_retention_days, "window": live.snapshot_window,
+                },
+                maintenance_window=live.maintenance_window,
+                pending_service_updates=live.pending_service_updates,
             )
+            if live.status == "available" and live.member_ids:
+                # Metrics only warn; a failed read never changes the phase or fails inspection.
+                try:
+                    metrics = self.elasticache_valkey.recent_metrics(
+                        state.provider_accounts[network.provider_account], network,
+                        live.member_ids,
+                    )
+                except ResourceError as exc:
+                    result["metrics_error"] = str(exc)
+                else:
+                    result["metrics"] = metrics
+                    result["warnings"] = resources_valkey_module.metric_warnings(metrics)
         elif observed is not None:
             result.update(
                 phase=progress.get("phase", "destroying")
@@ -652,10 +675,13 @@ class ManagedResourceOrchestrator:
         elif operation == "provisioning":
             result["phase"] = "pending"
         if observed is not None:
+            allocations = cast(dict[str, dict[str, object]], observed["allocations"])
             result["allocations"] = {
                 deployment_name: {"status": allocation["status"]}
-                for deployment_name, allocation in cast(
-                    dict[str, dict[str, object]], observed["allocations"]
-                ).items()
+                for deployment_name, allocation in allocations.items()
             }
+            if live is not None:
+                result["binding_count"] = sum(
+                    allocation["status"] == "active" for allocation in allocations.values()
+                )
         return result

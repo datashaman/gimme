@@ -340,7 +340,10 @@ The same tools accept an AWS ElastiCache Valkey resource (provider `aws_elastica
 [`use-aws-elasticache-valkey.md`](../how-to/use-aws-elasticache-valkey.md)).
 `plan_apply_resource` and `apply_resource` create its replication group, and
 `inspect_resource` reports secret-free `phase`, `status`, `engine_version`,
-`effective_durability`, fixed `issues` codes, and `drift`, never an endpoint or identifier.
+`effective_durability`, fixed `issues` codes, `drift`, `topology`, snapshot and maintenance policy,
+`pending_service_updates`, `binding_count`, and, for an available group, bounded recent CloudWatch
+`metrics` with fixed `warnings` codes (or a bounded `metrics_error`), never an endpoint or
+identifier.
 `apply_resource` on an existing group makes one modification of only the differing same-major
 `engine_version`, `node_type`, snapshot, and maintenance fields, and refuses anything else with
 a fixed `aws_elasticache_modify_forbidden_<reason>` code before any change. A bound Deployment

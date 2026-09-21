@@ -102,7 +102,8 @@ The resolver role already reads the workload namespace, which a restore uses to 
 user from the credential already stored, and rotation reads the same secret. Whether these
 statements are sufficient is unverified.
 
-Four read-only calls do not support resource-level permissions, so they need `"Resource": "*"`:
+Five read-only calls do not support resource-level permissions, so they need `"Resource": "*"`
+(`cloudwatch:GetMetricData` serves the bounded metrics in [Inspect and remove](#inspect-and-remove)):
 
 ```json
 {
@@ -112,7 +113,8 @@ Four read-only calls do not support resource-level permissions, so they need `"R
     "elasticache:DescribeUpdateActions",
     "elasticache:DescribeCacheEngineVersions",
     "elasticache:DescribeReservedCacheNodesOfferings",
-    "ec2:DescribeSecurityGroupRules"
+    "ec2:DescribeSecurityGroupRules",
+    "cloudwatch:GetMetricData"
   ],
   "Resource": "*"
 }
@@ -525,9 +527,28 @@ ones.
 ## Inspect and remove
 
 `inspect_resource` describes the group live and returns `phase`, `status`, `engine_version`,
-`effective_durability`, and `issues`. It never returns an endpoint, address, ARN, user, group
-identifier, or secret identifier. If AWS cannot be reached it returns the last cached state
-with a bounded `refresh_error`.
+`effective_durability`, `issues`, `drift`, `topology` (shards, members, Multi-AZ, automatic
+failover, TLS, and encryption at rest), `snapshot_policy`, `maintenance_window`,
+`pending_service_updates` (unfinished updates AWS lists for the group), and `binding_count`. It
+never returns an endpoint, address, ARN, node or user identifier, or secret identifier. If AWS
+cannot be reached it returns the last cached state with a bounded `refresh_error`, and none of
+the live-only fields.
+
+For an `available` group it also reads CloudWatch once, through the inspection role, for the
+maximum over the last 15 minutes across the nodes, and returns `metrics` (`null` without a
+datapoint): `memory_usage_percent`, `connections`, `evictions`, `replica_lag_seconds`,
+`durability_lag_ms`, `durability_rejections`, and `traffic_management_active`, from the
+`AWS/ElastiCache` metrics `DatabaseMemoryUsagePercentage`, `CurrConnections`, `Evictions`,
+`ReplicationLag`, `DurabilityLag`, `DurabilityBufferExceededErrorCount`, and
+`TrafficManagementActive`. `warnings` lists fixed codes, never readiness `issues`: `metric_memory_high`
+(above 80), `metric_evictions` (above 0; the parameter group is `noeviction`),
+`metric_replica_lag` (above 5 seconds), `metric_durability_lag` and
+`metric_durability_rejections` (above 0; AWS documents both as always 0 for synchronous
+durability), and `metric_traffic_management` (above 0). Metrics change no phase and trigger no
+sizing, admission control, or scaling. A failed CloudWatch read returns a bounded `metrics_error`
+(for example `aws_elasticache_metrics_access_denied`) and everything else as usual. The metric
+names and the `CacheClusterId` dimension come from AWS's documentation and are unverified until
+run against a live account.
 
 `plan_cleanup_resource` and `apply_cleanup_resource` require `RETAIN <name>` and remove only the
 local registration, writing a Retained Resource tombstone. The replication group, its data,
@@ -544,7 +565,7 @@ are never included. Operations include `subnet_group`, `parameter_group`,
 `parameter_group_verify`, `parameter_group_modify`, `user_create`, `user_group_create`,
 `user_describe`, `user_bind`, `user_group_bind`, `user_restore`, `user_group_restore`, `snapshots`,
 `credential_read`, `rotate_user`, `security_group`, `tags`, `describe`, `describe_cluster`, `update_actions`, `node_types`,
-`options`, `modify`, and `create`.
+`options`, `metrics`, `modify`, and `create`.
 `aws_elasticache_group_ownership_mismatch` and
 `aws_elasticache_parameter_group_ownership_mismatch` mean a same-named object exists that this
 Resource does not own; rename or delete it yourself. `unavailable` covers anything unclassified,
