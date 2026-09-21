@@ -108,6 +108,8 @@ class FakeValkey:
         self.credentials: dict[str, list[str]] = {}
         self.removed_users: list[str] = []
         self.events: list[str] = []
+        self.scheduled: list[tuple[str, str, str]] = []
+        self.schedule_error: ResourceError | None = None
         self.remove_error: ResourceError | None = None
         self.begin_error: ResourceError | None = None
         self.metrics: dict[str, float | None] = dict.fromkeys(METRIC_KEYS)
@@ -206,9 +208,22 @@ class FakeValkey:
     def disable_binding(self, account, network, group_id, user_id):
         self.events.append(f"disable:{user_id}")
 
+    def ensure_admin_capture_access(self, account, network, resource_name):
+        self.events.append("admin-access")
+
+    def resolve_admin_credential(self, account, store, resource_name):
+        return {"username": "gimme-admin", "password": PASSWORD}
+
+    def schedule_credential_deletion(self, account, store, store_name, resource_name, deployment):
+        if self.schedule_error is not None:
+            raise self.schedule_error
+        self.events.append(f"schedule:{deployment}")
+        self.scheduled.append((store_name, resource_name, deployment))
+
     def remove_user(self, account, network, resource_name, user_id):
         assert account.destructive_role_arn is not None
         self.removed_users.append(user_id)
+        self.events.append(f"remove:{user_id}")
         if self.remove_error is not None:
             raise self.remove_error
         self.users.discard(user_id)
@@ -4762,3 +4777,413 @@ def test_an_unfinished_unbind_still_blocks_destruction(tmp_path, monkeypatch) ->
 
     with pytest.raises(ResourceError, match="^aws_elasticache_destroy_bindings_remain$"):
         server_module.plan_destroy_resource(NAME)
+
+
+# --- allocation purge ---------------------------------------------------------------------
+
+PURGE_CONFIRM = f"PURGE {DEPLOYMENT} FROM {NAME}"
+PURGE_DONE = "GIMME_VALKEY_PURGE|0|no"
+
+
+def purge_runs(monkeypatch, adapter: FakeValkey, outputs) -> list[dict[str, object]]:
+    """Every remote purge round, answered from `outputs` (a string, or an exception to raise).
+    The credential file is read while it exists, to prove its mode and that only it holds the
+    password."""
+    calls: list[dict[str, object]] = []
+    queue = list(outputs)
+
+    def run(task, *args, **kwargs):
+        assert task == "gimme:resource:purge-valkey-allocation"
+        secret = Path(kwargs["secret_file"])
+        calls.append({
+            "task": task, **{key: value for key, value in kwargs.items() if key != "secret_file"},
+            "mode": stat.S_IMODE(secret.stat().st_mode), "secret": json.loads(secret.read_text()),
+        })
+        adapter.events.append("purge-round")
+        item = queue.pop(0) if queue else PURGE_DONE
+        if isinstance(item, Exception):
+            raise item
+        return CommandResult(["dep"], 0, item)
+
+    monkeypatch.setattr(server_module.runner, "run", run)
+    return calls
+
+
+def purge_plan(deployment: str = DEPLOYMENT) -> dict[str, object]:
+    return server_module.plan_purge_resource_allocation(NAME, deployment)
+
+
+def apply_purge(plan: dict[str, object] | None = None, confirmation: str = PURGE_CONFIRM):
+    plan = plan or purge_plan()
+    return server_module.apply_purge_resource_allocation(
+        NAME, DEPLOYMENT, str(plan["plan_id"]), confirmation
+    )
+
+
+def test_a_purge_plan_without_a_valkey_policy_warns_that_recovery_is_not_guaranteed(
+    tmp_path, monkeypatch
+) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch)
+
+    plan = purge_plan()
+
+    assert plan["confirmation"] == PURGE_CONFIRM and plan["kind"] == "resource_allocation_purge"
+    assert plan["recovery_evidence"] is None and plan["recovery_expected"] is False
+    assert any("not guaranteed" in warning for warning in plan["warnings"])
+    text = json.dumps(plan)
+    assert USER_G1 not in text and PASSWORD not in text and "password" not in text.lower()
+    assert "{gimme:example-local}:" in text
+
+
+def test_a_purge_plan_with_fresh_evidence_names_it_and_needs_no_warning(
+    tmp_path, monkeypatch
+) -> None:
+    detached_and_destroyable(tmp_path, monkeypatch, expected=True)
+
+    plan = purge_plan()
+
+    assert cast(dict, plan["recovery_evidence"])["recovery_point_id"] == "rp_" + "a" * 20
+    assert plan["warnings"] == [] and plan["recovery_expected"] is True
+
+
+@pytest.mark.parametrize(
+    "problem", ["evidence_missing", "evidence_stale", "bound", "active", "absent", "role"],
+)
+def test_a_purge_plan_fails_closed_until_it_is_safe(tmp_path, monkeypatch, problem) -> None:
+    match problem:
+        case "evidence_missing":
+            detached_and_destroyable(tmp_path, monkeypatch, expected=False)
+            expected = "aws_elasticache_allocation_recovery_evidence_missing"
+        case "evidence_stale":
+            detached_and_destroyable(tmp_path, monkeypatch, expected=True)
+            monkeypatch.setattr(server_module, "_recovery_evidence", lambda *a, **k: None)
+            expected = "aws_elasticache_allocation_recovery_evidence_stale"
+        case "bound":
+            detached_and_destroyable(tmp_path, monkeypatch)
+            document = server_module.store.load().model_dump(mode="json")
+            document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+                "resource": NAME, "uses": ["cache"]}
+            server_module.store.save(ControlState.model_validate(document))
+            expected = "aws_elasticache_allocation_still_bound"
+        case "active":
+            detachable(tmp_path, monkeypatch)
+            document = server_module.store.load().model_dump(mode="json")
+            document["provider_accounts"]["main"]["destructive_role_arn"] = DESTROYER
+            document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+                "resource": "devbox-valkey", "uses": ["cache"]}
+            server_module.store.save(ControlState.model_validate(document))
+            expected = "aws_elasticache_detached_allocation_missing"
+        case "absent":
+            detached_and_destroyable(tmp_path, monkeypatch)
+            expected = "aws_elasticache_detached_allocation_missing"
+        case _:
+            detached_and_destroyable(tmp_path, monkeypatch)
+            document = server_module.store.load().model_dump(mode="json")
+            document["provider_accounts"]["main"]["destructive_role_arn"] = None
+            server_module.store.save(ControlState.model_validate(document))
+            expected = "aws_elasticache_destroy_role_missing"
+
+    with pytest.raises(ResourceError, match=f"^{expected}$"):
+        if problem == "absent":
+            purge_plan("nobody")
+        else:
+            purge_plan()
+
+
+def test_a_purge_deletes_keys_then_users_then_schedules_the_secret_and_forgets_the_allocation(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    adapter.events.clear()
+    calls = purge_runs(monkeypatch, adapter, ["GIMME_VALKEY_PURGE|7|no", PURGE_DONE])
+
+    result = apply_purge()
+
+    assert result["purged"] is True and result["keys_deleted"] == 7
+    assert result["secret_recovery_window_days"] == 30
+    assert adapter.events == [
+        "admin-access", "purge-round", "purge-round", f"remove:{USER_G1}",
+        f"schedule:{DEPLOYMENT}",
+    ]
+    assert adapter.scheduled == [("workload-secrets", NAME, DEPLOYMENT)]
+    assert [call["resource_cache_prefix"] for call in calls] == ["{gimme:example-local}:"] * 2
+    assert calls[0]["resource_endpoint"] == ("cfg.example.cache.amazonaws.com", 6379)
+    assert calls[0]["mode"] == 0o600
+    assert calls[0]["secret"] == {"username": "gimme-admin", "password": PASSWORD}
+    observed = load_observed(server_module.store.root, NAME)
+    assert observed is not None and DEPLOYMENT not in cast(dict, observed["allocations"])
+    assert resources_valkey_module.read_marker(server_module.store.root, "purging", NAME) is None
+    text = json.dumps(result)
+    assert PASSWORD not in text and USER_G1 not in text
+
+
+def test_a_purge_that_needs_more_rounds_resumes_with_the_same_plan(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    calls = purge_runs(monkeypatch, adapter, ["GIMME_VALKEY_PURGE|100|yes"] * 6)
+    plan = purge_plan()
+
+    first = apply_purge(plan)
+
+    assert first["purged"] is False and first["phase"] == "purging" and first["deleted"] == 600
+    assert len(calls) == 6 and adapter.removed_users == [] and adapter.scheduled == []
+    assert allocation()["status"] == "detached"
+    assert purge_plan()["plan_id"] == plan["plan_id"]
+
+    second = apply_purge(plan)
+
+    assert second["purged"] is True and second["keys_deleted"] == 600
+    assert len(calls) == 7 and adapter.removed_users == [USER_G1]
+
+
+def test_a_purge_in_progress_blocks_binding_destruction_and_other_purges(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    purge_runs(monkeypatch, adapter, ["GIMME_VALKEY_PURGE|100|yes"] * 6)
+    apply_purge()
+
+    inspected = server_module.inspect_resource(NAME)
+    assert inspected["operation"] == "purging"
+    assert inspected["progress"] == {"deployment": DEPLOYMENT, "phase": "prepared", "deleted": 600}
+
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": "devbox-valkey", "uses": ["cache"]}
+    server_module.store.save(ControlState.model_validate(document))
+    with pytest.raises(ResourceError, match="^aws_elasticache_purge_in_progress$"):
+        server_module.apply_destroy_resource(
+            NAME, str(server_module.plan_destroy_resource(NAME)["plan_id"]), CONFIRM
+        )
+    with pytest.raises(ResourceError, match="^aws_elasticache_purge_in_progress$"):
+        resources_valkey_module.refuse_while_busy(server_module.store.root, NAME)
+
+
+def test_a_round_failure_keeps_the_marker_and_deletes_nothing_else(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    for failure in (RuntimeError(f"boom {PASSWORD}"), "garbage", "GIMME_VALKEY_PURGE|x|no"):
+        purge_runs(monkeypatch, adapter, [failure])
+        with pytest.raises(ResourceError) as raised:
+            apply_purge()
+        assert str(raised.value) == "aws_elasticache_purge_keys_failed"
+        assert PASSWORD not in repr(raised.value)
+        marker = resources_valkey_module.load_purge_marker(server_module.store.root, NAME)
+        assert marker is not None and marker["phase"] == "prepared"
+    assert adapter.removed_users == [] and adapter.scheduled == []
+
+    purge_runs(monkeypatch, adapter, [PURGE_DONE])
+    assert apply_purge()["purged"] is True
+
+
+def test_the_secret_is_scheduled_only_after_the_users_are_gone_and_a_retry_resumes(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    purge_runs(monkeypatch, adapter, [])
+    adapter.schedule_error = ResourceError("aws_elasticache_secret_schedule_throttled")
+
+    with pytest.raises(ResourceError, match="secret_schedule_throttled"):
+        apply_purge()
+
+    marker = resources_valkey_module.load_purge_marker(server_module.store.root, NAME)
+    assert marker is not None and marker["phase"] == "user_deleted"
+    assert allocation()["status"] == "detached" and adapter.removed_users == [USER_G1]
+
+    adapter.schedule_error = None
+    assert apply_purge()["purged"] is True
+    assert adapter.removed_users == [USER_G1] and len(adapter.scheduled) == 1
+
+
+def test_a_purge_finished_but_not_cleared_is_cleared_by_repeating_it(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    purge_runs(monkeypatch, adapter, [])
+    plan = purge_plan()
+    apply_purge(plan)
+    resources_valkey_module.write_marker(server_module.store.root, "purging", NAME, {
+        "schema_version": 1, "resource": NAME, "deployment": DEPLOYMENT,
+        "phase": "secret_scheduled", "plan": plan, "deleted": 0,
+    })
+
+    result = apply_purge(plan)
+
+    assert result["purged"] is True and result["changed"] is False
+    assert resources_valkey_module.read_marker(server_module.store.root, "purging", NAME) is None
+    assert len(adapter.scheduled) == 1
+
+
+def test_a_purge_needs_the_exact_confirmation_and_a_current_plan(tmp_path, monkeypatch) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    calls = purge_runs(monkeypatch, adapter, [])
+    plan = purge_plan()
+
+    with pytest.raises(ValueError, match="confirmation must exactly equal"):
+        apply_purge(plan, "PURGE")
+    with pytest.raises(ValueError, match="invalid or stale"):
+        server_module.apply_purge_resource_allocation(
+            NAME, DEPLOYMENT, "plan_" + "0" * 20, PURGE_CONFIRM
+        )
+
+    path = server_module.store.root / "observed-resources" / f"{NAME}.json"
+    document = json.loads(path.read_text())
+    document["allocations"][DEPLOYMENT]["secret_version_id"] = "changed"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="invalid or stale"):
+        apply_purge(plan)
+    assert calls == [] and adapter.removed_users == []
+
+
+@pytest.mark.parametrize("change", ["identity", "status"])
+def test_a_purge_needs_the_planned_group_to_be_available(
+    tmp_path, monkeypatch, change
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    calls = purge_runs(monkeypatch, adapter, [])
+    plan = purge_plan()
+    assert adapter.live is not None
+    changed = dataclasses.replace(
+        adapter.live,
+        **({"identity": ARN + "x"} if change == "identity" else {"status": "modifying"}),
+    )
+    monkeypatch.setattr(adapter, "describe_group", lambda *args: changed)
+
+    with pytest.raises(ResourceError, match=(
+        "^aws_elasticache_purge_identity_changed$" if change == "identity"
+        else "^aws_elasticache_purge_resource_not_ready$"
+    )):
+        apply_purge(plan)
+    assert calls == [] and adapter.removed_users == []
+
+
+def test_a_purge_also_deletes_the_retired_users_of_earlier_generations(
+    tmp_path, monkeypatch
+) -> None:
+    adapter = detached_and_destroyable(tmp_path, monkeypatch)
+    document = server_module.store.load().model_dump(mode="json")
+    document["deployments"][DEPLOYMENT]["resources"]["valkey"] = {
+        "resource": NAME, "uses": ["cache"]}
+    server_module.store.save(ControlState.model_validate(document))
+    bind()
+    unbind()
+    assert allocation()["retired_user_ids"] == [USER_G1]
+    adapter.events.clear()
+    purge_runs(monkeypatch, adapter, [])
+
+    apply_purge()
+
+    assert adapter.removed_users == [USER_G2, USER_G1]
+
+
+def test_purge_never_targets_another_deployments_prefix() -> None:
+    from gimme.resource_retirement_orchestration import _purge_round_result
+
+    assert _purge_round_result("[dep] GIMME_VALKEY_PURGE|3|yes\n") == (3, True)
+    for output in ("", "GIMME_VALKEY_PURGE|3", "GIMME_VALKEY_PURGE|-1|no", "X|3|no"):
+        with pytest.raises(ResourceError, match="^aws_elasticache_purge_keys_failed$"):
+            _purge_round_result(output)
+
+
+# --- the boto adapter: scheduling a credential secret -------------------------------------
+
+
+def secret_tags(deployment: str = DEPLOYMENT, store: str = "workload-secrets") -> list[dict]:
+    return [
+        {"Key": "gimme:resource", "Value": NAME}, {"Key": "gimme:secret-store", "Value": store},
+        {"Key": "gimme:deployment", "Value": deployment},
+    ]
+
+
+def scheduler(monkeypatch, *, role: bool = True):
+    client, stub = stubbed("secretsmanager")
+    adapter = adapter_with(monkeypatch, ("secretsmanager", (client, stub)))
+    account, _network, store = context()
+    if role:
+        account = account.model_copy(update={"destructive_role_arn": DESTROYER})
+    return adapter, stub, account, store
+
+
+def test_a_credential_secret_is_scheduled_after_its_tags_match(monkeypatch) -> None:
+    adapter, stub, account, store = scheduler(monkeypatch)
+    stub.add_response("describe_secret", {"Tags": secret_tags()}, {"SecretId": ANY})
+    stub.add_response(
+        "delete_secret", {}, {"SecretId": ANY, "RecoveryWindowInDays": 30},
+    )
+
+    with stub:
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [secret_tags("someone-else"), secret_tags(store="other-store"), []],
+)
+def test_a_credential_secret_that_is_not_this_deployments_is_never_scheduled(
+    monkeypatch, tags
+) -> None:
+    adapter, stub, account, store = scheduler(monkeypatch)
+    stub.add_response("describe_secret", {"Tags": tags}, {"SecretId": ANY})
+
+    with stub, pytest.raises(
+        ResourceError, match="^aws_elasticache_purge_secret_ownership_mismatch$"
+    ):
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+
+
+def test_an_already_scheduled_or_missing_credential_secret_counts_as_done(monkeypatch) -> None:
+    adapter, stub, account, store = scheduler(monkeypatch)
+    stub.add_response(
+        "describe_secret",
+        {"Tags": secret_tags(), "DeletedDate": datetime.datetime(2026, 1, 1)},
+        {"SecretId": ANY},
+    )
+    stub.add_client_error("describe_secret", "ResourceNotFoundException")
+
+    with stub:
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+
+
+def test_scheduling_a_credential_secret_needs_the_destructive_role_and_fails_bounded(
+    monkeypatch,
+) -> None:
+    adapter, _stub, account, store = scheduler(monkeypatch, role=False)
+    with pytest.raises(ResourceError, match="^aws_elasticache_destroy_role_missing$"):
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+
+    adapter, stub, account, store = scheduler(monkeypatch)
+    stub.add_response("describe_secret", {"Tags": secret_tags()}, {"SecretId": ANY})
+    stub.add_client_error("delete_secret", "AccessDeniedException", f"denied {PASSWORD}")
+    with stub, pytest.raises(ResourceError) as raised:
+        adapter.schedule_credential_deletion(account, store, "workload-secrets", NAME, DEPLOYMENT)
+    assert str(raised.value) == "aws_elasticache_secret_schedule_access_denied"
+    assert PASSWORD not in repr(raised.value)
+
+
+def test_retained_credentials_are_deleted_only_when_secrets_manager_tags_match(
+    monkeypatch,
+) -> None:
+    reader, reader_stub = stubbed("secretsmanager")
+    killer, killer_stub = stubbed("secretsmanager")
+    calls = iter([reader, killer])
+    adapter = BotoElastiCacheAdapter()
+    monkeypatch.setattr(adapter, "_session", lambda *a, **k: StubbedSession(
+        {"secretsmanager": next(calls)}))
+    account, _network, store = context()
+    account = account.model_copy(update={"destructive_role_arn": DESTROYER})
+    tags = [{"Key": "gimme:resource", "Value": NAME},
+            {"Key": "gimme:secret-store", "Value": "workload-secrets"}]
+    reader_stub.add_response("describe_secret", {"Tags": tags}, {"SecretId": ANY})
+    killer_stub.add_response(
+        "delete_secret", {}, {"SecretId": ANY, "ForceDeleteWithoutRecovery": True}
+    )
+
+    with reader_stub, killer_stub:
+        deleted = adapter.delete_retained_secrets(
+            account, store, "workload-secrets", NAME, ["_admin"]
+        )
+
+    assert deleted == 1

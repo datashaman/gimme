@@ -109,6 +109,9 @@ DETACHED_FIELDS = frozenset({"detached_at", "recovery_expected", "recovery_evide
 ALLOCATION_OPTIONAL = frozenset({"generation", "retired_user_ids"}) | DETACHED_FIELDS
 # Disabled users left behind by rebinding, deleted with the destructive role at purge or destroy.
 MAX_RETIRED_USERS = 8
+# A purged credential secret stays recoverable this long before Secrets Manager deletes it.
+DELETION_RECOVERY_DAYS = 30
+PURGE_PHASES = ("prepared", "keys_deleted", "user_deleted", "secret_scheduled")
 
 
 def validate_update(
@@ -319,6 +322,11 @@ class ElastiCacheAdapter(Protocol):
         self, account: AWSProviderAccount, network: AWSNetwork, resource_name: str, user_id: str,
     ) -> None: ...
 
+    def schedule_credential_deletion(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, store_name: str,
+        resource_name: str, deployment_name: str,
+    ) -> None: ...
+
     def delete_group(
         self, account: AWSProviderAccount, network: AWSNetwork, group_id: str,
         final_snapshot: str,
@@ -345,7 +353,8 @@ def metric_warnings(metrics: dict[str, float | None]) -> list[str]:
 
 
 def _tags(response: dict[str, object]) -> dict[object, object]:
-    tags = response.get("TagList") or []
+    # ElastiCache lists tags under TagList, Secrets Manager under Tags.
+    tags = response.get("TagList") or response.get("Tags") or []
     return {
         item.get("Key"): item.get("Value") for item in tags if isinstance(item, dict)
     } if isinstance(tags, list) else {}
@@ -1005,6 +1014,43 @@ class BotoElastiCacheAdapter(AWSAdapter):
             deleted += 1
         return deleted
 
+    def schedule_credential_deletion(
+        self, account: AWSProviderAccount, store: AWSSecretsManagerStore, store_name: str,
+        resource_name: str, deployment_name: str,
+    ) -> None:
+        """Schedule one Deployment's Resource Credential for deletion after the fixed recovery
+        window, only if it carries this Resource's, store's, and Deployment's ownership tags.
+        Already scheduled or gone counts as done."""
+        if account.destructive_role_arn is None:
+            raise ResourceError(f"{self.error_prefix}_destroy_role_missing")
+        session = self._session(
+            account, account.destructive_role_arn, "elasticache-credential-schedule"
+        )
+        client = session.client("secretsmanager", region_name=store.region)
+        secret_id = f"{store.prefix}/{resource_name}/{deployment_name}"
+        try:
+            described = client.describe_secret(SecretId=secret_id)
+        except Exception as exc:
+            error = _provider_error(exc, "secret_verify", self.error_prefix)
+            if "missing" in str(error):
+                return
+            raise error from None
+        tags = _tags(described)
+        if (
+            tags.get("gimme:resource") != resource_name
+            or tags.get("gimme:secret-store") != store_name
+            or tags.get("gimme:deployment") != deployment_name
+        ):
+            raise ResourceError("aws_elasticache_purge_secret_ownership_mismatch")
+        if described.get("DeletedDate") is not None:
+            return
+        try:
+            client.delete_secret(SecretId=secret_id, RecoveryWindowInDays=DELETION_RECOVERY_DAYS)
+        except Exception as exc:
+            error = _provider_error(exc, "secret_schedule", self.error_prefix)
+            if "missing" not in str(error):
+                raise error from None
+
     def _read_secret(
         self, account: AWSProviderAccount, store: AWSSecretsManagerStore, name: str,
         stage: str = "AWSCURRENT",
@@ -1638,6 +1684,41 @@ def recovery_evidence_is_fresh(allocation: dict[str, object]) -> bool:
     return detached_at - timedelta(hours=24) <= captured_at <= detached_at
 
 
+def remove_allocation(root: Path, resource_name: str, deployment_name: str) -> None:
+    """Forget one Deployment's allocation once its purge has finished."""
+    document = load_observed(root, resource_name)
+    if document is None:
+        raise ResourceError("observed_resource_missing")
+    allocations = dict(cast(dict[str, object], document["allocations"]))
+    allocations.pop(deployment_name, None)
+    _write_json(
+        _observed_path(root, resource_name),
+        _validate_observed({**document, "allocations": allocations}), resource_name,
+    )
+
+
+def load_purge_marker(root: Path, resource_name: str) -> dict[str, object] | None:
+    """The one in-progress allocation purge on this Resource, if any."""
+    marker = read_marker(root, "purging", resource_name)
+    if marker is None:
+        return None
+    deleted = marker.get("deleted")
+    if (
+        set(marker) != {"schema_version", "resource", "deployment", "phase", "plan", "deleted"}
+        or marker["schema_version"] != 1 or marker["resource"] != resource_name
+        or DEPLOYMENT_NAME.fullmatch(str(marker["deployment"])) is None
+        or marker["phase"] not in PURGE_PHASES or not isinstance(marker["plan"], dict)
+        or isinstance(deleted, bool) or not isinstance(deleted, int) or deleted < 0
+    ):
+        raise ResourceError("aws_elasticache_purging_marker_invalid")
+    return marker
+
+
+def save_purge_marker(root: Path, resource_name: str, marker: dict[str, object]) -> None:
+    write_marker(root, "purging", resource_name, marker)
+    load_purge_marker(root, resource_name)
+
+
 def retain_group(root: Path, resource_name: str, aws_network: str) -> dict[str, object]:
     """Record a secret-free Retained Resource tombstone. Ordinary removal never deletes the
     replication group or its data; this is inventory only."""
@@ -1665,6 +1746,7 @@ MARKERS = {
     "destroying": "aws_elasticache_destroy_in_progress",
     "restoring": "aws_elasticache_restore_in_progress",
     "rotating": "aws_elasticache_rotate_in_progress",
+    "purging": "aws_elasticache_purge_in_progress",
 }
 
 
@@ -1712,7 +1794,8 @@ def operation_progress(root: Path, resource_name: str, kind: str) -> dict[str, o
     except ResourceError:
         return {}
     return {
-        key: marker[key] for key in ("verified", "failed", "deployment", "phase") if key in marker
+        key: marker[key] for key in ("verified", "failed", "deployment", "phase", "deleted")
+        if key in marker
     }
 
 

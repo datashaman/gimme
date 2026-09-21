@@ -1380,3 +1380,18 @@ def test_the_stop_processes_task_disables_every_unit_and_changes_nothing_else() 
     assert "Process management requires a Laravel application" in task
     for untouched in (".env", "artisan", "composer", "symlink", "restart"):
         assert untouched not in task
+
+
+def test_the_valkey_allocation_purge_task_runs_a_fixed_program_with_a_private_credential() -> None:
+    recipe = deployer_source()
+    task = recipe.split("task('gimme:resource:purge-valkey-allocation'", 1)[1].split(
+        "task('gimme:backup:dump-postgres'", 1
+    )[0]
+
+    assert "required_env('GIMME_CACHE_PREFIX')" in task
+    assert r"'/^\{gimme:[a-z][a-z0-9-]{0,63}\}:$/'" in task
+    assert "valid_endpoint($host)" in task and "is_link($localSecretFile)" in task
+    assert "file_get_contents(__DIR__ . '/scripts/gimme-purge-valkey')" in task
+    assert "install -d -m 0700" in task and "chmod 0600" in task
+    assert "} finally {" in task and "rm -f " in task.split("} finally {", 1)[1]
+    assert task.index("upload($localSecretFile") < task.index("python3 -")

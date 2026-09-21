@@ -1735,6 +1735,41 @@ task('gimme:resource:purge-postgres-allocation', function (): void {
     }
 });
 
+task('gimme:resource:purge-valkey-allocation', function (): void {
+    $localSecretFile = getenv('GIMME_SECRET_FILE') ?: '';
+    if ($localSecretFile === '' || !is_file($localSecretFile) || is_link($localSecretFile)) {
+        throw new \RuntimeException('A safe secret file is required to purge a Valkey allocation');
+    }
+    $host = required_env('GIMME_RESOURCE_ENDPOINT');
+    $port = required_env('GIMME_RESOURCE_PORT');
+    $prefix = required_env('GIMME_CACHE_PREFIX');
+    if (!valid_endpoint($host) || !preg_match('/^[1-9][0-9]{0,4}$/', $port) ||
+        (int) $port > 65535 ||
+        !preg_match('/^\{gimme:[a-z][a-z0-9-]{0,63}\}:$/', $prefix)) {
+        throw new \RuntimeException('Unsafe managed Valkey allocation purge identity');
+    }
+    $program = file_get_contents(__DIR__ . '/scripts/gimme-purge-valkey');
+    if ($program === false) {
+        throw new \RuntimeException('Missing Valkey allocation purge program');
+    }
+    $remoteDirectory = '/tmp/.gimme-resource-purge';
+    $remoteSecretFile = "{$remoteDirectory}/." . bin2hex(random_bytes(8)) . '.json';
+    run('install -d -m 0700 ' . escapeshellarg($remoteDirectory));
+    try {
+        upload($localSecretFile, $remoteSecretFile);
+        run('chmod 0600 ' . escapeshellarg($remoteSecretFile));
+        writeln(run(
+            'printf %s ' . escapeshellarg(base64_encode($program)) .
+            ' | base64 -d | python3 - ' . escapeshellarg($prefix) . ' ' .
+            escapeshellarg($host) . ' ' . escapeshellarg($port) . ' ' .
+            escapeshellarg($remoteSecretFile),
+            timeout: 180,
+        ));
+    } finally {
+        run('rm -f ' . escapeshellarg($remoteSecretFile));
+    }
+});
+
 task('gimme:backup:dump-postgres', function () use ($appsRoot): void {
     $database = required_env('GIMME_DATABASE_IDENTIFIER');
     $localPath = required_env('GIMME_BACKUP_LOCAL_PATH');

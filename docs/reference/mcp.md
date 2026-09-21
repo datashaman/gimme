@@ -368,8 +368,8 @@ generation (see the how-to).
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |
 | `apply_cleanup_resource` | Local write | Remove local registration after exact confirmation |
-| `plan_purge_resource_allocation` | Read | Plan purging one detached managed PostgreSQL allocation with current Recovery Point evidence |
-| `apply_purge_resource_allocation` | Remote write (destructive) | Delete the exact detached database and roles, then schedule its workload secret for the fixed 30-day recovery window after exact confirmation `PURGE <deployment> FROM <resource>` |
+| `plan_purge_resource_allocation` | Read | Plan purging one detached managed PostgreSQL or Valkey allocation with current Recovery Point evidence, or an explicit recovery-not-guaranteed warning for Valkey when its Recovery Policy excluded it; reads only local state |
+| `apply_purge_resource_allocation` | Remote write (destructive) | Delete the exact detached database and roles, or (Valkey) delete its exact key prefix in resumable bounded rounds and its ACL users, then schedule its workload secret for the fixed 30-day recovery window after exact confirmation `PURGE <deployment> FROM <resource>` |
 | `plan_destroy_resource` | Read | Plan destroying a managed ElastiCache Valkey or AWS RDS PostgreSQL Resource and its data, listing every Detached Allocation and its recovery evidence or a recovery-not-guaranteed warning; reads only local state and never assumes the destructive role |
 | `apply_destroy_resource` | Remote write (destructive) | Destroy the reviewed Resource through the Provider Account's destructive role after exact confirmation `DESTROY RESOURCE <name>`; Valkey and RDS both preserve a verified final snapshot, and RDS also retains automated backups |
 | `plan_purge_final_snapshot` | Read | Plan deleting only the deterministic final snapshot retained after a destroyed Valkey Resource; reads a local receipt only |

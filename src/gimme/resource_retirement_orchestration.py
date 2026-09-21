@@ -18,10 +18,26 @@ from gimme.control_plans import (
     postgres_destroy_plan,
     resource_cleanup_plan,
     resource_forget_plan,
+    valkey_allocation_purge_plan,
     valkey_destroy_plan,
 )
 from gimme.resources_postgres import ResourceError
 from gimme.secrets import protected_secret_file
+
+# One apply runs at most this many purge rounds; the same reviewed plan resumes the rest.
+MAX_PURGE_ROUNDS = 6
+
+
+def _purge_round_result(output: str) -> tuple[int, bool]:
+    """(keys deleted, more to do) from one purge round's fixed output line."""
+    for raw in output.splitlines():
+        parts = raw.split("] ", 1)[-1].strip().split("|")
+        if (
+            len(parts) == 3 and parts[0] == "GIMME_VALKEY_PURGE" and parts[1].isdigit()
+            and parts[2] in {"yes", "no"}
+        ):
+            return int(parts[1]), parts[2] == "yes"
+    raise ResourceError("aws_elasticache_purge_keys_failed")
 
 
 @dataclass(frozen=True)
@@ -155,6 +171,8 @@ class ResourceRetirementOrchestrator:
     def allocation_purge_plan(
         self, name: str, deployment: str
     ) -> dict[str, object]:
+        if isinstance(self.store.load().resources.get(name), AWSElastiCacheValkeyResource):
+            return self._valkey_allocation_purge_plan(name, deployment)
         marker = resources_postgres_module.load_allocation_purge(
             self.store.root, name, deployment
         )
@@ -210,6 +228,10 @@ class ResourceRetirementOrchestrator:
                 )
             state = self.store.load()
             resource = state.resources.get(name)
+            if isinstance(resource, AWSElastiCacheValkeyResource):
+                return self._apply_valkey_allocation_purge(
+                    name, deployment, resource, expected
+                )
             if not isinstance(resource, AWSRDSPostgresResource):
                 raise ResourceError("aws_rds_resource_missing")
             if any(
@@ -336,6 +358,164 @@ class ResourceRetirementOrchestrator:
                     resources_postgres_module.DELETION_RECOVERY_DAYS
                 ),
             }
+
+    def _valkey_allocation_of(
+        self, name: str, deployment: str
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        observed = resources_valkey_module.load_observed(self.store.root, name)
+        if observed is None:
+            raise ResourceError("observed_resource_missing")
+        allocation = cast(dict[str, dict[str, object]], observed["allocations"]).get(deployment)
+        return observed, allocation
+
+    def _refuse_valkey_binding(self, name: str, deployment: str) -> None:
+        if any(
+            deployment_name == deployment
+            and getattr(configured.resources.valkey, "resource", None) == name
+            for deployment_name, configured in self.store.load().deployments.items()
+        ):
+            raise ResourceError("aws_elasticache_allocation_still_bound")
+
+    def _valkey_allocation_purge_plan(self, name: str, deployment: str) -> dict[str, object]:
+        marker = resources_valkey_module.load_purge_marker(self.store.root, name)
+        if marker is not None and marker["deployment"] == deployment:
+            return cast(dict[str, object], marker["plan"])
+        state = self.store.load()
+        resource = cast(AWSElastiCacheValkeyResource, state.resources[name])
+        self._refuse_valkey_binding(name, deployment)
+        observed, allocation = self._valkey_allocation_of(name, deployment)
+        if allocation is None or allocation["status"] != "detached":
+            raise ResourceError("aws_elasticache_detached_allocation_missing")
+        evidence = None
+        if allocation["recovery_expected"]:
+            # The Recovery Policy included Valkey: a verified Component Backup taken within 24
+            # hours before disablement must still exist. Otherwise the plan carries a warning.
+            if not resources_valkey_module.recovery_evidence_is_fresh(allocation):
+                raise ResourceError("aws_elasticache_allocation_recovery_evidence_missing")
+            evidence = self.recovery_evidence("valkey", deployment, allocation)
+            if evidence != allocation["recovery_evidence"]:
+                raise ResourceError("aws_elasticache_allocation_recovery_evidence_stale")
+        network = state.aws_networks[resource.aws_network]
+        if state.provider_accounts[network.provider_account].destructive_role_arn is None:
+            raise ResourceError("aws_elasticache_destroy_role_missing")
+        return valkey_allocation_purge_plan(
+            name, deployment,
+            resources_valkey_module.identity_fingerprint(str(observed["identity"])),
+            self.store.digest(allocation), cast(dict[str, object] | None, evidence),
+        )
+
+    def _purge_valkey_keys(
+        self, name: str, deployment: str, resource: AWSElastiCacheValkeyResource,
+        observed: dict[str, object], marker: dict[str, object],
+    ) -> tuple[dict[str, object], bool]:
+        """Run bounded purge rounds on the administration Target with the admin identity. Done
+        only when a full pass finds nothing left, so the last round is the verification."""
+        state = self.store.load()
+        network = state.aws_networks[resource.aws_network]
+        account = state.provider_accounts[network.provider_account]
+        store = cast(AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store])
+        self.elasticache_valkey.ensure_admin_capture_access(account, network, name)
+        credential = self.elasticache_valkey.resolve_admin_credential(account, store, name)
+        admin_target = state.targets[resource.administration_target]
+        with protected_secret_file(credential) as secret_file:
+            for _round in range(MAX_PURGE_ROUNDS):
+                try:
+                    result = self.runner.run(
+                        "gimme:resource:purge-valkey-allocation",
+                        legacy_server(admin_target),
+                        stack=admin_target.stack,
+                        resource_endpoint=(
+                            str(observed["endpoint"]), int(cast(int, observed["port"]))
+                        ),
+                        resource_cache_prefix=f"{{gimme:{deployment}}}:",
+                        secret_file=secret_file,
+                        timeout=240,
+                    )
+                except Exception:
+                    raise ResourceError("aws_elasticache_purge_keys_failed") from None
+                deleted, more = _purge_round_result(result.output)
+                marker = {**marker, "deleted": int(cast(int, marker["deleted"])) + deleted}
+                resources_valkey_module.save_purge_marker(self.store.root, name, marker)
+                if not more and deleted == 0:
+                    return marker, True
+        return marker, False
+
+    def _apply_valkey_allocation_purge(
+        self, name: str, deployment: str, resource: AWSElastiCacheValkeyResource,
+        expected: dict[str, object],
+    ) -> dict[str, object]:
+        root = self.store.root
+        self._refuse_valkey_binding(name, deployment)
+        resources_valkey_module.refuse_while_busy(root, name, allow="purging")
+        marker = resources_valkey_module.load_purge_marker(root, name)
+        if marker is not None and marker["deployment"] != deployment:
+            raise ResourceError("aws_elasticache_purge_in_progress")
+        observed, allocation = self._valkey_allocation_of(name, deployment)
+        purged = {
+            "changed": True, "resource": name, "deployment": deployment, "purged": True,
+            "secret_recovery_window_days": resources_valkey_module.DELETION_RECOVERY_DAYS,
+        }
+        if allocation is None:
+            if marker is not None and marker["phase"] == "secret_scheduled":
+                resources_valkey_module.clear_marker(root, "purging", name)
+                return purged | {"changed": False}
+            raise ResourceError("aws_elasticache_detached_allocation_missing")
+        if allocation["status"] != "detached":
+            raise ResourceError("aws_elasticache_detached_allocation_missing")
+        if self.store.digest(allocation) != expected["allocation_fingerprint"]:
+            raise ValueError("plan_id is invalid or stale; request a fresh plan")
+        if marker is None:
+            if allocation["recovery_expected"] and self.recovery_evidence(
+                "valkey", deployment, allocation
+            ) != allocation["recovery_evidence"]:
+                raise ResourceError("aws_elasticache_allocation_recovery_evidence_stale")
+            marker = {
+                "schema_version": 1, "resource": name, "deployment": deployment,
+                "phase": "prepared", "plan": expected, "deleted": 0,
+            }
+            resources_valkey_module.save_purge_marker(root, name, marker)
+        state = self.store.load()
+        network = state.aws_networks[resource.aws_network]
+        account = state.provider_accounts[network.provider_account]
+        live = self.elasticache_valkey.describe_group(
+            account, network, resources_valkey_module.derive_group_id(name)
+        )
+        if (
+            live is None or live.identity != observed["identity"]
+            or resources_valkey_module.identity_fingerprint(live.identity)
+            != expected["identity_fingerprint"]
+        ):
+            raise ResourceError("aws_elasticache_purge_identity_changed")
+        if live.status != "available" or observed["endpoint"] is None or observed["port"] is None:
+            raise ResourceError("aws_elasticache_purge_resource_not_ready")
+        if marker["phase"] == "prepared":
+            marker, done = self._purge_valkey_keys(name, deployment, resource, observed, marker)
+            if not done:
+                return {
+                    "changed": True, "resource": name, "deployment": deployment, "purged": False,
+                    "phase": "purging", "deleted": marker["deleted"],
+                }
+            marker = {**marker, "phase": "keys_deleted"}
+            resources_valkey_module.save_purge_marker(root, name, marker)
+        if marker["phase"] == "keys_deleted":
+            for user_id in [
+                str(allocation["user_id"]),
+                *cast(list[str], allocation.get("retired_user_ids", [])),
+            ]:
+                self.elasticache_valkey.remove_user(account, network, name, user_id)
+            marker = {**marker, "phase": "user_deleted"}
+            resources_valkey_module.save_purge_marker(root, name, marker)
+        if marker["phase"] == "user_deleted":
+            self.elasticache_valkey.schedule_credential_deletion(
+                account,
+                cast(AWSSecretsManagerStore, state.secret_stores[resource.workload_secret_store]),
+                resource.workload_secret_store, name, deployment,
+            )
+            marker = {**marker, "phase": "secret_scheduled"}
+            resources_valkey_module.save_purge_marker(root, name, marker)
+        resources_valkey_module.remove_allocation(root, name, deployment)
+        resources_valkey_module.clear_marker(root, "purging", name)
+        return purged | {"keys_deleted": marker["deleted"]}
 
     def resource_cleanup_plan(self, name: str) -> dict[str, object]:
         state = self.store.load()

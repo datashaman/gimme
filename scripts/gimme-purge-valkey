@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+"""Delete one detached Deployment's Valkey prefix, in bounded rounds, with the admin identity."""
+
+from __future__ import annotations
+
+import json
+import re
+import socket
+import ssl
+import stat
+import sys
+import time
+from pathlib import Path
+
+
+MAX_BULK = 64 * 1024 * 1024
+MAX_KEYS = 100_000
+BATCH = 500
+# One run stops at either budget and reports `yes` so the caller resumes it.
+MAX_DELETED = 50_000
+MAX_SECONDS = 90
+PREFIX = re.compile(r"^\{gimme:[a-z][a-z0-9-]{0,63}\}:$")
+HOST = re.compile(r"^[a-zA-Z0-9.-]{1,255}$")
+
+
+class PurgeFailure(RuntimeError):
+    pass
+
+
+class ServerError(PurgeFailure):
+    def __init__(self, message: bytes):
+        super().__init__("valkey server rejected purge")
+        self.message = message
+
+
+class Connection:
+    def __init__(self, host: str, port: int):
+        raw = socket.create_connection((host, port), timeout=10)
+        self.socket = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        self.socket.settimeout(10)
+        self.reader = self.socket.makefile("rb")
+
+    def call(self, *arguments: str | bytes | int):
+        parts = [item if isinstance(item, bytes) else str(item).encode() for item in arguments]
+        self.socket.sendall(
+            b"*%d\r\n" % len(parts)
+            + b"".join(b"$%d\r\n%s\r\n" % (len(item), item) for item in parts)
+        )
+        return self.read()
+
+    def read(self):
+        line = self.reader.readline(128)
+        if not line.endswith(b"\r\n"):
+            raise PurgeFailure("valkey purge protocol invalid")
+        kind, value = line[:1], line[1:-2]
+        if kind == b"+":
+            return value
+        if kind == b"-":
+            raise ServerError(value)
+        if kind == b":":
+            return int(value)
+        if kind == b"$":
+            size = int(value)
+            if size < 0:
+                return None
+            if size > MAX_BULK:
+                raise PurgeFailure("valkey purge value too large")
+            payload = self.reader.read(size + 2)
+            if len(payload) != size + 2 or not payload.endswith(b"\r\n"):
+                raise PurgeFailure("valkey purge protocol invalid")
+            return payload[:-2]
+        if kind == b"*":
+            count = int(value)
+            if count < 0:
+                return None
+            if count > MAX_KEYS:
+                raise PurgeFailure("valkey purge response too large")
+            return [self.read() for _ in range(count)]
+        raise PurgeFailure("valkey purge protocol invalid")
+
+    def close(self) -> None:
+        self.reader.close()
+        self.socket.close()
+
+
+class Session:
+    def __init__(self, host: str, port: int, username: str, password: str):
+        self.base_host = host
+        self.username = username
+        self.password = password
+        self.connection = Connection(host, port)
+        self.connection.call("AUTH", username, password)
+
+    def call(self, *arguments: str | bytes | int):
+        for _attempt in range(3):
+            try:
+                return self.connection.call(*arguments)
+            except ServerError as error:
+                parts = error.message.split()
+                if len(parts) < 3 or parts[0] != b"MOVED":
+                    raise
+                host, separator, port = parts[2].decode("ascii", "strict").rpartition(":")
+                domain = self.base_host.partition(".")[2]
+                if (
+                    separator != ":" or not port.isdigit() or not 1 <= int(port) <= 65535
+                    or not (
+                        host == self.base_host
+                        or ("." in domain and host.endswith("." + domain))
+                    )
+                ):
+                    raise PurgeFailure("valkey purge redirect invalid") from None
+                self.connection.close()
+                self.connection = Connection(host, int(port))
+                self.connection.call("AUTH", self.username, self.password)
+        raise PurgeFailure("valkey purge redirect limit")
+
+
+def credential(path: str) -> tuple[str, str]:
+    secret = Path(path)
+    details = secret.lstat()
+    if (
+        secret.is_symlink() or not stat.S_ISREG(details.st_mode)
+        or details.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        or details.st_size > 4096
+    ):
+        raise PurgeFailure("valkey purge credential invalid")
+    value = json.loads(secret.read_text())
+    if (
+        not isinstance(value, dict) or set(value) != {"username", "password"}
+        or not all(isinstance(item, str) and item for item in value.values())
+    ):
+        raise PurgeFailure("valkey purge credential invalid")
+    return value["username"], value["password"]
+
+
+def purge(
+    prefix: bytes, host: str, port: int, username: str, password: str,
+) -> tuple[int, bool]:
+    """Scan the prefix and delete what it finds, batch by batch. Returns (deleted, more). A
+    complete pass reports more=False; the caller confirms with a further pass that deletes none.
+    Every key must start with the prefix, so no other Deployment's key is ever named."""
+    session = Session(host, port, username, password)
+    deadline = time.monotonic() + MAX_SECONDS
+    deleted = 0
+    cursor = 0
+    try:
+        while True:
+            response = session.call("SCAN", cursor, "MATCH", prefix + b"*", "COUNT", 1000)
+            if not isinstance(response, list) or len(response) != 2:
+                raise PurgeFailure("valkey purge scan invalid")
+            cursor = int(response[0])
+            keys = response[1]
+            if not isinstance(keys, list):
+                raise PurgeFailure("valkey purge scan invalid")
+            if any(not isinstance(key, bytes) or not key.startswith(prefix) for key in keys):
+                raise PurgeFailure("valkey purge isolation failed")
+            for start in range(0, len(keys), BATCH):
+                removed = session.call("DEL", *keys[start:start + BATCH])
+                if not isinstance(removed, int):
+                    raise PurgeFailure("valkey purge response invalid")
+                deleted += removed
+            if cursor == 0:
+                return deleted, False
+            if deleted >= MAX_DELETED or time.monotonic() >= deadline:
+                return deleted, True
+    finally:
+        session.connection.close()
+
+
+def main() -> None:
+    if len(sys.argv) != 5:
+        raise PurgeFailure("valkey purge requires fixed internal inputs")
+    prefix_value, host, port_value, secret_path = sys.argv[1:]
+    if (
+        PREFIX.fullmatch(prefix_value) is None or HOST.fullmatch(host) is None
+        or not port_value.isdigit() or not 1 <= int(port_value) <= 65535
+    ):
+        raise PurgeFailure("valkey purge policy invalid")
+    username, password = credential(secret_path)
+    deleted, more = purge(prefix_value.encode(), host, int(port_value), username, password)
+    print(f"GIMME_VALKEY_PURGE|{deleted}|{'yes' if more else 'no'}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (PurgeFailure, OSError, ValueError, json.JSONDecodeError):
+        print("GIMME_VALKEY_PURGE_FAILED|purge_failed", file=sys.stderr)
+        raise SystemExit(1) from None

@@ -591,3 +591,26 @@ def test_valkey_restore_context_must_be_complete(tmp_path: Path) -> None:
         runner(tmp_path).run(
             "gimme:recovery:valkey", server(), valkey_restore_request_id="restore-1"
         )
+
+
+def test_a_resource_cache_prefix_reaches_the_task_without_an_application(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, str] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return subprocess.CompletedProcess(args[0], 0, "ok")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    runner(tmp_path).run(
+        "gimme:resource:purge-valkey-allocation",
+        server(),
+        resource_endpoint=("cfg.example.internal", 6379),
+        resource_cache_prefix="{gimme:example-local}:",
+    )
+
+    assert captured["GIMME_CACHE_PREFIX"] == "{gimme:example-local}:"
+    assert captured["GIMME_RESOURCE_ENDPOINT"] == "cfg.example.internal"
+    assert captured["GIMME_RESOURCE_PORT"] == "6379"
