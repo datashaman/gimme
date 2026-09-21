@@ -17,9 +17,15 @@ recreation of an empty group) after a group is lost, and per-Deployment credenti
 
 The disposable integration workflow also drives cache, session, queue, and Horizon through a
 locked real Laravel application against a TLS, cluster-mode, ACL-enforcing local Valkey/Redis
-server. It proves the derived namespaces and observes cross-namespace and command denials through
-Laravel's Redis connection. The fixed pre-switchover probes below remain independent and speak the
-Redis protocol directly.
+server. It drives the cache, session, and queue (with Horizon) uses each on its own and then
+together, proves each stays inside its derived namespace, and observes cross-namespace and command
+denials through Laravel's Redis connection. It also rehearses the rotation contract against the same server: a
+candidate with a wrong password or a missing permission is refused while the live credential and
+its open connection keep working, and rolling the candidate back removes its user; a probed next
+generation passes while the previous one still works; deleting the previous user closes its
+connection and ends its credential, and only the new generation passes afterwards; and a worker
+that meets a server restart fails within the contract's bounds and recovers once it reconnects. The
+fixed pre-switchover probes below remain independent and speak the Redis protocol directly.
 
 The AWS calls have only been exercised against botocore stubs. Nothing here has run against a
 live account, so the IAM statements (destructive role included) and the ACL access strings below
@@ -577,11 +583,19 @@ destruction (`aws_elasticache_rotate_in_progress`), and a rotation of a differen
 refuses the same way. The group must be `ready` to start one
 (`aws_elasticache_rotate_resource_not_ready`).
 
-Existing connections that authenticated as the deleted user are closed by ElastiCache, and PHP
+Existing connections that authenticated as the deleted user are closed (observed against a local
+Valkey/Redis server by the disposable Laravel suite; ElastiCache itself is unverified), and PHP
 processes that cached configuration keep the old credential until they reload it. Whether
 `apply_deployment_resources` and a worker restart reach every such process is unverified; the probe
 proves the new credential from the Target, not from each running process. Whether ElastiCache lets
 a user be deleted while it is still a member of a user group is also unverified.
+
+Restarts and failovers: the disposable suite observed that a Predis cluster client instance that
+lost its connection to a restarted server stayed unable to connect through the contract's bounded
+retries, and that reconnecting (Laravel's connection purge) or starting a fresh process worked at
+once. So a long-running worker that meets a Resource restart should be restarted, which the process
+manager already does when it exits; do not rely on the in-process client to heal. This was observed
+on a local single-node cluster, not on an ElastiCache failover, which is unverified.
 
 For the executable, separately authorized live restore and rotation matrix, see
 [Validate ElastiCache Valkey against AWS](validate-aws-elasticache-live.md#run-the-executable-recovery-matrix).
