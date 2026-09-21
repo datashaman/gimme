@@ -9,6 +9,13 @@ may contain deliberate schema and MCP API breaks.
   'status'` right after it created the group: the real adapter's `create_group` returns nothing
   (AWS accepting the call is the acknowledgement), and the restore now reads the group afterwards,
   as provisioning already did. Found by the first live restore on AWS.
+- Fixed bootstrapping a Target that has no placed Deployments (an administration Target, or any
+  Target before its first placement): the desired state wrote `"sites": []`, which the privileged
+  helper rejected with `sites must be an object`. It now writes an empty object.
+- Fixed managed Valkey creation failing its first apply with
+  `aws_elasticache_create_invalid_state`: AWS refuses a replication group whose new user group is
+  still `creating` (`InvalidUserGroupStateFault`, seen on every live create). Create now waits up to
+  a minute for the user group to be usable.
 - Fixed `inspect_resource` reporting a false `security_group` readiness issue while a managed
   Valkey group was `modifying` (found live during a failover): attached security groups are read
   only from an available group, so a modifying group is now compared on nothing rather than on
