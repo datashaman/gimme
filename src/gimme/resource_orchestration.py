@@ -543,6 +543,13 @@ class ManagedResourceOrchestrator:
                 identity_fingerprint=resources_postgres_module.identity_fingerprint(
                     live.identity
                 ),
+                multi_az=live.multi_az,
+                storage_encrypted=live.storage_encrypted,
+                deletion_protection=live.deletion_protection,
+                publicly_accessible=live.publicly_accessible,
+                backup_retention_days=live.backup_retention_days,
+                backup_window=live.backup_window,
+                maintenance_window=live.maintenance_window,
                 readiness_issues=issues,
                 drift=resources_postgres_module.instance_drift(resource, live),
             )
@@ -553,6 +560,13 @@ class ManagedResourceOrchestrator:
                 identity_fingerprint=resources_postgres_module.identity_fingerprint(
                     str(observed["identity"])
                 ),
+                multi_az=observed["multi_az"],
+                storage_encrypted=observed["storage_encrypted"],
+                deletion_protection=observed["deletion_protection"],
+                publicly_accessible=observed["publicly_accessible"],
+                backup_retention_days=observed["backup_retention_days"],
+                backup_window=observed["backup_window"],
+                maintenance_window=observed["maintenance_window"],
                 readiness_issues=observed["readiness_issues"],
             )
         if observed is not None:

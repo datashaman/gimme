@@ -4605,12 +4605,29 @@ def test_inspect_resource_prefers_live_state_and_falls_back_to_the_cache(
 
     live = server_module.inspect_resource("primary-rds")
     assert (live["source"], live["phase"], live["engine_version"]) == ("live", "ready", "17.2")
+    assert {
+        key: live[key]
+        for key in (
+            "multi_az", "storage_encrypted", "deletion_protection",
+            "publicly_accessible", "backup_retention_days", "backup_window",
+            "maintenance_window",
+        )
+    } == {
+        "multi_az": True,
+        "storage_encrypted": True,
+        "deletion_protection": True,
+        "publicly_accessible": False,
+        "backup_retention_days": 7,
+        "backup_window": "03:00-04:00",
+        "maintenance_window": "sun:05:00-sun:06:00",
+    }
 
     adapter.fail_describe = True
     cached = server_module.inspect_resource("primary-rds")
     assert cached["source"] == "cache"
     assert cached["refresh_error"] == "aws_rds_describe_throttled"
     assert cached["phase"] == "ready"
+    assert cached["multi_az"] is True and cached["storage_encrypted"] is True
 
 
 def test_inspect_resource_reports_target_local_resources_without_provider_calls(

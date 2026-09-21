@@ -59,6 +59,8 @@ jobs:
         run: |
           uv run gimme-bootstrap-target integration
           uv run gimme-bootstrap-database integration
+      - name: Exercise the zero-cost managed PostgreSQL lifecycle
+        run: uv run python tests/integration/rds_postgres_local_scenario.py
       - name: Pin observed resource versions
         run: uv run python tests/integration/disposable_vm_smoke.py pin-resources
       - name: Exercise isolated resources and host services

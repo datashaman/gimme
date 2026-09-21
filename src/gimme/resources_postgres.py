@@ -1130,11 +1130,25 @@ def _validate_observed(document: object) -> dict[str, object]:
         "readiness_issues", "administration_verified",
         "master_secret_version_fingerprint", "extension_versions",
     }
+    topology_fields = {
+        "multi_az", "storage_encrypted", "deletion_protection",
+        "publicly_accessible", "backup_retention_days", "backup_window",
+        "maintenance_window",
+    }
     if not isinstance(document, dict) or frozenset(document) not in {
-        frozenset(base_fields), frozenset(base_fields | added_fields)
+        frozenset(base_fields),
+        frozenset(base_fields | added_fields),
+        frozenset(base_fields | added_fields | topology_fields),
     }:
         raise ResourceError("observed_resource_invalid")
-    if document.get("schema_version") not in {1, 2}:
+    if document.get("schema_version") not in {1, 2, 3}:
+        raise ResourceError("observed_resource_invalid")
+    expected_fields = {
+        1: base_fields,
+        2: base_fields | added_fields,
+        3: base_fields | added_fields | topology_fields,
+    }[cast(int, document["schema_version"])]
+    if set(document) != expected_fields:
         raise ResourceError("observed_resource_invalid")
     if RESOURCE_NAME.fullmatch(str(document.get("resource"))) is None:
         raise ResourceError("observed_resource_invalid")
@@ -1155,7 +1169,7 @@ def _validate_observed(document: object) -> dict[str, object]:
         normalized_allocations[deployment_name] = _validate_allocation(allocation)
     document = {**document, "allocations": normalized_allocations}
     if document["schema_version"] == 1:
-        return {
+        document = {
             **document,
             "schema_version": 2,
             "readiness_issues": ["aws_rds_not_ready_administration"],
@@ -1184,6 +1198,38 @@ def _validate_observed(document: object) -> dict[str, object]:
             or re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version) is None
             for version in extension_versions.values()
         )
+    ):
+        raise ResourceError("observed_resource_invalid")
+    if document["schema_version"] == 2:
+        return {
+            **document,
+            "schema_version": 3,
+            "multi_az": None,
+            "storage_encrypted": None,
+            "deletion_protection": None,
+            "publicly_accessible": None,
+            "backup_retention_days": None,
+            "backup_window": None,
+            "maintenance_window": None,
+        }
+    if any(
+        document.get(field) is not None and not isinstance(document.get(field), bool)
+        for field in (
+            "multi_az", "storage_encrypted", "deletion_protection", "publicly_accessible",
+        )
+    ):
+        raise ResourceError("observed_resource_invalid")
+    if (
+        document.get("backup_retention_days") is not None
+        and (
+            isinstance(document.get("backup_retention_days"), bool)
+            or not isinstance(document.get("backup_retention_days"), int)
+        )
+    ):
+        raise ResourceError("observed_resource_invalid")
+    if any(
+        document.get(field) is not None and not isinstance(document.get(field), str)
+        for field in ("backup_window", "maintenance_window")
     ):
         raise ResourceError("observed_resource_invalid")
     return document
@@ -1233,7 +1279,7 @@ def _instance_document(
 ) -> dict[str, object]:
     issues = readiness_issues(resource, observation)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "resource": resource_name,
         "aws_instance_identifier": aws_instance_identifier,
         "identity": observation.identity,
@@ -1243,6 +1289,13 @@ def _instance_document(
         "endpoint": observation.endpoint,
         "port": observation.port,
         "master_secret_arn": observation.master_secret_arn,
+        "multi_az": observation.multi_az,
+        "storage_encrypted": observation.storage_encrypted,
+        "deletion_protection": observation.deletion_protection,
+        "publicly_accessible": observation.publicly_accessible,
+        "backup_retention_days": observation.backup_retention_days,
+        "backup_window": observation.backup_window,
+        "maintenance_window": observation.maintenance_window,
         "master_secret_version_fingerprint": ABSENT_VALUE,
         "extension_versions": {},
         "administration_verified": False,

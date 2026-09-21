@@ -1,4 +1,5 @@
 import dataclasses
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,9 @@ from gimme.resources_postgres import (
     BotoRDSAdapter,
     InstanceObservation,
     ResourceError,
+    SnapshotObservation,
     _provider_error,
+    apply_destroy,
     apply_provision,
     derive_instance_identifier,
     generate_workload_password,
@@ -1011,6 +1014,90 @@ def test_destructive_adapter_tags_final_snapshot_and_preserves_automated_backups
         "SkipFinalSnapshot": True,
         "DeleteAutomatedBackups": False,
     }
+
+
+def test_destroy_progresses_through_snapshot_delete_timeout_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    provisioner = FakeRDSAdapter()
+    apply_provision(
+        provisioner, tmp_path, account(), network(), resource(), "devbox-postgres",
+        sleep=lambda _: None,
+    )
+    identifier = derive_instance_identifier("devbox-postgres")
+    identity = provisioner.instances[identifier].identity
+    fingerprint = "sha256:" + hashlib.sha256(identity.encode()).hexdigest()
+    snapshot_id = f"gimme-devbox-postgres-g1-final-{fingerprint[-12:]}"
+
+    class Lifecycle:
+        live = dataclasses.replace(
+            provisioner.instances[identifier],
+            ownership_verified=True,
+            generation=1,
+            deletion_protection=False,
+        )
+        snapshot: SnapshotObservation | None = None
+        dependents_ready = False
+        deleted = 0
+
+        def describe_instance(self, account, network, selected):
+            assert selected == identifier
+            return self.live
+
+        def describe_final_snapshot(self, account, network, selected):
+            assert selected == snapshot_id
+            return self.snapshot
+
+        def create_final_snapshot(
+            self, account, network, selected, snapshot, resource_name, generation,
+        ):
+            assert (selected, snapshot, resource_name, generation) == (
+                identifier, snapshot_id, "devbox-postgres", 1,
+            )
+            self.snapshot = SnapshotObservation(
+                "snapshot-identity", "creating", identifier, True, 1
+            )
+            return self.snapshot
+
+        def delete_instance_preserving_backups(self, account, network, selected):
+            self.deleted += 1
+            self.live = dataclasses.replace(self.live, status="deleting")
+
+        def delete_instance_dependents(self, account, network, selected):
+            return self.dependents_ready
+
+    adapter = Lifecycle()
+    destructive = account().model_copy(update={
+        "destructive_role_arn": "arn:aws:iam::123456789012:role/gimme-destroy"
+    })
+
+    snapshotting = apply_destroy(
+        adapter, tmp_path, destructive, network(), "devbox-postgres",
+        fingerprint, snapshot_id, sleep=lambda _: None,
+    )
+    assert snapshotting["phase"] == "snapshotting"
+
+    adapter.snapshot = dataclasses.replace(adapter.snapshot, status="available")
+    clock = iter((0.0, 31.0))
+    deleting = apply_destroy(
+        adapter, tmp_path, destructive, network(), "devbox-postgres",
+        fingerprint, snapshot_id, sleep=lambda _: None, now=lambda: next(clock),
+    )
+    assert deleting["phase"] == "deleting" and adapter.deleted == 1
+
+    adapter.live = None
+    cleaning = apply_destroy(
+        adapter, tmp_path, destructive, network(), "devbox-postgres",
+        fingerprint, snapshot_id, sleep=lambda _: None,
+    )
+    assert cleaning["phase"] == "cleaning"
+
+    adapter.dependents_ready = True
+    destroyed = apply_destroy(
+        adapter, tmp_path, destructive, network(), "devbox-postgres",
+        fingerprint, snapshot_id, sleep=lambda _: None,
+    )
+    assert destroyed["phase"] == "destroyed" and destroyed["destroyed"] is True
 
 
 IDENTIFIER = derive_instance_identifier("devbox-postgres")

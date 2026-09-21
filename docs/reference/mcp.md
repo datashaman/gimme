@@ -354,7 +354,7 @@ refused with `aws_elasticache_node_type_unavailable`.
 | --- | --- | --- |
 | `plan_apply_resource` | Read | Plan creating one managed instance or converging an existing one; makes no AWS call |
 | `apply_resource` | Remote write | Create the RDS instance, or converge an existing one with one immediate modification, without returning a credential |
-| `inspect_resource` | Remote read | Live secret-free provider identity, health, and version through the inspection role, plus allocations and, after a successful live read, `drift` against desired state; falls back to the last observed state with a bounded `refresh_error` and no drift |
+| `inspect_resource` | Remote read | Live secret-free provider identity, health, exact version, topology booleans, deletion protection, and lifecycle windows through the inspection role, plus allocations and, after a successful live read, `drift` against desired state; falls back to the last observed state with a bounded `refresh_error` and no drift |
 | `plan_bind_resource` | Read | Plan creating a deployment's isolated database, role, and workload secret, and its Valkey ACL user, namespace, and credential |
 | `bind_resource` | Remote write | Create or reconcile the binding; never returns the workload credential |
 | `plan_cleanup_resource` | Read | Plan local resource removal |
