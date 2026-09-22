@@ -5,6 +5,9 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Recorded a third live ElastiCache run in `docs/how-to/validate-aws-elasticache-live.md`: real
+  Laravel activation probes, rotation, restore, process stop, detach, and purge, plus what is
+  still unverified.
 - Fixed the AWS ElastiCache how-to's IAM example: `elasticache:DescribeSnapshots` does not
   support resource-level permissions, so scoped to `snapshot:gimme-*` it was denied and snapshot
   listing failed with `aws_elasticache_snapshots_access_denied`. It is now its own
