@@ -10,6 +10,13 @@ may contain deliberate schema and MCP API breaks.
   future Ansible reconciliation backend. It is not wired into any MCP tool, CLI
   argument, or desired state; `plan_target_stack`/`apply_target_stack` keep using the
   existing Deployer/privileged-helper path unchanged.
+- Recorded a third live ElastiCache run in `docs/how-to/validate-aws-elasticache-live.md`: real
+  Laravel activation probes, rotation, restore, process stop, detach, and purge, plus what is
+  still unverified.
+- Fixed the AWS ElastiCache how-to's IAM example: `elasticache:DescribeSnapshots` does not
+  support resource-level permissions, so scoped to `snapshot:gimme-*` it was denied and snapshot
+  listing failed with `aws_elasticache_snapshots_access_denied`. It is now its own
+  `"Resource": "*"` statement. Found by a live restore on AWS.
 - Fixed a managed Valkey snapshot restore crashing with `'NoneType' object has no attribute
   'status'` right after it created the group: the real adapter's `create_group` returns nothing
   (AWS accepting the call is the acknowledgement), and the restore now reads the group afterwards,
