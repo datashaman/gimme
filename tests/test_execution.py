@@ -22,6 +22,7 @@ def write_execution_tree(root: Path) -> None:
         "scripts/gimme-purge-valkey": "valkey-purge-v1\n",
         "scripts/gimme-restore-postgres": "postgres-restore-v1\n",
         "scripts/gimme-restore-valkey": "valkey-restore-v1\n",
+        "src/gimme/target_stack_adapter.py": "target-stack-adapter-v1\n",
         "vendor/deployer/deployer/bin/dep": "deployer-bin-v1\n",
         "vendor/deployer/deployer/src/functions.php": "deployer-functions-v1\n",
         "pyproject.toml": "python-project-v1\n",
@@ -43,6 +44,14 @@ def test_execution_fingerprint_changes_with_executable_sources_only(tmp_path: Pa
     assert execution_fingerprint(tmp_path) == first
 
     (tmp_path / "deploy/configuration.php").write_text("configuration-v2\n")
+    assert execution_fingerprint(tmp_path) != first
+
+
+def test_execution_fingerprint_changes_with_the_target_stack_adapter(tmp_path: Path) -> None:
+    write_execution_tree(tmp_path)
+    first = execution_fingerprint(tmp_path)
+
+    (tmp_path / "src/gimme/target_stack_adapter.py").write_text("target-stack-adapter-v2\n")
     assert execution_fingerprint(tmp_path) != first
 
 

@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added ADR 0011 and a non-mutating Ansible Target-stack adapter boundary
+  (`gimme.target_stack_adapter`): a deterministic, secret-free renderer contract for a
+  future Ansible reconciliation backend. It is not wired into any MCP tool, CLI
+  argument, or desired state; `plan_target_stack`/`apply_target_stack` keep using the
+  existing Deployer/privileged-helper path unchanged.
 - Recorded a third live ElastiCache run in `docs/how-to/validate-aws-elasticache-live.md`: real
   Laravel activation probes, rotation, restore, process stop, detach, and purge, plus what is
   still unverified.
