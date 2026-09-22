@@ -5,6 +5,11 @@ may contain deliberate schema and MCP API breaks.
 
 ## [Unreleased]
 
+- Added ADR 0011 and a non-mutating Ansible Target-stack adapter boundary
+  (`gimme.target_stack_adapter`): a deterministic, secret-free renderer contract for a
+  future Ansible reconciliation backend. It is not wired into any MCP tool, CLI
+  argument, or desired state; `plan_target_stack`/`apply_target_stack` keep using the
+  existing Deployer/privileged-helper path unchanged.
 - Fixed a managed Valkey snapshot restore crashing with `'NoneType' object has no attribute
   'status'` right after it created the group: the real adapter's `create_group` returns nothing
   (AWS accepting the call is the acknowledgement), and the restore now reads the group afterwards,
